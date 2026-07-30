@@ -1,6 +1,6 @@
 import { useMemo, useState, type FormEvent } from "react";
 import { api, writeBody } from "./api";
-import { Field, Modal, Stamp, UtilityIcon, formatTime, useDaemonAvailable } from "./components";
+import { EmployeeAvatar, Field, Modal, Stamp, UtilityIcon, formatTime, useDaemonAvailable } from "./components";
 import type { Bootstrap, JsonObject, Skill, SkillBinding } from "./types";
 
 interface PageProps {
@@ -161,7 +161,7 @@ export function SkillsPage({ data, refresh, notify }: PageProps) {
         return <article className={`skill-ledger-row ${skill.status === "archived" ? "is-archived" : ""}`} key={skill.id}>
           <button type="button" className="skill-ledger-identity" onClick={() => setInspectId(skill.id)}><span className="skill-book" aria-hidden="true">S</span><span><strong>{skill.displayName}</strong><small>{skill.description}</small></span></button>
           <div className="skill-source"><code>LOCAL</code><span>{skill.id}</span><small>revision v{skill.version}</small></div>
-          <div className="skill-bound"><strong>{bound.length} 人绑定</strong><span>{enabled} 人启用</span><div>{bound.slice(0, 3).map((employee) => <abbr title={employee.identity.displayName} key={employee.id}>{employee.presentation.initials || employee.identity.displayName.slice(0, 1)}</abbr>)}</div></div>
+          <div className="skill-bound"><strong>{bound.length} 人绑定</strong><span>{enabled} 人启用</span><div>{bound.slice(0, 3).map((employee) => <EmployeeAvatar className="small skill-bound-avatar" title={employee.identity.displayName} displayName={employee.identity.displayName} presentation={employee.presentation} key={employee.id} />)}</div></div>
           <Stamp status={skill.status} label={skill.status === "active" ? "可绑定" : "已归档"} />
           <div className="skill-row-actions"><button type="button" className="text-button" onClick={() => setInspectId(skill.id)}>查看</button>{skill.status === "active" ? <><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setEditor(skill.id)}>修订</button><button type="button" className="text-button danger-text" disabled={!daemonAvailable} onClick={() => setArchiveId(skill.id)}>归档</button></> : <button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => void restore(skill)}>恢复</button>}</div>
         </article>;

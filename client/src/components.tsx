@@ -5,6 +5,7 @@ import {
   useId,
   useRef,
   useState,
+  type CSSProperties,
   type PropsWithChildren,
   type ReactNode
 } from "react";
@@ -191,6 +192,27 @@ export function formatTime(value?: string): string {
 
 export function initials(displayName: string, configured?: string): string {
   return configured?.trim().slice(0, 2).toUpperCase() || displayName.trim().slice(0, 2).toUpperCase() || "AG";
+}
+
+export function EmployeeAvatar({ displayName, presentation, className = "", title }: {
+  displayName: string;
+  presentation?: { accent?: string; initials?: string; avatarUrl?: string };
+  className?: string;
+  title?: string;
+}) {
+  const avatarUrl = presentation?.avatarUrl?.trim();
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [avatarUrl]);
+  const hasAvatar = Boolean(avatarUrl && !failed);
+  return <span
+    className={`employee-initials ${hasAvatar ? "has-avatar" : ""} ${className}`.trim()}
+    style={{ "--accent": presentation?.accent ?? DEFAULT_EMPLOYEE_ACCENT } as CSSProperties}
+    title={title}
+  >
+    {hasAvatar
+      ? <img src={avatarUrl} alt="" loading="lazy" decoding="async" referrerPolicy="no-referrer" onError={() => setFailed(true)} />
+      : initials(displayName, presentation?.initials)}
+  </span>;
 }
 
 export function Icon({ name }: { name: "employees" | "skills" | "workflows" | "runs" | "publications" | "command" }) {

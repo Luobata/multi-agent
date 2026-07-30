@@ -44,8 +44,10 @@ describe("Local Agent Workbench", () => {
       },
       description: "Reviews evidence locally.",
       skills: [{ id: "evidence-review", config: { tone: "concise" } }],
-      providerId: "mock"
+      providerId: "mock",
+      presentation: { accent: "#6A5544", initials: "LA", avatarUrl: "/avatars/local-analyst.png" }
     });
+    expect(employee.presentation.avatarUrl).toBe("/avatars/local-analyst.png");
 
     const first = await service.invokeEmployee(employee.id, { message: "Review the first dossier" });
     expect(first.status).toBe("passed");
@@ -79,6 +81,7 @@ describe("Local Agent Workbench", () => {
     expect(clone.version).toBe(1);
     expect(clone.identity.displayName).toBe("Analyst Copy");
     expect(clone.skillVersions["evidence-review"]).toBe(1);
+    expect(clone.presentation.avatarUrl).toBe("/avatars/local-analyst.png");
     expect(service.listSessions(clone.id)).toEqual([]);
 
     const workflow = await service.createWorkflow({
@@ -108,6 +111,7 @@ describe("Local Agent Workbench", () => {
 
     const reopened = await WorkbenchService.open({ dataRoot: root });
     expect(reopened.getEmployee(employee.id).version).toBe(3);
+    expect(reopened.getEmployee(employee.id).presentation.avatarUrl).toBe("/avatars/local-analyst.png");
     expect(reopened.getSession(first.session.id).messages).toHaveLength(4);
     await expect(reopened.listRuns()).resolves.toHaveLength(3);
   });

@@ -4,6 +4,7 @@ import {
   DossierSection,
   DEFAULT_EMPLOYEE_ACCENT,
   defaultEmployeeAccentInput,
+  EmployeeAvatar,
   EmptyState,
   Field,
   Modal,
@@ -11,7 +12,6 @@ import {
   Stamp,
   UtilityIcon,
   formatTime,
-  initials,
   scrollRecordIntoView,
   useDaemonAvailable
 } from "./components";
@@ -253,7 +253,10 @@ function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify 
         <div className="form-grid three">
           <Field label="档案强调色"><input type="color" value={draft.accent} onChange={(e) => patch("accent", e.target.value)} /></Field>
           <Field label="首字母"><input maxLength={2} value={draft.initials} onChange={(e) => patch("initials", e.target.value)} /></Field>
-          <Field label="头像地址"><input type="url" value={draft.avatarUrl} onChange={(e) => patch("avatarUrl", e.target.value)} /></Field>
+          <div className="avatar-field-row">
+            <EmployeeAvatar className="large" displayName={draft.displayName || draft.id || "新员工"} presentation={{ accent: draft.accent, initials: draft.initials, avatarUrl: draft.avatarUrl }} />
+            <Field label="头像地址" hint="支持 /avatars/... 项目资源或 https:// 图片；加载失败自动回退首字母。"><input type="text" placeholder="/avatars/employee.png" value={draft.avatarUrl} onChange={(e) => patch("avatarUrl", e.target.value)} /></Field>
+          </div>
         </div>
       </DossierSection>
 
@@ -539,7 +542,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       <div className="list-tools"><input type="search" placeholder="检索姓名、ID 或职责…" value={search} onChange={(e) => setSearch(e.target.value)} /><label className="archive-toggle"><input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />含归档</label><button className="text-button" disabled={!daemonAvailable} onClick={() => setRegistryOpen(true)}>共享注册表</button></div>
       <div className="record-scroll">
         {visible.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
-          <span className="employee-initials" style={{ "--accent": employee.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT } as React.CSSProperties}>{initials(employee.identity.displayName, employee.presentation.initials)}</span>
+          <EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} />
           <span className="employee-card-copy"><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><small>{employee.description}</small><span className="employee-runtime"><span>模型 <code>{runtime.model}</code></span><span title={runtime.launchCommand}>启动 <code>{runtime.launchPreview}</code></span></span></span>
           <Stamp status={employee.status} />
         </button>; })}
@@ -552,7 +555,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       {!selected ? <EmptyState title="建立第一位本地员工" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>建立档案</button>}>定义他的背景、职责、提示词、共享 Skill、Provider 与权限。之后可以在任意 MCP 会话直接调用，也可以将他放进协作编排。</EmptyState> : <div className="dossier" style={{ "--dossier-accent": selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT } as React.CSSProperties}>
         <header className="dossier-cover">
           <div className="file-index"><span>LOCAL PERSONNEL RECORD</span><code>No. {selected.id.toUpperCase()}</code></div>
-          <div className="dossier-title-row"><span className="employee-initials large">{initials(selected.identity.displayName, selected.presentation.initials)}</span><div><h2>{selected.identity.displayName}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div>
+          <div className="dossier-title-row"><EmployeeAvatar className="large" displayName={selected.identity.displayName} presentation={selected.presentation} /><div><h2>{selected.identity.displayName}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div>
           <div className="dossier-actions"><button className="button primary" disabled={selected.status === "archived"} onClick={() => scrollRecordIntoView("direct-desk")}>直接交办</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订档案</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setCloneDraft({ id: `${selected.id}-copy`, displayName: `${selected.identity.displayName} 副本` }); setCloneOpen(true); }}>复制</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div>
         </header>
 
@@ -560,7 +563,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
         <DossierSection number="02" title="提示词"><div className="prompt-preview"><div><span>系统指令</span><p>{selected.systemPrompt}</p></div><div><span>请求指令</span><p>{selected.requestPrompt}</p></div></div></DossierSection>
         <DossierSection number="03" title="技能" action={<button type="button" className="text-button icon-text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setSkillManagerOpen(true)}><UtilityIcon name="add" />管理绑定</button>}><div className="employee-skill-ledger">{selected.skills.length ? selected.skills.map((binding) => { const id = bindingId(binding); const skill = data.skills.find((candidate) => candidate.id === id); const enabled = bindingEnabled(binding); return <article className={!enabled ? "is-disabled" : ""} key={id}><div className="skill-book" aria-hidden="true">S</div><div><strong>{skill?.displayName ?? id}</strong><code>{id} · 固定 v{selected.skillVersions[id] ?? "—"}</code><small>{skill?.description ?? "共享能力定义不可用"}</small></div><Stamp status={enabled ? "active" : "archived"} label={enabled ? "已启用" : "已停用"} /><label className="compact-switch"><span className="sr-only">{enabled ? "停用" : "启用"} {skill?.displayName ?? id}</span><input type="checkbox" role="switch" disabled={!daemonAvailable || Boolean(togglingSkill) || selected.status === "archived"} checked={enabled} onChange={(event) => void toggleSkill(id, event.target.checked)} /></label></article>; }) : <div className="empty-inline"><span>尚未绑定共享 Skill</span><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setSkillManagerOpen(true)}>添加第一个</button></div>}</div></DossierSection>
         <div className="dossier-columns"><DossierSection number="04" title="Provider"><dl className="ledger"><dt>实例</dt><dd><code>{selected.providerId}</code></dd><dt>模型</dt><dd className="provider-model"><code>{selectedRuntime.model}</code></dd><dt>Adapter</dt><dd>{selectedRuntime.adapter}</dd><dt>最大尝试</dt><dd>{selected.maxAttempts}</dd></dl><div className="provider-launch"><span>启动指令模板</span><pre>{selectedRuntime.launchCommand}</pre><small>当前 Provider 配置中的 argv；模板变量会在运行时渲染，敏感参数仅显示为 ***。</small></div></DossierSection><DossierSection number="05" title="权限"><dl className="ledger"><dt>写入</dt><dd>{selected.permissions.write}</dd><dt>声明工具</dt><dd>{selected.permissions.tools?.join(", ") || "无"}</dd><dt>历史窗口</dt><dd>{selected.contextPolicy.historyLimit} 条</dd><dt>Verdict</dt><dd>{selected.verdict ? <code>{selected.verdict.path}: {selected.verdict.pass.join("/")} | {selected.verdict.block.join("/")}</code> : "未配置"}</dd></dl></DossierSection></div>
-        <DossierSection number="06" title="外观"><dl className="ledger horizontal"><dt>强调色</dt><dd><span className="color-chip" style={{ background: selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT }} />{selected.presentation.accent ?? "默认朱红"}</dd><dt>首字母</dt><dd>{initials(selected.identity.displayName, selected.presentation.initials)}</dd></dl></DossierSection>
+        <DossierSection number="06" title="外观"><dl className="ledger horizontal"><dt>强调色</dt><dd><span className="color-chip" style={{ background: selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT }} />{selected.presentation.accent ?? "默认朱红"}</dd><dt>首字母</dt><dd>{selected.presentation.initials || selected.identity.displayName.slice(0, 2)}</dd><dt>头像</dt><dd>{selected.presentation.avatarUrl ? <code className="avatar-source">{selected.presentation.avatarUrl}</code> : "未配置，显示首字母"}</dd></dl></DossierSection>
         <DossierSection number="07" title="版本"><div className="version-strip">{versions.map((version) => <div key={version.version} className={version.version === selected.version ? "current" : ""}><code>v{version.version}</code><span>{version.status === "archived" ? "归档" : version.version === selected.version ? "当前" : "历史"}</span><time>{formatTime(version.updatedAt)}</time></div>)}</div></DossierSection>
         <div id="direct-desk"><DirectDesk employee={selected} sessions={sessions} refresh={refresh} notify={notify} onContext={(sessionId) => { setContextSessionId(sessionId); setContextOpen(true); }} /></div>
       </div>}

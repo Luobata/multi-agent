@@ -93,9 +93,14 @@ input[type="color"] { padding: var(--space-1); }
 .employee-card:active, .workflow-card:active, .run-card:active, .publication-card:active { transform: translateY(1px); box-shadow: none; }
 .employee-card.selected, .workflow-card.selected, .run-card.selected, .publication-card.selected { border-color: var(--line-strong); background: var(--paper-raised); color: var(--ink); box-shadow: var(--shadow-paper-small); }
 .employee-card.selected::before, .workflow-card.selected::before, .run-card.selected::before, .publication-card.selected::before { content: ""; position: absolute; inset: var(--space-3) auto var(--space-3) -4px; width: 3px; background: var(--stamp-red); }
-.employee-initials { --accent: var(--stamp-red); width: 40px; height: 40px; display: grid; place-items: center; flex: 0 0 auto; border: var(--rule) solid color-mix(in oklch, var(--accent) 82%, var(--ink)); border-radius: var(--radius-1); background-color: color-mix(in oklch, var(--accent) 9%, var(--paper-raised)); color: color-mix(in oklch, var(--accent) 84%, var(--ink)); font-family: var(--font-display); font-size: var(--text-base); font-weight: 600; letter-spacing: .04em; }
+.employee-initials { --accent: var(--stamp-red); position: relative; width: 40px; height: 40px; display: grid; place-items: center; flex: 0 0 auto; overflow: hidden; border: var(--rule) solid color-mix(in oklch, var(--accent) 82%, var(--ink)); border-radius: var(--radius-1); background-color: color-mix(in oklch, var(--accent) 9%, var(--paper-raised)); color: color-mix(in oklch, var(--accent) 84%, var(--ink)); font-family: var(--font-display); font-size: var(--text-base); font-weight: 600; letter-spacing: .04em; }
+.employee-initials.has-avatar { background: var(--paper-raised); }
+.employee-initials.has-avatar::after { content: ""; position: absolute; inset: 2px; border: 1px solid color-mix(in oklch, var(--paper-raised) 46%, transparent); pointer-events: none; }
+.employee-initials img { width: 100%; height: 100%; display: block; object-fit: cover; object-position: 50% 42%; }
 .employee-initials.large { --accent: var(--dossier-accent); width: 58px; height: 58px; font-size: var(--text-subtitle); }
 .employee-initials.small { width: 30px; height: 30px; font-size: var(--text-xs); }
+.avatar-field-row { grid-column: 1 / -1; display: grid; grid-template-columns: 58px minmax(0, 1fr); align-items: start; gap: var(--space-3); }
+.avatar-source { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .employee-card-copy { min-width: 0; display: flex; flex-direction: column; gap: var(--space-1); }
 .employee-card-copy strong, .workflow-card strong, .publication-card strong { font-size: var(--text-base); font-weight: 600; }
 .employee-card-copy code, .publication-card code { color: var(--ink-3); font-size: var(--text-xs); }
@@ -343,7 +348,7 @@ input[type="color"] { padding: var(--space-1); }
 .skill-source span, .skill-bound strong { overflow: hidden; font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
 .skill-source small, .skill-bound > span { color: var(--ink-3); font-size: var(--text-xs); }
 .skill-bound > div { display: flex; margin-top: var(--space-1); }
-.skill-bound abbr { width: 24px; height: 24px; display: grid; place-items: center; margin-right: -4px; border: 1px solid var(--paper-raised); border-radius: 50%; background: var(--paper-sunken); color: var(--ink-2); font-family: var(--font-machine); font-size: 9px; text-decoration: none; }
+.skill-bound-avatar { width: 24px !important; height: 24px !important; margin-right: -4px; border-color: var(--paper-raised); border-radius: 50%; font-size: 9px; }
 .skill-row-actions { min-height: 44px; display: flex; align-items: center; justify-content: flex-end; gap: var(--space-3); }
 .library-empty { padding: var(--space-8); color: var(--ink-3); text-align: center; }
 .library-footnote { max-width: 1480px; display: flex; gap: var(--space-4); margin: var(--space-5) auto 0; padding: var(--space-3) var(--space-4); border-left: 3px solid var(--seal-amber); background: var(--seal-amber-bg); color: var(--ink-2); font-size: var(--text-xs); }
@@ -447,7 +452,7 @@ input[role="switch"]:checked::after { border-color: var(--paper-raised); transfo
 .workflow-canvas-node:hover { border-color: var(--ink); box-shadow: var(--shadow-lift); }
 .workflow-canvas-node.selected { border-color: var(--stamp-red); box-shadow: 0 0 0 2px color-mix(in oklch, var(--stamp-red) 20%, transparent), var(--shadow-lift); }
 .canvas-node-index { align-self: start; color: var(--stamp-red-ink); font-family: var(--font-machine); font-size: 9px; }
-.canvas-node-avatar { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--node-accent); background: color-mix(in oklch, var(--node-accent) 8%, var(--paper)); color: var(--node-accent); font-family: var(--font-display); font-size: var(--text-xs); }
+.canvas-node-avatar { --accent: var(--node-accent) !important; width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--node-accent); background: color-mix(in oklch, var(--node-accent) 8%, var(--paper)); color: var(--node-accent); font-family: var(--font-display); font-size: var(--text-xs); }
 .canvas-node-copy { min-width: 0; display: flex; flex-direction: column; gap: var(--space-1); }
 .canvas-node-copy strong, .canvas-node-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .canvas-node-copy strong { font-family: var(--font-machine); font-size: var(--text-xs); }

@@ -1,5 +1,5 @@
 import { useMemo, useRef, type KeyboardEvent, type PointerEvent } from "react";
-import { DEFAULT_EMPLOYEE_ACCENT, initials } from "./components";
+import { DEFAULT_EMPLOYEE_ACCENT, EmployeeAvatar } from "./components";
 import { layoutTopology } from "./topology";
 import type { Employee, WorkflowNode } from "./types";
 
@@ -87,7 +87,7 @@ export function WorkflowCanvas({ nodes, employees, positions, selectedId, onSele
           onPointerCancel={() => { drag.current = undefined; }}
         >
           <span className="canvas-node-index">{String(index + 1).padStart(2, "0")}</span>
-          <span className="canvas-node-avatar">{initials(employee?.identity.displayName ?? node.employeeId, employee?.presentation.initials)}</span>
+          <EmployeeAvatar className="canvas-node-avatar" displayName={employee?.identity.displayName ?? node.employeeId} presentation={employee?.presentation} />
           <span className="canvas-node-copy"><strong>{node.id}</strong><small>{employee?.identity.displayName ?? node.employeeId}</small></span>
           <span className="canvas-node-port" aria-hidden="true" />
         </button>;
