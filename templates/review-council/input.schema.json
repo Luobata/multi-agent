@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["requirement", "changeSummary", "dashboardUrl"],
+  "properties": {
+    "requirement": { "type": "string", "minLength": 1 },
+    "changeSummary": { "type": "string", "minLength": 1 },
+    "dashboardUrl": { "type": "string", "minLength": 1 }
+  }
+}

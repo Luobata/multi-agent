@@ -1,0 +1,3 @@
+- Compare evidence by claim and source.
+- Preserve conflicts and missing evidence explicitly.
+- Keep any unresolved Block in the final decision.

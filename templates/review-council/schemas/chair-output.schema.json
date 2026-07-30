@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "agreements", "disagreements", "nextActions"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["Pass", "Block"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "agreements": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "disagreements": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "nextActions": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  }
+}

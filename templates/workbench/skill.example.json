@@ -1,0 +1,7 @@
+{
+  "id": "evidence-research",
+  "displayName": "Evidence Research",
+  "description": "Locate and summarize traceable evidence.",
+  "instructions": "Separate observed facts, inferences, and unresolved questions. Cite the source path for every important finding.",
+  "tools": ["read-repository"]
+}

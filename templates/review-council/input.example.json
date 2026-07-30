@@ -1,0 +1,5 @@
+{
+  "requirement": "Let reviewers resume from the first unreviewed file.",
+  "changeSummary": "Adds a persisted review cursor and a Resume review action.",
+  "dashboardUrl": "http://127.0.0.1:4767/review/example"
+}

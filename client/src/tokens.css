@@ -1,0 +1,127 @@
+/* Hallmark · pre-emit critique: P5 H4 E5 S5 R5 V4 · genre: modern-minimal · macrostructure: Workbench
+ * theme: custom Dossier Office · vibe: "archival warmth, precise, local-first"
+ * offline font stack: Songti SC / PingFang SC / SF Mono · axes: light / classical-CJK-serif / warm-vermilion
+ * reference: user-approved Dossier screenshot · designer: lin-mo-product-designer@v1
+ */
+:root {
+  color-scheme: light;
+
+  /* Warm paper band and readable ink. */
+  --paper: oklch(95% 0.014 95);
+  --paper-raised: oklch(97.4% 0.008 95);
+  --paper-sunken: oklch(92% 0.015 98);
+  --paper-hover: oklch(96.2% 0.012 94);
+  --ink: oklch(19% 0.009 85);
+  --ink-hover: oklch(27% 0.012 88);
+  --ink-2: oklch(42% 0.013 90);
+  --ink-3: oklch(47% 0.012 92);
+  --ink-ghost: oklch(61% 0.014 92);
+  --line: oklch(85% 0.016 95);
+  --line-strong: oklch(62% 0.02 92);
+
+  /* Vermilion index marks and semantic seals. */
+  --stamp-red: oklch(50% 0.155 33);
+  --stamp-red-ink: oklch(39% 0.12 32);
+  --seal-green: oklch(41% 0.07 158);
+  --seal-green-bg: oklch(95% 0.018 150);
+  --seal-amber: oklch(42% 0.1 80);
+  --seal-amber-bg: oklch(93.5% 0.03 95);
+  --seal-blue: oklch(41% 0.065 252);
+  --seal-blue-bg: oklch(93% 0.015 245);
+  --seal-gray: oklch(48% 0.012 90);
+  --danger-bg: oklch(92.5% 0.02 40);
+  --accent-ink: var(--paper-raised);
+  --focus: var(--seal-blue);
+  --selection: oklch(85% 0.025 55);
+  --scrim: oklch(19% 0.009 85 / 48%);
+  --scrim-soft: oklch(19% 0.009 85 / 28%);
+  --paper-shadow: oklch(62% 0.02 92 / 28%);
+  --ink-shadow: oklch(19% 0.009 85 / 20%);
+
+  /* Serializable fallback for <input type="color">. */
+  --employee-accent-data: #b93a24;
+
+  /* Canonical color aliases. */
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-raised);
+  --color-paper-sunken: var(--paper-sunken);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--stamp-red);
+  --color-accent-ink: var(--accent-ink);
+  --color-focus: var(--focus);
+  --color-danger: var(--stamp-red-ink);
+  --color-warning: var(--seal-amber);
+  --color-info: var(--seal-blue);
+
+  /* Human-facing serif, prose sans, machine-print mono. No remote fonts. */
+  --font-display: "Noto Serif SC", "Songti SC", "STSong", "SimSun", serif;
+  --font-body: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-machine: "SF Mono", "JetBrains Mono", "Sarasa Mono SC", ui-monospace, monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-body: 15px;
+  --text-subtitle: 18px;
+  --text-title: 24px;
+
+  /* Four-point density, restrained paper geometry, named motion. */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-5: 16px;
+  --space-6: 24px;
+  --space-7: 36px;
+  --space-8: 60px;
+  --space-9: 96px;
+  --rule: 1px;
+  --rule-hair: 1px;
+  --radius-1: 2px;
+  --radius-2: 4px;
+  --radius-3: 6px;
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 280ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-standard: var(--ease-out);
+  --shadow-paper: 7px 8px 0 var(--paper-shadow);
+  --shadow-paper-small: 2px 2px 0 var(--line);
+  --shadow-lift: 3px 4px 0 var(--paper-shadow);
+  --shadow-modal: 10px 12px 0 var(--ink-shadow);
+  --shadow-drawer: -8px 0 0 var(--ink-shadow);
+
+  /* App geometry and layering. */
+  --banner-height: 32px;
+  --rail-width: 208px;
+  --rail-compact: 58px;
+  --list-width: 324px;
+  --control-height: 34px;
+  --touch-height: 48px;
+  --mobile-nav-height: 62px;
+  --topology-sticky-offset: 72px;
+  --z-rail: 70;
+  --z-banner: 80;
+  --z-mobile-nav: 90;
+  --z-dialog: 120;
+  --z-drawer: 130;
+  --z-toast: 200;
+
+  --ink-secondary: var(--ink-2);
+  --ink-faint: var(--ink-3);
+  --focus-ring: var(--focus);
+  --font-sans: var(--font-body);
+  --font-serif: var(--font-display);
+  --font-mono: var(--font-machine);
+
+  font-family: var(--font-body);
+  color: var(--ink);
+  background: var(--paper);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}

@@ -1,0 +1,168 @@
+version: 1
+name: review-council
+artifactRoot: .multi-agent
+
+providers:
+  local-mock:
+    adapter: command
+    model: local-deterministic-mock
+    command: node
+    args:
+      - ./mock-provider.mjs
+      - "{{role.id}}"
+    timeoutMs: 10000
+    outputProtocol: json
+
+skills:
+  requirement-analysis:
+    displayName: Requirement Analysis
+    description: Recover product intent and turn it into observable acceptance criteria.
+    instructions: skills/requirement-analysis.md
+    configSchema: skills/requirement-analysis.schema.json
+    tools: [read-repository]
+
+  runtime-design-review:
+    displayName: Runtime Design Review
+    description: Evaluate interaction and visual behavior from running-product evidence.
+    instructions: skills/runtime-design-review.md
+    tools: [browser, read-repository]
+
+  browser-validation:
+    displayName: Browser Validation
+    description: Verify affected behavior and identify concrete automated coverage.
+    instructions: skills/browser-validation.md
+    tools: [browser, read-tests]
+
+  evidence-synthesis:
+    displayName: Evidence Synthesis
+    description: Reconcile independent structured findings without erasing disagreement.
+    instructions: skills/evidence-synthesis.md
+
+roles:
+  product-manager:
+    identity:
+      displayName: Product Manager
+      background: An independent product reviewer experienced in reconstructing intent, controlling scope, and defining observable outcomes.
+      responsibilities:
+        - Separate explicit requirements from assumptions.
+        - Define user value, scope boundaries, critical states, and acceptance criteria.
+        - Return an evidence-backed Pass or Block without implementing changes.
+      goals:
+        - Make the product contract unambiguous and testable.
+      constraints:
+        - Do not modify project files.
+        - Do not substitute design or test judgment for product judgment.
+      metadata:
+        discipline: product
+        independence: required
+    provider: local-mock
+    instructions: roles/product-manager/instructions.md
+    skills:
+      - id: requirement-analysis
+        config:
+          scope: product-acceptance
+          includeAlternatives: true
+    requestTemplate: roles/product-manager/request.md
+    outputSchema: schemas/reviewer-output.schema.json
+    maxAttempts: 2
+    permissions:
+      write: artifacts-only
+    verdict: &review-verdict
+      path: verdict
+      pass: [Pass]
+      block: [Block]
+
+  designer:
+    identity:
+      displayName: Product Designer
+      background: A senior product designer focused on interaction clarity, visual hierarchy, accessibility, and runtime evidence.
+      responsibilities:
+        - Inspect the affected running experience.
+        - Identify concrete interaction and visual strengths or defects.
+        - Return a scoped Pass or Block without implementing changes.
+      goals:
+        - Preserve usability and visual coherence in the affected workflow.
+      constraints:
+        - Source inspection cannot replace running-page evidence.
+        - Do not modify project files.
+      metadata:
+        discipline: design
+        evidenceMode: runtime-first
+    provider: local-mock
+    instructions: roles/designer/instructions.md
+    skills: [runtime-design-review]
+    requestTemplate: roles/designer/request.md
+    outputSchema: schemas/reviewer-output.schema.json
+    permissions:
+      write: artifacts-only
+    verdict: *review-verdict
+
+  tester:
+    identity:
+      displayName: Test Engineer
+      background: An independent test engineer experienced in browser validation, failure recovery, persistence, and E2E coverage analysis.
+      responsibilities:
+        - Exercise the affected behavior with reproducible checks.
+        - Assess loading, success, failure, and persistence behavior.
+        - Identify concrete automated coverage or gaps.
+      goals:
+        - Prevent unverified critical behavior from passing acceptance.
+      constraints:
+        - Do not modify project files or active runtime evidence.
+      metadata:
+        discipline: quality
+        evidenceMode: browser-and-tests
+    provider: local-mock
+    instructions: roles/tester/instructions.md
+    skills: [browser-validation]
+    requestTemplate: roles/tester/request.md
+    outputSchema: schemas/reviewer-output.schema.json
+    permissions:
+      write: artifacts-only
+    verdict: *review-verdict
+
+  chair:
+    identity:
+      displayName: Review Chair
+      background: A neutral synthesis role responsible for preserving evidence, conflicts, and missing information across independent reviews.
+      responsibilities:
+        - Compare structured findings from every required reviewer.
+        - Preserve disagreements instead of averaging them away.
+        - Produce a final verdict and explicit next actions.
+      goals:
+        - Produce a traceable decision without fabricating consensus.
+      constraints:
+        - A missing technical result cannot be treated as a passing review.
+      metadata:
+        discipline: synthesis
+        decisionStyle: evidence-preserving
+    provider: local-mock
+    instructions: roles/chair/instructions.md
+    skills: [evidence-synthesis]
+    requestTemplate: roles/chair/request.md
+    outputSchema: schemas/chair-output.schema.json
+    permissions:
+      write: artifacts-only
+    verdict:
+      path: verdict
+      pass: [Pass]
+      block: [Block]
+
+workflows:
+  review-council:
+    architecture: graph
+    description: Run product, design, and test reviews independently, then synthesize their evidence.
+    inputSchema: input.schema.json
+    config:
+      maxConcurrency: 3
+      failFast: false
+      nodes:
+        - id: product-review
+          role: product-manager
+        - id: design-review
+          role: designer
+        - id: test-review
+          role: tester
+        - id: final-decision
+          role: chair
+          needs: [product-review, design-review, test-review]

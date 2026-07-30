@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Multi-Agent Workflows"
+  short_description: "Design and validate reusable multi-agent architectures"
+  default_prompt: "Use $design-multi-agent-workflows to design a reusable multi-agent workflow for this project."

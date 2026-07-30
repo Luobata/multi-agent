@@ -1,0 +1,137 @@
+# Local Agent Workbench
+
+这是从 `cart-fe-workflow-review` 的多 Agent 方案中独立抽象出的本地优先员工与架构工作台。源项目没有被修改；本仓库将 Provider、共享 Skill、Role identity、Employee、Architecture、Workflow、Session、Run Store 与协议入口拆成独立边界。
+
+第一版已经可以：
+
+- 创建、修订、复制和归档本地 Employee；
+- 灵活定义背景、职责、目标、约束、提示词、Skill、Provider、权限与输出 Schema；
+- 在独立 Skill 台账中注册、查看、版本化修订、归档与恢复能力，并对每个员工单独绑定、配置或停用；
+- 在每份员工档案中核对 Provider 模型、adapter 与脱敏后的启动指令；
+- 从 CLI、HTTP、MCP 或本地 UI 直接调用任意 Employee；
+- 查看版本固定的 Session、六层上下文和完整有效 Prompt；
+- 从四种常用多 Agent 模板生成 Graph 草稿，在画布拖动节点、改派员工与编辑依赖，并保存不可变 Run 证据；
+- 将一个 Employee 或 Workflow 发布成 A2A v1 Agent；
+- 在 `127.0.0.1` 上运行由 `claude-kimi` 设计的「档案室 / Dossier Office」客户端。
+
+## 形态
+
+| 层 | 责任 | v1 状态 |
+| --- | --- | --- |
+| TypeScript Core | 校验、编译、执行、版本与证据 | 已完成 |
+| CLI | 人工与 CI 的确定性入口 | 已完成 |
+| Codex Skill | 多 Agent 架构设计指导 | 已完成，保持薄层 |
+| Local daemon | 单写者、共享注册表与本地 API | 已完成，默认仅回环地址 |
+| React client | Employee、Skill、Workflow、Run、Publication 工作台 | 已完成 |
+| MCP | 任意 MCP 会话调用本地 Employee/Workflow | 已完成，stdio 代理 daemon |
+| A2A | 将 Employee/Workflow 作为统一 Agent 发布 | 已完成，JSON-RPC v1 |
+
+MCP 和 A2A 都是协议适配边界，不是多 Agent Workflow 模型。直接调用 Employee 也不会绕开架构层，而是编译成一个节点的 Graph。
+
+```mermaid
+flowchart LR
+  UI["档案室 UI"] --> API["Loopback daemon"]
+  CLI["CLI"] --> Core["WorkbenchService / Core"]
+  MCP["MCP stdio"] --> API
+  A2A["A2A v1"] --> Core
+  API --> Core
+  Core --> Registry["Provider / Skill / Employee Registries"]
+  Registry --> Graph["Graph Architecture Adapter"]
+  Graph --> Providers["Provider Adapters"]
+  Graph --> Store["Run Store"]
+```
+
+## 快速开始
+
+```bash
+npm install
+npm run check
+npm run workbench
+```
+
+然后打开 [http://127.0.0.1:4318](http://127.0.0.1:4318)。默认数据目录是 `~/.multi-agent/workbench`，可用 `MULTI_AGENT_DATA_DIR` 或 `--data-root` 覆盖。默认 `mock` Provider 不需要账号，可以先完成全链路验收。
+
+开发客户端：
+
+```bash
+npm run workbench
+npm run dev:client
+```
+
+Vite 开发页位于 `http://127.0.0.1:4319`，API 转发到 4318。
+
+## CLI
+
+声明式 Workflow CLI 继续可用：
+
+```bash
+npm run cli -- validate --config templates/review-council/multi-agent.yaml
+npm run cli -- plan review-council --config templates/review-council/multi-agent.yaml --format mermaid
+npm run cli -- run review-council --config templates/review-council/multi-agent.yaml --input templates/review-council/input.example.json
+```
+
+Workbench CLI 使用同一份全局注册表：
+
+```bash
+npm run cli -- workbench skill-create templates/workbench/skill.example.json
+npm run cli -- workbench employee create templates/workbench/employee.example.json
+npm run cli -- workbench employee list
+npm run cli -- workbench employee invoke local-researcher "核对这份技术方案"
+npm run cli -- workbench employee context local-researcher
+npm run cli -- workbench workflow create templates/workbench/workflow.example.json
+npm run cli -- workbench workflow run research-review --input templates/workbench/input.example.json
+```
+
+员工修改生成新版本；已有 Session 保持固定版本。普通复制不会复制 Session、密钥和 Run 历史。删除语义是软归档，历史证据继续可读。
+
+## MCP 与 A2A
+
+先运行 daemon，再把 MCP 客户端命令配置为：
+
+```json
+{
+  "command": "multi-agent-mcp",
+  "args": ["--daemon-url", "http://127.0.0.1:4318"]
+}
+```
+
+仓库内开发可使用 `npm run mcp -- --daemon-url http://127.0.0.1:4318`。MCP tools 包括 `list_employees`、`get_employee_context`、`invoke_employee`、`list_workflows`、`run_workflow` 与 `list_runs`。
+
+Publication 的 A2A 地址为：
+
+```text
+Agent Card: /a2a/<publication-id>/.well-known/agent-card.json
+JSON-RPC:   /a2a/<publication-id>
+```
+
+v1 只监听回环地址且没有认证，不应直接暴露到局域网或公网。业务 `blocked` 映射为 completed Task + Block artifact；只有 Provider、解析、Schema 或运行时技术故障映射为 failed Task。
+
+## 稳定边界
+
+- `providers`：定义“怎么调用”；Adapter 代码注册与 Provider 实例注册彼此分开。
+- `skills`：定义可复用能力、配置契约和声明工具；多个 Employee 可以用不同配置复用。
+- `employees`：定义“谁负责”，是版本化、可寻址的运行实例，不在 `src/` 硬编码产品角色。
+- `architectures`：定义协作控制流；当前只有 `graph`，fan-out/gather/critic 等形态优先表达为 Graph 模板。
+- `workflows`：把 Employee 放进架构节点，用 `needs` 声明真实信息依赖。
+- `sessions`：固定 Employee 版本的显式对话历史，不暗中推断长期记忆。
+- `artifacts/runs`：保存输入、计划、system/request/effective prompt、raw output、规范化结果和状态事件。
+- `MCP/A2A`：只负责接入与发布，不复制编排逻辑。
+
+## 文档
+
+- [Workbench v1 产品与领域设计](docs/workbench-v1.md)
+- [档案室 UI 规范](docs/workbench-ui.md)
+- [实现与协议手册](docs/workbench-implementation.md)
+- [架构与源方案映射](docs/architecture.md)
+- [Architecture Adapter 演进](docs/architecture-adapters.md)
+- [常用多 Agent 模式与可视化编排](docs/multi-agent-patterns-and-composer.md)
+- [Provider Adapter 配置](docs/provider-adapters.md)
+- [多 Agent 设计 Skill](skills/design-multi-agent-workflows/SKILL.md)
+
+## 当前边界
+
+- 内置 `mock` 与安全的 direct `command` Provider Adapter；command 使用 argv + stdin，不经过 shell 拼接。
+- 当前只注册 `graph` Architecture Adapter；Supervisor、handoff、group-chat 等在出现真实控制循环需求后再增加。
+- `permissions` 是可审计声明；实际工具与文件权限必须由 Provider/sandbox 强制执行。
+- mutable Workbench state 当前使用本地原子 JSON 文件；Run 证据为不可变目录。跨进程多写、恢复队列和多人共享应升级到 SQLite/数据库后再开放网络部署。
+- A2A Task Store 当前在内存中，daemon 重启后不会恢复协议层 Task；底层 Run 证据仍在本地。

@@ -1,0 +1,3 @@
+- Inspect the supplied running page before concluding.
+- Evaluate task flow, hierarchy, state feedback, accessibility, and layout stability.
+- Report concrete observations rather than aesthetic preference alone.

@@ -1,0 +1,68 @@
+{
+  "name": "multi-agent-architecture-kit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A declarative, local-first toolkit for designing and running multi-agent workflows.",
+  "type": "module",
+  "bin": {
+    "multi-agent": "./dist/cli/main.js",
+    "multi-agent-daemon": "./dist/daemon/main.js",
+    "multi-agent-mcp": "./dist/mcp/main.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./workbench": "./dist/workbench/service.js",
+    "./daemon": "./dist/daemon/server.js",
+    "./mcp": "./dist/mcp/server.js"
+  },
+  "files": [
+    "dist",
+    "templates",
+    "skills",
+    "docs",
+    "scripts"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && npm run build:server && npm run build:client",
+    "build:server": "tsc -p tsconfig.build.json",
+    "build:client": "vite build --config client/vite.config.ts",
+    "typecheck": "npm run typecheck:server && npm run typecheck:client",
+    "typecheck:server": "tsc --noEmit -p tsconfig.json",
+    "typecheck:client": "tsc --noEmit -p client/tsconfig.json",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build",
+    "cli": "tsx src/cli/main.ts",
+    "workbench": "tsx src/daemon/main.ts",
+    "mcp": "tsx src/mcp/main.ts",
+    "dev:client": "vite --config client/vite.config.ts",
+    "example:plan": "tsx src/cli/main.ts plan review-council --config templates/review-council/multi-agent.yaml",
+    "example:run": "tsx src/cli/main.ts run review-council --config templates/review-council/multi-agent.yaml --input templates/review-council/input.example.json"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ajv": "^8.17.1",
+    "commander": "^14.0.1",
+    "express": "^5.2.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "yaml": "^2.8.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.1.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "jsdom": "^29.1.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "^7.3.6",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

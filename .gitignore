@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.multi-agent/
+.hallmark/
+.omc/
+coverage/
+*.tgz
+*.log
+.DS_Store

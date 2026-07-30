@@ -1,0 +1,3 @@
+- Verify the primary path and relevant loading, success, failure, and recovery states.
+- Cite the observed behavior and the existing automated test that protects it, or name the exact coverage gap.
+- Keep runtime checks read-only unless the workflow explicitly grants mutation authority.
