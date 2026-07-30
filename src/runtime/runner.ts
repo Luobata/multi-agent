@@ -16,7 +16,7 @@ import type {
   NodeRunResult,
   WorkflowRunRecord
 } from "../core/types.js";
-import { RunStore } from "./artifacts.js";
+import { RunStore, type RunEvent } from "./artifacts.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers.js";
 import { parseProviderOutput, readJsonSchema, statusFromVerdict, validateStructuredOutput } from "./output.js";
 
@@ -26,6 +26,12 @@ export interface RunWorkflowOptions {
   artifactRoot?: string;
   providers?: ProviderRegistry;
   architectures?: ArchitectureRegistry;
+  onEvent?: (event: ObservedRunEvent) => void | Promise<void>;
+}
+
+export interface ObservedRunEvent extends RunEvent {
+  runId: string;
+  workflow: string;
 }
 
 export interface RunWorkflowResult {
@@ -133,7 +139,8 @@ async function executeNode(
   node: ExecutionPlanNode,
   input: JsonObject,
   store: RunStore,
-  registry: ProviderRegistry
+  registry: ProviderRegistry,
+  emit: (type: string, nodeId?: string, detail?: JsonValue) => Promise<void>
 ): Promise<NodeRunResult> {
   const role = loaded.manifest.roles[node.role];
   if (!role) throw new Error(`role not found: ${node.role}`);
@@ -143,7 +150,7 @@ async function executeNode(
   if (!adapter) throw new Error(`provider adapter not registered: ${provider.adapter}`);
   const failedDependency = node.needs.find((nodeId) => ["failed", "skipped"].includes(run.nodes[nodeId]?.status ?? "pending"));
   if (failedDependency) {
-    return {
+    const skipped: NodeRunResult = {
       nodeId: node.id,
       roleId: node.role,
       status: "skipped",
@@ -151,6 +158,10 @@ async function executeNode(
       completedAt: now(),
       error: `dependency ${failedDependency} did not complete`
     };
+    run.nodes[node.id] = skipped;
+    await store.writeRun(run);
+    await emit("node.skipped", node.id, { reason: skipped.error ?? "dependency did not complete" });
+    return skipped;
   }
 
   const result: NodeRunResult = {
@@ -160,6 +171,9 @@ async function executeNode(
     attempts: 0,
     startedAt: now()
   };
+  run.nodes[node.id] = result;
+  await store.writeRun(run);
+  await emit("node.started", node.id, { provider: node.provider, needs: node.needs });
   const maxAttempts = role.maxAttempts ?? 1;
   let lastError: unknown;
 
@@ -172,7 +186,7 @@ async function executeNode(
       await store.writeText(attemptDir, "system-prompt.md", bundle.systemPrompt);
       await store.writeText(attemptDir, "request-prompt.md", bundle.requestPrompt);
       await store.writeText(attemptDir, "prompt.md", bundle.prompt);
-      await store.appendEvent({ at: now(), type: "node.attempt.started", nodeId: node.id, detail: { attempt } });
+      await emit("node.attempt.started", node.id, { attempt });
       const response = await adapter.invoke({
         providerId: role.provider,
         definition: provider,
@@ -187,8 +201,11 @@ async function executeNode(
       const status = statusFromVerdict(output, role.verdict);
       await store.writeAttemptJson(attemptDir, "result.json", output);
       await store.writeAttemptJson(attemptDir, "metadata.json", { attempt, durationMs: response.durationMs, status });
-      await store.appendEvent({ at: now(), type: `node.${status}`, nodeId: node.id, detail: { attempt } });
-      return { ...result, status, output, completedAt: now() };
+      const completed: NodeRunResult = { ...result, status, output, completedAt: now() };
+      run.nodes[node.id] = completed;
+      await store.writeRun(run);
+      await emit(`node.${status}`, node.id, { attempt });
+      return completed;
     } catch (error) {
       lastError = error;
       if (error instanceof ProviderExecutionError) {
@@ -199,21 +216,23 @@ async function executeNode(
         attempt,
         error: error instanceof Error ? error.message : String(error)
       });
-      await store.appendEvent({
-        at: now(),
-        type: "node.attempt.failed",
-        nodeId: node.id,
-        detail: { attempt, error: error instanceof Error ? error.message : String(error) }
+      await emit("node.attempt.failed", node.id, {
+        attempt,
+        error: error instanceof Error ? error.message : String(error)
       });
     }
   }
 
-  return {
+  const failed: NodeRunResult = {
     ...result,
     status: "failed",
     completedAt: now(),
     error: lastError instanceof Error ? lastError.message : String(lastError)
   };
+  run.nodes[node.id] = failed;
+  await store.writeRun(run);
+  await emit("node.failed", node.id, { error: failed.error ?? "Provider invocation failed" });
+  return failed;
 }
 
 export async function runWorkflow(
@@ -245,19 +264,24 @@ export async function runWorkflow(
     )
   };
   const registry = options.providers ?? createDefaultProviderRegistry();
+  const emit = async (type: string, nodeId?: string, detail?: JsonValue): Promise<void> => {
+    const event: RunEvent = { at: now(), type, nodeId, detail };
+    await store.appendEvent(event);
+    await options.onEvent?.({ ...event, runId, workflow: workflowId });
+  };
   await store.writeInput(input);
   await store.writePlan(plan);
   await store.writeRun(run);
-  await store.appendEvent({ at: now(), type: "run.started", detail: { workflow: workflowId, architecture: plan.architecture } });
+  await emit("run.started", undefined, { workflow: workflowId, architecture: plan.architecture });
 
   await architecture.execute({
     loaded,
     input,
     plan,
     run,
-    executeNode: (node) => executeNode(loaded, run, node, input, store, registry),
+    executeNode: (node) => executeNode(loaded, run, node, input, store, registry, emit),
     persist: () => store.writeRun(run),
-    emit: (type, nodeId, detail) => store.appendEvent({ at: now(), type, nodeId, detail })
+    emit
   });
 
   const statuses = Object.values(run.nodes).map((node) => node.status);
@@ -268,6 +292,6 @@ export async function runWorkflow(
       : "passed";
   run.completedAt = now();
   await store.writeRun(run);
-  await store.appendEvent({ at: now(), type: `run.${run.status}` });
+  await emit(`run.${run.status}`);
   return { run, runDir: store.runDir };
 }

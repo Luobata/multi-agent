@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ProviderRegistry } from "../src/runtime/providers.js";
 import { WorkbenchService } from "../src/workbench/service.js";
 
 const temporaryDirectories: string[] = [];
@@ -17,6 +18,96 @@ afterEach(() => {
 });
 
 describe("Local Agent Workbench", () => {
+  it("tracks concurrent calls as isolated work instances on one Employee identity", async () => {
+    let started = 0;
+    let signalStarted = () => {};
+    let release = () => {};
+    const bothStarted = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const providers: ProviderRegistry = new Map([["slow", {
+      id: "slow",
+      validate: () => [],
+      invoke: async (invocation) => {
+        started += 1;
+        if (started === 2) signalStarted();
+        await gate;
+        const displayName = String((invocation.templateContext.role as { identity?: { displayName?: string } }).identity?.displayName ?? "Worker");
+        return { stdout: JSON.stringify({ message: `${displayName} completed isolated work.` }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("slow-provider", { adapter: "slow", model: "slow-test-model", outputProtocol: "json" });
+    const employee = await service.createEmployee({
+      id: "shared-worker",
+      identity: { displayName: "Shared Worker", background: "Handles concurrent projects.", responsibilities: ["Work independently"] },
+      providerId: "slow-provider"
+    });
+
+    const first = service.invokeEmployee(employee.id, { message: "Project Alpha" }, { kind: "mcp", project: "alpha", contextId: "thread-alpha" });
+    const second = service.invokeEmployee(employee.id, { message: "Project Beta" }, { kind: "a2a", project: "beta", contextId: "thread-beta" });
+    await bothStarted;
+
+    const live = service.getActivitySnapshot();
+    expect(live.instances.filter((instance) => instance.employeeId === employee.id && instance.status === "running")).toHaveLength(2);
+    expect(new Set(live.instances.map((instance) => instance.source.project))).toEqual(new Set(["alpha", "beta"]));
+    expect(new Set(live.instances.map((instance) => instance.model))).toEqual(new Set(["slow-test-model"]));
+    expect(new Set(live.instances.map((instance) => instance.invocationId)).size).toBe(2);
+
+    release();
+    await Promise.all([first, second]);
+    const completed = service.getActivitySnapshot();
+    expect(completed.invocations.slice(0, 2).every((invocation) => invocation.status === "completed")).toBe(true);
+    expect(completed.instances.slice(0, 2).every((instance) => instance.status === "completed")).toBe(true);
+  });
+
+  it("serializes concurrent calls that share one Session context", async () => {
+    let calls = 0;
+    let signalSecond = () => {};
+    let signalThird = () => {};
+    let releaseSecond = () => {};
+    let releaseThird = () => {};
+    const secondStarted = new Promise<void>((resolve) => { signalSecond = resolve; });
+    const thirdStarted = new Promise<void>((resolve) => { signalThird = resolve; });
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const thirdGate = new Promise<void>((resolve) => { releaseThird = resolve; });
+    const providers: ProviderRegistry = new Map([["session-lane", {
+      id: "session-lane",
+      validate: () => [],
+      invoke: async () => {
+        calls += 1;
+        if (calls === 2) { signalSecond(); await secondGate; }
+        if (calls === 3) { signalThird(); await thirdGate; }
+        return { stdout: JSON.stringify({ message: `Call ${calls} completed.` }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("session-provider", { adapter: "session-lane", model: "serialized-context", outputProtocol: "json" });
+    const employee = await service.createEmployee({
+      id: "session-worker",
+      identity: { displayName: "Session Worker", background: "Maintains ordered context.", responsibilities: ["Respond in order"] },
+      providerId: "session-provider"
+    });
+    const seed = await service.invokeEmployee(employee.id, { message: "Start session" });
+
+    const first = service.invokeEmployee(employee.id, { message: "Second turn", sessionId: seed.session.id });
+    const second = service.invokeEmployee(employee.id, { message: "Third turn", sessionId: seed.session.id });
+    await secondStarted;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const queued = service.getActivitySnapshot().instances.filter(
+      (instance) => instance.sessionId === seed.session.id && ["running", "waiting", "queued"].includes(instance.status)
+    );
+    expect(calls).toBe(2);
+    expect(queued.map((instance) => instance.status).sort()).toEqual(["running", "waiting"]);
+    expect(queued.find((instance) => instance.status === "waiting")?.phase).toBe("waiting-session");
+
+    releaseSecond();
+    await thirdStarted;
+    expect(calls).toBe(3);
+    releaseThird();
+    await Promise.all([first, second]);
+    expect(service.getSession(seed.session.id).messages).toHaveLength(6);
+  });
+
   it("versions, clones, archives, invokes, and persists Employees through the Graph runtime", async () => {
     const root = temporaryRoot();
     const service = await WorkbenchService.open({ dataRoot: root });

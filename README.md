@@ -95,7 +95,7 @@ npm run cli -- workbench workflow run research-review --input templates/workbenc
 }
 ```
 
-仓库内开发可使用 `npm run mcp -- --daemon-url http://127.0.0.1:4318`。MCP tools 包括 `list_employees`、`get_employee_context`、`invoke_employee`、`list_workflows`、`run_workflow` 与 `list_runs`。
+仓库内开发可使用 `npm run mcp -- --daemon-url http://127.0.0.1:4318`。MCP tools 包括员工与 Workflow 调试入口，以及面向外部会话的 `list_publications`、`invoke_publication` 调用包入口。调用包可以指向单 Employee 或多 Employee Workflow，调用方无需感知内部形态。
 
 Publication 的 A2A 地址为：
 
@@ -120,6 +120,7 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 ## 文档
 
 - [Workbench v1 产品与领域设计](docs/workbench-v1.md)
+- [实时调用与员工出勤模型](docs/live-invocations.md)
 - [档案室 UI 规范](docs/workbench-ui.md)
 - [实现与协议手册](docs/workbench-implementation.md)
 - [架构与源方案映射](docs/architecture.md)

@@ -19,6 +19,7 @@ program
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be an integer from 1 to 65535");
     const service = await WorkbenchService.open({ dataRoot: options.dataRoot });
     await startDaemon(service, { host: options.host, port, staticDir: options.staticDir });
+    await service.recoverInterruptedActivity();
     const urlHost = options.host.includes(":") && !options.host.startsWith("[") ? `[${options.host}]` : options.host;
     process.stdout.write(`Local Agent Workbench: http://${urlHost}:${port}\n`);
     process.stdout.write(`Data root: ${service.store.dataRoot}\n`);

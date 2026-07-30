@@ -37,10 +37,37 @@ async function fixture() {
   servers.push(server);
   await new Promise<void>((resolve) => server.once("listening", resolve));
   const port = (server.address() as AddressInfo).port;
-  return { base: `http://127.0.0.1:${port}` };
+  return { base: `http://127.0.0.1:${port}`, service };
 }
 
 describe("workbench daemon", () => {
+  it("streams live invocation and work-instance changes over SSE", async () => {
+    const { base } = await fixture();
+    const controller = new AbortController();
+    const response = await fetch(`${base}/api/activity/stream`, { signal: controller.signal });
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const invocation = fetch(`${base}/api/publications/desk-public/invoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-multi-agent-project": "sse-project" },
+      body: JSON.stringify({ message: "Show this live" })
+    });
+    const decoder = new TextDecoder();
+    let received = "";
+    while (!received.includes('"type":"instance.changed"')) {
+      const chunk = await reader!.read();
+      if (chunk.done) break;
+      received += decoder.decode(chunk.value, { stream: true });
+    }
+    await invocation;
+    controller.abort();
+    await reader!.cancel().catch(() => undefined);
+    expect(received).toContain("event: snapshot");
+    expect(received).toContain("event: activity");
+    expect(received).toContain("sse-project");
+  });
+
   it("serves CRUD, Agent Card, and A2A v1 JSON-RPC from loopback", async () => {
     const { base } = await fixture();
     const health = await fetch(`${base}/api/health`).then((response) => response.json()) as { data: { bindPolicy: string } };
@@ -52,6 +79,43 @@ describe("workbench daemon", () => {
       body: JSON.stringify({ message: "Review this" })
     }).then((response) => response.json()) as { data: { message: string } };
     expect(invoked.data.message).toContain("Desk Agent received");
+
+    const packageResponse = await fetch(`${base}/api/publications/desk-public/invoke`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-multi-agent-project": "outside-project",
+        "x-multi-agent-context": "outside-thread"
+      },
+      body: JSON.stringify({ message: "Invoke the package" })
+    });
+    expect(packageResponse.status).toBe(200);
+    const activity = await fetch(`${base}/api/activity`).then((response) => response.json()) as {
+      data: { invocations: Array<{ source: { kind: string; project?: string; contextId?: string; publicationId?: string } }> };
+    };
+    expect(activity.data.invocations[0]?.source).toMatchObject({
+      kind: "http",
+      project: "outside-project",
+      contextId: "outside-thread",
+      publicationId: "desk-public"
+    });
+    await fetch(`${base}/api/publications/desk-public/invoke`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-multi-agent-project": "outside-project",
+        "x-multi-agent-context": "outside-thread"
+      },
+      body: JSON.stringify({ message: "Continue the same external context" })
+    });
+    const continuedActivity = await fetch(`${base}/api/activity`).then((response) => response.json()) as {
+      data: { invocations: Array<{ sessionId?: string; source: { project?: string; contextId?: string; publicationId?: string } }> };
+    };
+    const outsideInvocations = continuedActivity.data.invocations.filter((invocation) =>
+      invocation.source.project === "outside-project" && invocation.source.contextId === "outside-thread"
+    );
+    expect(outsideInvocations).toHaveLength(2);
+    expect(new Set(outsideInvocations.map((invocation) => invocation.sessionId)).size).toBe(1);
 
     const cardResponse = await fetch(`${base}/a2a/desk-public/.well-known/agent-card.json`);
     const card = await cardResponse.json() as { name: string; supportedInterfaces: Array<{ protocolVersion: string }> };
@@ -96,6 +160,7 @@ describe("workbench daemon", () => {
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_employee");
+      expect(tools.tools.map((tool) => tool.name)).toContain("invoke_publication");
       const result = await client.callTool({
         name: "invoke_employee",
         arguments: { employeeId: "desk-agent", message: "Call through MCP" }
@@ -103,6 +168,16 @@ describe("workbench daemon", () => {
       const resultContent = result.content as Array<{ type: string; text?: string }>;
       const text = resultContent.find((item) => item.type === "text");
       expect(text?.text ?? "").toContain("Desk Agent received");
+      const packaged = await client.callTool({
+        name: "invoke_publication",
+        arguments: { publicationId: "desk-public", input: { message: "Call package through MCP" }, project: "mcp-project" }
+      });
+      const packageContent = packaged.content as Array<{ type: string; text?: string }>;
+      expect(packageContent.find((item) => item.type === "text")?.text ?? "").toContain("Desk Agent received");
+      const activity = await fetch(`${base}/api/activity`).then((response) => response.json()) as {
+        data: { invocations: Array<{ source: { kind: string; project?: string; publicationId?: string } }> };
+      };
+      expect(activity.data.invocations[0]?.source).toMatchObject({ kind: "mcp", project: "mcp-project", publicationId: "desk-public" });
     } finally {
       await client.close();
       await mcpServer.close();

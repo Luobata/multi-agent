@@ -6,6 +6,7 @@ import { UserBuilder, jsonRpcHandler } from "@a2a-js/sdk/server/express";
 import type { JsonObject, ProviderDefinition } from "../core/types.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
+import type { InvocationSource, InvocationSourceKind } from "../workbench/types.js";
 
 type AsyncHandler = (request: Request, response: Response, next: NextFunction) => Promise<void>;
 
@@ -43,6 +44,26 @@ function providerDefinition(value: unknown): ProviderDefinition {
   return definition as ProviderDefinition;
 }
 
+function headerText(request: Request, name: string): string | undefined {
+  const value = request.headers[name];
+  const text = Array.isArray(value) ? value[0] : value;
+  return typeof text === "string" && text.trim() ? text.trim().slice(0, 240) : undefined;
+}
+
+function invocationSource(request: Request, fallback: InvocationSourceKind): InvocationSource {
+  const requestedKind = headerText(request, "x-multi-agent-source");
+  const kind: InvocationSourceKind = requestedKind && ["workbench", "http", "mcp", "a2a"].includes(requestedKind)
+    ? requestedKind as InvocationSourceKind
+    : fallback;
+  return {
+    kind,
+    label: headerText(request, "x-multi-agent-source-label"),
+    project: headerText(request, "x-multi-agent-project"),
+    caller: headerText(request, "x-multi-agent-caller"),
+    contextId: headerText(request, "x-multi-agent-context")
+  };
+}
+
 export interface DaemonAppOptions {
   baseUrl?: string;
   staticDir?: string;
@@ -73,7 +94,34 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       employees: service.listEmployees(true),
       workflows: service.listWorkflows(true),
       sessions: service.listSessions(),
-      publications: service.listPublications(true)
+      publications: service.listPublications(true),
+      activity: service.getActivitySnapshot()
+    });
+  });
+
+  app.get("/api/activity", (request, response) => {
+    const parsed = Number(request.query.limit ?? 100);
+    send(response, service.getActivitySnapshot(Number.isFinite(parsed) ? parsed : 100));
+  });
+  app.get("/api/activity/stream", (request, response) => {
+    response.status(200);
+    response.set({
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no"
+    });
+    response.flushHeaders();
+    const write = (event: string, data: unknown) => {
+      response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+    write("snapshot", service.getActivitySnapshot());
+    const unsubscribe = service.subscribeActivity((event) => write("activity", event));
+    const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
+    request.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      response.end();
     });
   });
 
@@ -152,7 +200,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     );
   }));
   app.post("/api/employees/:id/invoke", asyncRoute(async (request, response) => {
-    send(response, await service.invokeEmployee(routeParam(request, "id"), request.body));
+    send(response, await service.invokeEmployee(routeParam(request, "id"), request.body, invocationSource(request, "http")));
   }));
 
   app.get("/api/sessions", (request, response) => {
@@ -190,7 +238,11 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, await service.planWorkflow(routeParam(request, "id")));
   }));
   app.post("/api/workflows/:id/run", asyncRoute(async (request, response) => {
-    send(response, await service.runWorkbenchWorkflow(routeParam(request, "id"), jsonObject(request.body ?? {}, "workflow input")));
+    send(response, await service.runWorkbenchWorkflow(
+      routeParam(request, "id"),
+      jsonObject(request.body ?? {}, "workflow input"),
+      invocationSource(request, "http")
+    ));
   }));
 
   app.get("/api/runs", asyncRoute(async (request, response) => {
@@ -224,6 +276,13 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       next(error);
     }
   });
+  app.post("/api/publications/:id/invoke", asyncRoute(async (request, response) => {
+    send(response, await service.invokePublication(
+      routeParam(request, "id"),
+      jsonObject(request.body ?? {}, "publication input"),
+      invocationSource(request, "http")
+    ));
+  }));
 
   app.get("/a2a/:publicationId/.well-known/agent-card.json", (request, response, next) => {
     try {

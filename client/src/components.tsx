@@ -215,8 +215,9 @@ export function EmployeeAvatar({ displayName, presentation, className = "", titl
   </span>;
 }
 
-export function Icon({ name }: { name: "employees" | "skills" | "workflows" | "runs" | "publications" | "command" }) {
+export function Icon({ name }: { name: "office" | "employees" | "skills" | "workflows" | "runs" | "publications" | "command" }) {
   const paths = {
+    office: <><path d="M3 20h18M5 20V8l7-4 7 4v12"/><path d="M9 20v-5h6v5M8 10h2M14 10h2"/><circle cx="12" cy="8" r="1"/></>,
     employees: <><path d="M5 20v-2.2A3.8 3.8 0 0 1 8.8 14h6.4a3.8 3.8 0 0 1 3.8 3.8V20"/><circle cx="12" cy="7" r="4"/></>,
     skills: <><path d="M5 4.5A2.5 2.5 0 0 1 7.5 2H19v17H7.5A2.5 2.5 0 0 0 5 21.5z"/><path d="M5 4.5v17M9 7h6M9 11h6"/></>,
     workflows: <><rect x="3" y="3" width="6" height="6"/><rect x="15" y="15" width="6" height="6"/><path d="M9 6h4a4 4 0 0 1 4 4v5M17 15l-2-2m2 2 2-2"/></>,

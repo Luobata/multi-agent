@@ -2,24 +2,34 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import { EmployeePage } from "./EmployeePage";
 import { DaemonGate, Icon, Modal } from "./components";
+import { OfficePage } from "./OfficePage";
 import { PublicationsPage } from "./PublicationsPage";
 import { RunsPage } from "./RunsPage";
 import { SkillsPage } from "./SkillsPage";
-import type { Bootstrap } from "./types";
+import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
 
-type Page = "employees" | "skills" | "workflows" | "runs" | "publications";
-const emptyBootstrap: Bootstrap = { providers: [], skills: [], architectureTemplates: [], employees: [], workflows: [], sessions: [], publications: [] };
+type Page = "office" | "employees" | "skills" | "workflows" | "runs" | "publications";
+const emptyBootstrap: Bootstrap = { providers: [], skills: [], architectureTemplates: [], employees: [], workflows: [], sessions: [], publications: [], activity: { invocations: [], instances: [] } };
 
 function pageFromHash(): Page {
   const value = window.location.hash.replace("#", "");
-  return ["employees", "skills", "workflows", "runs", "publications"].includes(value) ? value as Page : "employees";
+  return ["office", "employees", "skills", "workflows", "runs", "publications"].includes(value) ? value as Page : "office";
+}
+
+function upsertById<T extends { id: string }>(items: T[], value: T): T[] {
+  const index = items.findIndex((item) => item.id === value.id);
+  if (index < 0) return [value, ...items];
+  const next = [...items];
+  next[index] = value;
+  return next;
 }
 
 export function App() {
   const [page, setPage] = useState<Page>(pageFromHash);
   const [data, setData] = useState<Bootstrap>(emptyBootstrap);
   const [daemon, setDaemon] = useState<"checking" | "online" | "offline">("checking");
+  const [activityStream, setActivityStream] = useState<"connecting" | "live" | "reconnecting" | "offline">("connecting");
   const [notice, setNotice] = useState<{ message: string; kind: "success" | "error" }>();
   const [commandOpen, setCommandOpen] = useState(false);
 
@@ -43,6 +53,30 @@ export function App() {
 
   useEffect(() => { refresh().catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error")); }, [refresh, notify]);
   useEffect(() => {
+    if (daemon !== "online") { setActivityStream("offline"); return; }
+    setActivityStream("connecting");
+    const stream = new EventSource("/api/activity/stream");
+    const receiveSnapshot = (event: MessageEvent<string>) => {
+      const activity = JSON.parse(event.data) as ActivitySnapshot;
+      setData((current) => ({ ...current, activity }));
+      setActivityStream("live");
+    };
+    const receiveActivity = (event: MessageEvent<string>) => {
+      const update = JSON.parse(event.data) as ActivityEvent;
+      setData((current) => ({
+        ...current,
+        activity: update.type === "invocation.changed"
+          ? { ...current.activity, invocations: upsertById(current.activity.invocations, update.invocation) }
+          : { ...current.activity, instances: upsertById(current.activity.instances, update.instance) }
+      }));
+    };
+    stream.addEventListener("snapshot", receiveSnapshot as EventListener);
+    stream.addEventListener("activity", receiveActivity as EventListener);
+    stream.onopen = () => setActivityStream("live");
+    stream.onerror = () => setActivityStream("reconnecting");
+    return () => stream.close();
+  }, [daemon]);
+  useEffect(() => {
     const update = () => setPage(pageFromHash());
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
@@ -63,12 +97,15 @@ export function App() {
   }, []);
 
   const navigate = (next: Page) => { window.location.hash = next; setPage(next); };
+  const invocationRevision = data.activity.invocations.reduce((latest, invocation) => invocation.updatedAt > latest ? invocation.updatedAt : latest, "");
+  const activityRevision = data.activity.instances.reduce((latest, instance) => instance.updatedAt > latest ? instance.updatedAt : latest, invocationRevision);
   const nav = [
+    { id: "office" as const, label: "员工大厅", icon: "office" as const },
     { id: "employees" as const, label: "员工档案", icon: "employees" as const },
     { id: "skills" as const, label: "技能台账", icon: "skills" as const },
     { id: "workflows" as const, label: "协作编排", icon: "workflows" as const },
     { id: "runs" as const, label: "运行卷宗", icon: "runs" as const },
-    { id: "publications" as const, label: "对外发布", icon: "publications" as const }
+    { id: "publications" as const, label: "调用包", icon: "publications" as const }
   ];
 
   return <div className="app-shell">
@@ -84,10 +121,11 @@ export function App() {
       <div className="nav-foot"><span>MA</span><div><strong>Local Workbench</strong><small>v0.1 · A2A 1.0</small></div></div>
     </nav>
     <DaemonGate status={daemon}><div id="main-content" className="app-content" tabIndex={-1}>
+      {page === "office" && <OfficePage data={data} streamStatus={activityStream} />}
       {page === "employees" && <EmployeePage data={data} refresh={refresh} notify={notify} />}
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
-      {page === "runs" && <RunsPage notify={notify} />}
+      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
     </div></DaemonGate>
     {notice && <div className={`toast toast--${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"} aria-live={notice.kind === "error" ? "assertive" : "polite"} aria-atomic="true">

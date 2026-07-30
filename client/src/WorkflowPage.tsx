@@ -166,7 +166,7 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
 
   const run = async () => {
     if (!selected) return; setRunning(true);
-    try { const input = parseObject(runInput, "Workflow 输入"); const result = await api<{ run: { id: string; status: string } }>(`/api/workflows/${selected.id}/run`, writeBody(input)); notify(result.run.status === "blocked" ? `Run ${result.run.id} 完成，但存在业务阻塞` : `Run ${result.run.id} · ${result.run.status}`); await refresh(); }
+    try { const input = parseObject(runInput, "Workflow 输入"); const result = await api<{ run: { id: string; status: string } }>(`/api/workflows/${selected.id}/run`, { ...writeBody(input), headers: { "x-multi-agent-source": "workbench", "x-multi-agent-source-label": "编排调试台" } }); notify(result.run.status === "blocked" ? `Run ${result.run.id} 完成，但存在业务阻塞` : `Run ${result.run.id} · ${result.run.status}`); await refresh(); }
     catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
     finally { setRunning(false); }
   };

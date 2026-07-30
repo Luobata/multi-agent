@@ -22,6 +22,16 @@ function content(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
 }
 
+function invocationHeaders(metadata: { project?: string; contextId?: string; caller?: string } = {}): Record<string, string> {
+  return Object.fromEntries(Object.entries({
+    "x-multi-agent-source": "mcp",
+    "x-multi-agent-source-label": "MCP conversation",
+    "x-multi-agent-project": metadata.project,
+    "x-multi-agent-context": metadata.contextId,
+    "x-multi-agent-caller": metadata.caller
+  }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0));
+}
+
 export function createWorkbenchMcpServer(daemonUrl = "http://127.0.0.1:4318"): McpServer {
   const server = new McpServer({ name: "local-agent-workbench", version: "0.1.0" });
 
@@ -52,12 +62,15 @@ export function createWorkbenchMcpServer(daemonUrl = "http://127.0.0.1:4318"): M
     inputSchema: {
       employeeId: z.string().min(1),
       message: z.string().min(1),
-      sessionId: z.string().min(1).optional()
+      sessionId: z.string().min(1).optional(),
+      project: z.string().min(1).optional(),
+      contextId: z.string().min(1).optional(),
+      caller: z.string().min(1).optional()
     }
-  }, async ({ employeeId, message, sessionId }) => content(await request(
+  }, async ({ employeeId, message, sessionId, project, contextId, caller }) => content(await request(
     daemonUrl,
     `/api/employees/${encodeURIComponent(employeeId)}/invoke`,
-    { method: "POST", body: JSON.stringify({ message, sessionId }) }
+    { method: "POST", body: JSON.stringify({ message, sessionId }), headers: invocationHeaders({ project, contextId, caller }) }
   )));
 
   server.registerTool("list_workflows", {
@@ -74,12 +87,40 @@ export function createWorkbenchMcpServer(daemonUrl = "http://127.0.0.1:4318"): M
     description: "Run a registered Graph workflow with structured JSON input and persist its complete evidence.",
     inputSchema: {
       workflowId: z.string().min(1),
-      input: z.record(z.string(), z.unknown()).optional()
+      input: z.record(z.string(), z.unknown()).optional(),
+      project: z.string().min(1).optional(),
+      contextId: z.string().min(1).optional(),
+      caller: z.string().min(1).optional()
     }
-  }, async ({ workflowId, input }) => content(await request(
+  }, async ({ workflowId, input, project, contextId, caller }) => content(await request(
     daemonUrl,
     `/api/workflows/${encodeURIComponent(workflowId)}/run`,
-    { method: "POST", body: JSON.stringify(input ?? {}) }
+    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
+  )));
+
+  server.registerTool("list_publications", {
+    title: "List callable agent packages",
+    description: "List published single-Agent and multi-Agent packages without exposing their internal prompts or graph.",
+    inputSchema: { includeArchived: z.boolean().optional() }
+  }, async ({ includeArchived }) => content(await request(
+    daemonUrl,
+    `/api/publications?includeArchived=${includeArchived ? "true" : "false"}`
+  )));
+
+  server.registerTool("invoke_publication", {
+    title: "Invoke agent package",
+    description: "Invoke a published single-Agent or multi-Agent package through one stable MCP tool.",
+    inputSchema: {
+      publicationId: z.string().min(1),
+      input: z.record(z.string(), z.unknown()).optional(),
+      project: z.string().min(1).optional(),
+      contextId: z.string().min(1).optional(),
+      caller: z.string().min(1).optional()
+    }
+  }, async ({ publicationId, input, project, contextId, caller }) => content(await request(
+    daemonUrl,
+    `/api/publications/${encodeURIComponent(publicationId)}/invoke`,
+    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
   )));
 
   server.registerTool("list_runs", {

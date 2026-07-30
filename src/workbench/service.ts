@@ -14,11 +14,13 @@ import type { ArchitectureRegistry } from "../architectures/types.js";
 import { compilePlan } from "../core/plan.js";
 import type { JsonObject, JsonValue, RoleSkillBinding } from "../core/types.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
-import { runWorkflow, type RunWorkflowResult } from "../runtime/runner.js";
+import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
 import { materializeWorkflow, resolveSkillBinding } from "./materialize.js";
 import { WorkbenchStore } from "./store.js";
 import {
   DEFAULT_EMPLOYEE_OUTPUT_SCHEMA,
+  type ActivityEvent,
+  type ActivitySnapshot,
   type EmployeeContextView,
   type EmployeeCreateInput,
   type EmployeeDefinition,
@@ -26,12 +28,17 @@ import {
   type EmployeeInvocationResult,
   type EmployeeRecord,
   type EmployeeSession,
+  type InvocationRecord,
+  type InvocationSource,
+  type InvocationStatus,
   type PublicationDefinition,
   type SkillCreateInput,
   type SkillUpdateInput,
   type WorkbenchSkillDefinition,
   type WorkbenchState,
   type WorkbenchWorkflowDefinition,
+  type WorkInstanceRecord,
+  type WorkInstanceStatus,
   type WorkflowCreateInput,
   type WorkflowUpdateInput,
   type EmployeeUpdateInput
@@ -141,6 +148,27 @@ function invocationMessage(output: JsonValue | undefined): string {
   return output === undefined ? "No structured output was produced." : JSON.stringify(output, null, 2);
 }
 
+function runIdentifier(): string {
+  return `run-${new Date().toISOString().replaceAll(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`;
+}
+
+function summarizeInput(input: JsonObject): string {
+  const value = typeof input.message === "string" ? input.message : JSON.stringify(input);
+  return value.replaceAll(/\s+/g, " ").trim().slice(0, 180) || "Structured request";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isInvocationTerminal(status: InvocationStatus): boolean {
+  return ["completed", "blocked", "failed", "cancelled"].includes(status);
+}
+
+function isInstanceTerminal(status: WorkInstanceStatus): boolean {
+  return ["completed", "blocked", "failed", "skipped", "cancelled"].includes(status);
+}
+
 export interface WorkbenchServiceOptions {
   dataRoot?: string;
   providers?: ProviderRegistry;
@@ -150,6 +178,8 @@ export interface WorkbenchServiceOptions {
 export class WorkbenchService {
   readonly providers: ProviderRegistry;
   readonly architectures: ArchitectureRegistry;
+  private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
+  private readonly sessionQueues = new Map<string, Promise<void>>();
 
   private constructor(
     readonly store: WorkbenchStore,
@@ -172,6 +202,282 @@ export class WorkbenchService {
 
   snapshot(): WorkbenchState {
     return this.store.snapshot();
+  }
+
+  async recoverInterruptedActivity(): Promise<void> {
+    const state = this.snapshot();
+    const hasInterrupted = Object.values(state.invocations).some((invocation) => !isInvocationTerminal(invocation.status));
+    if (!hasInterrupted) return;
+    const timestamp = now();
+    await this.store.mutate((next) => {
+      for (const invocation of Object.values(next.invocations)) {
+        if (isInvocationTerminal(invocation.status)) continue;
+        invocation.status = "failed";
+        invocation.phase = "interrupted";
+        invocation.error = "Local runtime restarted before this invocation completed.";
+        invocation.updatedAt = timestamp;
+        invocation.completedAt = timestamp;
+        invocation.transitions.push({
+          at: timestamp,
+          status: "failed",
+          phase: "interrupted",
+          message: invocation.error
+        });
+      }
+      for (const instance of Object.values(next.workInstances)) {
+        if (isInstanceTerminal(instance.status)) continue;
+        instance.status = "failed";
+        instance.phase = "interrupted";
+        instance.error = "Local runtime restarted before this work instance completed.";
+        instance.updatedAt = timestamp;
+        instance.completedAt = timestamp;
+        instance.transitions.push({
+          at: timestamp,
+          status: "failed",
+          phase: "interrupted",
+          message: instance.error
+        });
+      }
+    });
+  }
+
+  subscribeActivity(listener: (event: ActivityEvent) => void): () => void {
+    this.activityListeners.add(listener);
+    return () => this.activityListeners.delete(listener);
+  }
+
+  private emitActivity(event: ActivityEvent): void {
+    for (const listener of this.activityListeners) {
+      try {
+        listener(event);
+      } catch {
+        // A disconnected observer must not interrupt Provider execution.
+      }
+    }
+  }
+
+  getActivitySnapshot(limit = 100): ActivitySnapshot {
+    const state = this.snapshot();
+    const ordered = Object.values(state.invocations).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const bounded = Math.max(1, Math.min(500, limit));
+    const active = ordered.filter((invocation) => !isInvocationTerminal(invocation.status));
+    const included = [...active, ...ordered.filter((invocation) => isInvocationTerminal(invocation.status)).slice(0, bounded)];
+    const invocationIds = new Set(included.map((invocation) => invocation.id));
+    return {
+      invocations: included,
+      instances: Object.values(state.workInstances)
+        .filter((instance) => invocationIds.has(instance.invocationId))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    };
+  }
+
+  private async createInvocationActivity(options: {
+    target: InvocationRecord["target"];
+    source: InvocationSource;
+    workflow: WorkbenchWorkflowDefinition;
+    employees: Map<string, EmployeeDefinition>;
+    input: JsonObject;
+    sessionId?: string;
+  }): Promise<InvocationRecord> {
+    const timestamp = now();
+    const runId = runIdentifier();
+    const invocationId = `inv-${randomUUID()}`;
+    const state = this.snapshot();
+    const instances: WorkInstanceRecord[] = options.workflow.nodes.map((node) => {
+      const employee = options.employees.get(node.employeeId);
+      if (!employee) throw new Error(`employee ${node.employeeId} is not materialized`);
+      const waiting = node.needs.length > 0;
+      const status: WorkInstanceStatus = waiting ? "waiting" : "queued";
+      const phase = waiting ? "waiting-dependencies" : "queued";
+      return {
+        id: `work-${randomUUID()}`,
+        invocationId,
+        employeeId: employee.id,
+        employeeVersion: employee.version,
+        workflowId: options.workflow.id,
+        workflowVersion: options.workflow.version,
+        nodeId: node.id,
+        runId,
+        sessionId: options.sessionId,
+        providerId: employee.providerId,
+        model: state.providers[employee.providerId]?.model,
+        source: options.source,
+        status,
+        phase,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        transitions: [{ at: timestamp, status, phase }]
+      };
+    });
+    const invocation: InvocationRecord = {
+      id: invocationId,
+      target: options.target,
+      source: options.source,
+      status: "queued",
+      phase: "queued",
+      requestSummary: summarizeInput(options.input),
+      runId,
+      sessionId: options.sessionId,
+      instanceIds: instances.map((instance) => instance.id),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      transitions: [{ at: timestamp, status: "queued", phase: "queued" }]
+    };
+    await this.store.mutate((next) => {
+      next.invocations[invocation.id] = invocation;
+      for (const instance of instances) next.workInstances[instance.id] = instance;
+    });
+    this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+    for (const instance of instances) this.emitActivity({ type: "instance.changed", at: timestamp, instance });
+    return invocation;
+  }
+
+  private async transitionInvocation(
+    id: string,
+    status: InvocationStatus,
+    phase: string,
+    message?: string
+  ): Promise<InvocationRecord> {
+    const timestamp = now();
+    const invocation = await this.store.mutate((state) => {
+      const target = state.invocations[id];
+      if (!target) throw new Error(`invocation not found: ${id}`);
+      target.status = status;
+      target.phase = phase;
+      target.updatedAt = timestamp;
+      if (status === "running") target.startedAt ??= timestamp;
+      if (isInvocationTerminal(status)) target.completedAt = timestamp;
+      if (status === "failed" && message !== undefined) target.error = message;
+      const previous = target.transitions.at(-1);
+      if (previous?.status !== status || previous.phase !== phase || (message && previous.message !== message)) {
+        target.transitions.push({ at: timestamp, status, phase, message });
+      }
+      return target;
+    });
+    this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+    return invocation;
+  }
+
+  private async transitionInstance(
+    invocationId: string,
+    nodeId: string,
+    status: WorkInstanceStatus,
+    phase: string,
+    message?: string
+  ): Promise<WorkInstanceRecord | undefined> {
+    const timestamp = now();
+    const instance = await this.store.mutate((state) => {
+      const invocation = state.invocations[invocationId];
+      const target = invocation?.instanceIds
+        .map((id) => state.workInstances[id])
+        .find((candidate) => candidate?.nodeId === nodeId);
+      if (!target) return undefined;
+      target.status = status;
+      target.phase = phase;
+      target.updatedAt = timestamp;
+      if (status === "running") target.startedAt ??= timestamp;
+      if (isInstanceTerminal(status)) target.completedAt = timestamp;
+      if (status === "failed") target.error = message;
+      const previous = target.transitions.at(-1);
+      if (previous?.status !== status || previous.phase !== phase || (message && previous.message !== message)) {
+        target.transitions.push({ at: timestamp, status, phase, message });
+      }
+      return target;
+    });
+    if (instance) this.emitActivity({ type: "instance.changed", at: timestamp, instance });
+    return instance;
+  }
+
+  private async observeRunEvent(invocationId: string, event: ObservedRunEvent): Promise<void> {
+    if (event.type === "run.started") {
+      await this.transitionInvocation(invocationId, "running", "executing");
+      return;
+    }
+    if (event.nodeId) {
+      if (event.type === "node.started" || event.type === "node.attempt.started") {
+        await this.transitionInstance(invocationId, event.nodeId, "running", "provider");
+      } else if (event.type === "node.attempt.failed") {
+        const detail = event.detail as { error?: string } | undefined;
+        await this.transitionInstance(invocationId, event.nodeId, "running", "retrying", detail?.error);
+      } else if (event.type === "node.passed") {
+        await this.transitionInstance(invocationId, event.nodeId, "completed", "done");
+      } else if (event.type === "node.blocked") {
+        await this.transitionInstance(invocationId, event.nodeId, "blocked", "done");
+      } else if (event.type === "node.failed") {
+        const detail = event.detail as { error?: string } | undefined;
+        await this.transitionInstance(invocationId, event.nodeId, "failed", "error", detail?.error);
+      } else if (event.type === "node.skipped") {
+        const detail = event.detail as { reason?: string } | undefined;
+        await this.transitionInstance(invocationId, event.nodeId, "skipped", "done", detail?.reason);
+      }
+    }
+    if (event.type === "run.passed") await this.transitionInvocation(invocationId, "completed", "done");
+    if (event.type === "run.blocked") await this.transitionInvocation(invocationId, "blocked", "done");
+    if (event.type === "run.failed") {
+      const state = this.snapshot();
+      const invocation = state.invocations[invocationId];
+      const failure = invocation?.instanceIds
+        .map((id) => state.workInstances[id]?.error)
+        .find((message): message is string => Boolean(message));
+      await this.transitionInvocation(invocationId, "failed", "error", failure ?? "One or more work instances failed.");
+    }
+  }
+
+  private async failInvocationActivity(invocationId: string, error: unknown): Promise<void> {
+    const message = errorMessage(error);
+    const snapshot = this.snapshot();
+    const invocation = snapshot.invocations[invocationId];
+    if (!invocation) return;
+    for (const instanceId of invocation.instanceIds) {
+      const instance = snapshot.workInstances[instanceId];
+      if (instance && !isInstanceTerminal(instance.status)) {
+        await this.transitionInstance(invocationId, instance.nodeId, "failed", "error", message);
+      }
+    }
+    await this.transitionInvocation(invocationId, "failed", "error", message);
+  }
+
+  private async runTrackedWorkflow(
+    invocation: InvocationRecord,
+    workflow: WorkbenchWorkflowDefinition,
+    employees: Map<string, EmployeeDefinition>,
+    input: JsonObject
+  ): Promise<RunWorkflowResult> {
+    await this.transitionInvocation(invocation.id, "running", "materializing");
+    try {
+      const materialized = await this.materialize(workflow, employees);
+      return await runWorkflow(materialized.loaded, materialized.workflowId, {
+        runId: invocation.runId,
+        input,
+        providers: this.providers,
+        architectures: this.architectures,
+        artifactRoot: path.join(this.store.dataRoot, "artifacts"),
+        onEvent: (event) => this.observeRunEvent(invocation.id, event)
+      });
+    } catch (error) {
+      await this.failInvocationActivity(invocation.id, error);
+      throw error;
+    }
+  }
+
+  private async inSessionQueue<T>(
+    sessionId: string,
+    onWaiting: () => void | Promise<void>,
+    task: () => Promise<T>
+  ): Promise<T> {
+    const predecessor = this.sessionQueues.get(sessionId);
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = (predecessor ?? Promise.resolve()).catch(() => undefined).then(() => gate);
+    this.sessionQueues.set(sessionId, tail);
+    if (predecessor) await onWaiting();
+    await predecessor?.catch(() => undefined);
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.sessionQueues.get(sessionId) === tail) this.sessionQueues.delete(sessionId);
+    }
   }
 
   listProviders(): Array<{ id: string; definition: WorkbenchState["providers"][string] }> {
@@ -489,7 +795,11 @@ export class WorkbenchService {
     });
   }
 
-  async invokeEmployee(employeeId: string, input: EmployeeInvocationInput): Promise<EmployeeInvocationResult> {
+  async invokeEmployee(
+    employeeId: string,
+    input: EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<EmployeeInvocationResult> {
     requireText(input.message, "message");
     const current = this.getEmployee(employeeId);
     if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
@@ -513,48 +823,59 @@ export class WorkbenchService {
         state.sessions[newSession.id] = newSession;
       });
     }
-    const history = session.messages
-      .slice(-employee.contextPolicy.historyLimit)
-      .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
-      .join("\n\n");
     const workflow = this.directWorkflow(employee);
-    const materialized = await this.materialize(workflow, new Map([[employee.id, employee]]));
-    const result = await runWorkflow(materialized.loaded, materialized.workflowId, {
-      input: { message: input.message.trim(), sessionHistory: history },
-      providers: this.providers,
-      architectures: this.architectures,
-      artifactRoot: path.join(this.store.dataRoot, "artifacts")
+    const employees = new Map([[employee.id, employee]]);
+    const invocation = await this.createInvocationActivity({
+      target: { kind: "employee", id: employee.id, version: employee.version },
+      source,
+      workflow,
+      employees,
+      input: { message: input.message.trim() },
+      sessionId: session.id
     });
-    const node = result.run.nodes.respond;
-    const responseMessage = invocationMessage(node?.output);
-    const timestamp = now();
     const sessionId = session.id;
-    const updatedSession = await this.store.mutate((state) => {
-      const target = state.sessions[sessionId];
-      if (!target) throw new Error(`session not found: ${sessionId}`);
-      target.messages.push(
-        { id: randomUUID(), role: "user", content: input.message.trim(), at: timestamp, runId: result.run.id, runDir: result.runDir },
-        {
-          id: randomUUID(),
-          role: node?.status === "failed" ? "system" : "employee",
-          content: responseMessage,
-          at: timestamp,
-          runId: result.run.id,
-          runDir: result.runDir,
-          output: node?.output
-        }
-      );
-      target.updatedAt = timestamp;
-      return target;
+    return this.inSessionQueue(sessionId, async () => {
+      await this.transitionInstance(invocation.id, "respond", "waiting", "waiting-session");
+    }, async () => {
+      const latestSession = this.getSession(sessionId);
+      const history = latestSession.messages
+        .slice(-employee.contextPolicy.historyLimit)
+        .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+        .join("\n\n");
+      const result = await this.runTrackedWorkflow(invocation, workflow, employees, {
+        message: input.message.trim(),
+        sessionHistory: history
+      });
+      const node = result.run.nodes.respond;
+      const responseMessage = invocationMessage(node?.output);
+      const timestamp = now();
+      const updatedSession = await this.store.mutate((state) => {
+        const target = state.sessions[sessionId];
+        if (!target) throw new Error(`session not found: ${sessionId}`);
+        target.messages.push(
+          { id: randomUUID(), role: "user", content: input.message.trim(), at: timestamp, runId: result.run.id, runDir: result.runDir },
+          {
+            id: randomUUID(),
+            role: node?.status === "failed" ? "system" : "employee",
+            content: responseMessage,
+            at: timestamp,
+            runId: result.run.id,
+            runDir: result.runDir,
+            output: node?.output
+          }
+        );
+        target.updatedAt = timestamp;
+        return target;
+      });
+      return {
+        session: updatedSession,
+        runId: result.run.id,
+        runDir: result.runDir,
+        status: result.run.status,
+        output: node?.output,
+        message: responseMessage
+      };
     });
-    return {
-      session: updatedSession,
-      runId: result.run.id,
-      runDir: result.runDir,
-      status: result.run.status,
-      output: node?.output,
-      message: responseMessage
-    };
   }
 
   async getEmployeeContext(employeeId: string, sessionId?: string): Promise<EmployeeContextView> {
@@ -749,20 +1070,25 @@ export class WorkbenchService {
     return compilePlan(materialized.loaded, materialized.workflowId, this.architectures);
   }
 
-  async runWorkbenchWorkflow(id: string, input: JsonObject = {}): Promise<RunWorkflowResult> {
+  async runWorkbenchWorkflow(
+    id: string,
+    input: JsonObject = {},
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<RunWorkflowResult> {
     const workflow = this.getWorkflow(id);
     if (workflow.status !== "active") throw new Error(`workflow ${id} is archived`);
     const employees = this.resolveWorkflowEmployees(workflow);
     for (const employee of employees.values()) {
       if (this.getEmployee(employee.id).status !== "active") throw new Error(`employee ${employee.id} is archived`);
     }
-    const materialized = await this.materialize(workflow, employees);
-    return runWorkflow(materialized.loaded, materialized.workflowId, {
-      input,
-      providers: this.providers,
-      architectures: this.architectures,
-      artifactRoot: path.join(this.store.dataRoot, "artifacts")
+    const invocation = await this.createInvocationActivity({
+      target: { kind: "workflow", id: workflow.id, version: workflow.version },
+      source,
+      workflow,
+      employees,
+      input
     });
+    return this.runTrackedWorkflow(invocation, workflow, employees, input);
   }
 
   async archiveWorkflow(id: string): Promise<WorkbenchWorkflowDefinition> {
@@ -832,14 +1158,40 @@ export class WorkbenchService {
     });
   }
 
-  async invokePublication(id: string, input: JsonObject): Promise<RunWorkflowResult | EmployeeInvocationResult> {
+  private sessionForExternalContext(employeeId: string, source: InvocationSource): string | undefined {
+    if (!source.contextId) return undefined;
+    const state = this.snapshot();
+    const match = Object.values(state.invocations)
+      .filter((invocation) =>
+        invocation.target.kind === "employee"
+        && invocation.target.id === employeeId
+        && invocation.sessionId !== undefined
+        && invocation.source.kind === source.kind
+        && invocation.source.contextId === source.contextId
+        && invocation.source.publicationId === source.publicationId
+        && invocation.source.project === source.project
+        && invocation.source.caller === source.caller
+      )
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    return match?.sessionId && state.sessions[match.sessionId]?.status === "active" ? match.sessionId : undefined;
+  }
+
+  async invokePublication(
+    id: string,
+    input: JsonObject,
+    source: InvocationSource = { kind: "http" }
+  ): Promise<RunWorkflowResult | EmployeeInvocationResult> {
     const publication = this.getPublication(id);
     if (publication.status !== "active") throw new Error(`publication ${id} is archived`);
+    const publicationSource: InvocationSource = { ...source, publicationId: id };
     if (publication.target.kind === "employee") {
       const message = typeof input.message === "string" ? input.message : JSON.stringify(input);
-      return this.invokeEmployee(publication.target.id, { message });
+      return this.invokeEmployee(publication.target.id, {
+        message,
+        sessionId: this.sessionForExternalContext(publication.target.id, publicationSource)
+      }, publicationSource);
     }
-    return this.runWorkbenchWorkflow(publication.target.id, input);
+    return this.runWorkbenchWorkflow(publication.target.id, input, publicationSource);
   }
 
   async listRuns(limit = 50): Promise<unknown[]> {

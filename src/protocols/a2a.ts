@@ -124,7 +124,12 @@ class WorkbenchPublicationExecutor implements AgentExecutor {
     eventBus.publish(AgentEvent.task(task));
 
     try {
-      const rawResult = await this.service.invokePublication(this.publicationId, readInput(userMessage));
+      const rawResult = await this.service.invokePublication(this.publicationId, readInput(userMessage), {
+        kind: "a2a",
+        label: "A2A task",
+        contextId,
+        taskId
+      });
       const result = resultSummary(rawResult);
       const failed = result.status === "failed";
       const blocked = result.status === "blocked";

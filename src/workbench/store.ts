@@ -18,7 +18,9 @@ function initialState(): WorkbenchState {
     employees: {},
     workflows: {},
     sessions: {},
-    publications: {}
+    publications: {},
+    invocations: {},
+    workInstances: {}
   };
 }
 
@@ -29,6 +31,8 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   state.skillHistory ??= Object.fromEntries(
     Object.entries(state.skills).map(([id, skill]) => [id, [skill]])
   );
+  state.invocations ??= {};
+  state.workInstances ??= {};
   for (const skill of Object.values(state.skills)) skill.status ??= "active";
   for (const versions of Object.values(state.skillHistory)) {
     for (const skill of versions) skill.status ??= "active";

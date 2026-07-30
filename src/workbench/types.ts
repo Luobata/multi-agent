@@ -112,6 +112,92 @@ export interface EmployeeSession {
   updatedAt: string;
 }
 
+export type InvocationSourceKind = "workbench" | "http" | "mcp" | "a2a";
+
+export interface InvocationSource {
+  kind: InvocationSourceKind;
+  label?: string;
+  project?: string;
+  caller?: string;
+  contextId?: string;
+  taskId?: string;
+  publicationId?: string;
+}
+
+export type InvocationStatus = "queued" | "running" | "completed" | "blocked" | "failed" | "cancelled";
+export type WorkInstanceStatus =
+  | "queued"
+  | "waiting"
+  | "running"
+  | "completed"
+  | "blocked"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+
+export interface ActivityTransition<TStatus extends string> {
+  at: string;
+  status: TStatus;
+  phase: string;
+  message?: string;
+}
+
+/** One addressable request entering the workbench through HTTP, MCP, A2A, or its local debug desk. */
+export interface InvocationRecord {
+  id: string;
+  target: {
+    kind: "employee" | "workflow";
+    id: string;
+    version: number;
+  };
+  source: InvocationSource;
+  status: InvocationStatus;
+  phase: string;
+  requestSummary: string;
+  runId: string;
+  sessionId?: string;
+  instanceIds: string[];
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  updatedAt: string;
+  completedAt?: string;
+  transitions: Array<ActivityTransition<InvocationStatus>>;
+}
+
+/** Ephemeral attendance of one Employee inside an Invocation. The Employee identity itself is never cloned. */
+export interface WorkInstanceRecord {
+  id: string;
+  invocationId: string;
+  employeeId: string;
+  employeeVersion: number;
+  workflowId: string;
+  workflowVersion: number;
+  nodeId: string;
+  runId: string;
+  sessionId?: string;
+  providerId: string;
+  model?: string;
+  source: InvocationSource;
+  status: WorkInstanceStatus;
+  phase: string;
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  updatedAt: string;
+  completedAt?: string;
+  transitions: Array<ActivityTransition<WorkInstanceStatus>>;
+}
+
+export interface ActivitySnapshot {
+  invocations: InvocationRecord[];
+  instances: WorkInstanceRecord[];
+}
+
+export type ActivityEvent =
+  | { type: "invocation.changed"; at: string; invocation: InvocationRecord }
+  | { type: "instance.changed"; at: string; instance: WorkInstanceRecord };
+
 export interface PublicationTarget {
   kind: "employee" | "workflow";
   id: string;
@@ -137,6 +223,8 @@ export interface WorkbenchState {
   workflows: Record<string, WorkbenchWorkflowRecord>;
   sessions: Record<string, EmployeeSession>;
   publications: Record<string, PublicationDefinition>;
+  invocations: Record<string, InvocationRecord>;
+  workInstances: Record<string, WorkInstanceRecord>;
 }
 
 export interface EmployeeCreateInput {

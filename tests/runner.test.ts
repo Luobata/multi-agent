@@ -44,6 +44,14 @@ describe("workflow runtime", () => {
     expect(fs.readFileSync(path.join(result.runDir, "nodes", "product-review", "attempt-1", "system-prompt.md"), "utf8")).toContain(
       "Requirement Analysis"
     );
+    const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; nodeId?: string });
+    expect(events.some((event) => event.type === "node.started" && event.nodeId === "product-review")).toBe(true);
+    expect(events.at(-1)?.type).toBe("run.passed");
+    const persisted = JSON.parse(fs.readFileSync(path.join(result.runDir, "run.json"), "utf8")) as typeof result.run;
+    expect(Object.values(persisted.nodes).every((node) => !["pending", "running"].includes(node.status))).toBe(true);
   });
 
   it("lets synthesis consume a domain Block", async () => {

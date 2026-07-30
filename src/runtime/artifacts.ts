@@ -17,6 +17,7 @@ async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> 
 
 export class RunStore {
   private eventQueue: Promise<void> = Promise.resolve();
+  private runQueue: Promise<void> = Promise.resolve();
 
   constructor(public readonly runDir: string) {}
 
@@ -35,7 +36,9 @@ export class RunStore {
   }
 
   async writeRun(run: WorkflowRunRecord): Promise<void> {
-    await writeJsonAtomic(path.join(this.runDir, "run.json"), run);
+    const snapshot = structuredClone(run);
+    this.runQueue = this.runQueue.then(() => writeJsonAtomic(path.join(this.runDir, "run.json"), snapshot));
+    await this.runQueue;
   }
 
   async appendEvent(event: RunEvent): Promise<void> {

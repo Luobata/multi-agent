@@ -3,13 +3,21 @@ import { api } from "./api";
 import { DossierSection, EmptyState, Stamp, formatTime } from "./components";
 import type { Run } from "./types";
 
-export function RunsPage({ notify }: { notify: (message: string, kind?: "success" | "error") => void }) {
+export function RunsPage({ notify, activityRevision = "" }: { notify: (message: string, kind?: "success" | "error") => void; activityRevision?: string }) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [loading, setLoading] = useState(true);
   useEffect(() => {
-    api<Run[]>("/api/runs?limit=100").then((value) => { setRuns(value); setSelectedId((current) => current || value[0]?.id || ""); }).catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error")).finally(() => setLoading(false));
-  }, [notify]);
+    let current = true;
+    api<Run[]>("/api/runs?limit=100").then((value) => {
+      if (!current) return;
+      setRuns(value);
+      setSelectedId((selected) => selected || value[0]?.id || "");
+    }).catch((error: unknown) => {
+      if (current) notify(error instanceof Error ? error.message : String(error), "error");
+    }).finally(() => { if (current) setLoading(false); });
+    return () => { current = false; };
+  }, [notify, activityRevision]);
   const selected = runs.find((run) => run.id === selectedId) ?? runs[0];
   return <div className="page-grid">
     <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="record-scroll run-list">{runs.map((run) => <button key={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {Object.keys(run.nodes).length} 节点</small></div><Stamp status={run.status} /></button>)}{!loading && runs.length === 0 && <div className="mini-empty">还没有 Run 证据。</div>}</div><footer className="list-footer"><span>{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>

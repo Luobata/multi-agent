@@ -349,7 +349,10 @@ function DirectDesk({ employee, sessions, refresh, notify, onContext }: {
     if (!message.trim()) return;
     setRunning(true);
     try {
-      const result = await api<{ session: Session; runId: string; status: string }>(`/api/employees/${employee.id}/invoke`, writeBody({ message, sessionId: sessionId || undefined }));
+      const result = await api<{ session: Session; runId: string; status: string }>(`/api/employees/${employee.id}/invoke`, {
+        ...writeBody({ message, sessionId: sessionId || undefined }),
+        headers: { "x-multi-agent-source": "workbench", "x-multi-agent-source-label": "直接交办调试台" }
+      });
       setSessionId(result.session.id);
       setMessage("");
       notify(result.status === "blocked" ? "请求完成，员工给出业务阻塞结论" : `工单已完成 · ${result.runId}`);

@@ -2,7 +2,7 @@
 
 ## 1. 进程与目录
 
-`multi-agent-daemon` 是 mutable Workbench state 的常驻写入者。它默认监听 `127.0.0.1:4318`，同时提供 REST API、静态客户端和 A2A 路由。离线 CLI 也可短时写入，但会使用同一跨进程锁；v1 仍不支持对同一数据目录运行多个 daemon。
+`multi-agent-daemon` 是 mutable Workbench state 的常驻写入者。它默认监听 `127.0.0.1:4318`，同时提供 REST API、SSE 实时状态、静态客户端和 A2A 路由。离线 CLI 也可短时写入，但会使用同一跨进程锁；v1 仍不支持对同一数据目录运行多个 daemon。
 
 ```text
 ~/.multi-agent/workbench/
@@ -33,7 +33,7 @@
 | 模块 | 责任 |
 | --- | --- |
 | `src/workbench/store.ts` | Workbench state 原子持久化 |
-| `src/workbench/service.ts` | Employee、Skill、Provider、Workflow、Session、Publication 领域操作 |
+| `src/workbench/service.ts` | Employee、Skill、Provider、Workflow、Session、Publication、Invocation 与 Work Instance 领域操作 |
 | `src/workbench/materialize.ts` | 把版本化 Workbench 数据编译为现有 manifest/prompt/schema |
 | `src/runtime/runner.ts` | Provider 调用、重试、Schema、verdict、Run Store |
 | `src/architectures/graph.ts` | DAG 校验、计划、并行与依赖控制 |
@@ -52,6 +52,8 @@
 | --- | --- | --- |
 | GET | `/api/health` | daemon 状态与安全边界 |
 | GET | `/api/bootstrap` | 客户端首屏注册表快照 |
+| GET | `/api/activity` | 调用与员工出勤快照 |
+| GET | `/api/activity/stream` | 调用与节点状态 SSE |
 | GET/PUT | `/api/providers[/:id]` | Provider 实例注册 |
 | GET/POST/PATCH | `/api/skills[/:id]` | 共享 Skill 注册与版本更新 |
 | GET/POST/PATCH | `/api/employees[/:id]` | Employee 列表、创建、详情与新版本 |
@@ -65,6 +67,7 @@
 | POST | `/api/workflows/:id/run` | 执行 Workflow |
 | GET | `/api/runs[/:id]` | 不可变 Run 记录 |
 | GET/POST | `/api/publications[/:id]` | A2A Publication |
+| POST | `/api/publications/:id/invoke` | 统一调用单 Agent / 多 Agent 包 |
 | GET | `/api/publications/:id/card` | UI 使用的 Agent Card envelope |
 
 ## 4. Provider 与身份注册
@@ -106,7 +109,7 @@ MCP server 只把 stdio tool call 转成 daemon HTTP 请求，不持有 Employee
 multi-agent-mcp --daemon-url http://127.0.0.1:4318
 ```
 
-调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。
+调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包，再用 `invoke_publication` 调用，不必感知包内是单 Employee 还是 Workflow。
 
 ## 6. A2A v1
 
