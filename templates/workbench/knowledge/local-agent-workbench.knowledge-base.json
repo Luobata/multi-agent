@@ -1,0 +1,57 @@
+{
+  "id": "local-agent-workbench",
+  "displayName": "Local Agent Workbench 手册",
+  "description": "Workbench 的产品、设计、工程与质量知识总库；通过 Collection 和 Knowledge Profile 按需分配，不直接绑定员工。",
+  "domain": "workbench",
+  "product": "multi-agent",
+  "classification": "internal",
+  "collections": [
+    {
+      "id": "foundation",
+      "displayName": "基础与架构边界",
+      "description": "系统目标、分层边界、核心概念与使用入口。",
+      "authority": "canonical",
+      "tags": ["workbench", "架构", "边界", "employee", "workflow"]
+    },
+    {
+      "id": "product",
+      "displayName": "产品与项目接入",
+      "description": "产品领域模型、用户路径、项目角色契约和验收目标。",
+      "authority": "canonical",
+      "tags": ["产品", "需求", "项目", "角色", "验收"]
+    },
+    {
+      "id": "design",
+      "displayName": "交互与视觉设计",
+      "description": "档案室界面原则、交互状态、信息层级和视觉规范。",
+      "authority": "canonical",
+      "tags": ["设计", "交互", "视觉", "UI", "状态"]
+    },
+    {
+      "id": "engineering",
+      "displayName": "工程实现",
+      "description": "运行时、Provider、Graph、持久化、协议和实现约束。",
+      "authority": "canonical",
+      "tags": ["工程", "实现", "TypeScript", "Provider", "Graph", "持久化"]
+    },
+    {
+      "id": "quality",
+      "displayName": "质量与运行证据",
+      "description": "实时调用、测试、发布隔离、可追溯证据和回归门禁。",
+      "authority": "canonical",
+      "tags": ["质量", "测试", "验收", "运行", "证据", "回归"]
+    }
+  ],
+  "sources": [
+    { "id": "foundation-readme", "kind": "file", "location": "README.md", "collectionId": "foundation" },
+    { "id": "foundation-architecture", "kind": "file", "location": "docs/architecture.md", "collectionId": "foundation" },
+    { "id": "product-domain", "kind": "file", "location": "docs/workbench-v1.md", "collectionId": "product" },
+    { "id": "product-project", "kind": "file", "location": "docs/project-integration.md", "collectionId": "product" },
+    { "id": "design-source", "kind": "file", "location": "design.md", "collectionId": "design" },
+    { "id": "design-ui", "kind": "file", "location": "docs/workbench-ui.md", "collectionId": "design" },
+    { "id": "engineering-runtime", "kind": "file", "location": "docs/workbench-implementation.md", "collectionId": "engineering" },
+    { "id": "engineering-architecture", "kind": "file", "location": "docs/architecture-adapters.md", "collectionId": "engineering" },
+    { "id": "quality-invocation", "kind": "file", "location": "docs/live-invocations.md", "collectionId": "quality" },
+    { "id": "quality-acceptance", "kind": "file", "location": "docs/knowledge-base/delivery-plan.md", "collectionId": "quality" }
+  ]
+}

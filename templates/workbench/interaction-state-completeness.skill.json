@@ -1,0 +1,7 @@
+{
+  "id": "interaction-state-completeness",
+  "displayName": "交互状态完整性审查",
+  "description": "在设计与验收阶段覆盖控件展开态、浮层边界、键盘路径和异常状态，避免只交付静态闭合态。",
+  "instructions": "先列出受影响页面的所有可交互组件，并为每类组件建立状态矩阵，至少检查 idle、hover、focus-visible、active、disabled、loading、success、warning、error、empty；选择器、菜单、提示和弹出层还必须检查 closed/open、selected/unselected、长内容和大量选项。不得只根据静态稿或闭合态判定通过。对于下拉选择器，明确选择原生控件还是产品化 listbox：若使用原生控件，必须说明系统菜单无法完全品牌化；若要求视觉统一，则检查触发器、展开菜单、选中标记、悬停/键盘高亮、禁用项、空列表、最大高度与内部滚动。所有浮层必须验证锚点关系、z-index、祖先 overflow 裁切、视口边缘避让、空间不足时向上展开，以及滚动或缩放后的定位；若触发器位于 modal dialog 或其他浏览器 top layer，浮层必须挂载到同一 top layer，普通 body portal 的任何 z-index 都无法越过 top layer。键盘路径至少覆盖 Tab、Enter/Space、方向键、Home/End、Escape 和关闭后的焦点恢复；弹窗内第一次 Escape 只能关闭菜单，第二次才关闭 dialog。方向键或 Home/End 改变 active option 后必须以 block: nearest 滚进菜单可视区，长列表验收至少使用 20 个 options。focus-visible 必须即时出现且对相邻背景对比度不低于 3:1，不得动画化焦点环。空列表、全禁用列表和禁用项必须给出文字原因；error 必须有非颜色信号、错误文本与 aria-describedby；粗指针下触发器和 option 点击区均不小于 44px。语义使用 combobox/listbox/option 或等价原生语义，长标签可视觉省略但完整名称、标签与选中状态必须可被辅助技术读取。最后在真实运行页面同时保留闭合态、展开态、底部翻转、长内容、20+ options、禁用/空态、普通页面 Portal、dialog 同层 Portal 和键盘路径证据，检查支持视口下无遮挡、无页面级横向溢出、无点击区重叠；任一关键展开态无法操作、被裁切、跳出产品视觉体系且未声明为原生取舍，结论必须为 Block。",
+  "tools": ["Read", "Glob", "Grep", "WebFetch", "browser"]
+}

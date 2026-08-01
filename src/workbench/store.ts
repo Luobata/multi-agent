@@ -1,7 +1,81 @@
-import { readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, readdirSync } from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
+import type { ProviderDefinition } from "../core/types.js";
 import type { WorkbenchState } from "./types.js";
+
+const KNOWLEDGE_CONTROL_TOOLS = [
+  "knowledge_control_snapshot",
+  "knowledge_base_get",
+  "knowledge_revision_assess",
+  "knowledge_revision_preview",
+  "knowledge_impact_get",
+  "knowledge_change_list",
+  "knowledge_change_get",
+  "knowledge_change_propose"
+];
+const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+function executable(filePath: string): boolean {
+  try {
+    accessSync(filePath, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveCodexCommand(): string {
+  const configured = process.env.MULTI_AGENT_CODEX_COMMAND?.trim();
+  if (configured) return configured;
+  const pathCandidates = (process.env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((directory) => path.join(directory, "codex"));
+  const home = os.homedir();
+  const nvmRoot = path.join(home, ".nvm", "versions", "node");
+  const nvmCandidates = existsSync(nvmRoot)
+    ? readdirSync(nvmRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((left, right) => right.localeCompare(left, undefined, { numeric: true }))
+      .map((version) => path.join(nvmRoot, version, "bin", "codex"))
+    : [];
+  const candidates = [
+    ...pathCandidates,
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    path.join(home, ".local", "bin", "codex"),
+    path.join(home, ".volta", "bin", "codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+    ...nvmCandidates
+  ];
+  return candidates.find(executable) ?? "codex";
+}
+
+function codexKnowledgeControlProvider(): ProviderDefinition {
+  return {
+    adapter: "codex",
+    command: resolveCodexCommand(),
+    filesystemIsolation: "workspace-read-only",
+    workingDirectory: "{{run.materializedRoot}}",
+    approvalPolicy: "never",
+    timeoutMs: 600_000,
+    outputProtocol: "json",
+    mcpServers: {
+      knowledge_control: {
+        command: process.execPath,
+        args: [path.join(packageRoot, "dist", "mcp", "main.js"), "--profile", "knowledge-control"],
+        cwd: "{{run.projectRoot}}",
+        enabledTools: KNOWLEDGE_CONTROL_TOOLS,
+        defaultToolsApprovalMode: "approve"
+      }
+    }
+  };
+}
 
 function initialState(): WorkbenchState {
   return {
@@ -11,14 +85,20 @@ function initialState(): WorkbenchState {
         adapter: "mock",
         model: "deterministic-mock",
         outputProtocol: "json"
-      }
+      },
+      "codex-knowledge-control": codexKnowledgeControlProvider()
     },
     skills: {},
     skillHistory: {},
+    knowledgeBases: {},
+    knowledgeProfiles: {},
+    knowledgeChangeRequests: {},
     employees: {},
     workflows: {},
     sessions: {},
     publications: {},
+    projects: {},
+    projectBindings: {},
     invocations: {},
     workInstances: {}
   };
@@ -28,17 +108,35 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   if (state.providers.mock?.adapter === "mock" && state.providers.mock.model === undefined) {
     state.providers.mock.model = "deterministic-mock";
   }
+  const currentKnowledgeControl = state.providers["codex-knowledge-control"];
+  state.providers["codex-knowledge-control"] = {
+    ...codexKnowledgeControlProvider(),
+    ...(typeof currentKnowledgeControl?.model === "string" ? { model: currentKnowledgeControl.model } : {})
+  };
   state.skillHistory ??= Object.fromEntries(
     Object.entries(state.skills).map(([id, skill]) => [id, [skill]])
   );
+  state.knowledgeBases ??= {};
+  state.knowledgeProfiles ??= {};
+  state.knowledgeChangeRequests ??= {};
   state.invocations ??= {};
   state.workInstances ??= {};
+  state.projects ??= {};
+  state.projectBindings ??= {};
+  for (const activity of [...Object.values(state.invocations), ...Object.values(state.workInstances)]) {
+    const source = activity.source;
+    if (source.label) source.label = decodeUtf8HeaderValue(source.label);
+    if (source.project) source.project = decodeUtf8HeaderValue(source.project);
+    if (source.caller) source.caller = decodeUtf8HeaderValue(source.caller);
+    if (source.contextId) source.contextId = decodeUtf8HeaderValue(source.contextId);
+  }
   for (const skill of Object.values(state.skills)) skill.status ??= "active";
   for (const versions of Object.values(state.skillHistory)) {
     for (const skill of versions) skill.status ??= "active";
   }
   for (const record of Object.values(state.employees)) {
     for (const employee of record.versions) {
+      employee.knowledgeProfileIds ??= [];
       employee.skillVersions ??= Object.fromEntries(
         employee.skills.map((binding) => {
           const id = typeof binding === "string" ? binding : binding.id;
@@ -47,12 +145,25 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
       );
     }
     record.current = record.versions.find((employee) => employee.version === record.current.version) ?? record.current;
+    record.current.knowledgeProfileIds ??= [];
     record.current.skillVersions ??= Object.fromEntries(
       record.current.skills.map((binding) => {
         const id = typeof binding === "string" ? binding : binding.id;
         return [id, state.skills[id]?.version ?? 1];
       })
     );
+  }
+  for (const record of Object.values(state.projects)) {
+    for (const project of record.versions) {
+      for (const role of project.roles) role.knowledgeProfileIds ??= [];
+    }
+    for (const role of record.current.roles) role.knowledgeProfileIds ??= [];
+  }
+  for (const record of Object.values(state.projectBindings)) {
+    for (const binding of record.versions) {
+      for (const role of binding.roles) role.knowledgeProfileIds ??= [];
+    }
+    for (const role of record.current.roles) role.knowledgeProfileIds ??= [];
   }
   return state;
 }

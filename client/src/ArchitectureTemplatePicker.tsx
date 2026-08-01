@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, writeBody } from "./api";
+import { SelectControl } from "./components";
 import type { ArchitectureTemplate, Employee, InstantiatedArchitectureTemplate } from "./types";
 
 export function ArchitectureTemplatePicker({ templates, employees, currentPatternId, onApply, notify }: {
@@ -43,7 +44,7 @@ export function ArchitectureTemplatePicker({ templates, employees, currentPatter
     </div>
     {template && <div className="template-mapping">
       <header><div><p className="record-meta">SLOT MAPPING</p><h4>{template.displayName}</h4><p>{template.bestFor}</p></div><span>{template.failFast ? "FAIL FAST" : "EVIDENCE FIRST"}</span></header>
-      <div className="template-slots">{template.slots.map((slot, index) => <label key={slot.id}><span><b>{slot.label}</b><small>{slot.description}</small></span><select value={assignments[index] ?? ""} onChange={(event) => setAssignments((current) => current.map((value, assignmentIndex) => assignmentIndex === index ? event.target.value : value))}><option value="">选择员工</option>{activeEmployees.map((employee) => <option key={employee.id} value={employee.id}>{employee.identity.displayName} · {employee.providerId}</option>)}</select></label>)}</div>
+      <div className="template-slots">{template.slots.map((slot, index) => <label key={slot.id}><span><b>{slot.label}</b><small>{slot.description}</small></span><SelectControl ariaLabel={`为${slot.label}选择员工`} value={assignments[index] ?? ""} options={[{ value: "", label: activeEmployees.length ? "选择员工" : "暂无在册员工", description: activeEmployees.length ? "映射到这个角色槽位" : "请先建立或恢复员工档案", disabled: activeEmployees.length === 0 }, ...activeEmployees.map((employee) => ({ value: employee.id, label: employee.identity.displayName, description: `${employee.providerId} · v${employee.version}` }))]} onChange={(employeeId) => setAssignments((current) => current.map((value, assignmentIndex) => assignmentIndex === index ? employeeId : value))} /></label>)}</div>
       <div className="template-apply"><span>同一员工可承担多个槽位；生成后仍能逐节点改派。</span><button type="button" className="button primary" disabled={applying || assignments.some((assignment) => !assignment)} onClick={() => void apply()}>{applying ? "生成中…" : currentPatternId ? "按模板重新生成" : "生成可编辑草稿"}</button></div>
     </div>}
   </div>;

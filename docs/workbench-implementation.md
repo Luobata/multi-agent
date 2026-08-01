@@ -33,7 +33,7 @@
 | 模块 | 责任 |
 | --- | --- |
 | `src/workbench/store.ts` | Workbench state 原子持久化 |
-| `src/workbench/service.ts` | Employee、Skill、Provider、Workflow、Session、Publication、Invocation 与 Work Instance 领域操作 |
+| `src/workbench/service.ts` | Employee、Project、ProjectBinding、Skill、Provider、Workflow、Session、Publication、Invocation 与 Work Instance 领域操作 |
 | `src/workbench/materialize.ts` | 把版本化 Workbench 数据编译为现有 manifest/prompt/schema |
 | `src/runtime/runner.ts` | Provider 调用、重试、Schema、verdict、Run Store |
 | `src/architectures/graph.ts` | DAG 校验、计划、并行与依赖控制 |
@@ -56,11 +56,22 @@
 | GET | `/api/activity/stream` | 调用与节点状态 SSE |
 | GET/PUT | `/api/providers[/:id]` | Provider 实例注册 |
 | GET/POST/PATCH | `/api/skills[/:id]` | 共享 Skill 注册与版本更新 |
+| GET/POST/PATCH | `/api/knowledge-bases[/:id]` | KnowledgeBase 目录与定义版本 |
+| GET | `/api/knowledge-bases/:id/assessment` | 指定 Revision 的发布前质量检查 |
+| POST | `/api/knowledge-bases/:id/preview` | 不发布、不调用 Provider 的草稿检索试跑 |
+| POST | `/api/knowledge-bases/:id/sync` | 从 Source 生成未发布 Revision |
+| POST | `/api/knowledge-bases/:id/publish` | 发布或回滚 Revision 指针 |
+| GET/POST/PATCH | `/api/knowledge-profiles[/:id]` | 可复用知识范围、激活与预算策略 |
+| GET | `/api/knowledge/impact` | KnowledgeBase → Profile → 使用方影响快照 |
 | GET/POST/PATCH | `/api/employees[/:id]` | Employee 列表、创建、详情与新版本 |
 | POST | `/api/employees/:id/clone` | 定义复制，不复制上下文/历史 |
 | POST | `/api/employees/:id/archive` | 软归档 |
 | POST | `/api/employees/:id/invoke` | 一节点 Graph 直接调用 |
-| GET | `/api/employees/:id/context` | 六层上下文证据 |
+| POST | `/api/employees/:id/knowledge-preview` | 不调用 Provider 的知识计划试跑 |
+| GET | `/api/employees/:id/context` | 七层上下文与知识证据 |
+| GET/POST | `/api/projects`、`/api/projects/connect` | Project 列表与声明文件接入 |
+| GET/PUT | `/api/projects/:id`、`/api/projects/:id/binding` | 项目详情与版本化员工任用 |
+| POST | `/api/projects/:id/roles/:roleId/invoke` | 解析任用关系并调用项目角色 |
 | GET | `/api/sessions[/:id]` | 版本固定 Session |
 | GET/POST/PATCH | `/api/workflows[/:id]` | Graph Workflow CRUD |
 | GET | `/api/workflows/:id/plan` | 不调用 Provider 的执行计划 |

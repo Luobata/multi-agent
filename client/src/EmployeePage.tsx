@@ -9,6 +9,7 @@ import {
   Field,
   Modal,
   ReadonlyEvidence,
+  SelectControl,
   Stamp,
   UtilityIcon,
   formatTime,
@@ -20,11 +21,18 @@ import type {
   ContextView,
   Employee,
   JsonObject,
+  KnowledgeProfile,
+  KnowledgeRuntimeResult,
   ProviderEntry,
   Session,
   Skill,
   SkillBinding
 } from "./types";
+import {
+  countAddedSkillBindings,
+  filterEmployeeSkillChoices,
+  type EmployeeSkillManagerMode
+} from "./employeeSkillPool";
 import { providerRuntimeSummary } from "./providerRuntime";
 
 interface PageProps {
@@ -46,6 +54,7 @@ interface EmployeeDraft {
   requestPrompt: string;
   providerId: string;
   selectedSkills: string[];
+  selectedKnowledgeProfiles: string[];
   skillConfigs: Record<string, string>;
   skillEnabled: Record<string, boolean>;
   write: "none" | "artifacts-only" | "project";
@@ -90,6 +99,7 @@ function draftFrom(employee?: Employee): EmployeeDraft {
     requestPrompt: employee?.requestPrompt ?? "完成当前交办事项，并按约定的结构化输出返回结果。",
     providerId: employee?.providerId ?? "mock",
     selectedSkills: employee?.skills.map(bindingId) ?? [],
+    selectedKnowledgeProfiles: employee?.knowledgeProfileIds ?? [],
     skillConfigs: Object.fromEntries((employee?.skills ?? []).map((binding) => [
       bindingId(binding),
       JSON.stringify(typeof binding === "string" ? {} : binding.config ?? {}, null, 2)
@@ -139,6 +149,7 @@ function payloadFrom(draft: EmployeeDraft) {
     systemPrompt: draft.systemPrompt.trim(),
     requestPrompt: draft.requestPrompt.trim(),
     skills,
+    knowledgeProfileIds: draft.selectedKnowledgeProfiles,
     providerId: draft.providerId,
     outputSchema: parseObject(draft.outputSchema, "Output Schema"),
     verdict: draft.verdictPath.trim() ? {
@@ -157,10 +168,11 @@ function payloadFrom(draft: EmployeeDraft) {
   };
 }
 
-function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify }: {
+function EmployeeEditor({ employee, providers, skills, knowledgeProfiles, onClose, onSaved, notify }: {
   employee?: Employee;
   providers: ProviderEntry[];
   skills: Skill[];
+  knowledgeProfiles: KnowledgeProfile[];
   onClose: () => void;
   onSaved: (employee: Employee) => void;
   notify: PageProps["notify"];
@@ -232,16 +244,27 @@ function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify 
         </div>}
       </DossierSection>
 
-      <DossierSection number="04" title="Provider">
+      <DossierSection number="04" title="知识 Profile">
+        <p className="muted">员工只绑定少量可复用 Profile；每次任务由 Resolver 和 Router 再缩小到相关 Collection。</p>
+        <div className="knowledge-base-choices employee-profile-choices">
+          {knowledgeProfiles.filter((profile) => profile.status === "active" || draft.selectedKnowledgeProfiles.includes(profile.id)).map((profile) => <label key={profile.id}>
+            <input type="checkbox" checked={draft.selectedKnowledgeProfiles.includes(profile.id)} onChange={(event) => patch("selectedKnowledgeProfiles", event.target.checked ? [...draft.selectedKnowledgeProfiles, profile.id] : draft.selectedKnowledgeProfiles.filter((id) => id !== profile.id))} />
+            <span><strong>{profile.displayName}</strong><small>{profile.id} · v{profile.version} · {profile.rules.length} 条规则</small></span>
+          </label>)}
+          {knowledgeProfiles.length === 0 && <span className="muted">尚无 Knowledge Profile；可先到“知识库”建立。</span>}
+        </div>
+      </DossierSection>
+
+      <DossierSection number="05" title="Provider">
         <div className="form-grid two">
-          <Field label="Provider 实例"><select value={draft.providerId} onChange={(e) => patch("providerId", e.target.value)}>{providers.map((provider) => { const runtime = providerRuntimeSummary(provider); return <option value={provider.id} key={provider.id}>{provider.id} · {runtime.model} · {runtime.adapter}</option>; })}</select></Field>
+          <Field label="Provider 实例"><SelectControl ariaLabel="Provider 实例" value={draft.providerId} options={providers.map((provider) => { const runtime = providerRuntimeSummary(provider); return { value: provider.id, label: provider.id, description: `${runtime.model} · ${runtime.adapter}` }; })} onChange={(providerId) => patch("providerId", providerId)} /></Field>
           <Field label="技术失败重试次数"><input type="number" min={1} max={10} value={draft.maxAttempts} onChange={(e) => patch("maxAttempts", Number(e.target.value))} /></Field>
         </div>
       </DossierSection>
 
-      <DossierSection number="05" title="权限与上下文">
+      <DossierSection number="06" title="权限与上下文">
         <div className="form-grid two">
-          <Field label="写入策略"><select value={draft.write} onChange={(e) => patch("write", e.target.value as EmployeeDraft["write"])}><option value="none">none · 不写入</option><option value="artifacts-only">artifacts-only · 仅证据目录</option><option value="project">project · 项目目录</option></select></Field>
+          <Field label="写入策略"><SelectControl ariaLabel="员工写入策略" value={draft.write} options={[{ value: "none", label: "none", description: "不写入" }, { value: "artifacts-only", label: "artifacts-only", description: "仅写入证据目录" }, { value: "project", label: "project", description: "允许写入项目目录" }]} onChange={(write) => patch("write", write as EmployeeDraft["write"])} /></Field>
           <Field label="Session 历史条数"><input type="number" min={0} max={100} value={draft.historyLimit} onChange={(e) => patch("historyLimit", Number(e.target.value))} /></Field>
         </div>
         <Field label="额外工具" hint="逗号分隔；这是声明，真正限制由 Provider/sandbox 执行。"><input value={draft.tools} onChange={(e) => patch("tools", e.target.value)} /></Field>
@@ -249,7 +272,7 @@ function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify 
         <div className="form-grid three"><Field label="Verdict JSON path" hint="可选，如 verdict"><input value={draft.verdictPath} onChange={(e) => patch("verdictPath", e.target.value)} /></Field><Field label="Pass 值" hint="逗号分隔"><input value={draft.verdictPass} onChange={(e) => patch("verdictPass", e.target.value)} /></Field><Field label="Block 值" hint="逗号分隔"><input value={draft.verdictBlock} onChange={(e) => patch("verdictBlock", e.target.value)} /></Field></div>
       </DossierSection>
 
-      <DossierSection number="06" title="外观">
+      <DossierSection number="07" title="外观">
         <div className="form-grid three">
           <Field label="档案强调色"><input type="color" value={draft.accent} onChange={(e) => patch("accent", e.target.value)} /></Field>
           <Field label="首字母"><input maxLength={2} value={draft.initials} onChange={(e) => patch("initials", e.target.value)} /></Field>
@@ -284,7 +307,7 @@ function ContextDrawer({ employee, sessionId, onClose }: {
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") closeRef.current();
       if (event.key === "Tab") {
-        const focusable = Array.from(drawerRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), summary, input:not([disabled]), textarea:not([disabled]), select:not([disabled])") ?? []).filter((element) => element.getClientRects().length > 0);
+        const focusable = Array.from(drawerRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), summary, input:not([disabled]), textarea:not([disabled]), [role='combobox']:not([disabled]), select:not([disabled])") ?? []).filter((element) => element.getClientRects().length > 0);
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
         if (!first || !last) return;
@@ -316,10 +339,11 @@ function ContextDrawer({ employee, sessionId, onClose }: {
     {!context ? <div className="drawer-loading">正在调取上下文证据…</div> : <div className="context-layers">
       <details><summary><b>01</b><span>身份与角色指令</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Identity" value={JSON.stringify(context.layers.identity, null, 2)} mono /><ReadonlyEvidence label="System instructions" value={context.layers.systemPrompt} /></details>
       <details><summary><b>02</b><span>Skill 指令、配置与工具</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Resolved skills" value={JSON.stringify(context.layers.skills, null, 2)} mono /></details>
-      <details><summary><b>03</b><span>Session 历史</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Pinned history" value={JSON.stringify(context.layers.history, null, 2)} mono /></details>
-      <details><summary><b>04</b><span>当前请求与依赖结果</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Current request" value={context.layers.currentRequest ?? "尚无请求"} /><ReadonlyEvidence label="Graph dependencies" value={Object.keys(context.layers.dependencyResults).length ? JSON.stringify(context.layers.dependencyResults, null, 2) : "直接调用编译为单节点 Graph；没有上游依赖。"} mono /></details>
-      <details open><summary><b>05</b><span>Effective Prompt</span><UtilityIcon name="toggle" /></summary>{context.effectivePrompt ? <><ReadonlyEvidence label="Combined prompt" value={context.effectivePrompt.combined} /><ReadonlyEvidence label="System prompt" value={context.effectivePrompt.system} /><ReadonlyEvidence label="Request prompt" value={context.effectivePrompt.request} /></> : <p className="muted drawer-note">尚无有效提示词证据；完成一次调用后生成。</p>}</details>
-      <details><summary><b>06</b><span>Run 元数据</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Run evidence" value={context.layers.runMetadata ? JSON.stringify(context.layers.runMetadata, null, 2) : "尚无 Run"} mono /></details>
+      <details><summary><b>03</b><span>Knowledge Plan 与证据</span><UtilityIcon name="toggle" /></summary>{context.layers.knowledge ? <><ReadonlyEvidence label="Knowledge Plan" value={JSON.stringify(context.layers.knowledge.plan, null, 2)} mono /><ReadonlyEvidence label="Retrieved evidence" value={JSON.stringify(context.layers.knowledge.evidence, null, 2)} mono /></> : <p className="muted drawer-note">本次运行没有知识证据；可能尚未分配 Profile，或没有内容达到相关度阈值。</p>}</details>
+      <details><summary><b>04</b><span>Session 历史</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Pinned history" value={JSON.stringify(context.layers.history, null, 2)} mono /></details>
+      <details><summary><b>05</b><span>当前请求与依赖结果</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Current request" value={context.layers.currentRequest ?? "尚无请求"} /><ReadonlyEvidence label="Graph dependencies" value={Object.keys(context.layers.dependencyResults).length ? JSON.stringify(context.layers.dependencyResults, null, 2) : "直接调用编译为单节点 Graph；没有上游依赖。"} mono /></details>
+      <details open><summary><b>06</b><span>Effective Prompt</span><UtilityIcon name="toggle" /></summary>{context.effectivePrompt ? <><ReadonlyEvidence label="Combined prompt" value={context.effectivePrompt.combined} /><ReadonlyEvidence label="System prompt" value={context.effectivePrompt.system} /><ReadonlyEvidence label="Request prompt" value={context.effectivePrompt.request} /></> : <p className="muted drawer-note">尚无有效提示词证据；完成一次调用后生成。</p>}</details>
+      <details><summary><b>07</b><span>Run 元数据</span><UtilityIcon name="toggle" /></summary><ReadonlyEvidence label="Run evidence" value={context.layers.runMetadata ? JSON.stringify(context.layers.runMetadata, null, 2) : "尚无 Run"} mono /></details>
     </div>}
     <footer className="drawer-footer"><button className="button secondary" disabled={!context} onClick={() => void copyAll()} aria-live="polite">{copiedAll ? "完整上下文已复制" : "复制完整上下文"}</button></footer>
   </aside>;
@@ -365,7 +389,7 @@ function DirectDesk({ employee, sessions, refresh, notify, onContext }: {
   };
 
   return <div className="work-order">
-    <header className="work-order-header"><div><p className="record-meta">{employee.id} · v{employee.version}</p><h3>直接交办</h3></div><div className="session-controls"><select aria-label="选择会话" value={sessionId} onChange={(e) => setSessionId(e.target.value)}><option value="">新会话 · 固定 v{employee.version}</option>{sessions.map((item) => <option key={item.id} value={item.id}>v{item.employeeVersion} · {item.title}</option>)}</select><button type="button" className="button ghost" onClick={() => { setSessionId(""); notify(`下一次请求将新建 v${employee.version} 会话`); }}>新会话</button><button type="button" className="button ghost" onClick={() => onContext(sessionId || undefined)}>检查上下文</button></div></header>
+    <header className="work-order-header"><div><p className="record-meta">{employee.id} · v{employee.version}</p><h3>直接交办</h3></div><div className="session-controls"><SelectControl ariaLabel="选择会话" value={sessionId} options={[{ value: "", label: "新会话", description: `固定员工 v${employee.version}` }, ...sessions.map((item) => ({ value: item.id, label: item.title, description: `员工 v${item.employeeVersion} · ${formatTime(item.updatedAt)}` }))]} onChange={setSessionId} /><button type="button" className="button ghost" onClick={() => { setSessionId(""); notify(`下一次请求将新建 v${employee.version} 会话`); }}>新会话</button><button type="button" className="button ghost" onClick={() => onContext(sessionId || undefined)}>检查上下文</button></div></header>
     <div className="transcript" aria-live="polite">
       {!session?.messages.length ? <div className="transcript-empty"><span>工单尚未填写</span><p>提交第一项请求后，原始请求、处理结果与 Run 编号会留存在这里。</p></div> : session.messages.map((item) => <article className={`transcript-row transcript-row--${item.role}`} key={item.id}>
         <div className="transcript-meta"><span>{item.role === "user" ? "请求" : item.role === "employee" ? "处理结果" : "系统记录"}</span><time>{formatTime(item.at)}</time>{item.runId && <code>{item.runId}</code>}</div>
@@ -381,15 +405,17 @@ function DirectDesk({ employee, sessions, refresh, notify, onContext }: {
   </div>;
 }
 
-function EmployeeSkillManager({ employee, skills, onClose, onSaved, notify }: {
+function EmployeeSkillManager({ employee, skills, mode, onClose, onSaved, notify }: {
   employee: Employee;
   skills: Skill[];
+  mode: EmployeeSkillManagerMode;
   onClose: () => void;
   onSaved: (employee: Employee) => Promise<void>;
   notify: PageProps["notify"];
 }) {
   const daemonAvailable = useDaemonAvailable();
-  const [selectedIds, setSelectedIds] = useState(() => employee.skills.map(bindingId));
+  const initialBoundIds = useMemo(() => employee.skills.map(bindingId), [employee.id, employee.version]);
+  const [selectedIds, setSelectedIds] = useState(() => initialBoundIds);
   const [configs, setConfigs] = useState<Record<string, string>>(() => Object.fromEntries(employee.skills.map((binding) => [
     bindingId(binding),
     JSON.stringify(typeof binding === "string" ? {} : binding.config ?? {}, null, 2)
@@ -397,7 +423,13 @@ function EmployeeSkillManager({ employee, skills, onClose, onSaved, notify }: {
   const [enabled, setEnabled] = useState<Record<string, boolean>>(() => Object.fromEntries(employee.skills.map((binding) => [bindingId(binding), bindingEnabled(binding)])));
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
-  const visible = skills.filter((skill) => (skill.status === "active" || selectedIds.includes(skill.id)) && `${skill.id} ${skill.displayName} ${skill.description}`.toLowerCase().includes(search.toLowerCase()));
+  const addedCount = countAddedSkillBindings(selectedIds, initialBoundIds);
+  const visible = filterEmployeeSkillChoices(skills, { mode, initialBoundIds, selectedIds, search });
+  const emptyMessage = mode === "add"
+    ? search.trim()
+      ? "没有匹配的可添加 Skill。"
+      : "技能池中暂无可添加的 Skill；已绑定或归档的 Skill 不会重复显示。"
+    : "没有可绑定的 Skill；请先在“技能台账”注册。";
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -409,7 +441,9 @@ function EmployeeSkillManager({ employee, skills, onClose, onSaved, notify }: {
         employee.skillVersions[id] ?? skills.find((skill) => skill.id === id)?.version ?? 1
       ]));
       const saved = await api<Employee>(`/api/employees/${employee.id}`, writeBody({ skills: bindings, skillVersions }, "PATCH"));
-      notify(`已更新 ${employee.identity.displayName} 的 Skill 绑定 · 员工 v${saved.version}`);
+      notify(mode === "add"
+        ? `已从技能池添加 ${addedCount} 个 Skill · 员工 v${saved.version}`
+        : `已更新 ${employee.identity.displayName} 的 Skill 绑定 · 员工 v${saved.version}`);
       await onSaved(saved);
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
@@ -418,10 +452,15 @@ function EmployeeSkillManager({ employee, skills, onClose, onSaved, notify }: {
     }
   };
 
-  return <Modal title="管理员工 Skill" eyebrow={`${employee.identity.displayName} · 独立绑定`} onClose={onClose} wide>
+  return <Modal
+    title={mode === "add" ? "从技能池添加" : "管理员工 Skill"}
+    eyebrow={`${employee.identity.displayName} · ${mode === "add" ? "选择未绑定能力" : "独立绑定"}`}
+    onClose={onClose}
+    wide
+  >
     <form className="editor-form employee-skill-manager" onSubmit={save}>
       <fieldset className="daemon-write-surface" disabled={!daemonAvailable}>
-        <div className="skill-manager-toolbar"><div><b>{selectedIds.length}</b><span>个已绑定能力</span></div><input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索 Skill…" /></div>
+        <div className="skill-manager-toolbar"><div aria-live="polite" aria-atomic="true"><b>{mode === "add" ? addedCount : selectedIds.length}</b><span>{mode === "add" ? "个待添加 Skill" : "个已绑定能力"}</span></div><input type="search" aria-label={mode === "add" ? "搜索技能池" : "搜索 Skill 绑定"} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={mode === "add" ? "搜索技能池…" : "搜索 Skill…"} /></div>
         <div className="skill-manager-list">{visible.map((skill) => {
           const selected = selectedIds.includes(skill.id);
           return <article className={selected ? "selected" : ""} key={skill.id}>
@@ -434,9 +473,9 @@ function EmployeeSkillManager({ employee, skills, onClose, onSaved, notify }: {
             }} /><span><strong>{skill.displayName}</strong><code>{skill.id} · v{employee.skillVersions[skill.id] ?? skill.version}</code><small>{skill.description}</small></span></label>
             {selected && <div className="skill-manager-config"><label className="switch-line"><span><b>本员工启用</b><small>关闭后保留版本与配置，运行时不注入。</small></span><input type="checkbox" role="switch" checked={enabled[skill.id] !== false} onChange={(event) => setEnabled({ ...enabled, [skill.id]: event.target.checked })} /></label><Field label="绑定配置 (JSON)"><textarea className="mono" rows={4} value={configs[skill.id] ?? "{}"} onChange={(event) => setConfigs({ ...configs, [skill.id]: event.target.value })} /></Field></div>}
           </article>;
-        })}{visible.length === 0 && <div className="library-empty">没有可绑定的 Skill；请先在“技能台账”注册。</div>}</div>
+        })}{visible.length === 0 && <div className="library-empty">{emptyMessage}</div>}</div>
       </fieldset>
-      <div className="editor-savebar"><span className="editor-save-note">保存会生成员工新版本，已有 Session 仍固定旧版本。</span><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={saving || !daemonAvailable}>{saving ? "保存中…" : `保存为 v${employee.version + 1}`}</button></div>
+      <div className="editor-savebar"><span className="editor-save-note">保存会生成员工新版本，已有 Session 仍固定旧版本。</span><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={saving || !daemonAvailable || (mode === "add" && addedCount === 0)}>{saving ? "保存中…" : mode === "add" ? `添加 ${addedCount} 个并保存为 v${employee.version + 1}` : `保存为 v${employee.version + 1}`}</button></div>
     </form>
   </Modal>;
 }
@@ -480,6 +519,26 @@ function RegistryModal({ data, onClose, refresh, notify }: { data: Bootstrap; on
   </Modal>;
 }
 
+function KnowledgePreviewModal({ employee, onClose, notify }: {
+  employee: Employee;
+  onClose: () => void;
+  notify: PageProps["notify"];
+}) {
+  const daemonAvailable = useDaemonAvailable();
+  const [message, setMessage] = useState("请预览这名员工处理当前职责相关任务时会获得哪些知识证据。");
+  const [result, setResult] = useState<KnowledgeRuntimeResult>();
+  const [loading, setLoading] = useState(false);
+  const preview = async (event: FormEvent) => {
+    event.preventDefault();
+    setLoading(true);
+    try {
+      setResult(await api<KnowledgeRuntimeResult>(`/api/employees/${employee.id}/knowledge-preview`, writeBody({ message })));
+    } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
+    finally { setLoading(false); }
+  };
+  return <Modal title="知识试跑" eyebrow={`${employee.id} · NO PROVIDER CALL`} onClose={onClose} wide><form className="modal-body compact-form" onSubmit={preview}><div className="project-connect-note"><strong>只运行 Resolver、Router 与 Retriever。</strong><p>不会调用 Provider，也不会创建 Session；用它检查 Profile 是否过宽、过窄或没有命中。</p></div><Field label="模拟任务"><textarea required rows={4} disabled={!daemonAvailable || loading} value={message} onChange={(event) => setMessage(event.target.value)} /></Field>{result && <div className="knowledge-preview-result"><ReadonlyEvidence label="Knowledge Plan" value={JSON.stringify(result.plan, null, 2)} mono /><ReadonlyEvidence label={`Evidence · ${result.evidence.length} 条`} value={result.evidence.length ? JSON.stringify(result.evidence, null, 2) : "没有内容达到相关度门槛。请检查 Profile 范围、发布 Revision、元数据标签或任务措辞。"} mono /></div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>关闭</button><button className="button primary" disabled={!daemonAvailable || loading}>{loading ? "路由中…" : "预览知识计划"}</button></div></form></Modal>;
+}
+
 export function EmployeePage({ data, refresh, notify }: PageProps) {
   const daemonAvailable = useDaemonAvailable();
   const [search, setSearch] = useState("");
@@ -502,7 +561,8 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
   const [contextSessionId, setContextSessionId] = useState<string | undefined>();
   const [contextOpen, setContextOpen] = useState(false);
   const [registryOpen, setRegistryOpen] = useState(false);
-  const [skillManagerOpen, setSkillManagerOpen] = useState(false);
+  const [skillManagerMode, setSkillManagerMode] = useState<EmployeeSkillManagerMode | null>(null);
+  const [knowledgePreviewOpen, setKnowledgePreviewOpen] = useState(false);
   const [togglingSkill, setTogglingSkill] = useState("");
 
   useEffect(() => {
@@ -539,7 +599,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
     finally { setTogglingSkill(""); }
   };
 
-  return <div className="page-grid">
+  return <div className="page-grid page-grid--employees">
     <aside className="record-list">
       <header className="list-header"><h1>员工档案</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setEditor("new")} aria-label="新建员工"><UtilityIcon name="add" /></button></header>
       <div className="list-tools"><input type="search" placeholder="检索姓名、ID 或职责…" value={search} onChange={(e) => setSearch(e.target.value)} /><label className="archive-toggle"><input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />含归档</label><button className="text-button" disabled={!daemonAvailable} onClick={() => setRegistryOpen(true)}>共享注册表</button></div>
@@ -555,26 +615,31 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
     </aside>
 
     <main className="detail-pane">
-      {!selected ? <EmptyState title="建立第一位本地员工" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>建立档案</button>}>定义他的背景、职责、提示词、共享 Skill、Provider 与权限。之后可以在任意 MCP 会话直接调用，也可以将他放进协作编排。</EmptyState> : <div className="dossier" style={{ "--dossier-accent": selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT } as React.CSSProperties}>
+      {!selected ? <EmptyState title="建立第一位本地员工" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>建立档案</button>}>定义他的背景、职责、提示词、共享 Skill、Provider 与权限。之后可以在任意 MCP 会话直接调用，也可以将他放进协作编排。</EmptyState> : <div className="dossier employee-dossier" style={{ "--dossier-accent": selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT } as React.CSSProperties}>
         <header className="dossier-cover">
           <div className="file-index"><span>LOCAL PERSONNEL RECORD</span><code>No. {selected.id.toUpperCase()}</code></div>
           <div className="dossier-title-row"><EmployeeAvatar className="large" displayName={selected.identity.displayName} presentation={selected.presentation} /><div><h2>{selected.identity.displayName}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div>
-          <div className="dossier-actions"><button className="button primary" disabled={selected.status === "archived"} onClick={() => scrollRecordIntoView("direct-desk")}>直接交办</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订档案</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setCloneDraft({ id: `${selected.id}-copy`, displayName: `${selected.identity.displayName} 副本` }); setCloneOpen(true); }}>复制</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div>
+          <div className="dossier-actions"><button className="button primary" disabled={selected.status === "archived"} onClick={() => scrollRecordIntoView("direct-desk")}>直接交办</button><button className="button secondary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setKnowledgePreviewOpen(true)}>知识试跑</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订档案</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setCloneDraft({ id: `${selected.id}-copy`, displayName: `${selected.identity.displayName} 副本` }); setCloneOpen(true); }}>复制</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div>
         </header>
 
         <DossierSection number="01" title="身份"><div className="fact-grid"><div><span>背景</span><p>{selected.identity.background}</p></div><div><span>职责</span><ul>{selected.identity.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul></div><div><span>目标</span><ul>{selected.identity.goals?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div><div><span>约束</span><ul>{selected.identity.constraints?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div></div></DossierSection>
         <DossierSection number="02" title="提示词"><div className="prompt-preview"><div><span>系统指令</span><p>{selected.systemPrompt}</p></div><div><span>请求指令</span><p>{selected.requestPrompt}</p></div></div></DossierSection>
-        <DossierSection number="03" title="技能" action={<button type="button" className="text-button icon-text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setSkillManagerOpen(true)}><UtilityIcon name="add" />管理绑定</button>}><div className="employee-skill-ledger">{selected.skills.length ? selected.skills.map((binding) => { const id = bindingId(binding); const skill = data.skills.find((candidate) => candidate.id === id); const enabled = bindingEnabled(binding); return <article className={!enabled ? "is-disabled" : ""} key={id}><div className="skill-book" aria-hidden="true">S</div><div><strong>{skill?.displayName ?? id}</strong><code>{id} · 固定 v{selected.skillVersions[id] ?? "—"}</code><small>{skill?.description ?? "共享能力定义不可用"}</small></div><Stamp status={enabled ? "active" : "archived"} label={enabled ? "已启用" : "已停用"} /><label className="compact-switch"><span className="sr-only">{enabled ? "停用" : "启用"} {skill?.displayName ?? id}</span><input type="checkbox" role="switch" disabled={!daemonAvailable || Boolean(togglingSkill) || selected.status === "archived"} checked={enabled} onChange={(event) => void toggleSkill(id, event.target.checked)} /></label></article>; }) : <div className="empty-inline"><span>尚未绑定共享 Skill</span><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setSkillManagerOpen(true)}>添加第一个</button></div>}</div></DossierSection>
-        <div className="dossier-columns"><DossierSection number="04" title="Provider"><dl className="ledger"><dt>实例</dt><dd><code>{selected.providerId}</code></dd><dt>模型</dt><dd className="provider-model"><code>{selectedRuntime.model}</code></dd><dt>Adapter</dt><dd>{selectedRuntime.adapter}</dd><dt>最大尝试</dt><dd>{selected.maxAttempts}</dd></dl><div className="provider-launch"><span>启动指令模板</span><pre>{selectedRuntime.launchCommand}</pre><small>当前 Provider 配置中的 argv；模板变量会在运行时渲染，敏感参数仅显示为 ***。</small></div></DossierSection><DossierSection number="05" title="权限"><dl className="ledger"><dt>写入</dt><dd>{selected.permissions.write}</dd><dt>声明工具</dt><dd>{selected.permissions.tools?.join(", ") || "无"}</dd><dt>历史窗口</dt><dd>{selected.contextPolicy.historyLimit} 条</dd><dt>Verdict</dt><dd>{selected.verdict ? <code>{selected.verdict.path}: {selected.verdict.pass.join("/")} | {selected.verdict.block.join("/")}</code> : "未配置"}</dd></dl></DossierSection></div>
-        <DossierSection number="06" title="外观"><dl className="ledger horizontal"><dt>强调色</dt><dd><span className="color-chip" style={{ background: selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT }} />{selected.presentation.accent ?? "默认朱红"}</dd><dt>首字母</dt><dd>{selected.presentation.initials || selected.identity.displayName.slice(0, 2)}</dd><dt>头像</dt><dd>{selected.presentation.avatarUrl ? <code className="avatar-source">{selected.presentation.avatarUrl}</code> : "未配置，显示首字母"}</dd></dl></DossierSection>
-        <DossierSection number="07" title="版本"><div className="version-strip">{versions.map((version) => <div key={version.version} className={version.version === selected.version ? "current" : ""}><code>v{version.version}</code><span>{version.status === "archived" ? "归档" : version.version === selected.version ? "当前" : "历史"}</span><time>{formatTime(version.updatedAt)}</time></div>)}</div></DossierSection>
+        <DossierSection number="03" title="技能" action={<div className="skill-section-actions">
+          <button type="button" className="text-button icon-text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setSkillManagerMode("add")}><UtilityIcon name="add" />从技能池添加</button>
+          <button type="button" className="text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setSkillManagerMode("manage")}>管理绑定</button>
+        </div>}><div className="employee-skill-ledger">{selected.skills.length ? selected.skills.map((binding) => { const id = bindingId(binding); const skill = data.skills.find((candidate) => candidate.id === id); const enabled = bindingEnabled(binding); return <article className={!enabled ? "is-disabled" : ""} key={id}><div className="skill-book" aria-hidden="true">S</div><div><strong>{skill?.displayName ?? id}</strong><code>{id} · 固定 v{selected.skillVersions[id] ?? "—"}</code><small>{skill?.description ?? "共享能力定义不可用"}</small></div><Stamp status={enabled ? "active" : "archived"} label={enabled ? "已启用" : "已停用"} /><label className="compact-switch"><span className="sr-only">{enabled ? "停用" : "启用"} {skill?.displayName ?? id}</span><input type="checkbox" role="switch" disabled={!daemonAvailable || Boolean(togglingSkill) || selected.status === "archived"} checked={enabled} onChange={(event) => void toggleSkill(id, event.target.checked)} /></label></article>; }) : <div className="empty-inline"><span>尚未绑定共享 Skill</span><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setSkillManagerMode("add")}>从技能池添加</button></div>}</div></DossierSection>
+        <DossierSection number="04" title="知识 Profile"><div className="employee-knowledge-profiles">{(selected.knowledgeProfileIds ?? []).length ? (selected.knowledgeProfileIds ?? []).map((profileId) => { const profile = (data.knowledgeProfiles ?? []).find((candidate) => candidate.id === profileId); return <article key={profileId}><span aria-hidden="true">知</span><div><strong>{profile?.displayName ?? profileId}</strong><code>{profileId} · 当前 v{profile?.version ?? "—"}</code><small>{profile?.description ?? "Profile 已不可用；后续调用会在 Knowledge Plan 中排除。"}</small></div><Stamp status={profile?.status ?? "blocked"} /></article>; }) : <div className="empty-inline"><span>尚未分配知识 Profile；员工仍可正常工作，但不会预加载知识证据。</span><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>分配 Profile</button></div>}</div></DossierSection>
+        <div className="dossier-columns"><DossierSection number="05" title="Provider"><dl className="ledger"><dt>实例</dt><dd><code>{selected.providerId}</code></dd><dt>模型</dt><dd className="provider-model"><code>{selectedRuntime.model}</code></dd><dt>Adapter</dt><dd>{selectedRuntime.adapter}</dd><dt>最大尝试</dt><dd>{selected.maxAttempts}</dd></dl><div className="provider-launch"><span>启动指令模板</span><pre>{selectedRuntime.launchCommand}</pre><small>当前 Provider 配置中的 argv；模板变量会在运行时渲染，敏感参数仅显示为 ***。</small></div></DossierSection><DossierSection number="06" title="权限"><dl className="ledger"><dt>写入</dt><dd>{selected.permissions.write}</dd><dt>声明工具</dt><dd>{selected.permissions.tools?.join(", ") || "无"}</dd><dt>历史窗口</dt><dd>{selected.contextPolicy.historyLimit} 条</dd><dt>Verdict</dt><dd>{selected.verdict ? <code>{selected.verdict.path}: {selected.verdict.pass.join("/")} | {selected.verdict.block.join("/")}</code> : "未配置"}</dd></dl></DossierSection></div>
+        <DossierSection number="07" title="外观"><dl className="ledger horizontal"><dt>强调色</dt><dd><span className="color-chip" style={{ background: selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT }} />{selected.presentation.accent ?? "默认朱红"}</dd><dt>首字母</dt><dd>{selected.presentation.initials || selected.identity.displayName.slice(0, 2)}</dd><dt>头像</dt><dd>{selected.presentation.avatarUrl ? <code className="avatar-source">{selected.presentation.avatarUrl}</code> : "未配置，显示首字母"}</dd></dl></DossierSection>
+        <DossierSection number="08" title="版本"><div className="version-strip">{versions.map((version) => <div key={version.version} className={version.version === selected.version ? "current" : ""}><code>v{version.version}</code><span>{version.status === "archived" ? "归档" : version.version === selected.version ? "当前" : "历史"}</span><time>{formatTime(version.updatedAt)}</time></div>)}</div></DossierSection>
         <div id="direct-desk"><DirectDesk employee={selected} sessions={sessions} refresh={refresh} notify={notify} onContext={(sessionId) => { setContextSessionId(sessionId); setContextOpen(true); }} /></div>
       </div>}
     </main>
 
-    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} providers={data.providers} skills={data.skills} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
+    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} providers={data.providers} skills={data.skills} knowledgeProfiles={data.knowledgeProfiles ?? []} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
     {registryOpen && <RegistryModal data={data} onClose={() => setRegistryOpen(false)} refresh={refresh} notify={notify} />}
-    {skillManagerOpen && selected && <EmployeeSkillManager employee={selected} skills={data.skills} notify={notify} onClose={() => setSkillManagerOpen(false)} onSaved={async () => { setSkillManagerOpen(false); await refresh(); }} />}
+    {skillManagerMode && selected && <EmployeeSkillManager employee={selected} skills={data.skills} mode={skillManagerMode} notify={notify} onClose={() => setSkillManagerMode(null)} onSaved={async () => { setSkillManagerMode(null); await refresh(); }} />}
+    {knowledgePreviewOpen && selected && <KnowledgePreviewModal employee={selected} notify={notify} onClose={() => setKnowledgePreviewOpen(false)} />}
     {cloneOpen && selected && <Modal title="复制员工档案" eyebrow={`来源 ${selected.id} · v${selected.version}`} onClose={() => setCloneOpen(false)}><form className="modal-body compact-form" onSubmit={clone}><p className="notice-copy">复制身份、提示词、Skill、Provider 与权限。不会复制 Session、密钥或 Run 历史。</p><Field label="新员工 ID"><input required disabled={!daemonAvailable} pattern="[a-z][a-z0-9-]*" value={cloneDraft.id} onChange={(e) => setCloneDraft({ ...cloneDraft, id: e.target.value })} /></Field><Field label="显示名"><input required disabled={!daemonAvailable} value={cloneDraft.displayName} onChange={(e) => setCloneDraft({ ...cloneDraft, displayName: e.target.value })} /></Field><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setCloneOpen(false)}>取消</button><button className="button primary" disabled={!daemonAvailable}>建立副本</button></div></form></Modal>}
     {archiveOpen && selected && <Modal title="归档员工" eyebrow={`${selected.id} · 保留历史`} onClose={() => setArchiveOpen(false)}><div className="modal-body"><div className="danger-notice"><b>只归档，不物理删除。</b><p>归档后不能接受新调用，也不能加入新 Workflow；已有 Session、版本与 Run 证据继续保留。</p></div><div className="modal-actions"><button className="button secondary" onClick={() => setArchiveOpen(false)}>保留在册</button><button className="button danger-filled" disabled={!daemonAvailable} onClick={() => void archive()}>确认归档</button></div></div></Modal>}
     {contextOpen && selected && <><div className="drawer-scrim" onClick={() => setContextOpen(false)} /><ContextDrawer employee={selected} sessionId={contextSessionId} onClose={() => setContextOpen(false)} /></>}

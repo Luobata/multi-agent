@@ -1,0 +1,33 @@
+{
+  "id": "workbench-quality-knowledge",
+  "displayName": "Workbench · 质量知识",
+  "description": "测试员工的稳定知识范围：质量、调用和运行证据为核心，基础架构仅在相关时参与。",
+  "rules": [
+    {
+      "id": "quality-core",
+      "selector": {
+        "knowledgeBaseIds": ["local-agent-workbench"],
+        "collectionIds": ["quality"],
+        "authorities": ["canonical"],
+        "maxClassification": "internal"
+      },
+      "activation": "core",
+      "priority": 30,
+      "required": false,
+      "budget": { "maxCollections": 1, "maxChunks": 5, "maxTokens": 2600 }
+    },
+    {
+      "id": "foundation-demand",
+      "selector": {
+        "knowledgeBaseIds": ["local-agent-workbench"],
+        "collectionIds": ["foundation"],
+        "authorities": ["canonical"],
+        "maxClassification": "internal"
+      },
+      "activation": "on-demand",
+      "priority": 10,
+      "required": false,
+      "budget": { "maxCollections": 1, "maxChunks": 3, "maxTokens": 1600 }
+    }
+  ]
+}

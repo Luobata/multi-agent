@@ -22,6 +22,25 @@ export interface CommandProviderDefinition extends ProviderDefinition {
   timeoutMs?: number;
 }
 
+export interface CodexMcpServerDefinition {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  enabledTools?: string[];
+  defaultToolsApprovalMode?: "auto" | "prompt" | "writes" | "approve";
+}
+
+export interface CodexProviderDefinition extends ProviderDefinition {
+  adapter: "codex";
+  command?: string;
+  sandbox?: "read-only" | "workspace-write";
+  filesystemIsolation?: "workspace-read-only";
+  workingDirectory?: string;
+  approvalPolicy?: "never";
+  timeoutMs?: number;
+  mcpServers?: Record<string, CodexMcpServerDefinition>;
+}
+
 export interface RoleVerdictDefinition {
   path: string;
   pass: JsonPrimitive[];

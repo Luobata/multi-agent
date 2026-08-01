@@ -1,0 +1,33 @@
+{
+  "id": "workbench-design-knowledge",
+  "displayName": "Workbench · 设计知识",
+  "description": "设计员工的稳定知识范围：交互与视觉为核心，基础架构仅在相关时参与。",
+  "rules": [
+    {
+      "id": "design-core",
+      "selector": {
+        "knowledgeBaseIds": ["local-agent-workbench"],
+        "collectionIds": ["design"],
+        "authorities": ["canonical"],
+        "maxClassification": "internal"
+      },
+      "activation": "core",
+      "priority": 30,
+      "required": false,
+      "budget": { "maxCollections": 1, "maxChunks": 5, "maxTokens": 2600 }
+    },
+    {
+      "id": "foundation-demand",
+      "selector": {
+        "knowledgeBaseIds": ["local-agent-workbench"],
+        "collectionIds": ["foundation"],
+        "authorities": ["canonical"],
+        "maxClassification": "internal"
+      },
+      "activation": "on-demand",
+      "priority": 10,
+      "required": false,
+      "budget": { "maxCollections": 1, "maxChunks": 3, "maxTokens": 1600 }
+    }
+  ]
+}

@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { UserBuilder, jsonRpcHandler } from "@a2a-js/sdk/server/express";
 import type { JsonObject, ProviderDefinition } from "../core/types.js";
+import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
 import type { InvocationSource, InvocationSourceKind } from "../workbench/types.js";
@@ -47,7 +48,9 @@ function providerDefinition(value: unknown): ProviderDefinition {
 function headerText(request: Request, name: string): string | undefined {
   const value = request.headers[name];
   const text = Array.isArray(value) ? value[0] : value;
-  return typeof text === "string" && text.trim() ? text.trim().slice(0, 240) : undefined;
+  if (typeof text !== "string") return undefined;
+  const decoded = decodeUtf8HeaderValue(text).trim();
+  return decoded ? decoded.slice(0, 240) : undefined;
 }
 
 function invocationSource(request: Request, fallback: InvocationSourceKind): InvocationSource {
@@ -82,7 +85,14 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       status: "ok",
       version: "0.1.0",
       dataRoot: service.store.dataRoot,
-      bindPolicy: "loopback-only"
+      bindPolicy: "loopback-only",
+      capabilities: {
+        knowledgeControlPlane: "v1",
+        knowledgeDraftPreview: true,
+        knowledgeImpactAnalysis: true,
+        knowledgeConversation: "codex-mcp-v1",
+        knowledgeChangeApproval: true
+      }
     });
   });
 
@@ -90,11 +100,16 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, {
       providers: service.listProviders(),
       skills: service.listSkills(true),
+      knowledgeBases: service.listKnowledgeBases(true),
+      knowledgeProfiles: service.listKnowledgeProfiles(true),
+      knowledgeChanges: service.listKnowledgeChangeRequests(),
       architectureTemplates: service.listArchitectureTemplates(),
       employees: service.listEmployees(true),
       workflows: service.listWorkflows(true),
       sessions: service.listSessions(),
       publications: service.listPublications(true),
+      projects: service.listProjects(true),
+      projectBindings: service.listProjectBindings(),
       activity: service.getActivitySnapshot()
     });
   });
@@ -146,6 +161,98 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, await service.restoreSkill(routeParam(request, "id")));
   }));
 
+  app.get("/api/knowledge-bases", (request, response) => {
+    send(response, service.listKnowledgeBases(booleanQuery(request.query.includeArchived)));
+  });
+  app.post("/api/knowledge-bases", asyncRoute(async (request, response) => {
+    send(response, await service.createKnowledgeBase(request.body), 201);
+  }));
+  app.get("/api/knowledge-bases/:id", asyncRoute(async (request, response) => {
+    send(response, await service.getKnowledgeBaseDetail(routeParam(request, "id")));
+  }));
+  app.get("/api/knowledge-bases/:id/assessment", asyncRoute(async (request, response) => {
+    const revision = request.query.revision === undefined ? undefined : Number(request.query.revision);
+    send(response, await service.assessKnowledgeRevision(routeParam(request, "id"), revision));
+  }));
+  app.post("/api/knowledge-bases/:id/preview", asyncRoute(async (request, response) => {
+    send(response, await service.previewKnowledgeRevision(routeParam(request, "id"), request.body));
+  }));
+  app.patch("/api/knowledge-bases/:id", asyncRoute(async (request, response) => {
+    send(response, await service.updateKnowledgeBase(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/knowledge-bases/:id/revisions", asyncRoute(async (request, response) => {
+    send(response, await service.createKnowledgeRevision(routeParam(request, "id"), request.body), 201);
+  }));
+  app.post("/api/knowledge-bases/:id/sync", asyncRoute(async (request, response) => {
+    send(response, await service.syncKnowledgeBase(routeParam(request, "id")));
+  }));
+  app.post("/api/knowledge-bases/:id/publish", asyncRoute(async (request, response) => {
+    const revision = request.body?.revision === undefined ? undefined : Number(request.body.revision);
+    send(response, await service.publishKnowledgeRevision(routeParam(request, "id"), revision));
+  }));
+  app.post("/api/knowledge-bases/:id/archive", asyncRoute(async (request, response) => {
+    send(response, await service.archiveKnowledgeBase(routeParam(request, "id")));
+  }));
+  app.post("/api/knowledge-bases/:id/restore", asyncRoute(async (request, response) => {
+    send(response, await service.restoreKnowledgeBase(routeParam(request, "id")));
+  }));
+
+  app.get("/api/knowledge-profiles", (request, response) => {
+    send(response, service.listKnowledgeProfiles(booleanQuery(request.query.includeArchived)));
+  });
+  app.post("/api/knowledge-profiles", asyncRoute(async (request, response) => {
+    send(response, await service.createKnowledgeProfile(request.body), 201);
+  }));
+  app.patch("/api/knowledge-profiles/:id", asyncRoute(async (request, response) => {
+    send(response, await service.updateKnowledgeProfile(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/knowledge-profiles/:id/archive", asyncRoute(async (request, response) => {
+    send(response, await service.archiveKnowledgeProfile(routeParam(request, "id")));
+  }));
+  app.post("/api/knowledge-profiles/:id/restore", asyncRoute(async (request, response) => {
+    send(response, await service.restoreKnowledgeProfile(routeParam(request, "id")));
+  }));
+  app.post("/api/employees/:id/knowledge-preview", asyncRoute(async (request, response) => {
+    send(response, await service.previewEmployeeKnowledge(routeParam(request, "id"), request.body));
+  }));
+  app.get("/api/knowledge/impact", (_request, response) => {
+    send(response, service.getKnowledgeImpactSnapshot());
+  });
+  app.get("/api/knowledge-changes", (_request, response) => {
+    send(response, service.listKnowledgeChangeRequests());
+  });
+  app.post("/api/knowledge-changes", asyncRoute(async (request, response) => {
+    send(response, await service.createKnowledgeChangeRequest(request.body), 201);
+  }));
+  app.get("/api/knowledge-changes/:id", (request, response, next) => {
+    try {
+      send(response, service.getKnowledgeChangeRequest(routeParam(request, "id")));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.post("/api/knowledge-changes/:id/approve", asyncRoute(async (request, response) => {
+    send(response, await service.approveKnowledgeChangeRequest(
+      routeParam(request, "id"),
+      "local-owner",
+      typeof request.body?.comment === "string" ? request.body.comment : undefined
+    ));
+  }));
+  app.post("/api/knowledge-changes/:id/reject", asyncRoute(async (request, response) => {
+    send(response, await service.rejectKnowledgeChangeRequest(
+      routeParam(request, "id"),
+      "local-owner",
+      typeof request.body?.comment === "string" ? request.body.comment : undefined
+    ));
+  }));
+  app.post("/api/knowledge-changes/:id/cancel", asyncRoute(async (request, response) => {
+    send(response, await service.cancelKnowledgeChangeRequest(
+      routeParam(request, "id"),
+      "local-owner",
+      typeof request.body?.comment === "string" ? request.body.comment : undefined
+    ));
+  }));
+
   app.get("/api/architecture-templates", (_request, response) => send(response, service.listArchitectureTemplates()));
   app.post("/api/architecture-templates/:id/instantiate", (request, response, next) => {
     try {
@@ -158,6 +265,43 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       next(error);
     }
   });
+
+  app.get("/api/projects", (request, response) => {
+    send(response, service.listProjects(booleanQuery(request.query.includeArchived)));
+  });
+  app.post("/api/projects/connect", asyncRoute(async (request, response) => {
+    send(response, await service.connectProject(request.body), 201);
+  }));
+  app.get("/api/projects/:id", (request, response, next) => {
+    try {
+      const id = routeParam(request, "id");
+      send(response, {
+        project: service.getProject(id),
+        versions: service.getProjectVersions(id),
+        binding: service.listProjectBindings().find((candidate) => candidate.projectId === id),
+        bindingVersions: service.getProjectBindingVersions(id)
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.put("/api/projects/:id/binding", asyncRoute(async (request, response) => {
+    send(response, await service.saveProjectBinding(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/projects/:id/binding/refresh", asyncRoute(async (request, response) => {
+    send(response, await service.refreshProjectBinding(routeParam(request, "id")));
+  }));
+  app.post("/api/projects/:id/archive", asyncRoute(async (request, response) => {
+    send(response, await service.archiveProject(routeParam(request, "id")));
+  }));
+  app.post("/api/projects/:id/roles/:roleId/invoke", asyncRoute(async (request, response) => {
+    send(response, await service.invokeProjectRole(
+      routeParam(request, "id"),
+      routeParam(request, "roleId"),
+      request.body,
+      invocationSource(request, "http")
+    ));
+  }));
 
   app.get("/api/employees", (request, response) => {
     send(response, service.listEmployees(booleanQuery(request.query.includeArchived)));

@@ -1,6 +1,6 @@
 # Provider Adapter 配置
 
-核心内置两种 adapter：`command` 使用 argv 启动进程，通过 stdin 发送 `inputTemplate` 渲染结果，不经过 shell 插值；`mock` 返回确定性的 `{ "message": "..." }`，用于本地 UI、测试与首轮架构验收。`inputTemplate` 默认为完整的 `{{prompt}}`；command Provider 的参数、环境变量和输入模板都可以引用运行上下文。
+核心内置三种 adapter：`command` 使用 argv 启动进程，通过 stdin 发送 `inputTemplate` 渲染结果，不经过 shell 插值；`mock` 返回确定性的 `{ "message": "..." }`；`codex` 以非交互方式调用 Codex CLI，并可为该 Provider 配置一组独立 stdio MCP Server。`inputTemplate` 默认为完整的 `{{prompt}}`；command Provider 的参数、环境变量和输入模板都可以引用运行上下文。
 
 Provider 可以声明可选的 `model` 元数据，供 Workbench 和其他调用方解释当前实例使用的模型。它不参与 adapter 调用，也不替代 `command/args`：adapter 定义仍是执行真相。若命令由别名或包装脚本在运行时选择模型，应在确认本地配置后显式登记；未知时保持未声明。
 
@@ -14,8 +14,9 @@ Workbench Provider 不允许把环境变量明文写进 `state.json`。使用 `$
 - `{{role.identity.displayName}}`、`{{role.identity.background}}` 等身份字段。
 - `{{role.nativeDefinitionJson}}`：可直接交给支持原生 Agent 注册的 Provider 的角色定义 JSON。
 - `{{role.outputSchemaJson}}`：压缩后的 JSON Schema。
+- `{{role.outputSchemaPath}}`：当前 materialized Role 输出 Schema 的绝对路径，可交给支持结构化输出的 Provider CLI。
 - `{{role.toolsCsv}}`：Skill 与 Role 权限合并后的有效工具列表。
-- `{{run.id}}`、`{{run.nodeId}}`、`{{run.artifactDir}}`、`{{run.projectRoot}}`。
+- `{{run.id}}`、`{{run.nodeId}}`、`{{run.artifactDir}}`、`{{run.projectRoot}}`。其中 `run.projectRoot` 与 Provider 的实际工作目录一致；项目角色调用时指向已接入项目根目录，普通 Workflow 则保持 manifest 根目录。
 - `{{node.id}}` 与 `{{node.with.<key>}}`。
 - `{{input.<key>}}` 与 `{{needs.<node-id>.output}}`。
 
@@ -52,6 +53,10 @@ providers:
 ```
 
 Role 仍然拥有“是谁、负责什么、会什么、需要哪些工具”的声明；Provider 负责把通用身份翻译为供应商的注册参数，并真正执行工具限制。仅填写 `permissions` 或 Skill 的 `tools` 不会自动创建 sandbox。
+
+## Codex 知识控制面实例
+
+Workbench 默认登记 `codex-knowledge-control`。它使用 `codex exec --ephemeral`、结构化输出 Schema、独立只读工作目录和根目录拒读的 permission profile，并通过当前 Node 运行时与绝对入口路径只加载带显式工具白名单的 `multi-agent-mcp --profile knowledge-control`，不依赖 daemon 的 shell PATH。这个实例用于项目内部 Knowledge Steward；MCP 只能读取、质检、试跑和创建待人工审批的知识变更，不能批准、拒绝、取消或直接执行。
 
 ## 何时增加新 adapter
 

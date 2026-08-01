@@ -24,8 +24,11 @@ export interface RunWorkflowOptions {
   input?: JsonObject;
   runId?: string;
   artifactRoot?: string;
+  /** Working directory exposed to the Provider. Manifest assets still resolve from loaded.projectRoot. */
+  providerCwd?: string;
   providers?: ProviderRegistry;
   architectures?: ArchitectureRegistry;
+  initialArtifacts?: Record<string, JsonValue>;
   onEvent?: (event: ObservedRunEvent) => void | Promise<void>;
 }
 
@@ -65,7 +68,8 @@ function buildPromptBundle(
   run: WorkflowRunRecord,
   node: ExecutionPlanNode,
   input: JsonObject,
-  attemptDir: string
+  attemptDir: string,
+  providerCwd: string
 ): PromptBundle {
   const profile = resolveRoleProfile(loaded, node.role);
   const role = profile.definition;
@@ -96,7 +100,8 @@ function buildPromptBundle(
     toolsCsv: profile.effectiveTools.join(","),
     skills: profile.skills.map((skill) => ({ id: skill.id, displayName: skill.displayName, config: skill.config })),
     outputSchema,
-    outputSchemaJson: JSON.stringify(outputSchema)
+    outputSchemaJson: JSON.stringify(outputSchema),
+    outputSchemaPath: path.resolve(loaded.projectRoot, role.outputSchema)
   };
   const baseContext: Record<string, unknown> = {
     input,
@@ -112,7 +117,8 @@ function buildPromptBundle(
       workflow: run.workflow,
       nodeId: node.id,
       artifactDir: attemptDir,
-      projectRoot: loaded.projectRoot
+      projectRoot: providerCwd,
+      materializedRoot: loaded.projectRoot
     }
   };
   const systemPrompt = renderRoleSystemPrompt(profile, baseContext);
@@ -140,7 +146,8 @@ async function executeNode(
   input: JsonObject,
   store: RunStore,
   registry: ProviderRegistry,
-  emit: (type: string, nodeId?: string, detail?: JsonValue) => Promise<void>
+  emit: (type: string, nodeId?: string, detail?: JsonValue) => Promise<void>,
+  providerCwd: string
 ): Promise<NodeRunResult> {
   const role = loaded.manifest.roles[node.role];
   if (!role) throw new Error(`role not found: ${node.role}`);
@@ -182,7 +189,7 @@ async function executeNode(
     const attemptDir = await store.createAttempt(node.id, attempt);
     result.artifactDir = path.relative(store.runDir, attemptDir).split(path.sep).join("/");
     try {
-      const bundle = buildPromptBundle(loaded, run, node, input, attemptDir);
+      const bundle = buildPromptBundle(loaded, run, node, input, attemptDir, providerCwd);
       await store.writeText(attemptDir, "system-prompt.md", bundle.systemPrompt);
       await store.writeText(attemptDir, "request-prompt.md", bundle.requestPrompt);
       await store.writeText(attemptDir, "prompt.md", bundle.prompt);
@@ -190,7 +197,7 @@ async function executeNode(
       const response = await adapter.invoke({
         providerId: role.provider,
         definition: provider,
-        cwd: loaded.projectRoot,
+        cwd: providerCwd,
         prompt: bundle.prompt,
         templateContext: bundle.context
       });
@@ -246,6 +253,7 @@ export async function runWorkflow(
   const plan = compilePlan(loaded, workflowId, architectures);
   const architecture = architectures.get(plan.architecture);
   if (!architecture) throw new Error(`architecture adapter not registered: ${plan.architecture}`);
+  const providerCwd = path.resolve(options.providerCwd ?? loaded.projectRoot);
   const runId = options.runId ?? `run-${new Date().toISOString().replaceAll(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`;
   const artifactRoot = options.artifactRoot
     ? path.resolve(options.artifactRoot)
@@ -271,6 +279,9 @@ export async function runWorkflow(
   };
   await store.writeInput(input);
   await store.writePlan(plan);
+  for (const [relativePath, value] of Object.entries(options.initialArtifacts ?? {})) {
+    await store.writeArtifact(relativePath, value);
+  }
   await store.writeRun(run);
   await emit("run.started", undefined, { workflow: workflowId, architecture: plan.architecture });
 
@@ -279,7 +290,7 @@ export async function runWorkflow(
     input,
     plan,
     run,
-    executeNode: (node) => executeNode(loaded, run, node, input, store, registry, emit),
+    executeNode: (node) => executeNode(loaded, run, node, input, store, registry, emit, providerCwd),
     persist: () => store.writeRun(run),
     emit
   });

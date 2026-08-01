@@ -1,45 +1,70 @@
-/* Hallmark · pre-emit critique: P5 H4 E5 S5 R5 V4 · genre: modern-minimal · macrostructure: Workbench
- * theme: custom Dossier Office · vibe: "archival warmth, precise, local-first"
- * offline font stack: Songti SC / PingFang SC / SF Mono · axes: light / classical-CJK-serif / warm-vermilion
- * reference: user-approved Dossier screenshot · designer: lin-mo-product-designer@v1
+/* Healing Pixel Dossier · original local-only visual system.
+ * Soft sky, seasonal pastels, two-pixel edges, stitched rules, and hard game-card shadows.
+ * All typography and artwork use local system resources or CSS/SVG primitives.
  */
 :root {
   color-scheme: light;
 
-  /* Warm paper band and readable ink. */
-  --paper: oklch(95% 0.014 95);
-  --paper-raised: oklch(97.4% 0.008 95);
-  --paper-sunken: oklch(92% 0.015 98);
-  --paper-hover: oklch(96.2% 0.012 94);
-  --ink: oklch(19% 0.009 85);
-  --ink-hover: oklch(27% 0.012 88);
-  --ink-2: oklch(42% 0.013 90);
-  --ink-3: oklch(47% 0.012 92);
-  --ink-ghost: oklch(61% 0.014 92);
-  --line: oklch(85% 0.016 95);
-  --line-strong: oklch(62% 0.02 92);
+  /* Town sky and cream dossier surfaces. */
+  --sky: #9bcfe0;
+  --sky-deep: #70aec5;
+  --sky-pale: #e3f4f4;
+  --cloud: #fffdf1;
+  --paper: #edf8f2;
+  --paper-raised: #fffdf1;
+  --paper-sunken: #d9edef;
+  --paper-hover: #f8f4d7;
+  --ink: #294b5a;
+  --ink-hover: #1f3d4a;
+  --ink-2: #476773;
+  --ink-3: #56707b;
+  --ink-ghost: #88a2aa;
+  --line: #b6d2d3;
+  --line-strong: #5d8492;
 
-  /* Vermilion index marks and semantic seals. */
-  --stamp-red: oklch(50% 0.155 33);
-  --stamp-red-ink: oklch(39% 0.12 32);
-  --seal-green: oklch(41% 0.07 158);
-  --seal-green-bg: oklch(95% 0.018 150);
-  --seal-amber: oklch(42% 0.1 80);
-  --seal-amber-bg: oklch(93.5% 0.03 95);
-  --seal-blue: oklch(41% 0.065 252);
-  --seal-blue-bg: oklch(93% 0.015 245);
-  --seal-gray: oklch(48% 0.012 90);
-  --danger-bg: oklch(92.5% 0.02 40);
-  --accent-ink: var(--paper-raised);
-  --focus: var(--seal-blue);
-  --selection: oklch(85% 0.025 55);
-  --scrim: oklch(19% 0.009 85 / 48%);
-  --scrim-soft: oklch(19% 0.009 85 / 28%);
-  --paper-shadow: oklch(62% 0.02 92 / 28%);
-  --ink-shadow: oklch(19% 0.009 85 / 20%);
+  /* Four seasons: spring mint, summer apricot, autumn rose, winter lavender. */
+  --season-spring: #9ed6ae;
+  --season-spring-soft: #def2d8;
+  --season-summer: #f2cf78;
+  --season-summer-soft: #fff0bd;
+  --season-autumn: #efa48c;
+  --season-autumn-soft: #ffe0d5;
+  --season-winter: #c4b7e4;
+  --season-winter-soft: #ece5fa;
+  --season-rose: #e49aae;
+  --season-rose-soft: #f9dce5;
+  --season-run: #8bc9dc;
+  --season-run-soft: #dceff5;
+
+  /* Named neutral play surfaces keep repeated UI fills intentional. */
+  --surface-roster: #dff1ef;
+  --surface-canvas: #e2f1ef;
+  --surface-terminal: #e5f0ed;
+  --surface-code: #e6f1ef;
+  --surface-muted: #edf1ef;
+
+  /* Existing semantic aliases stay stable for the component layer. */
+  --stamp-red: var(--season-rose);
+  --stamp-red-ink: #954d63;
+  --seal-green: #397961;
+  --seal-green-bg: var(--season-spring-soft);
+  --seal-amber: #806425;
+  --seal-amber-bg: var(--season-summer-soft);
+  --seal-blue: #326f8a;
+  --seal-blue-bg: var(--season-run-soft);
+  --seal-gray: #617780;
+  --danger-bg: #ffe3df;
+  --accent-ink: #fffdf1;
+  --focus: #215f7b;
+  --selection: #f6df91;
+  --scrim: rgb(41 75 90 / 48%);
+  --scrim-soft: rgb(41 75 90 / 28%);
+  --paper-shadow: #78a7b1;
+  --ink-shadow: rgb(38 70 82 / 28%);
+  --pixel-shadow: #6f9da7;
 
   /* Serializable fallback for <input type="color">. */
-  --employee-accent-data: #b93a24;
+  --employee-accent-data: #e49aae;
 
   /* Canonical color aliases. */
   --color-paper: var(--paper);
@@ -57,18 +82,18 @@
   --color-warning: var(--seal-amber);
   --color-info: var(--seal-blue);
 
-  /* Human-facing serif, prose sans, machine-print mono. No remote fonts. */
-  --font-display: "Noto Serif SC", "Songti SC", "STSong", "SimSun", serif;
-  --font-body: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
-  --font-machine: "SF Mono", "JetBrains Mono", "Sarasa Mono SC", ui-monospace, monospace;
+  /* Rounded Japanese UI faces with reliable offline CJK fallbacks. */
+  --font-display: "Hiragino Maru Gothic ProN", "Yu Gothic", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-body: "Hiragino Sans", "Yu Gothic UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-machine: "SFMono-Regular", Menlo, Monaco, "Cascadia Mono", "Sarasa Mono SC", monospace;
   --text-xs: 11px;
   --text-sm: 12px;
-  --text-base: 13px;
-  --text-body: 15px;
-  --text-subtitle: 18px;
-  --text-title: 24px;
+  --text-base: 14px;
+  --text-body: 16px;
+  --text-subtitle: 20px;
+  --text-title: 27px;
 
-  /* Four-point density, restrained paper geometry, named motion. */
+  /* Four-point rhythm, chunky edges, restrained hard shadows. */
   --space-1: 2px;
   --space-2: 4px;
   --space-3: 8px;
@@ -78,33 +103,33 @@
   --space-7: 36px;
   --space-8: 60px;
   --space-9: 96px;
-  --rule: 1px;
+  --rule: 2px;
   --rule-hair: 1px;
-  --radius-1: 2px;
-  --radius-2: 4px;
-  --radius-3: 6px;
-  --dur-fast: 120ms;
+  --radius-1: 4px;
+  --radius-2: 8px;
+  --radius-3: 12px;
+  --dur-fast: 110ms;
   --dur-base: 180ms;
   --dur-slow: 280ms;
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
   --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
   --ease-standard: var(--ease-out);
-  --shadow-paper: 7px 8px 0 var(--paper-shadow);
-  --shadow-paper-small: 2px 2px 0 var(--line);
-  --shadow-lift: 3px 4px 0 var(--paper-shadow);
-  --shadow-modal: 10px 12px 0 var(--ink-shadow);
-  --shadow-drawer: -8px 0 0 var(--ink-shadow);
+  --shadow-paper: 5px 5px 0 var(--paper-shadow);
+  --shadow-paper-small: 2px 2px 0 var(--paper-shadow);
+  --shadow-lift: 4px 4px 0 var(--paper-shadow);
+  --shadow-modal: 7px 7px 0 var(--pixel-shadow);
+  --shadow-drawer: -6px 0 0 var(--ink-shadow);
 
   /* App geometry and layering. */
-  --banner-height: 32px;
-  --rail-width: 208px;
-  --rail-compact: 58px;
-  --list-width: 324px;
-  --control-height: 34px;
+  --banner-height: 34px;
+  --rail-width: 220px;
+  --rail-compact: 62px;
+  --list-width: 332px;
+  --control-height: 38px;
   --touch-height: 48px;
-  --mobile-nav-height: 62px;
-  --topology-sticky-offset: 72px;
+  --mobile-nav-height: 66px;
+  --topology-sticky-offset: 74px;
   --z-rail: 70;
   --z-banner: 80;
   --z-mobile-nav: 90;
@@ -121,7 +146,7 @@
 
   font-family: var(--font-body);
   color: var(--ink);
-  background: var(--paper);
+  background: var(--sky);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }

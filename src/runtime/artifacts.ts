@@ -35,6 +35,15 @@ export class RunStore {
     await writeJsonAtomic(path.join(this.runDir, "plan.json"), plan);
   }
 
+  async writeArtifact(relativePath: string, value: unknown): Promise<void> {
+    if (path.isAbsolute(relativePath)) throw new Error("run artifact path must be relative");
+    const target = path.resolve(this.runDir, relativePath);
+    const relative = path.relative(this.runDir, target);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("run artifact path must stay inside the run directory");
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await writeJsonAtomic(target, value);
+  }
+
   async writeRun(run: WorkflowRunRecord): Promise<void> {
     const snapshot = structuredClone(run);
     this.runQueue = this.runQueue.then(() => writeJsonAtomic(path.join(this.runDir, "run.json"), snapshot));

@@ -2,7 +2,7 @@
 
 ## 1. Outcome
 
-The first release turns the existing workflow kit into a local employee workbench. A user can create, edit, clone, archive, inspect, and directly invoke addressable employees; combine employees into a Graph workflow; call the same registry from MCP-capable conversations; and publish an employee or workflow through an A2A v1 facade.
+The first release turns the existing workflow kit into a local employee workbench. A user can create, edit, clone, archive, inspect, and directly invoke addressable employees; connect project-owned role contracts without copying prompts; combine employees into a Graph workflow; call the same registry from MCP-capable conversations; and publish an employee or workflow through an A2A v1 facade.
 
 The release remains local-first. The daemon binds to loopback by default, definitions are exportable JSON/YAML-shaped data, and every invocation still uses the existing validation, Architecture Adapter, Provider Adapter, and Run Store.
 
@@ -13,6 +13,7 @@ The release remains local-first. The daemon binds to loopback by default, defini
 | Role Profile | Stable identity and accountability | Embedded in each versioned Employee |
 | Skill | Reusable capability instructions and tool declarations | Shared Workbench Skill registry |
 | Employee | Addressable runnable instance | Versioned, cloneable, archivable record |
+| Project / Binding | Project-owned demand and local Employee assignment | Descriptor plus version-pinned Employee/Skill selection |
 | Session | Conversation-scoped context | Append-only messages with a pinned Employee version |
 | Architecture | Collaboration control flow | Existing `graph` adapter plus deterministic Graph templates |
 | Provider | Model/runtime invocation | Existing command adapter plus deterministic mock adapter |
@@ -52,10 +53,11 @@ The context inspector presents independent layers instead of one opaque prompt:
 
 1. Identity and role instructions.
 2. Resolved Skill instructions, configuration, and tools.
-3. Session message history.
-4. Current request and Graph dependency results.
-5. Effective system, request, and combined prompts from the latest Run.
-6. Run metadata and artifact paths.
+3. Knowledge Plan, selected Revision, exclusions, and retrieved citation evidence.
+4. Session message history.
+5. Current request and Graph dependency results.
+6. Effective system, request, and combined prompts from the latest Run.
+7. Run metadata and artifact paths.
 
 v1 stores explicit Session history but does not silently infer long-term memory. Memory extraction, approval, forgetting, and compaction are later policies.
 
@@ -69,7 +71,8 @@ The daemon is the normal long-running writer for mutable Workbench state. Offlin
 
 ```text
 <data-root>/
-  state.json                  # registries, versions, sessions, publications
+  state.json                  # registries, projects, bindings, versions, sessions, publications
+  knowledge/                 # immutable Knowledge Revisions and derived indexes
   generated/                 # materialized manifests and prompt/schema files
   artifacts/runs/<run-id>/   # existing immutable Run Store layout
 ```
@@ -84,6 +87,7 @@ The loopback daemon owns CRUD and execution:
 
 - `/api/employees`, `/api/employees/:id`, clone, archive, context, invoke;
 - `/api/skills` plus archive/restore and `/api/providers`;
+- `/api/projects`, descriptor connection, versioned binding, refresh, and role invocation;
 - `/api/architecture-templates`, `/api/workflows`, plan, and run;
 - `/api/sessions` and `/api/runs`;
 - `/api/publications` and generated A2A endpoint metadata.

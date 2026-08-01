@@ -7,6 +7,13 @@ import type {
   RoleSkillBinding,
   RoleVerdictDefinition
 } from "../core/types.js";
+import type {
+  KnowledgeBaseRecord,
+  KnowledgeChangeRequest,
+  KnowledgeEvidence,
+  KnowledgePlan,
+  KnowledgeProfileRecord
+} from "../knowledge/types.js";
 
 export type RecordStatus = "active" | "archived";
 
@@ -43,6 +50,7 @@ export interface EmployeeDefinition {
   requestPrompt: string;
   skills: RoleSkillBinding[];
   skillVersions: Record<string, number>;
+  knowledgeProfileIds: string[];
   providerId: string;
   outputSchema: JsonObject;
   maxAttempts: number;
@@ -105,6 +113,12 @@ export interface EmployeeSession {
   id: string;
   employeeId: string;
   employeeVersion: number;
+  assignment?: {
+    projectId: string;
+    projectVersion: number;
+    projectBindingVersion: number;
+    roleId: string;
+  };
   title: string;
   status: "active" | "closed";
   messages: EmployeeSessionMessage[];
@@ -118,6 +132,8 @@ export interface InvocationSource {
   kind: InvocationSourceKind;
   label?: string;
   project?: string;
+  projectRole?: string;
+  projectBindingVersion?: number;
   caller?: string;
   contextId?: string;
   taskId?: string;
@@ -214,17 +230,127 @@ export interface PublicationDefinition {
   updatedAt: string;
 }
 
+export type ProjectScope = "repository" | "workspace";
+export type ProjectBindingUpdatePolicy = "locked" | "compatible" | "latest";
+
+export interface ProjectConnectorDefinition {
+  kind: string;
+  config: JsonObject;
+}
+
+/** A role slot is a project-owned contract. It describes the work required, not the Employee identity. */
+export interface ProjectRoleContract {
+  id: string;
+  displayName: string;
+  description: string;
+  requiredSkills: string[];
+  optionalSkills: string[];
+  knowledgeProfileIds: string[];
+  instructions: string;
+  outputSchema?: JsonObject;
+  permissions?: RolePermissionDefinition;
+}
+
+export interface ProjectDefinition {
+  id: string;
+  version: number;
+  status: RecordStatus;
+  name: string;
+  description: string;
+  scope: ProjectScope;
+  rootPath: string;
+  descriptorPath: string;
+  connector: ProjectConnectorDefinition;
+  roles: ProjectRoleContract[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectRecord {
+  current: ProjectDefinition;
+  versions: ProjectDefinition[];
+}
+
+/** A version-pinned Employee assignment for one project role slot. */
+export interface ProjectRoleBinding {
+  roleId: string;
+  employeeId: string;
+  employeeVersion: number;
+  skills: RoleSkillBinding[];
+  skillVersions: Record<string, number>;
+  knowledgeProfileIds: string[];
+  updatePolicy: ProjectBindingUpdatePolicy;
+}
+
+export interface ProjectBindingDefinition {
+  projectId: string;
+  projectVersion: number;
+  version: number;
+  roles: ProjectRoleBinding[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectBindingRecord {
+  current: ProjectBindingDefinition;
+  versions: ProjectBindingDefinition[];
+}
+
 export interface WorkbenchState {
   schemaVersion: 1;
   providers: Record<string, ProviderDefinition>;
   skills: Record<string, WorkbenchSkillDefinition>;
   skillHistory: Record<string, WorkbenchSkillDefinition[]>;
+  knowledgeBases: Record<string, KnowledgeBaseRecord>;
+  knowledgeProfiles: Record<string, KnowledgeProfileRecord>;
+  knowledgeChangeRequests: Record<string, KnowledgeChangeRequest>;
   employees: Record<string, EmployeeRecord>;
   workflows: Record<string, WorkbenchWorkflowRecord>;
   sessions: Record<string, EmployeeSession>;
   publications: Record<string, PublicationDefinition>;
+  projects: Record<string, ProjectRecord>;
+  projectBindings: Record<string, ProjectBindingRecord>;
   invocations: Record<string, InvocationRecord>;
   workInstances: Record<string, WorkInstanceRecord>;
+}
+
+export interface ProjectCreateInput {
+  id: string;
+  name?: string;
+  description?: string;
+  scope?: ProjectScope;
+  rootPath: string;
+  descriptorPath: string;
+  connector?: Partial<ProjectConnectorDefinition> & Pick<ProjectConnectorDefinition, "kind">;
+  roles: Array<Partial<Omit<ProjectRoleContract, "id">> & Pick<ProjectRoleContract, "id">>;
+}
+
+export interface ProjectConnectInput {
+  rootPath: string;
+  descriptorPath?: string;
+}
+
+export interface ProjectRoleBindingInput {
+  roleId: string;
+  employeeId: string;
+  employeeVersion?: number;
+  skills?: RoleSkillBinding[];
+  knowledgeProfileIds?: string[];
+  updatePolicy?: ProjectBindingUpdatePolicy;
+}
+
+export interface ProjectBindingInput {
+  roles: ProjectRoleBindingInput[];
+}
+
+export interface ProjectBindingRefreshResult {
+  changed: boolean;
+  binding: ProjectBindingDefinition;
+  roles: Array<{
+    roleId: string;
+    status: "current" | "updated" | "locked" | "approval-required";
+    message: string;
+  }>;
 }
 
 export interface EmployeeCreateInput {
@@ -235,6 +361,7 @@ export interface EmployeeCreateInput {
   requestPrompt?: string;
   skills?: RoleSkillBinding[];
   skillVersions?: Record<string, number>;
+  knowledgeProfileIds?: string[];
   providerId?: string;
   outputSchema?: JsonObject;
   maxAttempts?: number;
@@ -292,6 +419,10 @@ export interface EmployeeContextView {
     identity: RoleIdentityDefinition;
     systemPrompt: string;
     skills: Array<{ id: string; enabled: boolean; instructions: string; config: JsonObject; tools: string[] }>;
+    knowledge?: {
+      plan: KnowledgePlan;
+      evidence: KnowledgeEvidence[];
+    };
     history: EmployeeSessionMessage[];
     currentRequest?: string;
     dependencyResults: JsonObject;

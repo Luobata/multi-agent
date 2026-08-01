@@ -6,12 +6,21 @@ import { loadManifest } from "../config/loadManifest.js";
 import { compilePlan, formatPlanMermaid, formatPlanText } from "../core/plan.js";
 import { resolveRoleProfile } from "../core/roles.js";
 import type { JsonObject, LoadedManifest } from "../core/types.js";
+import type {
+  KnowledgeBaseCreateInput,
+  KnowledgeBaseUpdateInput,
+  KnowledgeChangeCreateInput,
+  KnowledgeProfileCreateInput,
+  KnowledgeProfileUpdateInput,
+  KnowledgeRevisionCreateInput
+} from "../knowledge/types.js";
 import { runWorkflow } from "../runtime/runner.js";
 import { startDaemon } from "../daemon/server.js";
 import { WorkbenchService } from "../workbench/service.js";
 import type {
   EmployeeCreateInput,
   PublicationDefinition,
+  ProjectBindingInput,
   SkillCreateInput,
   WorkflowCreateInput
 } from "../workbench/types.js";
@@ -214,11 +223,223 @@ employee
     process.stdout.write(`${JSON.stringify(await (await workbenchService()).getEmployeeContext(id, options.session), null, 2)}\n`);
   });
 
+employee
+  .command("knowledge")
+  .description("Replace an Employee's reusable Knowledge Profile assignments")
+  .argument("<id>", "Employee id")
+  .argument("[profiles...]", "Knowledge Profile ids")
+  .action(async (id: string, profiles: string[]) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).updateEmployee(id, { knowledgeProfileIds: profiles }), null, 2)}\n`);
+  });
+
 workbench
   .command("skill-create")
   .argument("<file>", "Skill JSON definition")
   .action(async (file: string) => {
     process.stdout.write(`${JSON.stringify(await (await workbenchService()).createSkill(readJsonFile<SkillCreateInput>(file)), null, 2)}\n`);
+  });
+
+const knowledgeBase = workbench.command("knowledge-base").description("Manage versioned Knowledge Bases and local indexes");
+knowledgeBase
+  .command("list")
+  .option("--all", "include archived Knowledge Bases")
+  .action(async (options: { all?: boolean }) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).listKnowledgeBases(Boolean(options.all)), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("create")
+  .argument("<file>", "Knowledge Base JSON definition")
+  .action(async (file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).createKnowledgeBase(readJsonFile<KnowledgeBaseCreateInput>(file)), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("get")
+  .argument("<id>", "Knowledge Base id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).getKnowledgeBaseDetail(id), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("update")
+  .argument("<id>", "Knowledge Base id")
+  .argument("<file>", "Knowledge Base update JSON")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).updateKnowledgeBase(id, readJsonFile<KnowledgeBaseUpdateInput>(file)), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("revision")
+  .argument("<id>", "Knowledge Base id")
+  .argument("<file>", "Knowledge Revision JSON definition")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).createKnowledgeRevision(id, readJsonFile<KnowledgeRevisionCreateInput>(file)), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("assess")
+  .argument("<id>", "Knowledge Base id")
+  .option("--revision <revision>", "Revision to assess; defaults to latest")
+  .action(async (id: string, options: { revision?: string }) => {
+    const revision = options.revision === undefined ? undefined : Number(options.revision);
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).assessKnowledgeRevision(id, revision), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("preview")
+  .argument("<id>", "Knowledge Base id")
+  .argument("<query>", "Representative retrieval question")
+  .option("--revision <revision>", "Revision to preview; defaults to latest")
+  .option("--collections <collections>", "Comma-separated Collection ids")
+  .action(async (id: string, query: string, options: { revision?: string; collections?: string }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).previewKnowledgeRevision(id, {
+      message: query,
+      revision: options.revision === undefined ? undefined : Number(options.revision),
+      collectionIds: options.collections?.split(",").map((value) => value.trim()).filter(Boolean)
+    }), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("sync")
+  .argument("<id>", "Knowledge Base id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).syncKnowledgeBase(id), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("publish")
+  .argument("<id>", "Knowledge Base id")
+  .option("--revision <revision>", "Revision to publish or roll back to")
+  .action(async (id: string, options: { revision?: string }) => {
+    const revision = options.revision === undefined ? undefined : Number(options.revision);
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).publishKnowledgeRevision(id, revision), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("archive")
+  .argument("<id>", "Knowledge Base id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).archiveKnowledgeBase(id), null, 2)}\n`);
+  });
+knowledgeBase
+  .command("restore")
+  .argument("<id>", "Knowledge Base id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).restoreKnowledgeBase(id), null, 2)}\n`);
+  });
+
+const knowledgeProfile = workbench.command("knowledge-profile").description("Manage reusable Employee knowledge policies");
+knowledgeProfile
+  .command("list")
+  .option("--all", "include archived Knowledge Profiles")
+  .action(async (options: { all?: boolean }) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).listKnowledgeProfiles(Boolean(options.all)), null, 2)}\n`);
+  });
+knowledgeProfile
+  .command("create")
+  .argument("<file>", "Knowledge Profile JSON definition")
+  .action(async (file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).createKnowledgeProfile(readJsonFile<KnowledgeProfileCreateInput>(file)), null, 2)}\n`);
+  });
+knowledgeProfile
+  .command("get")
+  .argument("<id>", "Knowledge Profile id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).getKnowledgeProfile(id), null, 2)}\n`);
+  });
+knowledgeProfile
+  .command("update")
+  .argument("<id>", "Knowledge Profile id")
+  .argument("<file>", "Knowledge Profile update JSON")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).updateKnowledgeProfile(id, readJsonFile<KnowledgeProfileUpdateInput>(file)), null, 2)}\n`);
+  });
+knowledgeProfile
+  .command("archive")
+  .argument("<id>", "Knowledge Profile id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).archiveKnowledgeProfile(id), null, 2)}\n`);
+  });
+knowledgeProfile
+  .command("restore")
+  .argument("<id>", "Knowledge Profile id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).restoreKnowledgeProfile(id), null, 2)}\n`);
+  });
+
+workbench
+  .command("knowledge-impact")
+  .description("Explain Knowledge Base → Profile → Employee and project-role reach")
+  .action(async () => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).getKnowledgeImpactSnapshot(), null, 2)}\n`);
+  });
+
+const knowledgeChange = workbench.command("knowledge-change").description("Review and apply governed knowledge change requests");
+knowledgeChange
+  .command("list")
+  .action(async () => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).listKnowledgeChangeRequests(), null, 2)}\n`);
+  });
+knowledgeChange
+  .command("get")
+  .argument("<id>", "Knowledge change request id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).getKnowledgeChangeRequest(id), null, 2)}\n`);
+  });
+knowledgeChange
+  .command("propose")
+  .argument("<file>", "KnowledgeChangeCreateInput JSON")
+  .action(async (file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).createKnowledgeChangeRequest(readJsonFile<KnowledgeChangeCreateInput>(file)), null, 2)}\n`);
+  });
+knowledgeChange
+  .command("approve")
+  .argument("<id>", "Knowledge change request id")
+  .option("--comment <comment>", "Human approval comment")
+  .action(async (id: string, options: { comment?: string }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).approveKnowledgeChangeRequest(id, "local-cli-owner", options.comment), null, 2)}\n`);
+  });
+knowledgeChange
+  .command("reject")
+  .argument("<id>", "Knowledge change request id")
+  .option("--comment <comment>", "Human rejection reason")
+  .action(async (id: string, options: { comment?: string }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).rejectKnowledgeChangeRequest(id, "local-cli-owner", options.comment), null, 2)}\n`);
+  });
+knowledgeChange
+  .command("cancel")
+  .argument("<id>", "Knowledge change request id")
+  .option("--comment <comment>", "Human cancellation reason")
+  .action(async (id: string, options: { comment?: string }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).cancelKnowledgeChangeRequest(id, "local-cli-owner", options.comment), null, 2)}\n`);
+  });
+
+const workbenchProject = workbench.command("project").description("Connect projects and assign Employees to project role slots");
+workbenchProject
+  .command("list")
+  .option("--all", "include archived projects")
+  .action(async (options: { all?: boolean }) => {
+    const service = await workbenchService();
+    process.stdout.write(`${JSON.stringify({ projects: service.listProjects(Boolean(options.all)), bindings: service.listProjectBindings() }, null, 2)}\n`);
+  });
+workbenchProject
+  .command("connect")
+  .argument("[directory]", "project root directory", ".")
+  .option("--descriptor <path>", "descriptor path; relative paths resolve from the project root", "multi-agent.project.yaml")
+  .action(async (directory: string, options: { descriptor: string }) => {
+    const project = await (await workbenchService()).connectProject({ rootPath: directory, descriptorPath: options.descriptor });
+    process.stdout.write(`${JSON.stringify(project, null, 2)}\n`);
+  });
+workbenchProject
+  .command("bind")
+  .argument("<id>", "project id")
+  .argument("<file>", "ProjectBinding JSON definition")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).saveProjectBinding(id, readJsonFile<ProjectBindingInput>(file)), null, 2)}\n`);
+  });
+workbenchProject
+  .command("invoke")
+  .argument("<id>", "project id")
+  .argument("<role>", "project role id")
+  .argument("<message>", "request text")
+  .option("--session <id>", "continue a version-pinned project Session")
+  .action(async (id: string, role: string, message: string, options: { session?: string }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).invokeProjectRole(id, role, {
+      message,
+      sessionId: options.session
+    }), null, 2)}\n`);
   });
 
 const workbenchWorkflow = workbench.command("workflow").description("Create and run Employee Graph workflows");

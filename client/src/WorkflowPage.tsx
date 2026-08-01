@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { ArchitectureTemplatePicker } from "./ArchitectureTemplatePicker";
 import { api, writeBody } from "./api";
-import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, Stamp, UtilityIcon, formatTime, scrollRecordIntoView, useDaemonAvailable } from "./components";
+import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, ReadonlyEvidence, SelectControl, Stamp, UtilityIcon, formatTime, scrollRecordIntoView, useDaemonAvailable } from "./components";
 import { layoutTopology } from "./topology";
 import { automaticCanvasPositions, WorkflowCanvas, type CanvasPositions } from "./WorkflowCanvas";
+import { activeWorkflowPublications, buildWorkflowSessionPrompts } from "./workflowSessionPrompts";
 import type { Bootstrap, Employee, InstantiatedArchitectureTemplate, JsonObject, Workflow, WorkflowNode } from "./types";
 
 interface PageProps {
@@ -92,9 +93,11 @@ function WorkflowEditor({ workflow, data, onClose, onSaved, notify }: {
   const topology = layoutTopology(previewNodes);
   const duplicateIds = previewNodes.filter((node, index) => previewNodes.findIndex((candidate) => candidate.id === node.id) !== index).map((node) => node.id);
   const missingDependencies = previewNodes.flatMap((node) => node.needs.filter((need) => !previewNodes.some((candidate) => candidate.id === need)));
+  const unassignedNodes = previewNodes.filter((node) => !node.employeeId).map((node) => node.id || "未命名节点");
   const graphIssues = [...new Set([
     ...(duplicateIds.length ? [`重复节点：${duplicateIds.join(", ")}`] : []),
     ...(missingDependencies.length ? [`未知依赖：${missingDependencies.join(", ")}`] : []),
+    ...(unassignedNodes.length ? [`未分派员工：${unassignedNodes.join(", ")}`] : []),
     ...(topology.cyclic ? ["存在循环依赖"] : [])
   ])];
   const selectedNode = draft.nodes[selectedIndex] ?? draft.nodes[0];
@@ -142,7 +145,7 @@ function WorkflowEditor({ workflow, data, onClose, onSaved, notify }: {
         <section className="workflow-basics"><div className="section-kicker"><b>02</b><span>定义编排</span></div><div className="form-grid workflow-basics-grid"><Field label="Workflow ID"><input required pattern="[a-z][a-z0-9-]*" disabled={Boolean(workflow)} value={draft.id} onChange={(event) => setDraft({ ...draft, id: event.target.value })} /></Field><Field label="说明"><input required value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></Field><Field label="并发上限"><input type="number" min={1} max={32} value={draft.maxConcurrency} onChange={(event) => setDraft({ ...draft, maxConcurrency: Number(event.target.value) })} /></Field></div><label className="check-line"><input type="checkbox" checked={draft.failFast} onChange={(event) => setDraft({ ...draft, failFast: event.target.checked })} />技术故障后停止调度未开始节点（failFast）</label></section>
         <section className="workflow-builder"><header className="workflow-builder-toolbar"><div><p className="record-meta">03 / VISUAL COMPOSER</p><h3>拖动画布</h3></div><div className="canvas-actions"><button type="button" className="button ghost" onClick={() => setDraft({ ...draft, positions: automaticCanvasPositions(previewNodes) })}>自动排版</button><button type="button" className="button secondary" onClick={addNode}><UtilityIcon name="add" />添加节点</button></div></header>
           <div className="workflow-builder-grid"><div className="canvas-column"><div className="canvas-status"><span>拖动只调整展示位置；依赖关系在右侧检查器修改。</span><Stamp status={graphIssues.length ? "blocked" : "passed"} label={graphIssues.length ? `${graphIssues.length} 项待修正` : "草稿通过预检"} /></div><WorkflowCanvas nodes={previewNodes} employees={data.employees} positions={draft.positions} selectedId={selectedNode?.id} onSelect={(nodeId) => setSelectedIndex(Math.max(0, draft.nodes.findIndex((node) => node.id === nodeId)))} onPositionsChange={(positions) => setDraft((current) => ({ ...current, positions }))} />{graphIssues.length > 0 && <div className="canvas-issues" role="alert">{graphIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}</div>
-            <aside className="node-inspector">{selectedNode ? <><header><div><p className="record-meta">NODE INSPECTOR</p><h4>{selectedNode.id || "未命名节点"}</h4></div><button type="button" className="text-button danger-text" disabled={draft.nodes.length === 1} onClick={() => { removeNode(selectedIndex); setSelectedIndex(Math.max(0, selectedIndex - 1)); }}>移除</button></header><Field label="Node ID"><input required pattern="[a-z][a-z0-9-]*" value={selectedNode.id} onChange={(event) => renameNode(selectedIndex, event.target.value)} /></Field><Field label="Employee"><select required value={selectedNode.employeeId} onChange={(event) => setNode(selectedIndex, { employeeId: event.target.value })}><option value="">选择在册员工</option>{activeEmployees.map((employee) => <option key={employee.id} value={employee.id}>{employee.identity.displayName} · v{employee.version}</option>)}</select></Field><fieldset className="dependency-checks"><legend>依赖节点</legend>{draft.nodes.map((candidate, candidateIndex) => candidateIndex === selectedIndex ? null : <label key={`${candidate.id}-${candidateIndex}`}><input type="checkbox" checked={selectedNode.needs.includes(candidate.id)} onChange={(event) => setNode(selectedIndex, { needs: event.target.checked ? [...selectedNode.needs, candidate.id] : selectedNode.needs.filter((need) => need !== candidate.id) })} /><span><b>{candidate.id || "未命名"}</b><small>{candidate.employeeId}</small></span></label>)}{draft.nodes.length === 1 && <span className="muted">只有一个节点，无上游依赖。</span>}</fieldset><Field label="with (JSON)"><textarea className="mono" rows={7} value={selectedNode.withText} onChange={(event) => setNode(selectedIndex, { withText: event.target.value })} /></Field></> : <div className="mini-empty">选择一个节点开始编辑。</div>}</aside>
+            <aside className="node-inspector">{selectedNode ? <><header><div><p className="record-meta">NODE INSPECTOR</p><h4>{selectedNode.id || "未命名节点"}</h4></div><button type="button" className="text-button danger-text" disabled={draft.nodes.length === 1} onClick={() => { removeNode(selectedIndex); setSelectedIndex(Math.max(0, selectedIndex - 1)); }}>移除</button></header><Field label="Node ID"><input required pattern="[a-z][a-z0-9-]*" value={selectedNode.id} onChange={(event) => renameNode(selectedIndex, event.target.value)} /></Field><Field label="Employee"><SelectControl ariaLabel={`${selectedNode.id || "当前节点"}分派员工`} value={selectedNode.employeeId} invalid={!selectedNode.employeeId} errorMessage={!selectedNode.employeeId ? "请为节点分派一位员工。" : undefined} options={[{ value: "", label: activeEmployees.length ? "选择在册员工" : "暂无在册员工", description: activeEmployees.length ? "节点必须分派一位员工" : "请先建立或恢复员工档案", disabled: activeEmployees.length === 0 }, ...activeEmployees.map((employee) => ({ value: employee.id, label: employee.identity.displayName, description: `${employee.providerId} · v${employee.version}` }))]} onChange={(employeeId) => setNode(selectedIndex, { employeeId })} /></Field><fieldset className="dependency-checks"><legend>依赖节点</legend>{draft.nodes.map((candidate, candidateIndex) => candidateIndex === selectedIndex ? null : <label key={`${candidate.id}-${candidateIndex}`}><input type="checkbox" checked={selectedNode.needs.includes(candidate.id)} onChange={(event) => setNode(selectedIndex, { needs: event.target.checked ? [...selectedNode.needs, candidate.id] : selectedNode.needs.filter((need) => need !== candidate.id) })} /><span><b>{candidate.id || "未命名"}</b><small>{candidate.employeeId}</small></span></label>)}{draft.nodes.length === 1 && <span className="muted">只有一个节点，无上游依赖。</span>}</fieldset><Field label="with (JSON)"><textarea className="mono" rows={7} value={selectedNode.withText} onChange={(event) => setNode(selectedIndex, { withText: event.target.value })} /></Field></> : <div className="mini-empty">选择一个节点开始编辑。</div>}</aside>
           </div>
         </section>
         <section className="workflow-contract"><div className="section-kicker"><b>04</b><span>输入契约</span></div><Field label="Input JSON Schema"><textarea className="mono" rows={6} value={draft.inputSchema} onChange={(event) => setDraft({ ...draft, inputSchema: event.target.value })} /></Field></section>
@@ -162,7 +165,22 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
   const [runInput, setRunInput] = useState("{\n  \"message\": \"请完成这项协作任务\"\n}");
   const [running, setRunning] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const workflowPublications = useMemo(
+    () => selected ? activeWorkflowPublications(selected.id, data.publications) : [],
+    [data.publications, selected?.id]
+  );
+  const [publicationId, setPublicationId] = useState("");
   useEffect(() => { if (!selected) { setVersions([]); return; } api<{ versions: Workflow[] }>(`/api/workflows/${selected.id}`).then((detail) => setVersions(detail.versions)).catch(() => setVersions([selected])); }, [selected?.id, selected?.version]);
+  useEffect(() => {
+    setPublicationId((current) => workflowPublications.some((publication) => publication.id === current)
+      ? current
+      : workflowPublications[0]?.id ?? "");
+  }, [workflowPublications]);
+  const selectedPublication = workflowPublications.find((publication) => publication.id === publicationId) ?? workflowPublications[0];
+  const sessionPrompts = useMemo(
+    () => selected ? buildWorkflowSessionPrompts(selected, selectedPublication) : undefined,
+    [selected, selectedPublication]
+  );
 
   const run = async () => {
     if (!selected) return; setRunning(true);
@@ -177,7 +195,7 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
   };
   const selectedTemplate = data.architectureTemplates.find((template) => template.id === selected?.patternId);
 
-  return <div className="page-grid">
+  return <div className="page-grid page-grid--workflows">
     <aside className="record-list"><header className="list-header"><h1>协作编排</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setEditor("new")} aria-label="新建 Workflow"><UtilityIcon name="add" /></button></header><div className="architecture-summary"><span>{data.architectureTemplates.length} 个常用模板</span><small>统一编译为 Graph</small></div><div className="record-scroll workflow-list">{visible.map((workflow) => { const template = data.architectureTemplates.find((candidate) => candidate.id === workflow.patternId); return <button className={`workflow-card ${selected?.id === workflow.id ? "selected" : ""}`} key={workflow.id} onClick={() => setSelectedId(workflow.id)}><div><strong>{workflow.id}</strong><span>{workflow.description}</span><small>{template?.displayName ?? "自定义 Graph"} · {workflow.nodes.length} 节点</small></div><Stamp status={workflow.status} /></button>; })}{visible.length === 0 && <div className="mini-empty">尚无协作编排。</div>}</div><footer className="list-footer"><span>{visible.length} 份编排</span><span>GRAPH v1</span></footer></aside>
     <main className="detail-pane">{!selected ? <EmptyState title="用常用架构建立第一份编排" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>选择架构模板</button>}>从顺序流水线、并行汇总、评审委员会或计划执行模板开始，映射员工后可在画布继续拖动和修改依赖。</EmptyState> : <div className="dossier workflow-dossier">
       <header className="dossier-cover"><div className="file-index"><span>GRAPH WORKFLOW RECORD</span><code>No. {selected.id.toUpperCase()}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">织</div><div><h2>{selected.id}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div><div className="dossier-actions"><button className="button primary" disabled={!daemonAvailable || running || selected.status === "archived"} onClick={() => scrollRecordIntoView("run-workflow")}>运行编排</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>可视化修订</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div></header>
@@ -185,6 +203,33 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
       <DossierSection number="02" title="节点清册"><div className="node-ledger">{selected.nodes.map((node, index) => { const employee = data.employees.find((item) => item.id === node.employeeId); return <article key={node.id}><span className="node-number">{String(index + 1).padStart(2, "0")}</span><EmployeeAvatar className="small" displayName={employee?.identity.displayName ?? node.employeeId} presentation={employee?.presentation} /><div><strong>{node.id}</strong><span>{employee?.identity.displayName ?? node.employeeId} · v{node.employeeVersion ?? employee?.version ?? "—"}</span></div><code>{node.needs.length ? `← ${node.needs.join(", ")}` : "并行起点"}</code></article>; })}</div></DossierSection>
       <DossierSection number="03" title="依赖拓扑"><Topology nodes={selected.nodes} employees={data.employees} /></DossierSection>
       <DossierSection number="04" title="版本"><div className="version-strip">{versions.map((version) => <div key={version.version} className={version.version === selected.version ? "current" : ""}><code>v{version.version}</code><span>{version.version === selected.version ? "当前" : version.status === "archived" ? "归档" : "历史"}</span><time>{formatTime(version.updatedAt)}</time></div>)}</div></DossierSection>
+      {sessionPrompts && <DossierSection
+        number="05"
+        title="其他会话使用"
+        action={<Stamp
+          status={selected.status === "archived" ? "archived" : selectedPublication ? "active" : "pending"}
+          label={selected.status === "archived" ? "历史示例" : selectedPublication ? "稳定调用包" : "调试入口"}
+        />}
+      >
+        <div className={`workflow-session-route workflow-session-route--${sessionPrompts.mode}`}>
+          <div className="workflow-session-route-copy">
+            <span>{sessionPrompts.mode === "publication" ? "PUBLICATION → MCP" : "WORKFLOW → MCP"}</span>
+            <strong>{selectedPublication?.name ?? selected.id}</strong>
+            <p>{selected.status === "archived"
+              ? "此编排已归档，以下内容仅供历史参考，当前不可调用。"
+              : selectedPublication
+                ? <>其他会话使用 Publication ID <code>{selectedPublication.id}</code>，无需了解内部节点与 Prompt。</>
+                : "尚未建立活动调用包；以下示例使用 run_workflow 直接调试该编排。"}</p>
+          </div>
+          {workflowPublications.length > 1
+            ? <label className="workflow-publication-select"><span>选择调用包</span><SelectControl ariaLabel="选择 Workflow 调用包" value={selectedPublication?.id ?? ""} options={workflowPublications.map((publication) => ({ value: publication.id, label: publication.name, description: `${publication.id} · v${publication.version}` }))} onChange={setPublicationId} /></label>
+            : !selectedPublication && <a className="text-button workflow-publication-link" href="#publications">前往调用包建立稳定入口</a>}
+        </div>
+        <div className="workflow-session-examples">
+          <ReadonlyEvidence label="给 Codex 会话的提示词 · 推荐" value={sessionPrompts.humanPrompt} />
+          <ReadonlyEvidence label={`MCP 参数示例 · ${sessionPrompts.tool}`} value={sessionPrompts.mcpJson} mono />
+        </div>
+      </DossierSection>}
       <section id="run-workflow" className="run-order"><header><div><p className="record-meta">{selected.id} · v{selected.version}</p><h3>签发运行工单</h3></div><Stamp status={running ? "running" : "pending"} label={running ? "执行中" : "待签发"} /></header><Field label="Workflow 输入 (JSON)"><textarea className="mono" rows={8} disabled={!daemonAvailable} value={runInput} onChange={(event) => setRunInput(event.target.value)} /></Field><div className="run-actions"><span>运行会保存输入、计划、每个节点 Prompt、原始输出与状态事件。</span><button className="button primary" disabled={!daemonAvailable || running || selected.status === "archived"} onClick={() => void run()}>{running ? "正在执行…" : "签发并运行"}</button></div></section>
     </div>}</main>
     {editor && <WorkflowEditor workflow={editor === "edit" ? selected : undefined} data={data} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}

@@ -18,6 +18,36 @@ afterEach(() => {
 });
 
 describe("Local Agent Workbench", () => {
+  it("repairs persisted invocation metadata written with the legacy header encoding", async () => {
+    const root = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot: root });
+    await service.createEmployee({
+      id: "encoding-worker",
+      identity: { displayName: "Encoding Worker", background: "Tests metadata.", responsibilities: ["Respond"] }
+    });
+    await service.invokeEmployee(
+      "encoding-worker",
+      { message: "Create persisted activity" },
+      { kind: "http", label: "placeholder", project: "placeholder" }
+    );
+
+    const statePath = path.join(root, "state.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      invocations: Record<string, { source: { label?: string; project?: string } }>;
+      workInstances: Record<string, { source: { label?: string; project?: string } }>;
+    };
+    for (const activity of [...Object.values(state.invocations), ...Object.values(state.workInstances)]) {
+      activity.source.label = Buffer.from("小狐整体档案设计", "utf8").toString("latin1");
+      activity.source.project = `utf8:${encodeURIComponent("档案室项目")}`;
+    }
+    fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    const reopened = await WorkbenchService.open({ dataRoot: root });
+    const snapshot = reopened.getActivitySnapshot();
+    expect(snapshot.invocations[0]?.source).toMatchObject({ label: "小狐整体档案设计", project: "档案室项目" });
+    expect(snapshot.instances[0]?.source).toMatchObject({ label: "小狐整体档案设计", project: "档案室项目" });
+  });
+
   it("tracks concurrent calls as isolated work instances on one Employee identity", async () => {
     let started = 0;
     let signalStarted = () => {};
@@ -247,6 +277,108 @@ describe("Local Agent Workbench", () => {
     const enabledContext = await service.getEmployeeContext(enabledEmployee.id, enabledRun.session.id);
     expect(enabledContext.layers.skills[0]).toMatchObject({ id: "optional-voice", enabled: true });
     expect(enabledContext.effectivePrompt?.combined).toContain("DISABLED_SKILL_MARKER");
+  });
+
+  it("binds one Employee to a project role with a version-pinned Skill subset and Session", async () => {
+    const projectRoot = temporaryRoot();
+    const providerInvocations: Array<{ cwd: string; projectRoot?: string }> = [];
+    const providers: ProviderRegistry = new Map([["mock", {
+      id: "mock",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const context = invocation.templateContext.run as { projectRoot?: string };
+        providerInvocations.push({ cwd: invocation.cwd, projectRoot: context.projectRoot });
+        const role = invocation.templateContext.role as { identity?: { displayName?: string } };
+        const input = invocation.templateContext.input as { message?: string };
+        return {
+          stdout: JSON.stringify({ message: `${role.identity?.displayName ?? "Employee"} received: ${input.message ?? "request"}.` }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.createSkill({
+      id: "browser-e2e-validation",
+      description: "Validate browser behavior.",
+      instructions: "BROWSER_E2E_SKILL_MARKER"
+    });
+    await service.createSkill({
+      id: "project-visual-style",
+      description: "Apply one optional project style.",
+      instructions: "PROJECT_STYLE_MUST_NOT_BE_ACTIVE"
+    });
+    const employee = await service.createEmployee({
+      id: "shared-tester",
+      identity: { displayName: "Shared Tester", background: "Independent QA.", responsibilities: ["Verify behavior"] },
+      systemPrompt: "BASE_TESTER_PROMPT",
+      skills: ["browser-e2e-validation", "project-visual-style"]
+    });
+    await service.createProject({
+      id: "cart-review",
+      name: "Cart Review",
+      description: "Review the shopping-cart project.",
+      rootPath: projectRoot,
+      descriptorPath: path.join(projectRoot, "multi-agent.project.yaml"),
+      connector: { kind: "worktree-review", config: {} },
+      roles: [{
+        id: "tester",
+        displayName: "Project Tester",
+        description: "Run browser acceptance.",
+        requiredSkills: ["browser-e2e-validation"],
+        optionalSkills: ["project-visual-style"],
+        instructions: "PROJECT_ROLE_POLICY_MARKER",
+        permissions: { write: "none" }
+      }]
+    });
+    const binding = await service.saveProjectBinding("cart-review", {
+      roles: [{
+        roleId: "tester",
+        employeeId: employee.id,
+        skills: ["browser-e2e-validation"],
+        updatePolicy: "compatible"
+      }]
+    });
+    expect(binding).toMatchObject({ projectVersion: 1, version: 1 });
+    expect(binding.roles[0]?.skills).toEqual([{ id: "browser-e2e-validation", config: {}, enabled: true }]);
+
+    const first = await service.invokeProjectRole("cart-review", "tester", { message: "Check the running page" });
+    expect(first.session.assignment).toMatchObject({
+      projectId: "cart-review",
+      projectVersion: 1,
+      projectBindingVersion: 1,
+      roleId: "tester"
+    });
+    const context = await service.getEmployeeContext(employee.id, first.session.id);
+    expect(context.layers.skills.map((skill) => skill.id)).toEqual(["browser-e2e-validation"]);
+    expect(context.effectivePrompt?.combined).toContain("BASE_TESTER_PROMPT");
+    expect(context.effectivePrompt?.combined).toContain("PROJECT_ROLE_POLICY_MARKER");
+    expect(context.effectivePrompt?.combined).toContain("BROWSER_E2E_SKILL_MARKER");
+    expect(context.effectivePrompt?.combined).not.toContain("PROJECT_STYLE_MUST_NOT_BE_ACTIVE");
+
+    const versionTwo = await service.updateEmployee(employee.id, {
+      identity: { ...employee.identity, displayName: "Senior Shared Tester" },
+      systemPrompt: "UPDATED_TESTER_PROMPT"
+    });
+    expect(versionTwo.version).toBe(2);
+    const refresh = await service.refreshProjectBinding("cart-review");
+    expect(refresh.changed).toBe(true);
+    expect(refresh.binding.roles[0]?.employeeVersion).toBe(2);
+    expect(refresh.roles[0]?.status).toBe("updated");
+
+    const continued = await service.invokeProjectRole("cart-review", "tester", {
+      message: "Continue the pinned review",
+      sessionId: first.session.id
+    });
+    expect(continued.session.assignment?.projectBindingVersion).toBe(1);
+    expect(continued.message).toContain("Shared Tester received");
+    expect(continued.message).not.toContain("Senior Shared Tester received");
+    const fresh = await service.invokeProjectRole("cart-review", "tester", { message: "Start a new review" });
+    expect(fresh.session.assignment?.projectBindingVersion).toBe(2);
+    expect(fresh.message).toContain("Senior Shared Tester received");
+    expect(providerInvocations).toHaveLength(3);
+    expect(providerInvocations.every((invocation) => invocation.cwd === projectRoot)).toBe(true);
+    expect(providerInvocations.every((invocation) => invocation.projectRoot === projectRoot)).toBe(true);
   });
 
   it("archives and restores shared Skills while preserving version history", async () => {

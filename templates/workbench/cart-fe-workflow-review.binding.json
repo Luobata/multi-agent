@@ -1,0 +1,25 @@
+{
+  "roles": [
+    {
+      "roleId": "product-manager",
+      "employeeId": "xiaomiwang-product-manager",
+      "skills": ["humanizer-zh"],
+      "knowledgeProfileIds": ["workbench-product-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "designer",
+      "employeeId": "lin-mo-product-designer",
+      "skills": ["hallmark", "interaction-state-completeness"],
+      "knowledgeProfileIds": ["workbench-design-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "tester",
+      "employeeId": "xiaomixiang-tester",
+      "skills": ["browser-e2e-validation"],
+      "knowledgeProfileIds": ["workbench-quality-knowledge"],
+      "updatePolicy": "compatible"
+    }
+  ]
+}

@@ -87,7 +87,7 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
     await fs.writeFile(path.join(bundleDir, instructions), employee.systemPrompt.trim(), "utf8");
     await fs.writeFile(
       path.join(bundleDir, requestTemplate),
-      `${employee.requestPrompt.trim()}\n\n## Current input\n\n{{input}}\n\n## Dependency evidence\n\n{{needs}}\n`,
+      `${employee.requestPrompt.trim()}\n\n## Knowledge evidence\n\n{{node.with.__knowledgeEvidence}}\n\n## Current input\n\n{{input}}\n\n## Dependency evidence\n\n{{needs}}\n`,
       "utf8"
     );
     await writeJson(path.join(bundleDir, outputSchema), employee.outputSchema);
@@ -147,7 +147,7 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
             id: node.id,
             role: node.employeeId,
             needs: node.needs,
-            with: node.with
+            with: { ...node.with, __knowledgeEvidence: node.with.__knowledgeEvidence ?? "" }
           }))
         }
       }

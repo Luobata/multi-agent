@@ -1,0 +1,35 @@
+version: 1
+project:
+  id: cart-fe-workflow-review
+  name: Cart FE Workflow Review
+  description: 购物车前端评审工作台项目，以项目策略引用连接三类独立验收员工。
+  scope: repository
+connector:
+  kind: worktree-review
+  config:
+    roleSource: src/core/reviewRoleAgents.ts
+roles:
+  product-manager:
+    displayName: 产品验收
+    description: 还原需求、评估产品合理性并定义可追溯的验收标准。
+    requiredSkills: [humanizer-zh]
+    knowledgeProfiles: [workbench-product-knowledge]
+    policyRef: docs/review-role-agents/product-manager/base.md
+    permissions:
+      write: none
+  designer:
+    displayName: 设计验收
+    description: 对真实运行页面完成桌面端视觉与交互验收。
+    requiredSkills: [hallmark, interaction-state-completeness]
+    knowledgeProfiles: [workbench-design-knowledge]
+    policyRef: docs/review-role-agents/xiaohu-designer/base.md
+    permissions:
+      write: none
+  tester:
+    displayName: 测试验收
+    description: 通过真实浏览器行为与 E2E 覆盖确认交付质量。
+    requiredSkills: [browser-e2e-validation]
+    knowledgeProfiles: [workbench-quality-knowledge]
+    policyRef: docs/review-role-agents/xiaomixiang-tester/base.md
+    permissions:
+      write: none

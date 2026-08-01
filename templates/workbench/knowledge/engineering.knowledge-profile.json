@@ -1,0 +1,33 @@
+{
+  "id": "workbench-engineering-knowledge",
+  "displayName": "Workbench · 工程知识",
+  "description": "工程员工的稳定知识范围：运行时和实现约束为核心，基础架构仅在相关时参与。",
+  "rules": [
+    {
+      "id": "engineering-core",
+      "selector": {
+        "knowledgeBaseIds": ["local-agent-workbench"],
+        "collectionIds": ["engineering"],
+        "authorities": ["canonical"],
+        "maxClassification": "internal"
+      },
+      "activation": "core",
+      "priority": 30,
+      "required": false,
+      "budget": { "maxCollections": 1, "maxChunks": 6, "maxTokens": 3200 }
+    },
+    {
+      "id": "foundation-demand",
+      "selector": {
+        "knowledgeBaseIds": ["local-agent-workbench"],
+        "collectionIds": ["foundation"],
+        "authorities": ["canonical"],
+        "maxClassification": "internal"
+      },
+      "activation": "on-demand",
+      "priority": 10,
+      "required": false,
+      "budget": { "maxCollections": 1, "maxChunks": 3, "maxTokens": 1600 }
+    }
+  ]
+}

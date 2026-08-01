@@ -79,6 +79,7 @@ MCP 推荐入口：
 
 - 员工大厅：实时状态、并发数量、调用来源、当前节点、模型、上下文 ID 和耗时。
 - 员工档案：身份、Prompt、Skill、Provider、版本与 Session 上下文。
+- 协作编排：在详情中生成可复制给其他 Codex 会话的提示词与 MCP 参数；优先使用活动 Publication，未打包时明确回退到 Workflow 调试入口。
 - 调用包：把 Employee 或 Workflow 发布成 MCP/A2A/HTTP 稳定入口。
 - 运行卷宗：只读 Run 证据；通过 SSE 触发刷新，不承担员工身份状态。
 

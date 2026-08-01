@@ -1,0 +1,80 @@
+version: 1
+project:
+  id: local-agent-workbench
+  name: Local Agent Workbench
+  description: 当前仓库的全员协作接入；项目只声明角色契约，员工身份与 Provider 继续由 Workbench 管理。
+  scope: repository
+connector:
+  kind: repository-development
+  config:
+    sourceRoots: [src, client]
+roles:
+  product-manager:
+    displayName: 产品经理
+    description: 负责需求澄清、范围取舍、关键状态与可观察验收标准。
+    requiredSkills: [humanizer-zh]
+    knowledgeProfiles: [workbench-product-knowledge]
+    policyRef: docs/project-roles/product-manager.md
+    permissions:
+      write: none
+      tools: [Read, Glob, Grep]
+  product-designer:
+    displayName: 产品设计师
+    description: 负责信息架构、交互状态、视觉一致性与可访问性设计验收。
+    requiredSkills: [hallmark, interaction-state-completeness]
+    optionalSkills: [healing-pixel-dossier]
+    knowledgeProfiles: [workbench-design-knowledge]
+    policyRef: docs/project-roles/product-designer.md
+    permissions:
+      write: none
+      tools: [Read, Glob, Grep]
+  frontend-developer:
+    displayName: 前端开发工程师
+    description: 负责 client 下的 React、TypeScript、CSS、交互状态、数据接入和前端自动化测试。
+    knowledgeProfiles: [workbench-engineering-knowledge, workbench-design-knowledge]
+    policyRef: docs/project-roles/frontend-developer.md
+    permissions:
+      write: project
+      tools: [Read, Glob, Grep, Edit, Write, Bash]
+  backend-developer:
+    displayName: 服务端开发工程师
+    description: 负责 TypeScript 服务端、API、Provider、运行时、持久化与服务端测试。
+    knowledgeProfiles: [workbench-engineering-knowledge]
+    policyRef: docs/project-roles/backend-developer.md
+    permissions:
+      write: project
+      tools: [Read, Edit, Shell, Test]
+  fullstack-developer:
+    displayName: 全栈开发工程师
+    description: 负责明确分派的跨前后端实现、契约联调、迁移与集成验证。
+    knowledgeProfiles: [workbench-engineering-knowledge]
+    policyRef: docs/project-roles/fullstack-developer.md
+    permissions:
+      write: project
+      tools: [Read, Edit, Shell, Test]
+  test-engineer:
+    displayName: 测试工程师
+    description: 负责真实行为、服务响应、持久化结果与自动化覆盖的独立验收。
+    requiredSkills: [browser-e2e-validation]
+    knowledgeProfiles: [workbench-quality-knowledge]
+    policyRef: docs/project-roles/test-engineer.md
+    permissions:
+      write: none
+      tools: [Read, Glob, Grep, WebFetch, browser]
+  knowledge-steward:
+    displayName: 项目知识管理员
+    description: 通过受限 Knowledge Control MCP 查询知识状态、生成变更提案，并把最终审批留给人。
+    requiredSkills: [knowledge-control-conversation]
+    knowledgeProfiles: []
+    policyRef: docs/project-roles/knowledge-steward.md
+    permissions:
+      write: none
+      tools:
+        - knowledge_control_snapshot
+        - knowledge_base_get
+        - knowledge_revision_assess
+        - knowledge_revision_preview
+        - knowledge_impact_get
+        - knowledge_change_list
+        - knowledge_change_get
+        - knowledge_change_propose

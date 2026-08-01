@@ -47,6 +47,7 @@ function sourceName(instance: WorkInstanceRecord | InvocationRecord): string {
 
 function sourceCode(instance: WorkInstanceRecord | InvocationRecord): string {
   const { source } = instance;
+  if (source.projectRole) return `PROJECT / ${source.projectRole}`;
   return source.publicationId ? `PACKAGE / ${source.publicationId}` : source.kind.toUpperCase();
 }
 
@@ -89,7 +90,7 @@ function WorkInstanceCard({ instance, invocation, clock }: {
     <dl>
       <dt>流程 / 节点</dt><dd><code>{instance.workflowId} / {instance.nodeId}</code></dd>
       <dt>员工快照</dt><dd><code>{instance.employeeId} · v{instance.employeeVersion}</code></dd>
-      <dt>Provider</dt><dd><code>{instance.providerId} · {instance.model ?? "默认模型"}</code></dd>
+      <dt>Provider</dt><dd><code>{instance.providerId} · {instance.model ?? "由 Provider 决定"}</code></dd>
       <dt>调用方</dt><dd><code>{instance.source.caller ?? sourceName(instance)}</code></dd>
       <dt>上下文</dt><dd><code>{instance.source.contextId ?? instance.sessionId ?? "独立调用"}</code></dd>
       <dt>运行时间</dt><dd>{elapsed(instance.startedAt, instance.completedAt, clock)}</dd>
@@ -137,7 +138,7 @@ function EmployeeActivityDrawer({ employee, data, clock, onClose }: {
         <div><span>当前档案</span><strong>v{employee.version}</strong></div>
       </section>
       <section className="drawer-model-strip">
-        <span>启动配置</span><code>{employee.providerId}</code><code>{data.providers.find((provider) => provider.id === employee.providerId)?.definition.model ?? "默认模型"}</code>
+        <span>启动配置</span><code>{employee.providerId}</code><code>{data.providers.find((provider) => provider.id === employee.providerId)?.definition.model ?? "由 Provider 决定"}</code>
       </section>
       <section className="drawer-instance-section">
         <header><div><span>01</span><h3>实时与最近出勤</h3></div><small>每次调用隔离上下文，共享员工身份快照</small></header>
@@ -176,7 +177,7 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
       <div className="office-metrics">
         <div><span>在册员工</span><strong>{activeEmployees.length}</strong></div>
         <div className={activeInstances.length ? "metric-live" : ""}><span>出勤实例</span><strong>{activeInstances.length}</strong></div>
-        <div><span>可调用包</span><strong>{data.publications.filter((publication) => publication.status === "active").length}</strong></div>
+        <div><span>调用入口</span><strong>{data.publications.filter((publication) => publication.status === "active").length + data.projectBindings.reduce((count, binding) => count + binding.roles.length, 0)}</strong></div>
       </div>
     </header>
 
@@ -189,11 +190,16 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
             const state = runtimeState(instances);
             const latest = instances[0];
             const provider = data.providers.find((entry) => entry.id === employee.providerId);
-            const packageCount = data.publications.filter((publication) => {
+            const publicationCount = data.publications.filter((publication) => {
               if (publication.status !== "active") return false;
               if (publication.target.kind === "employee") return publication.target.id === employee.id;
               return data.workflows.find((workflow) => workflow.id === publication.target.id)?.nodes.some((node) => node.employeeId === employee.id);
             }).length;
+            const projectRoleCount = data.projectBindings.reduce(
+              (count, projectBinding) => count + projectBinding.roles.filter((role) => role.employeeId === employee.id).length,
+              0
+            );
+            const entryCount = publicationCount + projectRoleCount;
             return <button
               type="button"
               className={`office-employee runtime-${state}`}
@@ -216,9 +222,9 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
                 <p>{employeeRole(employee)}</p>
               </div>
               <div className="office-assignment">
-                {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.workflowId} / {latest.nodeId} · {elapsed(latest.startedAt, latest.completedAt, clock)}</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{packageCount} 个调用包可触达</small></>}
+                {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.workflowId} / {latest.nodeId} · {elapsed(latest.startedAt, latest.completedAt, clock)}</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
               </div>
-              <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "默认模型"}</code><span>查看实时台 →</span></footer>
+              <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>查看实时台 →</span></footer>
             </button>;
           })}
           {activeEmployees.length === 0 && <div className="office-empty">没有在册员工。先在员工档案中建立身份，再将其发布成调用包。</div>}

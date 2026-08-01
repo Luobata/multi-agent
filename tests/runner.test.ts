@@ -57,11 +57,15 @@ describe("workflow runtime", () => {
   it("lets synthesis consume a domain Block", async () => {
     const { config, input } = fixture();
     const contexts: Record<string, unknown>[] = [];
+    const invocationDirectories: string[] = [];
+    const providerCwd = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-provider-cwd-"));
+    temporaryDirectories.push(providerCwd);
     const adapter: ProviderAdapter = {
       id: "command",
       validate: () => [],
       async invoke(invocation) {
         contexts.push(invocation.templateContext);
+        invocationDirectories.push(invocation.cwd);
         const role = (invocation.templateContext.role as { id: string }).id;
         const output = role === "chair"
           ? { verdict: "Block", summary: "One reviewer blocked.", agreements: [], disagreements: ["Runtime evidence missing."], nextActions: ["Collect evidence."] }
@@ -70,7 +74,7 @@ describe("workflow runtime", () => {
       }
     };
     const providers: ProviderRegistry = new Map([["command", adapter]]);
-    const result = await runWorkflow(loadManifest(config), "review-council", { input, providers });
+    const result = await runWorkflow(loadManifest(config), "review-council", { input, providers, providerCwd });
 
     expect(result.run.nodes["design-review"]?.status).toBe("blocked");
     expect(result.run.nodes["final-decision"]?.status).toBe("blocked");
@@ -85,6 +89,8 @@ describe("workflow runtime", () => {
     expect(resolvedRole.toolsCsv).toBe("read-repository");
     expect(JSON.parse(resolvedRole.nativeDefinitionJson)["product-manager"].prompt).toContain("Requirement Analysis");
     expect(productContext?.requestPrompt).toContain("Resume at the first unreviewed file");
+    expect(invocationDirectories.every((directory) => directory === providerCwd)).toBe(true);
+    expect((productContext?.run as { projectRoot?: string }).projectRoot).toBe(providerCwd);
   });
 
   it("skips synthesis after a technical dependency failure", async () => {

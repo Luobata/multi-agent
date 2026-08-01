@@ -8,8 +8,11 @@
 - 灵活定义背景、职责、目标、约束、提示词、Skill、Provider、权限与输出 Schema；
 - 在独立 Skill 台账中注册、查看、版本化修订、归档与恢复能力，并对每个员工单独绑定、配置或停用；
 - 在每份员工档案中核对 Provider 模型、adapter 与脱敏后的启动指令；
+- 独立维护带 Collection、Source、Revision 和发布指针的知识库，并用可复用 Knowledge Profile 给员工和项目角色按需分配；
+- 在知识后台通过项目内部 Codex 员工进行受限对话；LLM 只经 Knowledge Control MCP 读取、试跑和生成待人工审批的变更单；
 - 从 CLI、HTTP、MCP 或本地 UI 直接调用任意 Employee；
-- 查看版本固定的 Session、六层上下文和完整有效 Prompt；
+- 用一份短小的项目声明接入代码仓库，在项目角色槽位上选择 Employee 与 Skill 子集，而不复制完整 Prompt；
+- 查看版本固定的 Session、七层上下文、Knowledge Plan 和完整有效 Prompt；
 - 从四种常用多 Agent 模板生成 Graph 草稿，在画布拖动节点、改派员工与编辑依赖，并保存不可变 Run 证据；
 - 将一个 Employee 或 Workflow 发布成 A2A v1 Agent；
 - 在 `127.0.0.1` 上运行由 `claude-kimi` 设计的「档案室 / Dossier Office」客户端。
@@ -19,11 +22,12 @@
 | 层 | 责任 | v1 状态 |
 | --- | --- | --- |
 | TypeScript Core | 校验、编译、执行、版本与证据 | 已完成 |
+| Knowledge runtime | Resolver、Router、Retriever、Revision 与引用证据 | 已完成，本地词项索引 |
 | CLI | 人工与 CI 的确定性入口 | 已完成 |
 | Codex Skill | 多 Agent 架构设计指导 | 已完成，保持薄层 |
 | Local daemon | 单写者、共享注册表与本地 API | 已完成，默认仅回环地址 |
-| React client | Employee、Skill、Workflow、Run、Publication 工作台 | 已完成 |
-| MCP | 任意 MCP 会话调用本地 Employee/Workflow | 已完成，stdio 代理 daemon |
+| React client | Employee、Project、Skill、Workflow、Run、Publication 工作台 | 已完成 |
+| MCP | 调用 Employee/Workflow，或以受限 profile 代理知识控制面 | 已完成，stdio 代理 daemon |
 | A2A | 将 Employee/Workflow 作为统一 Agent 发布 | 已完成，JSON-RPC v1 |
 
 MCP 和 A2A 都是协议适配边界，不是多 Agent Workflow 模型。直接调用 Employee 也不会绕开架构层，而是编译成一个节点的 Graph。
@@ -36,9 +40,12 @@ flowchart LR
   A2A["A2A v1"] --> Core
   API --> Core
   Core --> Registry["Provider / Skill / Employee Registries"]
+  Core --> Knowledge["Knowledge Resolver / Router / Retriever"]
+  Project["Project Descriptor + Binding"] --> Core
   Registry --> Graph["Graph Architecture Adapter"]
   Graph --> Providers["Provider Adapters"]
   Graph --> Store["Run Store"]
+  Knowledge --> Store
 ```
 
 ## 快速开始
@@ -78,6 +85,17 @@ npm run cli -- workbench employee create templates/workbench/employee.example.js
 npm run cli -- workbench employee list
 npm run cli -- workbench employee invoke local-researcher "核对这份技术方案"
 npm run cli -- workbench employee context local-researcher
+npm run cli -- workbench knowledge-base create templates/workbench/knowledge/local-agent-workbench.knowledge-base.json
+npm run cli -- workbench knowledge-base sync local-agent-workbench
+npm run cli -- workbench knowledge-base publish local-agent-workbench
+npm run cli -- workbench knowledge-profile create templates/workbench/knowledge/product.knowledge-profile.json
+npm run cli -- workbench employee knowledge local-researcher workbench-product-knowledge
+npm run cli -- workbench project connect /path/to/project
+npm run cli -- workbench project bind your-project project-binding.json
+npm run cli -- workbench project invoke your-project tester "验收当前改动"
+npm run cli -- workbench employee create templates/workbench/mihuhu-frontend-engineer.employee.json
+npm run cli -- workbench project connect .
+npm run cli -- workbench project bind local-agent-workbench templates/workbench/local-agent-workbench.binding.json
 npm run cli -- workbench workflow create templates/workbench/workflow.example.json
 npm run cli -- workbench workflow run research-review --input templates/workbench/input.example.json
 ```
@@ -95,7 +113,7 @@ npm run cli -- workbench workflow run research-review --input templates/workbenc
 }
 ```
 
-仓库内开发可使用 `npm run mcp -- --daemon-url http://127.0.0.1:4318`。MCP tools 包括员工与 Workflow 调试入口，以及面向外部会话的 `list_publications`、`invoke_publication` 调用包入口。调用包可以指向单 Employee 或多 Employee Workflow，调用方无需感知内部形态。
+仓库内开发可使用 `npm run mcp -- --daemon-url http://127.0.0.1:4318`。MCP tools 包括员工、项目角色与 Workflow 调试入口，以及面向外部会话的 `list_publications`、`invoke_publication` 调用包入口。项目通过 `invoke_project_role` 解析任用关系；调用方不需要拼接员工 Prompt。
 
 Publication 的 A2A 地址为：
 
@@ -111,6 +129,10 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 - `providers`：定义“怎么调用”；Adapter 代码注册与 Provider 实例注册彼此分开。
 - `skills`：定义可复用能力、配置契约和声明工具；多个 Employee 可以用不同配置复用。
 - `employees`：定义“谁负责”，是版本化、可寻址的运行实例，不在 `src/` 硬编码产品角色。
+- `knowledgeBases`：维护独立内容 Revision、Source 和发布指针；正文与派生索引不进入全局注册表。
+- `knowledgeProfiles`：定义可复用的候选范围、激活条件和单次预算；Employee 与项目角色只引用少量 Profile。
+- `Knowledge Plan`：Resolver 与 Router 针对一次 Work Instance 生成的临时结果，和引用证据一起写入 Run Store，不反向修改员工档案。
+- `projects`：由代码仓库声明“需要什么角色”；`projectBindings` 固定该角色使用的 Employee 版本、Skill 子集与更新策略。
 - `architectures`：定义协作控制流；当前只有 `graph`，fan-out/gather/critic 等形态优先表达为 Graph 模板。
 - `workflows`：把 Employee 放进架构节点，用 `needs` 声明真实信息依赖。
 - `sessions`：固定 Employee 版本的显式对话历史，不暗中推断长期记忆。
@@ -120,7 +142,9 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 ## 文档
 
 - [Workbench v1 产品与领域设计](docs/workbench-v1.md)
+- [知识库设计与交付入口](docs/knowledge-base/README.md)
 - [实时调用与员工出勤模型](docs/live-invocations.md)
+- [项目接入、员工任用与调用](docs/project-integration.md)
 - [档案室 UI 规范](docs/workbench-ui.md)
 - [实现与协议手册](docs/workbench-implementation.md)
 - [架构与源方案映射](docs/architecture.md)

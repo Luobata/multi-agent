@@ -12,10 +12,41 @@ import {
 } from "../architectures/templates.js";
 import type { ArchitectureRegistry } from "../architectures/types.js";
 import { compilePlan } from "../core/plan.js";
-import type { JsonObject, JsonValue, RoleSkillBinding } from "../core/types.js";
+import type { JsonObject, JsonValue, RolePermissionDefinition, RoleSkillBinding } from "../core/types.js";
+import { KnowledgeRuntime } from "../knowledge/runtime.js";
+import { assessKnowledgeRevision } from "../knowledge/assessment.js";
+import { knowledgeChangePlanHash, knowledgeChangeRisk } from "../knowledge/change.js";
+import { buildKnowledgeImpactSnapshot } from "../knowledge/impact.js";
+import type {
+  KnowledgeBaseCreateInput,
+  KnowledgeBaseDefinition,
+  KnowledgeBaseDetail,
+  KnowledgeBaseUpdateInput,
+  KnowledgeChangeCreateInput,
+  KnowledgeChangeImpactSummary,
+  KnowledgeChangeOperation,
+  KnowledgeChangeOperationType,
+  KnowledgeChangePreview,
+  KnowledgeChangeRequest,
+  KnowledgeDocumentDefinition,
+  KnowledgeDocumentInput,
+  KnowledgeImpactSnapshot,
+  KnowledgeProfileCreateInput,
+  KnowledgeProfileDefinition,
+  KnowledgeProfileRule,
+  KnowledgeProfileSelector,
+  KnowledgeProfileUpdateInput,
+  KnowledgeRevision,
+  KnowledgeRevisionAssessment,
+  KnowledgeRevisionCreateInput,
+  KnowledgeRevisionPreview,
+  KnowledgeRevisionPreviewInput,
+  KnowledgeRuntimeResult
+} from "../knowledge/types.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
 import { materializeWorkflow, resolveSkillBinding } from "./materialize.js";
+import { loadProjectDescriptor } from "./projectDescriptor.js";
 import { WorkbenchStore } from "./store.js";
 import {
   DEFAULT_EMPLOYEE_OUTPUT_SCHEMA,
@@ -32,6 +63,15 @@ import {
   type InvocationSource,
   type InvocationStatus,
   type PublicationDefinition,
+  type ProjectBindingDefinition,
+  type ProjectBindingInput,
+  type ProjectBindingRefreshResult,
+  type ProjectConnectInput,
+  type ProjectCreateInput,
+  type ProjectDefinition,
+  type ProjectRecord,
+  type ProjectRoleBinding,
+  type ProjectRoleBindingInput,
   type SkillCreateInput,
   type SkillUpdateInput,
   type WorkbenchSkillDefinition,
@@ -140,6 +180,139 @@ function employeeVersion(record: EmployeeRecord, version?: number): EmployeeDefi
   return found;
 }
 
+function projectVersion(record: ProjectRecord, version?: number): ProjectDefinition {
+  if (version === undefined) return record.current;
+  const found = record.versions.find((candidate) => candidate.version === version);
+  if (!found) throw new Error(`project ${record.current.id} version ${version} not found`);
+  return found;
+}
+
+function jsonEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function narrowPermissions(
+  employee: RolePermissionDefinition,
+  project: RolePermissionDefinition | undefined
+): RolePermissionDefinition {
+  if (!project) return employee;
+  const rank: Record<RolePermissionDefinition["write"], number> = { none: 0, "artifacts-only": 1, project: 2 };
+  const write = rank[employee.write] <= rank[project.write] ? employee.write : project.write;
+  const tools = employee.tools && project.tools
+    ? employee.tools.filter((tool) => project.tools?.includes(tool))
+    : employee.tools ?? project.tools;
+  return { write, tools };
+}
+
+function uniqueIds(values: string[], label: string): string[] {
+  const normalized = values.map((value) => requireId(value, label));
+  if (new Set(normalized).size !== normalized.length) throw new Error(`${label} must not contain duplicates`);
+  return normalized;
+}
+
+function validateKnowledgeProfileIds(state: WorkbenchState, values: string[], label: string): string[] {
+  const ids = uniqueIds(values, label);
+  for (const id of ids) {
+    const profile = state.knowledgeProfiles[id]?.current;
+    if (!profile) throw new Error(`knowledge profile not found: ${id}`);
+    if (profile.status !== "active") throw new Error(`knowledge profile ${id} is archived`);
+  }
+  return ids;
+}
+
+function normalizedStringList(values: string[] | undefined, label: string): string[] | undefined {
+  if (values === undefined) return undefined;
+  const normalized = values.map((value) => requireText(value, label));
+  return [...new Set(normalized)];
+}
+
+function boundedNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(minimum, Math.min(maximum, parsed));
+}
+
+function validRevision(value: number | undefined, fallback: number | undefined, label: string): number {
+  const revision = value ?? fallback;
+  if (!Number.isInteger(revision) || (revision ?? 0) < 1) throw new Error(`${label} must be a positive integer`);
+  return revision as number;
+}
+
+function normalizeKnowledgeRule(rule: KnowledgeProfileRule): KnowledgeProfileRule {
+  const selector: KnowledgeProfileSelector = {
+    knowledgeBaseIds: normalizedStringList(rule.selector.knowledgeBaseIds, "knowledge selector knowledgeBaseId")?.map((id) => requireId(id, "knowledge selector knowledgeBaseId")),
+    domains: normalizedStringList(rule.selector.domains, "knowledge selector domain")?.map((id) => requireId(id, "knowledge selector domain")),
+    products: normalizedStringList(rule.selector.products, "knowledge selector product")?.map((id) => requireId(id, "knowledge selector product")),
+    projectIds: normalizedStringList(rule.selector.projectIds, "knowledge selector projectId")?.map((id) => requireId(id, "knowledge selector projectId")),
+    collectionIds: normalizedStringList(rule.selector.collectionIds, "knowledge selector collectionId")?.map((id) => requireId(id, "knowledge selector collectionId")),
+    authorities: rule.selector.authorities ? [...new Set(rule.selector.authorities)] : ["canonical", "reference"],
+    maxClassification: rule.selector.maxClassification ?? "internal"
+  };
+  const hasCatalogScope = [
+    selector.knowledgeBaseIds,
+    selector.domains,
+    selector.products,
+    selector.projectIds,
+    selector.collectionIds
+  ].some((value) => value && value.length > 0);
+  if (!hasCatalogScope) {
+    throw new Error(`knowledge profile rule ${rule.id} must constrain a knowledge base, domain, product, project, or collection`);
+  }
+  if (selector.authorities?.some((authority) => !["canonical", "reference", "experimental"].includes(authority))) {
+    throw new Error(`knowledge profile rule ${rule.id} has an invalid authority`);
+  }
+  if (selector.maxClassification && !["internal", "confidential", "restricted"].includes(selector.maxClassification)) {
+    throw new Error(`knowledge profile rule ${rule.id} has an invalid maxClassification`);
+  }
+  if (!["core", "conditional", "on-demand"].includes(rule.activation)) {
+    throw new Error(`knowledge profile rule ${rule.id} has invalid activation ${String(rule.activation)}`);
+  }
+  const conditions = rule.conditions ? {
+    projectIds: normalizedStringList(rule.conditions.projectIds, "knowledge condition projectId")?.map((id) => requireId(id, "knowledge condition projectId")),
+    projectRoleIds: normalizedStringList(rule.conditions.projectRoleIds, "knowledge condition projectRoleId")?.map((id) => requireId(id, "knowledge condition projectRoleId")),
+    taskTags: normalizedStringList(rule.conditions.taskTags, "knowledge condition taskTag"),
+    requestTerms: normalizedStringList(rule.conditions.requestTerms, "knowledge condition requestTerm")
+  } : undefined;
+  return {
+    id: requireId(rule.id, "knowledge profile rule id"),
+    selector,
+    activation: rule.activation,
+    conditions,
+    priority: boundedNumber(rule.priority, 0, -100, 100),
+    required: Boolean(rule.required),
+    budget: {
+      maxCollections: boundedNumber(rule.budget?.maxCollections, 3, 1, 12),
+      maxChunks: boundedNumber(rule.budget?.maxChunks, 4, 1, 20),
+      maxTokens: boundedNumber(rule.budget?.maxTokens, 2_000, 128, 16_000)
+    }
+  };
+}
+
+function normalizeKnowledgeDocuments(
+  documents: KnowledgeDocumentInput[],
+  collectionIds: Set<string>,
+  timestamp: string
+): KnowledgeDocumentDefinition[] {
+  const seen = new Set<string>();
+  return documents.map((document) => {
+    const id = requireId(document.id, "knowledge document id");
+    if (seen.has(id)) throw new Error(`knowledge document ${id} is repeated`);
+    seen.add(id);
+    const collectionId = requireId(document.collectionId, `knowledge document ${id} collectionId`);
+    if (!collectionIds.has(collectionId)) throw new Error(`knowledge document ${id} references unknown collection ${collectionId}`);
+    return {
+      id,
+      title: requireText(document.title, `knowledge document ${id} title`),
+      content: requireText(document.content, `knowledge document ${id} content`),
+      collectionId,
+      sourceId: document.sourceId ? requireId(document.sourceId, `knowledge document ${id} sourceId`) : undefined,
+      sourceRef: document.sourceRef?.trim() || undefined,
+      metadata: document.metadata,
+      updatedAt: timestamp
+    };
+  });
+}
+
 function invocationMessage(output: JsonValue | undefined): string {
   if (typeof output === "object" && output !== null && !Array.isArray(output)) {
     const message = output.message;
@@ -161,6 +334,51 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const KNOWLEDGE_CHANGE_TYPES = new Set<KnowledgeChangeOperationType>([
+  "knowledge-base.create",
+  "knowledge-base.update",
+  "knowledge-base.sync",
+  "knowledge-base.archive",
+  "knowledge-base.restore",
+  "knowledge-revision.create",
+  "knowledge-revision.publish",
+  "knowledge-profile.create",
+  "knowledge-profile.update",
+  "knowledge-profile.archive",
+  "knowledge-profile.restore",
+  "employee-profiles.set",
+  "project-role-profiles.set"
+]);
+
+function jsonPayload(operation: KnowledgeChangeOperation): JsonObject {
+  const payload = operation.payload ?? {};
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new Error(`knowledge change ${operation.type} payload must be an object`);
+  }
+  return payload;
+}
+
+function jsonValue(value: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function internalProjectId(employee: EmployeeDefinition): string | undefined {
+  const value = employee.identity.metadata?.internalProjectId;
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function internalProjectRoleId(employee: EmployeeDefinition): string | undefined {
+  const value = employee.identity.metadata?.internalProjectRoleId;
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function stringArray(value: JsonValue | undefined, label: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`${label} must be an array of ids`);
+  }
+  return value as string[];
+}
+
 function isInvocationTerminal(status: InvocationStatus): boolean {
   return ["completed", "blocked", "failed", "cancelled"].includes(status);
 }
@@ -178,15 +396,18 @@ export interface WorkbenchServiceOptions {
 export class WorkbenchService {
   readonly providers: ProviderRegistry;
   readonly architectures: ArchitectureRegistry;
+  readonly knowledge: KnowledgeRuntime;
   private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
 
   private constructor(
     readonly store: WorkbenchStore,
+    knowledge: KnowledgeRuntime,
     options: WorkbenchServiceOptions
   ) {
     this.providers = options.providers ?? createDefaultProviderRegistry();
     this.architectures = options.architectures ?? createDefaultArchitectureRegistry();
+    this.knowledge = knowledge;
   }
 
   static defaultDataRoot(): string {
@@ -197,7 +418,8 @@ export class WorkbenchService {
 
   static async open(options: WorkbenchServiceOptions = {}): Promise<WorkbenchService> {
     const store = await WorkbenchStore.open(options.dataRoot ?? WorkbenchService.defaultDataRoot());
-    return new WorkbenchService(store, options);
+    const knowledge = await KnowledgeRuntime.open(store.dataRoot);
+    return new WorkbenchService(store, knowledge, options);
   }
 
   snapshot(): WorkbenchState {
@@ -441,17 +663,46 @@ export class WorkbenchService {
     invocation: InvocationRecord,
     workflow: WorkbenchWorkflowDefinition,
     employees: Map<string, EmployeeDefinition>,
-    input: JsonObject
+    input: JsonObject,
+    providerCwd?: string
   ): Promise<RunWorkflowResult> {
     await this.transitionInvocation(invocation.id, "running", "materializing");
     try {
-      const materialized = await this.materialize(workflow, employees);
+      const knowledgeArtifacts: Record<string, JsonValue> = {};
+      const inputTaskTags = (Array.isArray(input.taskTags) ? input.taskTags : [])
+        .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+        .map((value) => value.trim());
+      const request = typeof input.message === "string" ? input.message : JSON.stringify(input);
+      const enrichedWorkflow: WorkbenchWorkflowDefinition = {
+        ...workflow,
+        nodes: await Promise.all(workflow.nodes.map(async (node) => {
+          const employee = employees.get(node.employeeId);
+          if (!employee) throw new Error(`employee ${node.employeeId} is not materialized`);
+          const nodeTaskTags = (Array.isArray(node.with.taskTags) ? node.with.taskTags : [])
+            .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+            .map((value) => value.trim());
+          const knowledge = await this.knowledge.prepare(this.snapshot(), employee, {
+            request,
+            projectId: invocation.source.project,
+            projectRoleId: invocation.source.projectRole,
+            taskTags: [...new Set([...inputTaskTags, ...nodeTaskTags])]
+          });
+          knowledgeArtifacts[`knowledge/${node.id}.json`] = JSON.parse(JSON.stringify(knowledge)) as JsonValue;
+          return {
+            ...node,
+            with: { ...node.with, __knowledgeEvidence: knowledge.promptSection }
+          };
+        }))
+      };
+      const materialized = await this.materialize(enrichedWorkflow, employees);
       return await runWorkflow(materialized.loaded, materialized.workflowId, {
         runId: invocation.runId,
         input,
         providers: this.providers,
         architectures: this.architectures,
         artifactRoot: path.join(this.store.dataRoot, "artifacts"),
+        providerCwd,
+        initialArtifacts: knowledgeArtifacts,
         onEvent: (event) => this.observeRunEvent(invocation.id, event)
       });
     } catch (error) {
@@ -587,6 +838,953 @@ export class WorkbenchService {
     });
   }
 
+  listKnowledgeBases(includeArchived = false): KnowledgeBaseDefinition[] {
+    return Object.values(this.snapshot().knowledgeBases)
+      .map((record) => record.current)
+      .filter((knowledgeBase) => includeArchived || knowledgeBase.status === "active")
+      .sort((left, right) => left.displayName.localeCompare(right.displayName));
+  }
+
+  getKnowledgeBase(id: string, version?: number): KnowledgeBaseDefinition {
+    const record = this.snapshot().knowledgeBases[id];
+    if (!record) throw new Error(`knowledge base not found: ${id}`);
+    if (version === undefined) return record.current;
+    const found = record.versions.find((candidate) => candidate.version === version);
+    if (!found) throw new Error(`knowledge base ${id} version ${version} not found`);
+    return found;
+  }
+
+  getKnowledgeBaseVersions(id: string): KnowledgeBaseDefinition[] {
+    const record = this.snapshot().knowledgeBases[id];
+    if (!record) throw new Error(`knowledge base not found: ${id}`);
+    return [...record.versions].sort((left, right) => right.version - left.version);
+  }
+
+  async getKnowledgeBaseDetail(id: string): Promise<KnowledgeBaseDetail> {
+    const knowledgeBase = this.getKnowledgeBase(id);
+    const revisions = new Map<number, Promise<KnowledgeRevision>>();
+    const read = (revision: number | undefined): Promise<KnowledgeRevision> | undefined => {
+      if (!revision) return undefined;
+      const existing = revisions.get(revision);
+      if (existing) return existing;
+      const request = this.knowledge.contentStore.readRevision(id, revision);
+      revisions.set(revision, request);
+      return request;
+    };
+    const latestRevision = await read(knowledgeBase.latestRevision);
+    const publishedRevision = await read(knowledgeBase.publishedRevision);
+    const revisionNumbers = [...new Set(this.getKnowledgeBaseVersions(id).flatMap((version) => [
+      version.latestRevision,
+      version.publishedRevision
+    ]).filter((revision): revision is number => Boolean(revision)))].sort((left, right) => right - left);
+    const revisionHistory = await Promise.all(revisionNumbers.map(async (revisionNumber) => {
+      const revision = await read(revisionNumber);
+      if (!revision) throw new Error(`knowledge revision not found: ${id}@${revisionNumber}`);
+      const assessment = assessKnowledgeRevision(knowledgeBase, revision);
+      return {
+        revision: revisionNumber,
+        createdAt: revision.createdAt,
+        documentCount: assessment.documentCount,
+        sourceDocumentCount: assessment.sourceDocumentCount,
+        manualDocumentCount: assessment.manualDocumentCount,
+        assessmentStatus: assessment.status,
+        warningCount: assessment.warnings.length,
+        isLatest: revisionNumber === knowledgeBase.latestRevision,
+        isPublished: revisionNumber === knowledgeBase.publishedRevision
+      };
+    }));
+    return {
+      knowledgeBase,
+      versions: this.getKnowledgeBaseVersions(id),
+      latestRevision,
+      publishedRevision,
+      latestAssessment: latestRevision ? assessKnowledgeRevision(knowledgeBase, latestRevision) : undefined,
+      publishedAssessment: publishedRevision ? assessKnowledgeRevision(knowledgeBase, publishedRevision) : undefined,
+      revisionHistory
+    };
+  }
+
+  async assessKnowledgeRevision(id: string, revisionValue?: number): Promise<KnowledgeRevisionAssessment> {
+    const knowledgeBase = this.getKnowledgeBase(id);
+    if (revisionValue === undefined && !knowledgeBase.latestRevision) throw new Error(`knowledge base ${id} has no revision to assess`);
+    const revision = validRevision(revisionValue, knowledgeBase.latestRevision, "knowledge revision");
+    return assessKnowledgeRevision(knowledgeBase, await this.knowledge.contentStore.readRevision(id, revision));
+  }
+
+  async previewKnowledgeRevision(id: string, input: KnowledgeRevisionPreviewInput): Promise<KnowledgeRevisionPreview> {
+    const knowledgeBase = this.getKnowledgeBase(id);
+    if (knowledgeBase.status !== "active") throw new Error(`knowledge base ${id} is archived`);
+    if (input.revision === undefined && !knowledgeBase.latestRevision) throw new Error(`knowledge base ${id} has no revision to preview`);
+    const revision = validRevision(input.revision, knowledgeBase.latestRevision, "knowledge revision");
+    await this.knowledge.contentStore.readRevision(id, revision);
+    return this.knowledge.previewRevision(
+      knowledgeBase,
+      revision,
+      requireText(input.message, "knowledge revision preview message"),
+      {
+        collectionIds: input.collectionIds,
+        maxChunks: input.maxChunks,
+        maxTokens: input.maxTokens
+      }
+    );
+  }
+
+  getKnowledgeImpactSnapshot(): KnowledgeImpactSnapshot {
+    return buildKnowledgeImpactSnapshot(this.snapshot());
+  }
+
+  listKnowledgeChangeRequests(): KnowledgeChangeRequest[] {
+    return Object.values(this.snapshot().knowledgeChangeRequests)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  getKnowledgeChangeRequest(id: string): KnowledgeChangeRequest {
+    const request = this.snapshot().knowledgeChangeRequests[id];
+    if (!request) throw new Error(`knowledge change request not found: ${id}`);
+    return request;
+  }
+
+  private knowledgeChangeImpactSummary(
+    operation: KnowledgeChangeOperation,
+    impact: KnowledgeImpactSnapshot
+  ): KnowledgeChangeImpactSummary {
+    const knowledgeBaseIds = new Set<string>();
+    const profileIds = new Set<string>();
+    const employeeIds = new Set<string>();
+    const projectRoles = new Set<string>();
+    const addBase = (knowledgeBaseId: string) => {
+      knowledgeBaseIds.add(knowledgeBaseId);
+      const found = impact.knowledgeBases.find((candidate) => candidate.knowledgeBaseId === knowledgeBaseId);
+      for (const profile of found?.profileMatches ?? []) profileIds.add(profile.profileId);
+      for (const employee of found?.employees ?? []) employeeIds.add(employee.employeeId);
+      for (const role of found?.projectRoles ?? []) projectRoles.add(`${role.projectId}/${role.roleId}`);
+    };
+    const addProfile = (profileId: string) => {
+      profileIds.add(profileId);
+      const found = impact.profiles.find((candidate) => candidate.profileId === profileId);
+      for (const base of found?.knowledgeBases ?? []) knowledgeBaseIds.add(base.knowledgeBaseId);
+      for (const employee of found?.employees ?? []) employeeIds.add(employee.employeeId);
+      for (const role of found?.projectRoles ?? []) projectRoles.add(`${role.projectId}/${role.roleId}`);
+    };
+    if (operation.type.startsWith("knowledge-base.") || operation.type.startsWith("knowledge-revision.")) {
+      if (operation.targetId) addBase(operation.targetId);
+    } else if (operation.type.startsWith("knowledge-profile.")) {
+      if (operation.targetId) addProfile(operation.targetId);
+    } else if (operation.type === "employee-profiles.set") {
+      if (operation.targetId) employeeIds.add(operation.targetId);
+      for (const profileId of stringArray(jsonPayload(operation).profileIds, "employee profileIds")) addProfile(profileId);
+    } else if (operation.type === "project-role-profiles.set") {
+      if (operation.projectId && operation.roleId) projectRoles.add(`${operation.projectId}/${operation.roleId}`);
+      for (const profileId of stringArray(jsonPayload(operation).profileIds, "project role profileIds")) addProfile(profileId);
+    }
+    return {
+      knowledgeBaseIds: [...knowledgeBaseIds].sort(),
+      profileIds: [...profileIds].sort(),
+      employeeIds: [...employeeIds].sort(),
+      projectRoles: [...projectRoles].sort()
+    };
+  }
+
+  private normalizeKnowledgeChangeOperation(input: KnowledgeChangeOperation): KnowledgeChangeOperation {
+    if (!KNOWLEDGE_CHANGE_TYPES.has(input.type)) throw new Error(`unsupported knowledge change operation ${String(input.type)}`);
+    const payload = jsonValue(jsonPayload(input)) as JsonObject;
+    const targetRequired = !["project-role-profiles.set"].includes(input.type);
+    const targetId = targetRequired ? requireId(input.targetId ?? String(payload.id ?? ""), "knowledge change target id") : undefined;
+    if (input.type === "knowledge-base.create" || input.type === "knowledge-profile.create") {
+      const payloadId = typeof payload.id === "string" ? requireId(payload.id, "knowledge change payload id") : undefined;
+      if (payloadId && payloadId !== targetId) {
+        throw new Error(`knowledge change target id ${targetId} does not match payload id ${payloadId}`);
+      }
+      payload.id = targetId!;
+    }
+    const state = this.snapshot();
+    let currentVersion: number | undefined;
+    if (input.type.startsWith("knowledge-base.") || input.type.startsWith("knowledge-revision.")) {
+      currentVersion = input.type === "knowledge-base.create" ? undefined : state.knowledgeBases[targetId!]?.current.version;
+      if (input.type !== "knowledge-base.create" && currentVersion === undefined) throw new Error(`knowledge base not found: ${targetId}`);
+    } else if (input.type.startsWith("knowledge-profile.")) {
+      currentVersion = input.type === "knowledge-profile.create" ? undefined : state.knowledgeProfiles[targetId!]?.current.version;
+      if (input.type !== "knowledge-profile.create" && currentVersion === undefined) throw new Error(`knowledge profile not found: ${targetId}`);
+    } else if (input.type === "employee-profiles.set") {
+      currentVersion = state.employees[targetId!]?.current.version;
+      if (currentVersion === undefined) throw new Error(`employee not found: ${targetId}`);
+    } else {
+      const projectId = requireId(input.projectId ?? "", "knowledge change project id");
+      const roleId = requireId(input.roleId ?? "", "knowledge change project role id");
+      const binding = state.projectBindings[projectId]?.current;
+      if (!binding) throw new Error(`project binding not found: ${projectId}`);
+      if (!binding.roles.some((role) => role.roleId === roleId)) throw new Error(`project role is not assigned: ${projectId}/${roleId}`);
+      currentVersion = binding.version;
+    }
+    if (input.expectedVersion !== undefined && input.expectedVersion !== currentVersion) {
+      throw new Error(`knowledge change expected v${input.expectedVersion}, current version is ${currentVersion ?? "uncreated"}`);
+    }
+    return {
+      type: input.type,
+      targetId,
+      projectId: input.projectId,
+      roleId: input.roleId,
+      expectedVersion: currentVersion,
+      payload
+    };
+  }
+
+  private async planKnowledgeChange(input: KnowledgeChangeOperation): Promise<{
+    operation: KnowledgeChangeOperation;
+    preview: KnowledgeChangePreview;
+    planHash: string;
+  }> {
+    const operation = this.normalizeKnowledgeChangeOperation(input);
+    const payload = jsonPayload(operation);
+    const state = this.snapshot();
+    const hypothetical = structuredClone(state);
+    let summary = "";
+    let before: JsonValue | undefined;
+    let proposed: JsonValue | undefined;
+    let assessment: KnowledgeRevisionAssessment | undefined;
+    const warnings: string[] = [];
+    const targetId = operation.targetId;
+
+    switch (operation.type) {
+      case "knowledge-base.create": {
+        if (hypothetical.knowledgeBases[targetId!]) throw new Error(`knowledge base already exists: ${targetId}`);
+        const normalized = this.normalizeKnowledgeBase(payload as unknown as KnowledgeBaseCreateInput);
+        const documents = normalizeKnowledgeDocuments(
+          (payload.documents ?? []) as unknown as KnowledgeDocumentInput[],
+          new Set(normalized.collections.map((collection) => collection.id)),
+          now()
+        );
+        hypothetical.knowledgeBases[normalized.id] = { current: normalized, versions: [normalized] };
+        summary = `建立知识库 ${normalized.displayName}${documents.length ? `，并生成包含 ${documents.length} 份文档的未发布草稿` : "，等待补充首份草稿"}`;
+        proposed = jsonValue({ ...normalized, draftDocumentCount: documents.length });
+        break;
+      }
+      case "knowledge-base.update": {
+        const current = this.getKnowledgeBase(targetId!);
+        const normalized = this.normalizeKnowledgeBase({
+          id: targetId!,
+          displayName: typeof payload.displayName === "string" ? payload.displayName : current.displayName,
+          description: typeof payload.description === "string" ? payload.description : current.description,
+          domain: typeof payload.domain === "string" ? payload.domain : current.domain,
+          product: payload.product === undefined ? current.product : payload.product as string,
+          projectId: payload.projectId === undefined ? current.projectId : payload.projectId as string,
+          classification: payload.classification === undefined ? current.classification : payload.classification as KnowledgeBaseCreateInput["classification"],
+          collections: payload.collections === undefined ? current.collections : payload.collections as unknown as KnowledgeBaseCreateInput["collections"],
+          sources: payload.sources === undefined ? current.sources : payload.sources as unknown as KnowledgeBaseCreateInput["sources"]
+        }, current);
+        if (current.latestRevision) {
+          const revision = await this.knowledge.contentStore.readRevision(targetId!, current.latestRevision);
+          const allowed = new Set(normalized.collections.map((collection) => collection.id));
+          const orphan = revision.documents.find((document) => !allowed.has(document.collectionId));
+          if (orphan) throw new Error(`collection ${orphan.collectionId} is still used by knowledge document ${orphan.id}`);
+        }
+        hypothetical.knowledgeBases[targetId!]!.current = normalized;
+        hypothetical.knowledgeBases[targetId!]!.versions.push(normalized);
+        summary = `修订知识库 ${current.displayName} 的目录、来源或分类配置`;
+        before = jsonValue(current);
+        proposed = jsonValue(normalized);
+        break;
+      }
+      case "knowledge-base.sync": {
+        const current = this.getKnowledgeBase(targetId!);
+        if (current.status !== "active") throw new Error(`knowledge base ${targetId} is archived`);
+        if (current.sources.length === 0) throw new Error(`knowledge base ${targetId} has no configured sources`);
+        summary = `同步 ${current.displayName} 的 ${current.sources.length} 个来源并生成未发布 Revision`;
+        before = jsonValue(current);
+        warnings.push("同步只生成草稿，不会自动改变员工使用的发布版本。");
+        break;
+      }
+      case "knowledge-base.archive":
+      case "knowledge-base.restore": {
+        const current = this.getKnowledgeBase(targetId!);
+        const status = operation.type.endsWith("archive") ? "archived" as const : "active" as const;
+        const normalized = { ...current, status, version: current.version + 1, updatedAt: now() };
+        hypothetical.knowledgeBases[targetId!]!.current = normalized;
+        hypothetical.knowledgeBases[targetId!]!.versions.push(normalized);
+        summary = `${status === "archived" ? "归档" : "恢复"}知识库 ${current.displayName}`;
+        before = jsonValue(current);
+        proposed = jsonValue(normalized);
+        break;
+      }
+      case "knowledge-revision.create": {
+        const current = this.getKnowledgeBase(targetId!);
+        if (current.status !== "active") throw new Error(`knowledge base ${targetId} is archived`);
+        const documents = normalizeKnowledgeDocuments(
+          (payload.documents ?? []) as unknown as KnowledgeDocumentInput[],
+          new Set(current.collections.map((collection) => collection.id)),
+          now()
+        );
+        summary = `为 ${current.displayName} 建立包含 ${documents.length} 份文档的未发布 Revision`;
+        proposed = jsonValue({ revision: (current.latestRevision ?? 0) + 1, documentCount: documents.length });
+        break;
+      }
+      case "knowledge-revision.publish": {
+        const current = this.getKnowledgeBase(targetId!);
+        const revision = validRevision(typeof payload.revision === "number" ? payload.revision : undefined, current.latestRevision, "knowledge revision");
+        assessment = assessKnowledgeRevision(current, await this.knowledge.contentStore.readRevision(targetId!, revision));
+        if (assessment.status === "blocked") throw new Error(`knowledge revision ${targetId}@${revision} is blocked`);
+        warnings.push(...assessment.warnings.map((warning) => warning.message));
+        summary = `${revision < (current.publishedRevision ?? 0) ? "回滚" : "发布"} ${current.displayName} Revision R${revision}`;
+        before = jsonValue({ publishedRevision: current.publishedRevision });
+        proposed = jsonValue({ publishedRevision: revision });
+        hypothetical.knowledgeBases[targetId!]!.current = { ...current, publishedRevision: revision };
+        break;
+      }
+      case "knowledge-profile.create": {
+        if (hypothetical.knowledgeProfiles[targetId!]) throw new Error(`knowledge profile already exists: ${targetId}`);
+        const normalized = this.normalizeKnowledgeProfile(payload as unknown as KnowledgeProfileCreateInput);
+        hypothetical.knowledgeProfiles[normalized.id] = { current: normalized, versions: [normalized] };
+        summary = `建立知识 Profile ${normalized.displayName}`;
+        proposed = jsonValue(normalized);
+        break;
+      }
+      case "knowledge-profile.update": {
+        const current = this.getKnowledgeProfile(targetId!);
+        const normalized = this.normalizeKnowledgeProfile({
+          id: targetId!,
+          displayName: typeof payload.displayName === "string" ? payload.displayName : current.displayName,
+          description: typeof payload.description === "string" ? payload.description : current.description,
+          rules: payload.rules === undefined ? current.rules : payload.rules as unknown as KnowledgeProfileCreateInput["rules"]
+        }, current);
+        hypothetical.knowledgeProfiles[targetId!]!.current = normalized;
+        hypothetical.knowledgeProfiles[targetId!]!.versions.push(normalized);
+        summary = `修订知识 Profile ${current.displayName}`;
+        before = jsonValue(current);
+        proposed = jsonValue(normalized);
+        break;
+      }
+      case "knowledge-profile.archive":
+      case "knowledge-profile.restore": {
+        const current = this.getKnowledgeProfile(targetId!);
+        const status = operation.type.endsWith("archive") ? "archived" as const : "active" as const;
+        const normalized = { ...current, status, version: current.version + 1, updatedAt: now() };
+        hypothetical.knowledgeProfiles[targetId!]!.current = normalized;
+        hypothetical.knowledgeProfiles[targetId!]!.versions.push(normalized);
+        summary = `${status === "archived" ? "归档" : "恢复"}知识 Profile ${current.displayName}`;
+        before = jsonValue(current);
+        proposed = jsonValue(normalized);
+        break;
+      }
+      case "employee-profiles.set": {
+        const employee = this.getEmployee(targetId!);
+        const profileIds = validateKnowledgeProfileIds(state, stringArray(payload.profileIds, "employee profileIds"), `employee ${targetId} knowledge profile`);
+        const updated = { ...employee, knowledgeProfileIds: profileIds, version: employee.version + 1, updatedAt: now() };
+        hypothetical.employees[targetId!]!.current = updated;
+        hypothetical.employees[targetId!]!.versions.push(updated);
+        summary = `把员工 ${employee.identity.displayName} 的知识 Profile 调整为 ${profileIds.join("、") || "空"}`;
+        before = jsonValue({ knowledgeProfileIds: employee.knowledgeProfileIds });
+        proposed = jsonValue({ knowledgeProfileIds: profileIds });
+        break;
+      }
+      case "project-role-profiles.set": {
+        const projectId = operation.projectId!;
+        const roleId = operation.roleId!;
+        const project = this.getProject(projectId);
+        const role = project.roles.find((candidate) => candidate.id === roleId);
+        if (!role) throw new Error(`project role not found: ${projectId}/${roleId}`);
+        const profileIds = validateKnowledgeProfileIds(state, stringArray(payload.profileIds, "project role profileIds"), `project role ${roleId} knowledge profile`);
+        const unexpected = profileIds.filter((profileId) => !role.knowledgeProfileIds.includes(profileId));
+        if (unexpected.length > 0) throw new Error(`project role ${roleId} does not declare knowledge profiles: ${unexpected.join(", ")}`);
+        const binding = hypothetical.projectBindings[projectId]!.current;
+        const roleBinding = binding.roles.find((candidate) => candidate.roleId === roleId)!;
+        const previous = [...roleBinding.knowledgeProfileIds];
+        roleBinding.knowledgeProfileIds = profileIds;
+        binding.version += 1;
+        summary = `调整项目角色 ${project.name}/${role.displayName} 的知识 Profile`;
+        before = jsonValue({ knowledgeProfileIds: previous });
+        proposed = jsonValue({ knowledgeProfileIds: profileIds });
+        break;
+      }
+    }
+
+    const impact = this.knowledgeChangeImpactSummary(operation, buildKnowledgeImpactSnapshot(hypothetical, "preview"));
+    const preview: KnowledgeChangePreview = {
+      summary,
+      beforeVersion: operation.expectedVersion,
+      expectedVersion: operation.expectedVersion,
+      warnings,
+      impact,
+      assessment,
+      before,
+      proposed
+    };
+    const planHash = knowledgeChangePlanHash(jsonValue({
+      operation,
+      summary,
+      beforeVersion: preview.beforeVersion,
+      warnings,
+      impact,
+      assessment: assessment ? {
+        revision: assessment.revision,
+        status: assessment.status,
+        warnings: assessment.warnings.map((warning) => warning.code)
+      } : undefined
+    }));
+    return { operation, preview, planHash };
+  }
+
+  async createKnowledgeChangeRequest(input: KnowledgeChangeCreateInput): Promise<KnowledgeChangeRequest> {
+    const plan = await this.planKnowledgeChange(input.operation);
+    const timestamp = now();
+    const request: KnowledgeChangeRequest = {
+      id: `kc-${timestamp.replaceAll(/[:.]/g, "-").toLowerCase()}-${randomUUID().slice(0, 8)}`,
+      status: "awaiting-approval",
+      title: requireText(input.title, "knowledge change title"),
+      reason: requireText(input.reason, "knowledge change reason"),
+      requestedBy: input.requestedBy?.trim() || "knowledge-steward",
+      operation: plan.operation,
+      risk: knowledgeChangeRisk(plan.operation.type),
+      preview: plan.preview,
+      planHash: plan.planHash,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    return this.store.mutate((state) => {
+      state.knowledgeChangeRequests[request.id] = request;
+      return request;
+    });
+  }
+
+  private async applyKnowledgeChangeOperation(operation: KnowledgeChangeOperation): Promise<JsonValue> {
+    const payload = jsonPayload(operation);
+    switch (operation.type) {
+      case "knowledge-base.create":
+        return jsonValue(await this.createKnowledgeBase({ ...(payload as unknown as KnowledgeBaseCreateInput), publish: false }));
+      case "knowledge-base.update":
+        return jsonValue(await this.updateKnowledgeBase(operation.targetId!, payload as unknown as KnowledgeBaseUpdateInput));
+      case "knowledge-base.sync":
+        return jsonValue(await this.syncKnowledgeBase(operation.targetId!));
+      case "knowledge-base.archive":
+        return jsonValue(await this.archiveKnowledgeBase(operation.targetId!));
+      case "knowledge-base.restore":
+        return jsonValue(await this.restoreKnowledgeBase(operation.targetId!));
+      case "knowledge-revision.create":
+        return jsonValue(await this.createKnowledgeRevision(operation.targetId!, payload as unknown as KnowledgeRevisionCreateInput));
+      case "knowledge-revision.publish":
+        return jsonValue(await this.publishKnowledgeRevision(operation.targetId!, typeof payload.revision === "number" ? payload.revision : undefined));
+      case "knowledge-profile.create":
+        return jsonValue(await this.createKnowledgeProfile(payload as unknown as KnowledgeProfileCreateInput));
+      case "knowledge-profile.update":
+        return jsonValue(await this.updateKnowledgeProfile(operation.targetId!, payload as unknown as KnowledgeProfileUpdateInput));
+      case "knowledge-profile.archive":
+        return jsonValue(await this.archiveKnowledgeProfile(operation.targetId!));
+      case "knowledge-profile.restore":
+        return jsonValue(await this.restoreKnowledgeProfile(operation.targetId!));
+      case "employee-profiles.set":
+        return jsonValue(await this.updateEmployee(operation.targetId!, {
+          knowledgeProfileIds: stringArray(payload.profileIds, "employee profileIds")
+        }));
+      case "project-role-profiles.set": {
+        const projectId = operation.projectId!;
+        const roleId = operation.roleId!;
+        const binding = this.getProjectBinding(projectId);
+        const profileIds = stringArray(payload.profileIds, "project role profileIds");
+        return jsonValue(await this.saveProjectBinding(projectId, {
+          roles: binding.roles.map((role) => ({
+            roleId: role.roleId,
+            employeeId: role.employeeId,
+            employeeVersion: role.employeeVersion,
+            skills: role.skills,
+            knowledgeProfileIds: role.roleId === roleId ? profileIds : role.knowledgeProfileIds,
+            updatePolicy: role.updatePolicy
+          }))
+        }));
+      }
+    }
+  }
+
+  async approveKnowledgeChangeRequest(id: string, actor = "local-owner", comment?: string): Promise<KnowledgeChangeRequest> {
+    const current = this.getKnowledgeChangeRequest(id);
+    if (current.status !== "awaiting-approval") throw new Error(`knowledge change ${id} is ${current.status}`);
+    let plan: Awaited<ReturnType<WorkbenchService["planKnowledgeChange"]>>;
+    try {
+      plan = await this.planKnowledgeChange(current.operation);
+    } catch (error) {
+      await this.store.mutate((state) => {
+        const request = state.knowledgeChangeRequests[id];
+        if (!request) return;
+        request.status = "needs-reapproval";
+        request.error = errorMessage(error);
+        request.updatedAt = now();
+      });
+      throw error;
+    }
+    if (plan.planHash !== current.planHash) {
+      await this.store.mutate((state) => {
+        const request = state.knowledgeChangeRequests[id];
+        if (!request) return;
+        request.status = "needs-reapproval";
+        request.error = "knowledge change impact or validation result changed; create a fresh proposal";
+        request.updatedAt = now();
+      });
+      throw new Error(`knowledge change ${id} changed after review and needs reapproval`);
+    }
+    const approvedAt = now();
+    await this.store.mutate((state) => {
+      const request = state.knowledgeChangeRequests[id];
+      if (!request || request.status !== "awaiting-approval") throw new Error(`knowledge change ${id} is no longer awaiting approval`);
+      request.status = "applying";
+      request.approval = {
+        decision: "approved",
+        actor: requireText(actor, "knowledge change approver"),
+        at: approvedAt,
+        comment: comment?.trim() || undefined,
+        planHash: request.planHash
+      };
+      request.updatedAt = approvedAt;
+    });
+    try {
+      const result = await this.applyKnowledgeChangeOperation(plan.operation);
+      return this.store.mutate((state) => {
+        const request = state.knowledgeChangeRequests[id];
+        if (!request) throw new Error(`knowledge change request not found: ${id}`);
+        request.status = "applied";
+        request.result = result;
+        request.error = undefined;
+        request.appliedAt = now();
+        request.updatedAt = request.appliedAt;
+        return request;
+      });
+    } catch (error) {
+      await this.store.mutate((state) => {
+        const request = state.knowledgeChangeRequests[id];
+        if (!request) return;
+        request.status = "failed";
+        request.error = errorMessage(error);
+        request.updatedAt = now();
+      });
+      throw error;
+    }
+  }
+
+  async rejectKnowledgeChangeRequest(id: string, actor = "local-owner", comment?: string): Promise<KnowledgeChangeRequest> {
+    return this.store.mutate((state) => {
+      const request = state.knowledgeChangeRequests[id];
+      if (!request) throw new Error(`knowledge change request not found: ${id}`);
+      if (request.status !== "awaiting-approval") throw new Error(`knowledge change ${id} is ${request.status}`);
+      const timestamp = now();
+      request.status = "rejected";
+      request.approval = {
+        decision: "rejected",
+        actor: requireText(actor, "knowledge change reviewer"),
+        at: timestamp,
+        comment: comment?.trim() || undefined,
+        planHash: request.planHash
+      };
+      request.updatedAt = timestamp;
+      return request;
+    });
+  }
+
+  async cancelKnowledgeChangeRequest(
+    id: string,
+    actor = "local-owner",
+    comment?: string
+  ): Promise<KnowledgeChangeRequest> {
+    return this.store.mutate((state) => {
+      const request = state.knowledgeChangeRequests[id];
+      if (!request) throw new Error(`knowledge change request not found: ${id}`);
+      if (request.status !== "awaiting-approval" && request.status !== "needs-reapproval") {
+        throw new Error(`knowledge change ${id} cannot be cancelled from ${request.status}`);
+      }
+      const timestamp = now();
+      request.status = "cancelled";
+      request.cancellation = {
+        actor: requireText(actor, "knowledge change cancellation actor"),
+        at: timestamp,
+        comment: comment?.trim() || undefined
+      };
+      request.updatedAt = timestamp;
+      return request;
+    });
+  }
+
+  private normalizeKnowledgeBase(
+    input: KnowledgeBaseCreateInput,
+    current?: KnowledgeBaseDefinition
+  ): KnowledgeBaseDefinition {
+    const id = requireId(input.id, "knowledge base id");
+    const collectionIds = new Set<string>();
+    const collections = input.collections.map((collection) => {
+      const collectionId = requireId(collection.id, `knowledge base ${id} collection id`);
+      if (collectionIds.has(collectionId)) throw new Error(`knowledge base ${id} repeats collection ${collectionId}`);
+      collectionIds.add(collectionId);
+      if (!["canonical", "reference", "experimental"].includes(collection.authority)) {
+        throw new Error(`knowledge collection ${collectionId} has invalid authority ${String(collection.authority)}`);
+      }
+      return {
+        id: collectionId,
+        displayName: requireText(collection.displayName, `knowledge collection ${collectionId} displayName`),
+        description: requireText(collection.description, `knowledge collection ${collectionId} description`),
+        authority: collection.authority,
+        tags: [...new Set(collection.tags.map((tag) => requireText(tag, `knowledge collection ${collectionId} tag`)))]
+      };
+    });
+    if (collections.length === 0) throw new Error(`knowledge base ${id} must contain at least one collection`);
+    const sourceIds = new Set<string>();
+    const sources = (input.sources ?? []).map((source) => {
+      const sourceId = requireId(source.id, `knowledge base ${id} source id`);
+      if (sourceIds.has(sourceId)) throw new Error(`knowledge base ${id} repeats source ${sourceId}`);
+      sourceIds.add(sourceId);
+      if (source.kind !== "file" && source.kind !== "directory") {
+        throw new Error(`knowledge source ${sourceId} kind must be file or directory`);
+      }
+      const collectionId = requireId(source.collectionId, `knowledge source ${sourceId} collectionId`);
+      if (!collectionIds.has(collectionId)) throw new Error(`knowledge source ${sourceId} references unknown collection ${collectionId}`);
+      return {
+        id: sourceId,
+        kind: source.kind,
+        location: path.resolve(requireText(source.location, `knowledge source ${sourceId} location`)),
+        collectionId,
+        includeExtensions: source.includeExtensions?.map((extension) => requireText(extension, `knowledge source ${sourceId} extension`))
+      };
+    });
+    const classification = input.classification ?? current?.classification ?? "internal";
+    if (!["internal", "confidential", "restricted"].includes(classification)) {
+      throw new Error(`knowledge base ${id} has invalid classification ${String(classification)}`);
+    }
+    const timestamp = now();
+    return {
+      id,
+      version: current ? current.version + 1 : 1,
+      status: current?.status ?? "active",
+      displayName: requireText(input.displayName ?? id, "knowledge base displayName"),
+      description: requireText(input.description, "knowledge base description"),
+      domain: requireId(input.domain, "knowledge base domain"),
+      product: input.product ? requireId(input.product, "knowledge base product") : undefined,
+      projectId: input.projectId ? requireId(input.projectId, "knowledge base projectId") : undefined,
+      classification,
+      collections,
+      sources,
+      latestRevision: current?.latestRevision,
+      publishedRevision: current?.publishedRevision,
+      syncStatus: current?.syncStatus ?? "idle",
+      qualityStatus: current?.qualityStatus ?? "healthy",
+      lastSyncedAt: current?.lastSyncedAt,
+      lastSyncError: current?.lastSyncError,
+      createdAt: current?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+  }
+
+  async createKnowledgeBase(input: KnowledgeBaseCreateInput): Promise<KnowledgeBaseDefinition> {
+    if (this.snapshot().knowledgeBases[input.id]) throw new Error(`knowledge base already exists: ${input.id}`);
+    const knowledgeBase = this.normalizeKnowledgeBase(input);
+    const documents = normalizeKnowledgeDocuments(input.documents ?? [], new Set(knowledgeBase.collections.map((item) => item.id)), knowledgeBase.createdAt);
+    if (documents.length > 0) {
+      const revision: KnowledgeRevision = {
+        knowledgeBaseId: knowledgeBase.id,
+        revision: 1,
+        documents,
+        sourceSummary: { sourceCount: 0, documentCount: documents.length },
+        createdAt: knowledgeBase.createdAt
+      };
+      await this.knowledge.contentStore.writeRevision(revision);
+      knowledgeBase.latestRevision = 1;
+      if (input.publish) knowledgeBase.publishedRevision = 1;
+    }
+    return this.store.mutate((state) => {
+      if (state.knowledgeBases[knowledgeBase.id]) throw new Error(`knowledge base already exists: ${knowledgeBase.id}`);
+      state.knowledgeBases[knowledgeBase.id] = { current: knowledgeBase, versions: [knowledgeBase] };
+      return knowledgeBase;
+    });
+  }
+
+  async updateKnowledgeBase(id: string, input: KnowledgeBaseUpdateInput): Promise<KnowledgeBaseDefinition> {
+    const current = this.getKnowledgeBase(id);
+    const updated = this.normalizeKnowledgeBase({
+      id,
+      displayName: input.displayName ?? current.displayName,
+      description: input.description ?? current.description,
+      domain: input.domain ?? current.domain,
+      product: input.product === undefined ? current.product : input.product,
+      projectId: input.projectId === undefined ? current.projectId : input.projectId,
+      classification: input.classification ?? current.classification,
+      collections: input.collections ?? current.collections,
+      sources: input.sources ?? current.sources
+    }, current);
+    if (current.latestRevision) {
+      const revision = await this.knowledge.contentStore.readRevision(id, current.latestRevision);
+      const allowed = new Set(updated.collections.map((collection) => collection.id));
+      const orphan = revision.documents.find((document) => !allowed.has(document.collectionId));
+      if (orphan) throw new Error(`collection ${orphan.collectionId} is still used by knowledge document ${orphan.id}`);
+    }
+    return this.store.mutate((state) => {
+      const record = state.knowledgeBases[id];
+      if (!record) throw new Error(`knowledge base not found: ${id}`);
+      record.current = updated;
+      record.versions.push(updated);
+      return updated;
+    });
+  }
+
+  async createKnowledgeRevision(id: string, input: KnowledgeRevisionCreateInput): Promise<KnowledgeRevision> {
+    const knowledgeBase = this.getKnowledgeBase(id);
+    if (knowledgeBase.status !== "active") throw new Error(`knowledge base ${id} is archived`);
+    const timestamp = now();
+    const documents = normalizeKnowledgeDocuments(input.documents, new Set(knowledgeBase.collections.map((item) => item.id)), timestamp);
+    const revision: KnowledgeRevision = {
+      knowledgeBaseId: id,
+      revision: (knowledgeBase.latestRevision ?? 0) + 1,
+      documents,
+      sourceSummary: { sourceCount: 0, documentCount: documents.length },
+      createdAt: timestamp
+    };
+    await this.knowledge.contentStore.writeRevision(revision);
+    await this.store.mutate((state) => {
+      const record = state.knowledgeBases[id];
+      if (!record || record.current.version !== knowledgeBase.version) throw new Error(`knowledge base ${id} changed while creating revision`);
+      const updated: KnowledgeBaseDefinition = {
+        ...record.current,
+        version: record.current.version + 1,
+        latestRevision: revision.revision,
+        qualityStatus: "healthy",
+        updatedAt: timestamp
+      };
+      record.current = updated;
+      record.versions.push(updated);
+    });
+    return revision;
+  }
+
+  async syncKnowledgeBase(id: string): Promise<KnowledgeRevision> {
+    const current = this.getKnowledgeBase(id);
+    if (current.status !== "active") throw new Error(`knowledge base ${id} is archived`);
+    if (current.syncStatus === "syncing") throw new Error(`knowledge base ${id} is already syncing`);
+    if (current.sources.length === 0) throw new Error(`knowledge base ${id} has no configured sources`);
+    const startedAt = now();
+    const knowledgeBase = await this.store.mutate((state) => {
+      const record = state.knowledgeBases[id];
+      if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed before syncing`);
+      const syncing: KnowledgeBaseDefinition = {
+        ...record.current,
+        version: record.current.version + 1,
+        syncStatus: "syncing",
+        lastSyncError: undefined,
+        updatedAt: startedAt
+      };
+      record.current = syncing;
+      record.versions.push(syncing);
+      return syncing;
+    });
+    const timestamp = now();
+    try {
+      const previous = knowledgeBase.latestRevision
+        ? await this.knowledge.contentStore.readRevision(id, knowledgeBase.latestRevision)
+        : undefined;
+      const manualDocuments = previous?.documents.filter((document) => !document.sourceId) ?? [];
+      const sourceDocuments = await this.knowledge.contentStore.collectSources(knowledgeBase);
+      const documents = [...manualDocuments, ...sourceDocuments];
+      const seen = new Set<string>();
+      const allowedCollections = new Set(knowledgeBase.collections.map((collection) => collection.id));
+      for (const document of documents) {
+        if (seen.has(document.id)) throw new Error(`knowledge sync produced duplicate document ${document.id}`);
+        seen.add(document.id);
+        if (!allowedCollections.has(document.collectionId)) throw new Error(`knowledge document ${document.id} references unknown collection ${document.collectionId}`);
+      }
+      const revision: KnowledgeRevision = {
+        knowledgeBaseId: id,
+        revision: (knowledgeBase.latestRevision ?? 0) + 1,
+        documents,
+        sourceSummary: { sourceCount: knowledgeBase.sources.length, documentCount: documents.length },
+        createdAt: timestamp
+      };
+      await this.knowledge.contentStore.writeRevision(revision);
+      await this.store.mutate((state) => {
+        const record = state.knowledgeBases[id];
+        if (!record || record.current.version !== knowledgeBase.version) throw new Error(`knowledge base ${id} changed while syncing`);
+        const updated: KnowledgeBaseDefinition = {
+          ...record.current,
+          version: record.current.version + 1,
+          latestRevision: revision.revision,
+          syncStatus: "idle",
+          qualityStatus: "healthy",
+          lastSyncedAt: timestamp,
+          lastSyncError: undefined,
+          updatedAt: timestamp
+        };
+        record.current = updated;
+        record.versions.push(updated);
+      });
+      return revision;
+    } catch (error) {
+      await this.store.mutate((state) => {
+        const record = state.knowledgeBases[id];
+        if (!record) return;
+        if (record.current.version !== knowledgeBase.version || record.current.syncStatus !== "syncing") return;
+        const failed: KnowledgeBaseDefinition = {
+          ...record.current,
+          version: record.current.version + 1,
+          syncStatus: "failed",
+          qualityStatus: record.current.publishedRevision ? "degraded" : "stale",
+          lastSyncError: errorMessage(error),
+          updatedAt: now()
+        };
+        record.current = failed;
+        record.versions.push(failed);
+      });
+      throw error;
+    }
+  }
+
+  async publishKnowledgeRevision(id: string, revisionValue?: number): Promise<KnowledgeBaseDefinition> {
+    const current = this.getKnowledgeBase(id);
+    if (current.status !== "active") throw new Error(`knowledge base ${id} is archived`);
+    if (revisionValue === undefined && !current.latestRevision) throw new Error(`knowledge base ${id} has no revision to publish`);
+    const revision = validRevision(revisionValue, current.latestRevision, "knowledge revision");
+    const contentRevision = await this.knowledge.contentStore.readRevision(id, revision);
+    const assessment = assessKnowledgeRevision(current, contentRevision);
+    if (assessment.status === "blocked") {
+      throw new Error(`knowledge revision ${id}@${revision} is blocked: ${assessment.warnings.map((warning) => warning.message).join("; ")}`);
+    }
+    const updated: KnowledgeBaseDefinition = {
+      ...current,
+      version: current.version + 1,
+      publishedRevision: revision,
+      qualityStatus: "healthy",
+      updatedAt: now()
+    };
+    return this.store.mutate((state) => {
+      const record = state.knowledgeBases[id];
+      if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed while publishing`);
+      record.current = updated;
+      record.versions.push(updated);
+      return updated;
+    });
+  }
+
+  async archiveKnowledgeBase(id: string): Promise<KnowledgeBaseDefinition> {
+    const current = this.getKnowledgeBase(id);
+    if (current.status === "archived") return current;
+    const archived: KnowledgeBaseDefinition = { ...current, status: "archived", version: current.version + 1, updatedAt: now() };
+    return this.store.mutate((state) => {
+      const record = state.knowledgeBases[id];
+      if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed while archiving`);
+      record.current = archived;
+      record.versions.push(archived);
+      return archived;
+    });
+  }
+
+  async restoreKnowledgeBase(id: string): Promise<KnowledgeBaseDefinition> {
+    const current = this.getKnowledgeBase(id);
+    if (current.status === "active") return current;
+    const restored: KnowledgeBaseDefinition = { ...current, status: "active", version: current.version + 1, updatedAt: now() };
+    return this.store.mutate((state) => {
+      const record = state.knowledgeBases[id];
+      if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed while restoring`);
+      record.current = restored;
+      record.versions.push(restored);
+      return restored;
+    });
+  }
+
+  listKnowledgeProfiles(includeArchived = false): KnowledgeProfileDefinition[] {
+    return Object.values(this.snapshot().knowledgeProfiles)
+      .map((record) => record.current)
+      .filter((profile) => includeArchived || profile.status === "active")
+      .sort((left, right) => left.displayName.localeCompare(right.displayName));
+  }
+
+  getKnowledgeProfile(id: string, version?: number): KnowledgeProfileDefinition {
+    const record = this.snapshot().knowledgeProfiles[id];
+    if (!record) throw new Error(`knowledge profile not found: ${id}`);
+    if (version === undefined) return record.current;
+    const found = record.versions.find((candidate) => candidate.version === version);
+    if (!found) throw new Error(`knowledge profile ${id} version ${version} not found`);
+    return found;
+  }
+
+  private normalizeKnowledgeProfile(
+    input: KnowledgeProfileCreateInput,
+    current?: KnowledgeProfileDefinition
+  ): KnowledgeProfileDefinition {
+    const id = requireId(input.id, "knowledge profile id");
+    const rules = input.rules.map(normalizeKnowledgeRule);
+    if (rules.length === 0) throw new Error(`knowledge profile ${id} must contain at least one rule`);
+    if (new Set(rules.map((rule) => rule.id)).size !== rules.length) throw new Error(`knowledge profile ${id} repeats a rule id`);
+    const state = this.snapshot();
+    for (const knowledgeBaseId of rules.flatMap((rule) => rule.selector.knowledgeBaseIds ?? [])) {
+      if (!state.knowledgeBases[knowledgeBaseId]) throw new Error(`knowledge profile ${id} references unknown knowledge base ${knowledgeBaseId}`);
+    }
+    const timestamp = now();
+    return {
+      id,
+      version: current ? current.version + 1 : 1,
+      status: current?.status ?? "active",
+      displayName: requireText(input.displayName ?? id, "knowledge profile displayName"),
+      description: requireText(input.description, "knowledge profile description"),
+      rules,
+      createdAt: current?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+  }
+
+  async createKnowledgeProfile(input: KnowledgeProfileCreateInput): Promise<KnowledgeProfileDefinition> {
+    const profile = this.normalizeKnowledgeProfile(input);
+    return this.store.mutate((state) => {
+      if (state.knowledgeProfiles[profile.id]) throw new Error(`knowledge profile already exists: ${profile.id}`);
+      state.knowledgeProfiles[profile.id] = { current: profile, versions: [profile] };
+      return profile;
+    });
+  }
+
+  async updateKnowledgeProfile(id: string, input: KnowledgeProfileUpdateInput): Promise<KnowledgeProfileDefinition> {
+    const current = this.getKnowledgeProfile(id);
+    const updated = this.normalizeKnowledgeProfile({
+      id,
+      displayName: input.displayName ?? current.displayName,
+      description: input.description ?? current.description,
+      rules: input.rules ?? current.rules
+    }, current);
+    return this.store.mutate((state) => {
+      const record = state.knowledgeProfiles[id];
+      if (!record) throw new Error(`knowledge profile not found: ${id}`);
+      record.current = updated;
+      record.versions.push(updated);
+      return updated;
+    });
+  }
+
+  async archiveKnowledgeProfile(id: string): Promise<KnowledgeProfileDefinition> {
+    const current = this.getKnowledgeProfile(id);
+    if (current.status === "archived") return current;
+    const archived: KnowledgeProfileDefinition = { ...current, status: "archived", version: current.version + 1, updatedAt: now() };
+    return this.store.mutate((state) => {
+      const record = state.knowledgeProfiles[id];
+      if (!record || record.current.version !== current.version) throw new Error(`knowledge profile ${id} changed while archiving`);
+      record.current = archived;
+      record.versions.push(archived);
+      return archived;
+    });
+  }
+
+  async restoreKnowledgeProfile(id: string): Promise<KnowledgeProfileDefinition> {
+    const current = this.getKnowledgeProfile(id);
+    if (current.status === "active") return current;
+    const restored: KnowledgeProfileDefinition = { ...current, status: "active", version: current.version + 1, updatedAt: now() };
+    return this.store.mutate((state) => {
+      const record = state.knowledgeProfiles[id];
+      if (!record || record.current.version !== current.version) throw new Error(`knowledge profile ${id} changed while restoring`);
+      record.current = restored;
+      record.versions.push(restored);
+      return restored;
+    });
+  }
+
+  async previewEmployeeKnowledge(
+    employeeId: string,
+    input: { message: string; projectId?: string; projectRoleId?: string; taskTags?: string[] }
+  ): Promise<KnowledgeRuntimeResult> {
+    const employee = this.getEmployee(employeeId);
+    return this.knowledge.prepare(this.snapshot(), employee, {
+      request: requireText(input.message, "knowledge preview message"),
+      projectId: input.projectId,
+      projectRoleId: input.projectRoleId,
+      taskTags: input.taskTags ?? []
+    });
+  }
+
   listArchitectureTemplates(): ArchitectureTemplateDefinition[] {
     return listArchitectureTemplates();
   }
@@ -599,6 +1797,313 @@ export class WorkbenchService {
       if (employee.status !== "active") throw new Error(`employee ${employeeId} is archived`);
     }
     return instantiateArchitectureTemplate(id, employeeIds);
+  }
+
+  listProjects(includeArchived = false): ProjectDefinition[] {
+    return Object.values(this.snapshot().projects)
+      .map((record) => record.current)
+      .filter((project) => includeArchived || project.status === "active")
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  getProject(id: string, version?: number): ProjectDefinition {
+    const record = this.snapshot().projects[id];
+    if (!record) throw new Error(`project not found: ${id}`);
+    return projectVersion(record, version);
+  }
+
+  getProjectVersions(id: string): ProjectDefinition[] {
+    const record = this.snapshot().projects[id];
+    if (!record) throw new Error(`project not found: ${id}`);
+    return [...record.versions].sort((left, right) => right.version - left.version);
+  }
+
+  listProjectBindings(): ProjectBindingDefinition[] {
+    return Object.values(this.snapshot().projectBindings)
+      .map((record) => record.current)
+      .sort((left, right) => left.projectId.localeCompare(right.projectId));
+  }
+
+  getProjectBinding(projectId: string, version?: number): ProjectBindingDefinition {
+    const record = this.snapshot().projectBindings[projectId];
+    if (!record) throw new Error(`project binding not found: ${projectId}`);
+    if (version === undefined) return record.current;
+    const found = record.versions.find((candidate) => candidate.version === version);
+    if (!found) throw new Error(`project binding ${projectId} version ${version} not found`);
+    return found;
+  }
+
+  getProjectBindingVersions(projectId: string): ProjectBindingDefinition[] {
+    const record = this.snapshot().projectBindings[projectId];
+    if (!record) return [];
+    return [...record.versions].sort((left, right) => right.version - left.version);
+  }
+
+  private normalizeProject(input: ProjectCreateInput, current?: ProjectDefinition): ProjectDefinition {
+    const id = requireId(input.id, "project id");
+    const seen = new Set<string>();
+    const roles = input.roles.map((role) => {
+      const roleId = requireId(role.id, "project role id");
+      if (seen.has(roleId)) throw new Error(`duplicate project role ${roleId}`);
+      seen.add(roleId);
+      const requiredSkills = [...new Set(role.requiredSkills ?? [])].map((skillId) => requireId(skillId, `project role ${roleId} required skill`));
+      const optionalSkills = [...new Set(role.optionalSkills ?? [])].map((skillId) => requireId(skillId, `project role ${roleId} optional skill`));
+      const knowledgeProfileIds = uniqueIds(role.knowledgeProfileIds ?? [], `project role ${roleId} knowledge profile`);
+      const overlap = requiredSkills.filter((skillId) => optionalSkills.includes(skillId));
+      if (overlap.length > 0) throw new Error(`project role ${roleId} repeats skills as required and optional: ${overlap.join(", ")}`);
+      if (role.outputSchema) validateSchema(role.outputSchema, `project role ${roleId} outputSchema`);
+      return {
+        id: roleId,
+        displayName: requireText(role.displayName ?? roleId, `project role ${roleId} displayName`),
+        description: requireText(role.description ?? `Project role ${roleId}.`, `project role ${roleId} description`),
+        requiredSkills,
+        optionalSkills,
+        knowledgeProfileIds,
+        instructions: requireText(role.instructions ?? `Follow the ${roleId} project role contract.`, `project role ${roleId} instructions`),
+        outputSchema: role.outputSchema,
+        permissions: role.permissions
+      };
+    });
+    if (roles.length === 0) throw new Error("project roles must not be empty");
+    const timestamp = now();
+    return {
+      id,
+      version: current ? current.version + 1 : 1,
+      status: current?.status ?? "active",
+      name: requireText(input.name ?? id, "project name"),
+      description: requireText(input.description ?? `Locally connected project ${id}.`, "project description"),
+      scope: input.scope ?? "repository",
+      rootPath: path.resolve(requireText(input.rootPath, "project rootPath")),
+      descriptorPath: path.resolve(requireText(input.descriptorPath, "project descriptorPath")),
+      connector: {
+        kind: requireId(input.connector?.kind ?? "generic", "project connector kind"),
+        config: input.connector?.config ?? {}
+      },
+      roles,
+      createdAt: current?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+  }
+
+  async createProject(input: ProjectCreateInput): Promise<ProjectDefinition> {
+    const project = this.normalizeProject(input);
+    return this.store.mutate((state) => {
+      if (state.projects[project.id]) throw new Error(`project already exists: ${project.id}`);
+      state.projects[project.id] = { current: project, versions: [project] };
+      return project;
+    });
+  }
+
+  async updateProject(id: string, input: ProjectCreateInput): Promise<ProjectDefinition> {
+    const current = this.getProject(id);
+    if (input.id !== id) throw new Error(`project id cannot change from ${id} to ${input.id}`);
+    const project = this.normalizeProject(input, current);
+    const comparable = (value: ProjectDefinition) => ({
+      name: value.name,
+      description: value.description,
+      scope: value.scope,
+      rootPath: value.rootPath,
+      descriptorPath: value.descriptorPath,
+      connector: value.connector,
+      roles: value.roles,
+      status: value.status
+    });
+    if (jsonEqual(comparable(current), comparable(project))) return current;
+    return this.store.mutate((state) => {
+      const record = state.projects[id];
+      if (!record) throw new Error(`project not found: ${id}`);
+      record.current = project;
+      record.versions.push(project);
+      return project;
+    });
+  }
+
+  async connectProject(input: ProjectConnectInput): Promise<ProjectDefinition> {
+    const definition = await loadProjectDescriptor(input);
+    return this.snapshot().projects[definition.id]
+      ? this.updateProject(definition.id, definition)
+      : this.createProject(definition);
+  }
+
+  async archiveProject(id: string): Promise<ProjectDefinition> {
+    const current = this.getProject(id);
+    if (current.status === "archived") return current;
+    const archived: ProjectDefinition = { ...current, status: "archived", version: current.version + 1, updatedAt: now() };
+    return this.store.mutate((state) => {
+      const record = state.projects[id];
+      if (!record) throw new Error(`project not found: ${id}`);
+      record.current = archived;
+      record.versions.push(archived);
+      return archived;
+    });
+  }
+
+  private normalizeProjectRoleBinding(
+    state: WorkbenchState,
+    project: ProjectDefinition,
+    input: ProjectRoleBindingInput
+  ): ProjectRoleBinding {
+    const role = project.roles.find((candidate) => candidate.id === input.roleId);
+    if (!role) throw new Error(`project role not found: ${project.id}/${input.roleId}`);
+    const record = state.employees[input.employeeId];
+    if (!record) throw new Error(`employee not found: ${input.employeeId}`);
+    if (record.current.status !== "active") throw new Error(`employee ${input.employeeId} is archived`);
+    const employee = employeeVersion(record, input.employeeVersion);
+    const scopedProjectId = internalProjectId(employee);
+    if (scopedProjectId && scopedProjectId !== project.id) {
+      throw new Error(`employee ${employee.id} is internal to project ${scopedProjectId}`);
+    }
+    const scopedRoleId = internalProjectRoleId(employee);
+    if (scopedRoleId && scopedRoleId !== role.id) {
+      throw new Error(`employee ${employee.id} is internal to project role ${scopedRoleId}`);
+    }
+    const configured = new Map(employee.skills.map((binding) => [normalizeBinding(binding).id, binding]));
+    const requested = input.skills ?? [...role.requiredSkills, ...role.optionalSkills]
+      .filter((skillId) => configured.has(skillId))
+      .map((skillId) => skillId);
+    const selected = requested.map((binding) => {
+      const normalized = normalizeBinding(binding);
+      const employeeBinding = configured.get(normalized.id);
+      if (!employeeBinding) throw new Error(`employee ${employee.id} does not have project skill ${normalized.id}`);
+      const employeeNormalized = normalizeBinding(employeeBinding);
+      if (!employeeNormalized.enabled) throw new Error(`employee ${employee.id} has project skill ${normalized.id} disabled`);
+      return {
+        id: normalized.id,
+        config: typeof binding === "string" ? employeeNormalized.config : normalized.config,
+        enabled: true
+      };
+    });
+    const selectedIds = new Set(selected.map((binding) => binding.id));
+    const allowed = new Set([...role.requiredSkills, ...role.optionalSkills]);
+    const unexpected = [...selectedIds].filter((skillId) => !allowed.has(skillId));
+    if (unexpected.length > 0) throw new Error(`project role ${role.id} does not declare skills: ${unexpected.join(", ")}`);
+    const missing = role.requiredSkills.filter((skillId) => !selectedIds.has(skillId));
+    if (missing.length > 0) throw new Error(`employee ${employee.id} is missing required project skills: ${missing.join(", ")}`);
+    const skillVersions = Object.fromEntries(selected.map((binding) => {
+      const version = employee.skillVersions[binding.id];
+      if (!version) throw new Error(`employee ${employee.id} does not pin skill ${binding.id}`);
+      return [binding.id, version];
+    }));
+    validateSkillBindings(state, selected, skillVersions);
+    const requestedKnowledgeProfiles = input.knowledgeProfileIds ?? role.knowledgeProfileIds;
+    const unexpectedKnowledgeProfiles = requestedKnowledgeProfiles.filter((profileId) => !role.knowledgeProfileIds.includes(profileId));
+    if (unexpectedKnowledgeProfiles.length > 0) {
+      throw new Error(`project role ${role.id} does not declare knowledge profiles: ${unexpectedKnowledgeProfiles.join(", ")}`);
+    }
+    const knowledgeProfileIds = validateKnowledgeProfileIds(
+      state,
+      requestedKnowledgeProfiles,
+      `project role ${role.id} knowledge profile`
+    );
+    return {
+      roleId: role.id,
+      employeeId: employee.id,
+      employeeVersion: employee.version,
+      skills: selected,
+      skillVersions,
+      knowledgeProfileIds,
+      updatePolicy: input.updatePolicy ?? "compatible"
+    };
+  }
+
+  async saveProjectBinding(projectId: string, input: ProjectBindingInput): Promise<ProjectBindingDefinition> {
+    const state = this.snapshot();
+    const project = projectVersion(state.projects[projectId] ?? (() => { throw new Error(`project not found: ${projectId}`); })());
+    if (project.status !== "active") throw new Error(`project ${projectId} is archived`);
+    const seen = new Set<string>();
+    const roles = input.roles.map((role) => {
+      if (seen.has(role.roleId)) throw new Error(`project role ${role.roleId} is bound more than once`);
+      seen.add(role.roleId);
+      return this.normalizeProjectRoleBinding(state, project, role);
+    });
+    const current = state.projectBindings[projectId]?.current;
+    const timestamp = now();
+    const binding: ProjectBindingDefinition = {
+      projectId,
+      projectVersion: project.version,
+      version: current ? current.version + 1 : 1,
+      roles,
+      createdAt: current?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+    return this.store.mutate((next) => {
+      const record = next.projectBindings[projectId];
+      if (record) {
+        record.current = binding;
+        record.versions.push(binding);
+      } else {
+        next.projectBindings[projectId] = { current: binding, versions: [binding] };
+      }
+      return binding;
+    });
+  }
+
+  async refreshProjectBinding(projectId: string): Promise<ProjectBindingRefreshResult> {
+    const state = this.snapshot();
+    const binding = this.getProjectBinding(projectId);
+    const project = this.getProject(projectId, binding.projectVersion);
+    const refreshed: ProjectRoleBinding[] = [];
+    const results: ProjectBindingRefreshResult["roles"] = [];
+    let changed = false;
+    for (const roleBinding of binding.roles) {
+      const currentEmployee = state.employees[roleBinding.employeeId]?.current;
+      if (!currentEmployee || currentEmployee.status !== "active") {
+        refreshed.push(roleBinding);
+        results.push({ roleId: roleBinding.roleId, status: "approval-required", message: "员工已不存在或已归档。" });
+        continue;
+      }
+      if (currentEmployee.version === roleBinding.employeeVersion) {
+        refreshed.push(roleBinding);
+        results.push({ roleId: roleBinding.roleId, status: "current", message: `已固定在员工 v${currentEmployee.version}。` });
+        continue;
+      }
+      if (roleBinding.updatePolicy === "locked") {
+        refreshed.push(roleBinding);
+        results.push({ roleId: roleBinding.roleId, status: "locked", message: `发现员工 v${currentEmployee.version}，当前策略保持锁定。` });
+        continue;
+      }
+      const previousEmployee = employeeVersion(state.employees[roleBinding.employeeId]!, roleBinding.employeeVersion);
+      const compatible = previousEmployee.providerId === currentEmployee.providerId
+        && jsonEqual(previousEmployee.permissions, currentEmployee.permissions)
+        && jsonEqual(previousEmployee.outputSchema, currentEmployee.outputSchema)
+        && jsonEqual(previousEmployee.verdict, currentEmployee.verdict);
+      if (roleBinding.updatePolicy === "compatible" && !compatible) {
+        refreshed.push(roleBinding);
+        results.push({ roleId: roleBinding.roleId, status: "approval-required", message: `员工已更新至 v${currentEmployee.version}，Provider、权限或输出契约发生变化。` });
+        continue;
+      }
+      try {
+        const next = this.normalizeProjectRoleBinding(state, project, {
+          roleId: roleBinding.roleId,
+          employeeId: roleBinding.employeeId,
+          employeeVersion: currentEmployee.version,
+          skills: roleBinding.skills,
+          knowledgeProfileIds: roleBinding.knowledgeProfileIds,
+          updatePolicy: roleBinding.updatePolicy
+        });
+        refreshed.push(next);
+        changed = true;
+        results.push({ roleId: roleBinding.roleId, status: "updated", message: `已同步到员工 v${currentEmployee.version}；项目 Skill 子集保持不变。` });
+      } catch (error) {
+        refreshed.push(roleBinding);
+        results.push({ roleId: roleBinding.roleId, status: "approval-required", message: errorMessage(error) });
+      }
+    }
+    if (!changed) return { changed, binding, roles: results };
+    const timestamp = now();
+    const nextBinding: ProjectBindingDefinition = {
+      ...binding,
+      version: binding.version + 1,
+      roles: refreshed,
+      updatedAt: timestamp
+    };
+    await this.store.mutate((next) => {
+      const record = next.projectBindings[projectId];
+      if (!record) throw new Error(`project binding not found: ${projectId}`);
+      record.current = nextBinding;
+      record.versions.push(nextBinding);
+    });
+    return { changed, binding: nextBinding, roles: results };
   }
 
   listEmployees(includeArchived = false): EmployeeDefinition[] {
@@ -629,6 +2134,7 @@ export class WorkbenchService {
       const skills = input.skills ?? [];
       const skillVersions = pinSkillVersions(state, skills, input.skillVersions);
       validateSkillBindings(state, skills, skillVersions);
+      const knowledgeProfileIds = validateKnowledgeProfileIds(state, input.knowledgeProfileIds ?? [], `employee ${id} knowledge profile`);
       const outputSchema = input.outputSchema ?? DEFAULT_EMPLOYEE_OUTPUT_SCHEMA;
       validateSchema(outputSchema, `employee ${id} outputSchema`);
       const verdict = input.verdict ?? undefined;
@@ -657,6 +2163,7 @@ export class WorkbenchService {
         ),
         skills,
         skillVersions,
+        knowledgeProfileIds,
         providerId,
         outputSchema,
         maxAttempts: Math.max(1, Math.min(10, input.maxAttempts ?? 1)),
@@ -685,11 +2192,22 @@ export class WorkbenchService {
         ? current.skillVersions
         : pinSkillVersions(state, skills, input.skillVersions);
       validateSkillBindings(state, skills, skillVersions);
+      const knowledgeProfileIds = input.knowledgeProfileIds === undefined
+        ? current.knowledgeProfileIds
+        : validateKnowledgeProfileIds(state, input.knowledgeProfileIds, `employee ${id} knowledge profile`);
       const outputSchema = input.outputSchema ?? current.outputSchema;
       validateSchema(outputSchema, `employee ${id} outputSchema`);
       const verdict = input.verdict === undefined ? current.verdict : input.verdict ?? undefined;
       validateVerdict(verdict, `employee ${id}`);
       const identity = input.identity ?? current.identity;
+      const scopedProjectId = internalProjectId(current);
+      if (scopedProjectId && internalProjectId({ ...current, identity }) !== scopedProjectId) {
+        throw new Error(`employee ${id} internal project scope ${scopedProjectId} is immutable`);
+      }
+      const scopedRoleId = internalProjectRoleId(current);
+      if (scopedRoleId && internalProjectRoleId({ ...current, identity }) !== scopedRoleId) {
+        throw new Error(`employee ${id} internal project role scope ${scopedRoleId} is immutable`);
+      }
       const updated: EmployeeDefinition = {
         ...current,
         identity: {
@@ -705,6 +2223,7 @@ export class WorkbenchService {
         requestPrompt: input.requestPrompt === undefined ? current.requestPrompt : requireText(input.requestPrompt, "employee requestPrompt"),
         skills,
         skillVersions,
+        knowledgeProfileIds,
         providerId,
         outputSchema,
         maxAttempts: input.maxAttempts === undefined ? current.maxAttempts : Math.max(1, Math.min(10, input.maxAttempts)),
@@ -734,6 +2253,7 @@ export class WorkbenchService {
       requestPrompt: source.requestPrompt,
       skills: source.skills,
       skillVersions: source.skillVersions,
+      knowledgeProfileIds: source.knowledgeProfileIds,
       providerId: source.providerId,
       outputSchema: source.outputSchema,
       maxAttempts: source.maxAttempts,
@@ -768,20 +2288,76 @@ export class WorkbenchService {
     return session;
   }
 
-  private directWorkflow(employee: EmployeeDefinition): WorkbenchWorkflowDefinition {
+  private directWorkflow(
+    employee: EmployeeDefinition,
+    context?: { id: string; version: number; description: string }
+  ): WorkbenchWorkflowDefinition {
     const timestamp = now();
     return {
-      id: `direct-${employee.id}`,
-      version: employee.version,
+      id: context?.id ?? `direct-${employee.id}`,
+      version: context?.version ?? employee.version,
       status: "active",
       architecture: "graph",
-      description: `Direct invocation of ${employee.identity.displayName}`,
+      description: context?.description ?? `Direct invocation of ${employee.identity.displayName}`,
       nodes: [{ id: "respond", employeeId: employee.id, employeeVersion: employee.version, needs: [], with: {} }],
       maxConcurrency: 1,
       failFast: true,
       createdAt: timestamp,
       updatedAt: timestamp
     };
+  }
+
+  private resolveProjectEmployee(
+    projectId: string,
+    roleId: string,
+    projectVersionValue?: number,
+    bindingVersionValue?: number
+  ): {
+    project: ProjectDefinition;
+    binding: ProjectBindingDefinition;
+    roleBinding: ProjectRoleBinding;
+    employee: EmployeeDefinition;
+  } {
+    const project = this.getProject(projectId, projectVersionValue);
+    const binding = this.getProjectBinding(projectId, bindingVersionValue);
+    if (binding.projectVersion !== project.version) {
+      throw new Error(`project binding v${binding.version} targets project v${binding.projectVersion}, not v${project.version}`);
+    }
+    const role = project.roles.find((candidate) => candidate.id === roleId);
+    if (!role) throw new Error(`project role not found: ${project.id}/${roleId}`);
+    const roleBinding = binding.roles.find((candidate) => candidate.roleId === roleId);
+    if (!roleBinding) throw new Error(`project role is not assigned: ${project.id}/${roleId}`);
+    const base = this.getEmployee(roleBinding.employeeId, roleBinding.employeeVersion);
+    const assignmentHeader = [
+      "## Project assignment",
+      `Project: ${project.name} (${project.id})`,
+      `Role slot: ${role.displayName} (${role.id})`,
+      `Project version: v${project.version}; binding version: v${binding.version}`,
+      "The following policy is scoped to this project assignment and does not change your reusable Employee identity.",
+      "",
+      role.instructions
+    ].join("\n");
+    const employee: EmployeeDefinition = {
+      ...base,
+      identity: {
+        ...base.identity,
+        metadata: {
+          ...(base.identity.metadata ?? {}),
+          projectId: project.id,
+          projectRole: role.id,
+          projectVersion: project.version,
+          projectBindingVersion: binding.version
+        }
+      },
+      description: `${base.description} Assigned as ${role.displayName} for ${project.name}.`,
+      systemPrompt: `${base.systemPrompt.trim()}\n\n${assignmentHeader}`,
+      skills: roleBinding.skills,
+      skillVersions: roleBinding.skillVersions,
+      knowledgeProfileIds: [...new Set([...base.knowledgeProfileIds, ...roleBinding.knowledgeProfileIds])],
+      outputSchema: role.outputSchema ?? base.outputSchema,
+      permissions: narrowPermissions(base.permissions, role.permissions)
+    };
+    return { project, binding, roleBinding, employee };
   }
 
   private async materialize(workflow: WorkbenchWorkflowDefinition, employees: Map<string, EmployeeDefinition>) {
@@ -795,23 +2371,24 @@ export class WorkbenchService {
     });
   }
 
-  async invokeEmployee(
-    employeeId: string,
-    input: EmployeeInvocationInput,
-    source: InvocationSource = { kind: "workbench" }
-  ): Promise<EmployeeInvocationResult> {
-    requireText(input.message, "message");
-    const current = this.getEmployee(employeeId);
-    if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
-    let session = input.sessionId ? this.getSession(input.sessionId) : undefined;
-    if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
-    const employee = session ? this.getEmployee(employeeId, session.employeeVersion) : current;
+  private async invokeResolvedEmployee(options: {
+    employee: EmployeeDefinition;
+    input: EmployeeInvocationInput;
+    source: InvocationSource;
+    session?: EmployeeSession;
+    assignment?: EmployeeSession["assignment"];
+    workflow?: { id: string; version: number; description: string };
+    providerCwd?: string;
+  }): Promise<EmployeeInvocationResult> {
+    const { employee, input, source } = options;
+    let session = options.session;
     if (!session) {
       const timestamp = now();
       session = {
         id: randomUUID(),
-        employeeId,
+        employeeId: employee.id,
         employeeVersion: employee.version,
+        assignment: options.assignment,
         title: input.message.trim().slice(0, 72),
         status: "active",
         messages: [],
@@ -823,7 +2400,7 @@ export class WorkbenchService {
         state.sessions[newSession.id] = newSession;
       });
     }
-    const workflow = this.directWorkflow(employee);
+    const workflow = this.directWorkflow(employee, options.workflow);
     const employees = new Map([[employee.id, employee]]);
     const invocation = await this.createInvocationActivity({
       target: { kind: "employee", id: employee.id, version: employee.version },
@@ -845,7 +2422,7 @@ export class WorkbenchService {
       const result = await this.runTrackedWorkflow(invocation, workflow, employees, {
         message: input.message.trim(),
         sessionHistory: history
-      });
+      }, options.providerCwd);
       const node = result.run.nodes.respond;
       const responseMessage = invocationMessage(node?.output);
       const timestamp = now();
@@ -878,10 +2455,83 @@ export class WorkbenchService {
     });
   }
 
+  async invokeEmployee(
+    employeeId: string,
+    input: EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<EmployeeInvocationResult> {
+    requireText(input.message, "message");
+    const current = this.getEmployee(employeeId);
+    if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
+    const scopedProjectId = internalProjectId(current);
+    if (scopedProjectId) throw new Error(`employee ${employeeId} is internal to project ${scopedProjectId}; invoke it through a project role`);
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
+    if (session?.assignment) throw new Error(`session ${session.id} belongs to project ${session.assignment.projectId}/${session.assignment.roleId}`);
+    const employee = session ? this.getEmployee(employeeId, session.employeeVersion) : current;
+    return this.invokeResolvedEmployee({ employee, input: { ...input, message: input.message.trim() }, source, session });
+  }
+
+  async invokeProjectRole(
+    projectId: string,
+    roleId: string,
+    input: EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<EmployeeInvocationResult> {
+    requireText(input.message, "message");
+    const currentProject = this.getProject(projectId);
+    if (currentProject.status !== "active") throw new Error(`project ${projectId} is archived`);
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    if (session && (!session.assignment || session.assignment.projectId !== projectId || session.assignment.roleId !== roleId)) {
+      throw new Error(`session ${session.id} belongs to another project assignment`);
+    }
+    const resolved = session?.assignment
+      ? this.resolveProjectEmployee(
+          projectId,
+          roleId,
+          session.assignment.projectVersion,
+          session.assignment.projectBindingVersion
+        )
+      : this.resolveProjectEmployee(projectId, roleId);
+    const currentEmployee = this.getEmployee(resolved.employee.id);
+    if (currentEmployee.status !== "active") throw new Error(`employee ${resolved.employee.id} is archived`);
+    const assignment = session?.assignment ?? {
+      projectId,
+      projectVersion: resolved.project.version,
+      projectBindingVersion: resolved.binding.version,
+      roleId
+    };
+    return this.invokeResolvedEmployee({
+      employee: resolved.employee,
+      input: { ...input, message: input.message.trim() },
+      source: {
+        ...source,
+        project: projectId,
+        projectRole: roleId,
+        projectBindingVersion: resolved.binding.version
+      },
+      session,
+      assignment,
+      providerCwd: resolved.project.rootPath,
+      workflow: {
+        id: `project-${projectId}-${roleId}`,
+        version: resolved.binding.version,
+        description: `${resolved.project.name} / ${resolved.project.roles.find((role) => role.id === roleId)?.displayName ?? roleId}`
+      }
+    });
+  }
+
   async getEmployeeContext(employeeId: string, sessionId?: string): Promise<EmployeeContextView> {
     const session = sessionId ? this.getSession(sessionId) : this.listSessions(employeeId)[0];
     if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
-    const employee = this.getEmployee(employeeId, session?.employeeVersion);
+    const employee = session?.assignment
+      ? this.resolveProjectEmployee(
+          session.assignment.projectId,
+          session.assignment.roleId,
+          session.assignment.projectVersion,
+          session.assignment.projectBindingVersion
+        ).employee
+      : this.getEmployee(employeeId, session?.employeeVersion);
     const state = this.snapshot();
     const skills = employee.skills.map((binding) => {
       const id = normalizeBinding(binding).id;
@@ -927,6 +2577,14 @@ export class WorkbenchService {
           artifactDir: run.artifactDir ?? latest.runDir,
           attempts: attempt
         };
+        try {
+          const knowledge = JSON.parse(
+            await fs.readFile(path.join(latest.runDir, "knowledge", "respond.json"), "utf8")
+          ) as KnowledgeRuntimeResult;
+          view.layers.knowledge = { plan: knowledge.plan, evidence: knowledge.evidence };
+        } catch {
+          // Older runs and employees without prepared knowledge have no knowledge artifact.
+        }
       } catch {
         // A failed attempt can legitimately have incomplete prompt artifacts.
       }
@@ -973,6 +2631,12 @@ export class WorkbenchService {
         node.employeeVersion
       );
       if (state.employees[node.employeeId]?.current.status !== "active") throw new Error(`employee ${employee.id} is archived`);
+      const scopedProjectId = internalProjectId(employee);
+      if (scopedProjectId) {
+        throw new Error(
+          `employee ${employee.id} is internal to project ${scopedProjectId} and cannot be used in a global workflow`
+        );
+      }
       return {
         id: node.id,
         employeeId: node.employeeId,
@@ -1080,6 +2744,12 @@ export class WorkbenchService {
     const employees = this.resolveWorkflowEmployees(workflow);
     for (const employee of employees.values()) {
       if (this.getEmployee(employee.id).status !== "active") throw new Error(`employee ${employee.id} is archived`);
+      const scopedProjectId = internalProjectId(employee);
+      if (scopedProjectId) {
+        throw new Error(
+          `employee ${employee.id} is internal to project ${scopedProjectId} and cannot run in a global workflow`
+        );
+      }
     }
     const invocation = await this.createInvocationActivity({
       target: { kind: "workflow", id: workflow.id, version: workflow.version },
@@ -1124,6 +2794,9 @@ export class WorkbenchService {
     requireId(input.id, "publication id");
     const target = input.target.kind === "employee" ? this.getEmployee(input.target.id) : this.getWorkflow(input.target.id);
     if (target.status !== "active") throw new Error(`${input.target.kind} ${input.target.id} is archived`);
+    if (input.target.kind === "employee" && internalProjectId(target as EmployeeDefinition)) {
+      throw new Error(`employee ${input.target.id} is project-internal and cannot be published directly`);
+    }
     return this.store.mutate((state) => {
       if (state.publications[input.id]) throw new Error(`publication already exists: ${input.id}`);
       const timestamp = now();

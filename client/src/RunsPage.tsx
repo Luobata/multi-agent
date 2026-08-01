@@ -19,7 +19,7 @@ export function RunsPage({ notify, activityRevision = "" }: { notify: (message: 
     return () => { current = false; };
   }, [notify, activityRevision]);
   const selected = runs.find((run) => run.id === selectedId) ?? runs[0];
-  return <div className="page-grid">
+  return <div className="page-grid page-grid--runs">
     <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="record-scroll run-list">{runs.map((run) => <button key={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {Object.keys(run.nodes).length} 节点</small></div><Stamp status={run.status} /></button>)}{!loading && runs.length === 0 && <div className="mini-empty">还没有 Run 证据。</div>}</div><footer className="list-footer"><span>{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
     <main className="detail-pane">{loading ? <div className="skeleton-page" aria-label="正在调取运行卷宗"><i /><i /><i /></div> : !selected ? <EmptyState title="尚无运行卷宗">直接交办员工或签发一次 Workflow 后，这里会出现不可变的执行记录。</EmptyState> : <div className="dossier run-dossier">
       <header className="dossier-cover"><div className="file-index"><span>RUN EVIDENCE RECORD</span><code>{selected.id}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">证</div><div><h2>{selected.workflow}</h2><p>{selected.status === "blocked" ? "流程已完成，但存在业务阻塞结论。" : selected.status === "failed" ? "执行发生技术故障，可查看原始输出与错误证据。" : selected.status === "running" ? "执行仍在进行。" : "流程完成，证据已归档。"}</p></div><Stamp status={selected.status} /></div></header>

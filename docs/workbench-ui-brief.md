@@ -35,7 +35,7 @@ Produce a complete implementable UI specification containing:
 - one clear visual concept and rationale;
 - information architecture and navigation;
 - desktop layout and responsive transformation;
-- component inventory and states;
+- component inventory plus a state matrix for every interactive component; selectors and overlays must explicitly show closed/open, selected, hover, keyboard focus, disabled, empty, error, long-content, viewport-edge and clipped-ancestor cases;
 - exact design tokens: colors, typography, spacing, radii, borders, shadows, motion;
 - the Employee card/dossier design;
 - direct-call and context-inspector interaction design;
@@ -43,6 +43,7 @@ Produce a complete implementable UI specification containing:
 - publication and safety messaging;
 - empty/loading/success/blocked/error states;
 - accessibility requirements;
+- real-browser acceptance evidence for both closed and expanded states, including a 20+ option list, active-option auto-scroll, instant high-contrast focus, empty/all-disabled/error states, two-stage dialog Escape, keyboard navigation, focus return, overlay stacking and viewport collision handling;
 - representative UI copy;
 - an ASCII wireframe for the primary Employee workspace;
 - implementation notes suitable for React and plain CSS.

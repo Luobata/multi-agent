@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createDefaultProviderRegistry, registerProviderAdapter } from "../src/runtime/providers.js";
+import { buildCodexInvocationArgs, createDefaultProviderRegistry, registerProviderAdapter } from "../src/runtime/providers.js";
 
 describe("provider adapters", () => {
   it("includes a deterministic local mock adapter", async () => {
@@ -42,9 +42,62 @@ describe("provider adapters", () => {
     const registry = createDefaultProviderRegistry();
     const command = registry.get("command")!;
     const mock = registry.get("mock")!;
+    const codex = registry.get("codex")!;
     expect(command.validate({ providerId: "cli", definition: { adapter: "command", model: "local-v1", command: "agent" }, projectRoot: process.cwd() })).toEqual([]);
     expect(command.validate({ providerId: "cli", definition: { adapter: "command", model: "", command: "agent" }, projectRoot: process.cwd() })).toContain("provider cli model must be a non-empty string");
     expect(mock.validate({ providerId: "mock", definition: { adapter: "mock", model: "deterministic-mock" }, projectRoot: process.cwd() })).toEqual([]);
+    expect(codex.validate({
+      providerId: "codex-knowledge-control",
+      definition: {
+        adapter: "codex",
+        sandbox: "read-only",
+        approvalPolicy: "never",
+        mcpServers: { knowledge_control: { command: "npm", args: ["run", "mcp"] } }
+      },
+      projectRoot: process.cwd()
+    })).toEqual([]);
+    expect(codex.validate({
+      providerId: "unsafe-codex",
+      definition: { adapter: "codex", sandbox: "danger-full-access" },
+      projectRoot: process.cwd()
+    })).toContain("provider unsafe-codex sandbox must be read-only or workspace-write");
+  });
+
+  it("places Codex global safety and MCP options before the exec subcommand", () => {
+    const args = buildCodexInvocationArgs({
+      adapter: "codex",
+      filesystemIsolation: "workspace-read-only",
+      approvalPolicy: "never",
+      mcpServers: {
+        knowledge_control: {
+          command: "npm",
+          args: ["run", "mcp"],
+          cwd: "{{run.projectRoot}}",
+          enabledTools: ["knowledge_control_snapshot"],
+          defaultToolsApprovalMode: "approve"
+        }
+      }
+    }, { run: { projectRoot: "/tmp/project" } }, "/tmp/knowledge-output.schema.json");
+
+    expect(args.slice(0, 3)).toEqual(["--strict-config", "--ask-for-approval", "never"]);
+    expect(args).not.toContain("--sandbox");
+    expect(args).toContain('default_permissions="knowledge-control"');
+    expect(args).toContain('permissions.knowledge-control.filesystem={":root"="deny", ":minimal"="read", ":workspace_roots"={"."="read"}}');
+    expect(args).toContain('mcp_servers.knowledge_control.cwd="/tmp/project"');
+    expect(args).toContain('mcp_servers.knowledge_control.enabled_tools=["knowledge_control_snapshot"]');
+    expect(args).toContain('mcp_servers.knowledge_control.default_tools_approval_mode="approve"');
+    expect(args.indexOf("-c")).toBeLessThan(args.indexOf("exec"));
+    expect(args.slice(args.indexOf("exec"))).toEqual([
+      "exec",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      "--output-schema",
+      "/tmp/knowledge-output.schema.json",
+      "-"
+    ]);
   });
 
   it("resolves explicit environment references without persisting their value in a Provider definition", async () => {

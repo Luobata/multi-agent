@@ -1,0 +1,56 @@
+{
+  "roles": [
+    {
+      "roleId": "product-manager",
+      "employeeId": "xiaomiwang-product-manager",
+      "skills": ["humanizer-zh"],
+      "knowledgeProfileIds": ["workbench-product-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "product-designer",
+      "employeeId": "lin-mo-product-designer",
+      "skills": ["hallmark", "interaction-state-completeness", "healing-pixel-dossier"],
+      "knowledgeProfileIds": ["workbench-design-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "frontend-developer",
+      "employeeId": "mihuhu-frontend-engineer",
+      "skills": [],
+      "knowledgeProfileIds": [
+        "workbench-engineering-knowledge",
+        "workbench-design-knowledge"
+      ],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "backend-developer",
+      "employeeId": "huotuizhu-product-manager",
+      "skills": [],
+      "knowledgeProfileIds": ["workbench-engineering-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "fullstack-developer",
+      "employeeId": "yaoxi-programmer",
+      "skills": [],
+      "knowledgeProfileIds": ["workbench-engineering-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "test-engineer",
+      "employeeId": "xiaomixiang-tester",
+      "skills": ["browser-e2e-validation"],
+      "knowledgeProfileIds": ["workbench-quality-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
+      "roleId": "knowledge-steward",
+      "employeeId": "local-agent-workbench-knowledge-steward",
+      "skills": ["knowledge-control-conversation"],
+      "knowledgeProfileIds": [],
+      "updatePolicy": "locked"
+    }
+  ]
+}
