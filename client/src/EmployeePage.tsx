@@ -9,9 +9,11 @@ import {
   Field,
   Modal,
   ReadonlyEvidence,
+  RuntimeStatusChip,
   SelectControl,
   Stamp,
   UtilityIcon,
+  employeeRuntimeStatus,
   formatTime,
   scrollRecordIntoView,
   useDaemonAvailable
@@ -21,7 +23,6 @@ import type {
   ContextView,
   Employee,
   JsonObject,
-  KnowledgeProfile,
   KnowledgeRuntimeResult,
   ProviderEntry,
   Session,
@@ -34,6 +35,8 @@ import {
   type EmployeeSkillManagerMode
 } from "./employeeSkillPool";
 import { providerRuntimeSummary } from "./providerRuntime";
+import { KnowledgePerspectiveExplorer } from "./knowledgePerspective";
+import { EmployeeKnowledgeGrantModal } from "./employeeKnowledgeGrant";
 
 interface PageProps {
   data: Bootstrap;
@@ -54,7 +57,6 @@ interface EmployeeDraft {
   requestPrompt: string;
   providerId: string;
   selectedSkills: string[];
-  selectedKnowledgeProfiles: string[];
   skillConfigs: Record<string, string>;
   skillEnabled: Record<string, boolean>;
   write: "none" | "artifacts-only" | "project";
@@ -99,7 +101,6 @@ function draftFrom(employee?: Employee): EmployeeDraft {
     requestPrompt: employee?.requestPrompt ?? "完成当前交办事项，并按约定的结构化输出返回结果。",
     providerId: employee?.providerId ?? "mock",
     selectedSkills: employee?.skills.map(bindingId) ?? [],
-    selectedKnowledgeProfiles: employee?.knowledgeProfileIds ?? [],
     skillConfigs: Object.fromEntries((employee?.skills ?? []).map((binding) => [
       bindingId(binding),
       JSON.stringify(typeof binding === "string" ? {} : binding.config ?? {}, null, 2)
@@ -149,7 +150,6 @@ function payloadFrom(draft: EmployeeDraft) {
     systemPrompt: draft.systemPrompt.trim(),
     requestPrompt: draft.requestPrompt.trim(),
     skills,
-    knowledgeProfileIds: draft.selectedKnowledgeProfiles,
     providerId: draft.providerId,
     outputSchema: parseObject(draft.outputSchema, "Output Schema"),
     verdict: draft.verdictPath.trim() ? {
@@ -168,11 +168,10 @@ function payloadFrom(draft: EmployeeDraft) {
   };
 }
 
-function EmployeeEditor({ employee, providers, skills, knowledgeProfiles, onClose, onSaved, notify }: {
+function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify }: {
   employee?: Employee;
   providers: ProviderEntry[];
   skills: Skill[];
-  knowledgeProfiles: KnowledgeProfile[];
   onClose: () => void;
   onSaved: (employee: Employee) => void;
   notify: PageProps["notify"];
@@ -244,15 +243,14 @@ function EmployeeEditor({ employee, providers, skills, knowledgeProfiles, onClos
         </div>}
       </DossierSection>
 
-      <DossierSection number="04" title="知识 Profile">
-        <p className="muted">员工只绑定少量可复用 Profile；每次任务由 Resolver 和 Router 再缩小到相关 Collection。</p>
-        <div className="knowledge-base-choices employee-profile-choices">
-          {knowledgeProfiles.filter((profile) => profile.status === "active" || draft.selectedKnowledgeProfiles.includes(profile.id)).map((profile) => <label key={profile.id}>
-            <input type="checkbox" checked={draft.selectedKnowledgeProfiles.includes(profile.id)} onChange={(event) => patch("selectedKnowledgeProfiles", event.target.checked ? [...draft.selectedKnowledgeProfiles, profile.id] : draft.selectedKnowledgeProfiles.filter((id) => id !== profile.id))} />
-            <span><strong>{profile.displayName}</strong><small>{profile.id} · v{profile.version} · {profile.rules.length} 条规则</small></span>
-          </label>)}
-          {knowledgeProfiles.length === 0 && <span className="muted">尚无 Knowledge Profile；可先到“知识库”建立。</span>}
+      <DossierSection number="04" title="知识授权">
+        <div className="project-connect-note">
+          <strong>知识授权与员工档案分开管理。</strong>
+          <p>{employee
+            ? "本次档案修订不会改变知识 Profile。请保存后在员工详情使用“调整授权”，生成待人工审批的变更提案。"
+            : "先建立员工档案，再从员工详情生成知识授权提案；新员工不会因为建立档案而自动获得知识。"}</p>
         </div>
+        {employee && <p className="muted">当前知识 Profile：{(employee.knowledgeProfileIds ?? []).length ? (employee.knowledgeProfileIds ?? []).join("、") : "无"}</p>}
       </DossierSection>
 
       <DossierSection number="05" title="Provider">
@@ -541,6 +539,13 @@ function KnowledgePreviewModal({ employee, onClose, notify }: {
 
 export function EmployeePage({ data, refresh, notify }: PageProps) {
   const daemonAvailable = useDaemonAvailable();
+  // Lightweight page clock so a short-lived "completed" chip actually fades
+  // after its dwell while someone stays on this page. Cleaned up on unmount.
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [search, setSearch] = useState("");
   const [showArchived, setShowArchived] = useState(false);
   const visible = useMemo(() => data.employees.filter((employee) => {
@@ -552,6 +557,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
   const selected = data.employees.find((employee) => employee.id === selectedId) ?? visible[0];
   const selectedProvider = selected ? data.providers.find((provider) => provider.id === selected.providerId) : undefined;
   const selectedRuntime = providerRuntimeSummary(selectedProvider);
+  const selectedRuntimeState = selected ? employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === selected.id), clock) : "idle";
   const sessions = selected ? data.sessions.filter((session) => session.employeeId === selected.id) : [];
   const [versions, setVersions] = useState<Employee[]>([]);
   const [editor, setEditor] = useState<"new" | "edit" | null>(null);
@@ -563,6 +569,8 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
   const [registryOpen, setRegistryOpen] = useState(false);
   const [skillManagerMode, setSkillManagerMode] = useState<EmployeeSkillManagerMode | null>(null);
   const [knowledgePreviewOpen, setKnowledgePreviewOpen] = useState(false);
+  const [perspectiveOpen, setPerspectiveOpen] = useState(false);
+  const [knowledgeGrantOpen, setKnowledgeGrantOpen] = useState(false);
   const [togglingSkill, setTogglingSkill] = useState("");
 
   useEffect(() => {
@@ -604,10 +612,10 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       <header className="list-header"><h1>员工档案</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setEditor("new")} aria-label="新建员工"><UtilityIcon name="add" /></button></header>
       <div className="list-tools"><input type="search" placeholder="检索姓名、ID 或职责…" value={search} onChange={(e) => setSearch(e.target.value)} /><label className="archive-toggle"><input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />含归档</label><button className="text-button" disabled={!daemonAvailable} onClick={() => setRegistryOpen(true)}>共享注册表</button></div>
       <div className="record-scroll">
-        {visible.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
+        {visible.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); const runtimeState = employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id), clock); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
           <EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} />
           <span className="employee-card-copy"><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><small>{employee.description}</small><span className="employee-runtime"><span>模型 <code>{runtime.model}</code></span><span title={runtime.launchCommand}>启动 <code>{runtime.launchPreview}</code></span></span></span>
-          <Stamp status={employee.status} />
+          <span className="employee-card-stamps"><Stamp status={employee.status} />{runtimeState !== "idle" && <RuntimeStatusChip status={runtimeState} />}</span>
         </button>; })}
         {visible.length === 0 && <div className="mini-empty">没有符合条件的员工档案。</div>}
       </div>
@@ -618,8 +626,8 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       {!selected ? <EmptyState title="建立第一位本地员工" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>建立档案</button>}>定义他的背景、职责、提示词、共享 Skill、Provider 与权限。之后可以在任意 MCP 会话直接调用，也可以将他放进协作编排。</EmptyState> : <div className="dossier employee-dossier" style={{ "--dossier-accent": selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT } as React.CSSProperties}>
         <header className="dossier-cover">
           <div className="file-index"><span>LOCAL PERSONNEL RECORD</span><code>No. {selected.id.toUpperCase()}</code></div>
-          <div className="dossier-title-row"><EmployeeAvatar className="large" displayName={selected.identity.displayName} presentation={selected.presentation} /><div><h2>{selected.identity.displayName}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div>
-          <div className="dossier-actions"><button className="button primary" disabled={selected.status === "archived"} onClick={() => scrollRecordIntoView("direct-desk")}>直接交办</button><button className="button secondary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setKnowledgePreviewOpen(true)}>知识试跑</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订档案</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setCloneDraft({ id: `${selected.id}-copy`, displayName: `${selected.identity.displayName} 副本` }); setCloneOpen(true); }}>复制</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div>
+          <div className="dossier-title-row"><EmployeeAvatar className="large" displayName={selected.identity.displayName} presentation={selected.presentation} /><div><h2>{selected.identity.displayName}</h2><p>{selected.description}</p></div><div className="dossier-stamps"><Stamp status={selected.status} />{selectedRuntimeState !== "idle" && <RuntimeStatusChip status={selectedRuntimeState} />}</div></div>
+          <div className="dossier-actions"><button className="button primary" disabled={selected.status === "archived"} onClick={() => scrollRecordIntoView("direct-desk")}>直接交办</button>{selectedRuntimeState === "failed" && <button className="button secondary" onClick={() => { window.location.hash = "runs"; }}>查看故障运行证据</button>}<button className="button secondary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setKnowledgePreviewOpen(true)}>知识试跑</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setPerspectiveOpen(true)}>知识视角</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订档案</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setCloneDraft({ id: `${selected.id}-copy`, displayName: `${selected.identity.displayName} 副本` }); setCloneOpen(true); }}>复制</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div>
         </header>
 
         <DossierSection number="01" title="身份"><div className="fact-grid"><div><span>背景</span><p>{selected.identity.background}</p></div><div><span>职责</span><ul>{selected.identity.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul></div><div><span>目标</span><ul>{selected.identity.goals?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div><div><span>约束</span><ul>{selected.identity.constraints?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div></div></DossierSection>
@@ -628,7 +636,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
           <button type="button" className="text-button icon-text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setSkillManagerMode("add")}><UtilityIcon name="add" />从技能池添加</button>
           <button type="button" className="text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setSkillManagerMode("manage")}>管理绑定</button>
         </div>}><div className="employee-skill-ledger">{selected.skills.length ? selected.skills.map((binding) => { const id = bindingId(binding); const skill = data.skills.find((candidate) => candidate.id === id); const enabled = bindingEnabled(binding); return <article className={!enabled ? "is-disabled" : ""} key={id}><div className="skill-book" aria-hidden="true">S</div><div><strong>{skill?.displayName ?? id}</strong><code>{id} · 固定 v{selected.skillVersions[id] ?? "—"}</code><small>{skill?.description ?? "共享能力定义不可用"}</small></div><Stamp status={enabled ? "active" : "archived"} label={enabled ? "已启用" : "已停用"} /><label className="compact-switch"><span className="sr-only">{enabled ? "停用" : "启用"} {skill?.displayName ?? id}</span><input type="checkbox" role="switch" disabled={!daemonAvailable || Boolean(togglingSkill) || selected.status === "archived"} checked={enabled} onChange={(event) => void toggleSkill(id, event.target.checked)} /></label></article>; }) : <div className="empty-inline"><span>尚未绑定共享 Skill</span><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setSkillManagerMode("add")}>从技能池添加</button></div>}</div></DossierSection>
-        <DossierSection number="04" title="知识 Profile"><div className="employee-knowledge-profiles">{(selected.knowledgeProfileIds ?? []).length ? (selected.knowledgeProfileIds ?? []).map((profileId) => { const profile = (data.knowledgeProfiles ?? []).find((candidate) => candidate.id === profileId); return <article key={profileId}><span aria-hidden="true">知</span><div><strong>{profile?.displayName ?? profileId}</strong><code>{profileId} · 当前 v{profile?.version ?? "—"}</code><small>{profile?.description ?? "Profile 已不可用；后续调用会在 Knowledge Plan 中排除。"}</small></div><Stamp status={profile?.status ?? "blocked"} /></article>; }) : <div className="empty-inline"><span>尚未分配知识 Profile；员工仍可正常工作，但不会预加载知识证据。</span><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>分配 Profile</button></div>}</div></DossierSection>
+        <DossierSection number="04" title="知识授权" action={<div className="skill-section-actions"><button type="button" className="text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setKnowledgeGrantOpen(true)}>调整授权</button><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setPerspectiveOpen(true)}>查看知识视角</button></div>}><div className="employee-knowledge-profiles">{(selected.knowledgeProfileIds ?? []).length ? (selected.knowledgeProfileIds ?? []).map((profileId) => { const profile = (data.knowledgeProfiles ?? []).find((candidate) => candidate.id === profileId); return <article key={profileId}><span aria-hidden="true">知</span><div><strong>{profile?.displayName ?? profileId}</strong><code>{profileId} · 当前 v{profile?.version ?? "—"}</code><small>{profile?.description ?? "Profile 已不可用；后续调用会在 Knowledge Plan 中排除。"}</small></div><Stamp status={profile?.status ?? "blocked"} /></article>; }) : <div className="empty-inline"><span>尚未授权知识 Profile；员工仍可正常工作，但不会预加载知识证据。</span><button type="button" className="text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setKnowledgeGrantOpen(true)}>生成授权提案</button></div>}</div></DossierSection>
         <div className="dossier-columns"><DossierSection number="05" title="Provider"><dl className="ledger"><dt>实例</dt><dd><code>{selected.providerId}</code></dd><dt>模型</dt><dd className="provider-model"><code>{selectedRuntime.model}</code></dd><dt>Adapter</dt><dd>{selectedRuntime.adapter}</dd><dt>最大尝试</dt><dd>{selected.maxAttempts}</dd></dl><div className="provider-launch"><span>启动指令模板</span><pre>{selectedRuntime.launchCommand}</pre><small>当前 Provider 配置中的 argv；模板变量会在运行时渲染，敏感参数仅显示为 ***。</small></div></DossierSection><DossierSection number="06" title="权限"><dl className="ledger"><dt>写入</dt><dd>{selected.permissions.write}</dd><dt>声明工具</dt><dd>{selected.permissions.tools?.join(", ") || "无"}</dd><dt>历史窗口</dt><dd>{selected.contextPolicy.historyLimit} 条</dd><dt>Verdict</dt><dd>{selected.verdict ? <code>{selected.verdict.path}: {selected.verdict.pass.join("/")} | {selected.verdict.block.join("/")}</code> : "未配置"}</dd></dl></DossierSection></div>
         <DossierSection number="07" title="外观"><dl className="ledger horizontal"><dt>强调色</dt><dd><span className="color-chip" style={{ background: selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT }} />{selected.presentation.accent ?? "默认朱红"}</dd><dt>首字母</dt><dd>{selected.presentation.initials || selected.identity.displayName.slice(0, 2)}</dd><dt>头像</dt><dd>{selected.presentation.avatarUrl ? <code className="avatar-source">{selected.presentation.avatarUrl}</code> : "未配置，显示首字母"}</dd></dl></DossierSection>
         <DossierSection number="08" title="版本"><div className="version-strip">{versions.map((version) => <div key={version.version} className={version.version === selected.version ? "current" : ""}><code>v{version.version}</code><span>{version.status === "archived" ? "归档" : version.version === selected.version ? "当前" : "历史"}</span><time>{formatTime(version.updatedAt)}</time></div>)}</div></DossierSection>
@@ -636,10 +644,14 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       </div>}
     </main>
 
-    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} providers={data.providers} skills={data.skills} knowledgeProfiles={data.knowledgeProfiles ?? []} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
+    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} providers={data.providers} skills={data.skills} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
     {registryOpen && <RegistryModal data={data} onClose={() => setRegistryOpen(false)} refresh={refresh} notify={notify} />}
     {skillManagerMode && selected && <EmployeeSkillManager employee={selected} skills={data.skills} mode={skillManagerMode} notify={notify} onClose={() => setSkillManagerMode(null)} onSaved={async () => { setSkillManagerMode(null); await refresh(); }} />}
     {knowledgePreviewOpen && selected && <KnowledgePreviewModal employee={selected} notify={notify} onClose={() => setKnowledgePreviewOpen(false)} />}
+    {perspectiveOpen && selected && <Modal title={`知识视角 · ${selected.identity.displayName}`} eyebrow={`${selected.id} v${selected.version} · ELIGIBLE → ACTIVATED → SELECTED`} onClose={() => setPerspectiveOpen(false)} wide>
+      <div className="modal-body perspective-modal-body"><KnowledgePerspectiveExplorer employee={selected} bindings={data.projectBindings} notify={notify} /></div>
+    </Modal>}
+    {knowledgeGrantOpen && selected && <EmployeeKnowledgeGrantModal employee={selected} knowledgeProfiles={data.knowledgeProfiles ?? []} notify={notify} onClose={() => setKnowledgeGrantOpen(false)} onCreated={refresh} />}
     {cloneOpen && selected && <Modal title="复制员工档案" eyebrow={`来源 ${selected.id} · v${selected.version}`} onClose={() => setCloneOpen(false)}><form className="modal-body compact-form" onSubmit={clone}><p className="notice-copy">复制身份、提示词、Skill、Provider 与权限。不会复制 Session、密钥或 Run 历史。</p><Field label="新员工 ID"><input required disabled={!daemonAvailable} pattern="[a-z][a-z0-9-]*" value={cloneDraft.id} onChange={(e) => setCloneDraft({ ...cloneDraft, id: e.target.value })} /></Field><Field label="显示名"><input required disabled={!daemonAvailable} value={cloneDraft.displayName} onChange={(e) => setCloneDraft({ ...cloneDraft, displayName: e.target.value })} /></Field><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setCloneOpen(false)}>取消</button><button className="button primary" disabled={!daemonAvailable}>建立副本</button></div></form></Modal>}
     {archiveOpen && selected && <Modal title="归档员工" eyebrow={`${selected.id} · 保留历史`} onClose={() => setArchiveOpen(false)}><div className="modal-body"><div className="danger-notice"><b>只归档，不物理删除。</b><p>归档后不能接受新调用，也不能加入新 Workflow；已有 Session、版本与 Run 证据继续保留。</p></div><div className="modal-actions"><button className="button secondary" onClick={() => setArchiveOpen(false)}>保留在册</button><button className="button danger-filled" disabled={!daemonAvailable} onClick={() => void archive()}>确认归档</button></div></div></Modal>}
     {contextOpen && selected && <><div className="drawer-scrim" onClick={() => setContextOpen(false)} /><ContextDrawer employee={selected} sessionId={contextSessionId} onClose={() => setContextOpen(false)} /></>}

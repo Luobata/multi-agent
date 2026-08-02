@@ -29,20 +29,31 @@ User conversation
 - `knowledge_change_list`
 - `knowledge_change_get`
 - `knowledge_change_propose`
+- `knowledge_url_preview`
+- `knowledge_url_propose`
+- `knowledge_wiki_get`
+- `employee_knowledge_perspective`
+- `knowledge_review_list`
 
-它没有 approve、reject、cancel、apply、Employee invoke 或 Workflow run 工具。Codex 使用非交互 `never` approval policy、独立只读工作目录和根目录拒读的 permission profile；用户级 Codex 配置不会进入这个内部员工。Codex 原生命令即使被模型选中，也只能读取生成的会话包，不能读取项目源码、访问网络或持久化写文件；知识服务只通过带显式工具白名单的 MCP 访问。
+它没有 approve、reject、cancel、apply、Employee invoke、Workflow run 或通用网络请求工具。Codex 使用非交互 `never` approval policy、独立只读工作目录和根目录拒读的 permission profile；用户级 Codex 配置不会进入这个内部员工。Codex 原生命令即使被模型选中，也只能读取生成的会话包，不能读取项目源码、访问网络或持久化写文件；需要导入 URL 时只能调用 `knowledge_url_preview / knowledge_url_propose`，由服务端执行受限抓取。
 
 `knowledge_change_propose` 使用按 `operation.type` 区分的严格 Schema，而不是开放 JSON：每一种新建、修订、同步、发布、归档或授权动作都有自己的必填字段和 payload 结构，未知字段会在 MCP 入口被拒绝。Schema 只描述意图；资源存在性、版本、发布质量与授权范围仍由 Core 再校验。
 
+URL 入口同样是有限能力：只接收目标 KnowledgeBase、Collection 和 HTTP(S) URL；返回结构化正文、冻结哈希和有限关系候选。模型只能选择预览中已有的候选和固定关系类型，不能自行构造任意引用。提案生成的是 `knowledge-revision.create` 草稿，发布仍需单独的人审提案。
+
+`knowledge_wiki_get`、`employee_knowledge_perspective` 和 `knowledge_review_list` 都是解释性读取：分别回答“全量知识是什么”“某员工在当前任务下能看到并实际选择什么”“哪些授权需要人复核”，不会反向写入 Profile 或授权。
+
 ## 3. KnowledgeChangeRequest
 
-每个长期变更只有一个类型化 Operation。首版支持 KnowledgeBase、Revision、Profile、Employee Profile assignment 和 Project Role Profile assignment。创建提案时 Core 会：
+每个长期变更只有一个类型化 Operation。当前支持 KnowledgeBase、Revision、Profile、Employee Profile assignment 和 Project Role Profile assignment；URL 导入最终也归一化为 Revision 变更。创建提案时 Core 会：
 
 1. 固定目标 `expectedVersion`；
 2. 校验输入和引用；
 3. 计算质量、授权与影响预览；
 4. 计算 `planHash`；
 5. 保存为 `awaiting-approval`。
+
+`employee-profiles.set` 与 `project-role-profiles.set` 保存逐 Profile 的 Grant。新增授权必须有 `reason / grantedBy`，可带到期与复核周期；未涉及的现有 Grant 保持不变。复核动作也只生成 ChangeRequest，台账不会按日期自动改权。
 
 批准前重新执行同一计划。目标版本、质量或影响发生变化时，状态进入 `needs-reapproval`，旧审批不能继续使用。批准、拒绝和执行接口不暴露给 Knowledge Control MCP。
 

@@ -138,6 +138,45 @@ describe("Local Agent Workbench", () => {
     expect(service.getSession(seed.session.id).messages).toHaveLength(6);
   });
 
+  it("starts a multi-agent workflow asynchronously and exposes durable invocation status", async () => {
+    let started = () => {};
+    let release = () => {};
+    const providerStarted = new Promise<void>((resolve) => { started = resolve; });
+    const providerGate = new Promise<void>((resolve) => { release = resolve; });
+    const providers: ProviderRegistry = new Map([["slow", {
+      id: "slow",
+      validate: () => [],
+      invoke: async () => {
+        started();
+        await providerGate;
+        return { stdout: JSON.stringify({ message: "Async work completed." }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("slow-provider", { adapter: "slow", model: "slow-test-model", outputProtocol: "json" });
+    const employee = await service.createEmployee({
+      id: "async-worker",
+      identity: { displayName: "Async Worker", background: "Runs in the background.", responsibilities: ["Respond"] },
+      providerId: "slow-provider"
+    });
+    await service.createWorkflow({
+      id: "async-flow",
+      nodes: [{ id: "respond", employeeId: employee.id }]
+    });
+
+    const receipt = await service.startWorkbenchWorkflow("async-flow", { message: "Start without blocking" });
+    expect(receipt.runId).toBe(receipt.invocation.runId);
+    expect(receipt.invocation.status).toBe("queued");
+    await providerStarted;
+    expect((await service.getInvocationDetail(receipt.invocation.id)).invocation.status).toBe("running");
+
+    release();
+    const completed = await service.waitForInvocation(receipt.invocation.id);
+    expect(completed.invocation.status).toBe("completed");
+    expect(completed.instances[0]?.status).toBe("completed");
+    expect(completed.run).toMatchObject({ id: receipt.runId, status: "passed" });
+  });
+
   it("versions, clones, archives, invokes, and persists Employees through the Graph runtime", async () => {
     const root = temporaryRoot();
     const service = await WorkbenchService.open({ dataRoot: root });

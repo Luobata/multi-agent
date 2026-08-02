@@ -67,6 +67,15 @@ function bestOptions(scope: KnowledgeScope): SelectionOption[] {
   );
 }
 
+export function activatedKnowledgeCollectionKeys(scope: KnowledgeScope): Set<string> {
+  const requestTokens = new Set(knowledgeQueryTokens(scope.context.request));
+  return new Set(scope.eligibleCollections.flatMap((candidate) => {
+    const relevance = relevanceScore(candidate, requestTokens);
+    const activated = candidate.matches.some((match) => match.activation !== "on-demand" || relevance > 0);
+    return activated ? [`${candidate.knowledgeBaseId}/${candidate.collection.id}`] : [];
+  }));
+}
+
 function routeReason(option: SelectionOption): string {
   const base = option.match.reason;
   if (option.match.activation !== "on-demand") return base;
@@ -79,6 +88,7 @@ export function routeKnowledge(scope: KnowledgeScope, options: KnowledgeRouterOp
   const selectedKeys = new Set<string>();
   const ruleCounts = new Map<string, number>();
   const exclusions: KnowledgeExclusion[] = [...scope.exclusions];
+  const activatedKeys = activatedKnowledgeCollectionKeys(scope);
 
   for (const option of bestOptions(scope)) {
     const collectionKey = `${option.candidate.knowledgeBaseId}/${option.candidate.collection.id}`;
@@ -107,12 +117,11 @@ export function routeKnowledge(scope: KnowledgeScope, options: KnowledgeRouterOp
   for (const candidate of scope.eligibleCollections) {
     const key = `${candidate.knowledgeBaseId}/${candidate.collection.id}`;
     if (selectedKeys.has(key)) continue;
-    const hasAlwaysEligibleMatch = candidate.matches.some((match) => match.activation !== "on-demand");
     exclusions.push({
       knowledgeBaseId: candidate.knowledgeBaseId,
       collectionId: candidate.collection.id,
       profileId: candidate.matches[0]?.profileId,
-      reason: hasAlwaysEligibleMatch ? "collection budget excluded this candidate" : "on-demand metadata did not match the request"
+      reason: activatedKeys.has(key) ? "collection budget excluded this candidate" : "on-demand metadata did not match the request"
     });
   }
 

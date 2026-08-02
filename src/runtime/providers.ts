@@ -16,6 +16,7 @@ export interface ProviderInvocation {
   cwd: string;
   prompt: string;
   templateContext: Record<string, unknown>;
+  signal?: AbortSignal;
 }
 
 export interface ProviderResponse {
@@ -164,18 +165,34 @@ class CommandProviderAdapter implements ProviderAdapter {
       let settled = false;
       let timedOut = false;
 
+      const failureOptions = (status: number | null) => {
+        const detail = `${stdout}\n${stderr}`.toLowerCase();
+        if (/maximum budget|max_budget|budget exhausted/.test(detail)) {
+          return { kind: "budget" as const, retryable: false, durationMs: Date.now() - started };
+        }
+        if (/rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up/.test(detail)) {
+          return { kind: "rate-limit" as const, retryable: true, durationMs: Date.now() - started };
+        }
+        return { kind: "exit" as const, retryable: status === 75, durationMs: Date.now() - started };
+      };
+
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
+        invocation.signal?.removeEventListener("abort", abort);
         callback();
+      };
+      const abort = () => {
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
       };
       const timeout = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
+        abort();
       }, timeoutMs);
       timeout.unref();
+      invocation.signal?.addEventListener("abort", abort, { once: true });
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
@@ -186,16 +203,37 @@ class CommandProviderAdapter implements ProviderAdapter {
         stderr += chunk;
       });
       child.once("error", (error) => {
-        finish(() => reject(new ProviderExecutionError(error.message, stdout, stderr)));
+        finish(() => reject(new ProviderExecutionError(error.message, stdout, stderr, {
+          kind: "start",
+          retryable: false,
+          durationMs: Date.now() - started
+        })));
       });
       child.once("close", (status) => {
         finish(() => {
+          if (invocation.signal?.aborted) {
+            reject(new ProviderExecutionError(`provider ${invocation.providerId} was aborted`, stdout, stderr, {
+              kind: "aborted",
+              retryable: false,
+              durationMs: Date.now() - started
+            }));
+            return;
+          }
           if (timedOut) {
-            reject(new ProviderExecutionError(`provider ${invocation.providerId} timed out after ${timeoutMs}ms`, stdout, stderr));
+            reject(new ProviderExecutionError(`provider ${invocation.providerId} timed out after ${timeoutMs}ms`, stdout, stderr, {
+              kind: "timeout",
+              retryable: false,
+              durationMs: Date.now() - started
+            }));
             return;
           }
           if (status !== 0) {
-            reject(new ProviderExecutionError(`provider ${invocation.providerId} exited with status ${status}`, stdout, stderr));
+            reject(new ProviderExecutionError(
+              `provider ${invocation.providerId} exited with status ${status}`,
+              stdout,
+              stderr,
+              failureOptions(status)
+            ));
             return;
           }
           resolve({ stdout, stderr, durationMs: Date.now() - started });
@@ -378,14 +416,19 @@ class CodexProviderAdapter implements ProviderAdapter {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
+        invocation.signal?.removeEventListener("abort", abort);
         callback();
+      };
+      const abort = () => {
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
       };
       const timeout = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
+        abort();
       }, timeoutMs);
       timeout.unref();
+      invocation.signal?.addEventListener("abort", abort, { once: true });
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => { stdout += chunk; });
@@ -393,13 +436,31 @@ class CodexProviderAdapter implements ProviderAdapter {
       child.once("error", (error) => finish(() => reject(new ProviderExecutionError(
         `provider ${invocation.providerId} could not start ${definition.command?.trim() || "codex"}; set MULTI_AGENT_CODEX_COMMAND when Codex is outside the daemon PATH (${error.message})`,
         stdout,
-        stderr
+        stderr,
+        { kind: "start", retryable: false, durationMs: Date.now() - started }
       ))));
       child.once("close", (status) => finish(() => {
-        if (timedOut) {
-          reject(new ProviderExecutionError(`provider ${invocation.providerId} timed out after ${timeoutMs}ms`, stdout, stderr));
+        if (invocation.signal?.aborted) {
+          reject(new ProviderExecutionError(`provider ${invocation.providerId} was aborted`, stdout, stderr, {
+            kind: "aborted",
+            retryable: false,
+            durationMs: Date.now() - started
+          }));
+        } else if (timedOut) {
+          reject(new ProviderExecutionError(`provider ${invocation.providerId} timed out after ${timeoutMs}ms`, stdout, stderr, {
+            kind: "timeout",
+            retryable: false,
+            durationMs: Date.now() - started
+          }));
         } else if (status !== 0) {
-          reject(new ProviderExecutionError(`provider ${invocation.providerId} exited with status ${status}`, stdout, stderr));
+          const detail = `${stdout}\n${stderr}`.toLowerCase();
+          const budget = /maximum budget|max_budget|budget exhausted/.test(detail);
+          const transient = /rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up/.test(detail);
+          reject(new ProviderExecutionError(`provider ${invocation.providerId} exited with status ${status}`, stdout, stderr, {
+            kind: budget ? "budget" : transient ? "rate-limit" : "exit",
+            retryable: transient,
+            durationMs: Date.now() - started
+          }));
         } else {
           resolve({ stdout, stderr, durationMs: Date.now() - started });
         }

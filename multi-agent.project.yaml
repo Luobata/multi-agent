@@ -74,6 +74,11 @@ roles:
         - knowledge_base_get
         - knowledge_revision_assess
         - knowledge_revision_preview
+        - knowledge_url_preview
+        - knowledge_url_propose
+        - knowledge_wiki_get
+        - employee_knowledge_perspective
+        - knowledge_review_list
         - knowledge_impact_get
         - knowledge_change_list
         - knowledge_change_get

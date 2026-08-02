@@ -30,6 +30,7 @@ export interface RunWorkflowOptions {
   architectures?: ArchitectureRegistry;
   initialArtifacts?: Record<string, JsonValue>;
   onEvent?: (event: ObservedRunEvent) => void | Promise<void>;
+  signal?: AbortSignal;
 }
 
 export interface ObservedRunEvent extends RunEvent {
@@ -147,7 +148,8 @@ async function executeNode(
   store: RunStore,
   registry: ProviderRegistry,
   emit: (type: string, nodeId?: string, detail?: JsonValue) => Promise<void>,
-  providerCwd: string
+  providerCwd: string,
+  signal?: AbortSignal
 ): Promise<NodeRunResult> {
   const role = loaded.manifest.roles[node.role];
   if (!role) throw new Error(`role not found: ${node.role}`);
@@ -185,6 +187,10 @@ async function executeNode(
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (signal?.aborted) throw new ProviderExecutionError("workflow execution was aborted", "", "", {
+      kind: "aborted",
+      retryable: false
+    });
     result.attempts = attempt;
     const attemptDir = await store.createAttempt(node.id, attempt);
     result.artifactDir = path.relative(store.runDir, attemptDir).split(path.sep).join("/");
@@ -199,7 +205,8 @@ async function executeNode(
         definition: provider,
         cwd: providerCwd,
         prompt: bundle.prompt,
-        templateContext: bundle.context
+        templateContext: bundle.context,
+        signal
       });
       await store.writeText(attemptDir, "stdout.txt", response.stdout);
       await store.writeText(attemptDir, "stderr.txt", response.stderr);
@@ -219,14 +226,24 @@ async function executeNode(
         await store.writeText(attemptDir, "stdout.txt", error.stdout);
         await store.writeText(attemptDir, "stderr.txt", error.stderr);
       }
+      const retryable = error instanceof ProviderExecutionError && error.retryable;
+      const willRetry = attempt < maxAttempts && retryable;
       await store.writeAttemptJson(attemptDir, "error.json", {
         attempt,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        kind: error instanceof ProviderExecutionError ? error.kind : "validation",
+        retryable,
+        willRetry,
+        durationMs: error instanceof ProviderExecutionError ? error.durationMs : undefined
       });
       await emit("node.attempt.failed", node.id, {
         attempt,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        kind: error instanceof ProviderExecutionError ? error.kind : "validation",
+        retryable,
+        willRetry
       });
+      if (!willRetry) break;
     }
   }
 
@@ -290,7 +307,7 @@ export async function runWorkflow(
     input,
     plan,
     run,
-    executeNode: (node) => executeNode(loaded, run, node, input, store, registry, emit, providerCwd),
+    executeNode: (node) => executeNode(loaded, run, node, input, store, registry, emit, providerCwd, options.signal),
     persist: () => store.writeRun(run),
     emit
   });

@@ -116,6 +116,17 @@ function buildIndex(revision: KnowledgeRevision): KnowledgeIndex {
   };
 }
 
+function normalizeStoredRevision(revision: KnowledgeRevision): KnowledgeRevision {
+  return {
+    ...revision,
+    documents: revision.documents.map((document, index) => ({
+      ...document,
+      order: Number.isInteger(document.order) && document.order >= 0 ? document.order : index,
+      references: Array.isArray(document.references) ? document.references : []
+    }))
+  };
+}
+
 async function collectDirectoryFiles(root: string): Promise<string[]> {
   const files: string[] = [];
   const visit = async (directory: string): Promise<void> => {
@@ -154,6 +165,8 @@ async function readSourceDocument(
     collectionId: source.collectionId,
     sourceId: source.id,
     sourceRef: filePath,
+    order: 0,
+    references: [],
     metadata: { relativePath: relativePath.split(path.sep).join("/") },
     updatedAt: stat.mtime.toISOString()
   };
@@ -189,7 +202,9 @@ export class KnowledgeStore {
   }
 
   async readRevision(knowledgeBaseId: string, revision: number): Promise<KnowledgeRevision> {
-    return JSON.parse(await fs.readFile(this.revisionPath(knowledgeBaseId, revision), "utf8")) as KnowledgeRevision;
+    return normalizeStoredRevision(
+      JSON.parse(await fs.readFile(this.revisionPath(knowledgeBaseId, revision), "utf8")) as KnowledgeRevision
+    );
   }
 
   async readIndex(knowledgeBaseId: string, revision: number): Promise<KnowledgeIndex> {
@@ -209,6 +224,6 @@ export class KnowledgeStore {
         documents.push(await readSourceDocument(source, filePath, relativePath));
       }
     }
-    return documents;
+    return documents.map((document, index) => ({ ...document, order: index }));
   }
 }

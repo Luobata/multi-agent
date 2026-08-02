@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +16,12 @@ import type { JsonObject, JsonValue, RolePermissionDefinition, RoleSkillBinding 
 import { KnowledgeRuntime } from "../knowledge/runtime.js";
 import { assessKnowledgeRevision } from "../knowledge/assessment.js";
 import { knowledgeChangePlanHash, knowledgeChangeRisk } from "../knowledge/change.js";
+import { buildKnowledgeWiki, deriveKnowledgeRelationCandidates } from "../knowledge/documents.js";
 import { buildKnowledgeImpactSnapshot } from "../knowledge/impact.js";
+import { resolveKnowledgeScope } from "../knowledge/resolver.js";
+import { activatedKnowledgeCollectionKeys, routeKnowledge } from "../knowledge/router.js";
+import { RestrictedKnowledgeUrlFetcher } from "../knowledge/urlFetcher.js";
+import { webpageToKnowledgeDocuments } from "../knowledge/urlImport.js";
 import type {
   KnowledgeBaseCreateInput,
   KnowledgeBaseDefinition,
@@ -30,7 +35,16 @@ import type {
   KnowledgeChangeRequest,
   KnowledgeDocumentDefinition,
   KnowledgeDocumentInput,
+  KnowledgeEvidenceUsage,
+  KnowledgeGrantReviewItem,
+  KnowledgeGrantReviewLedger,
   KnowledgeImpactSnapshot,
+  KnowledgePerspective,
+  KnowledgePerspectiveInput,
+  KnowledgeProfileGrant,
+  KnowledgeProfileGrantInput,
+  KnowledgeProfileGrantOverride,
+  KnowledgeReferenceType,
   KnowledgeProfileCreateInput,
   KnowledgeProfileDefinition,
   KnowledgeProfileRule,
@@ -41,7 +55,11 @@ import type {
   KnowledgeRevisionCreateInput,
   KnowledgeRevisionPreview,
   KnowledgeRevisionPreviewInput,
-  KnowledgeRuntimeResult
+  KnowledgeRuntimeResult,
+  KnowledgeUrlPreview,
+  KnowledgeUrlPreviewInput,
+  KnowledgeUrlProposeInput,
+  KnowledgeWikiView
 } from "../knowledge/types.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
@@ -59,7 +77,9 @@ import {
   type EmployeeInvocationResult,
   type EmployeeRecord,
   type EmployeeSession,
+  type InvocationDetail,
   type InvocationRecord,
+  type InvocationStartResult,
   type InvocationSource,
   type InvocationStatus,
   type PublicationDefinition,
@@ -238,6 +258,72 @@ function validRevision(value: number | undefined, fallback: number | undefined, 
   return revision as number;
 }
 
+function normalizedTimestamp(value: string, label: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new Error(`${label} must be an ISO-8601 timestamp`);
+  return new Date(timestamp).toISOString();
+}
+
+function normalizeKnowledgeGrants(
+  profileIds: string[],
+  inputs: KnowledgeProfileGrantInput[] | undefined,
+  fallbackAt: string,
+  existing: KnowledgeProfileGrant[] = []
+): KnowledgeProfileGrant[] {
+  if (inputs === undefined) {
+    const previous = new Map(existing.map((grant) => [grant.profileId, grant]));
+    return profileIds.map((profileId) => previous.get(profileId) ?? {
+      profileId,
+      reason: "Legacy knowledgeProfileIds assignment",
+      grantedBy: "legacy-migration",
+      grantedAt: fallbackAt,
+      source: "legacy" as const
+    });
+  }
+  const previous = new Map(existing.map((grant) => [grant.profileId, grant]));
+  const seen = new Set<string>();
+  const normalized = inputs.map((input) => {
+    const profileId = requireId(input.profileId, "knowledge grant profileId");
+    if (seen.has(profileId)) throw new Error(`knowledge grant ${profileId} is repeated`);
+    seen.add(profileId);
+    const grantedAt = input.grantedAt ? normalizedTimestamp(input.grantedAt, `knowledge grant ${profileId} grantedAt`) : fallbackAt;
+    const expiresAt = input.expiresAt ? normalizedTimestamp(input.expiresAt, `knowledge grant ${profileId} expiresAt`) : undefined;
+    const lastReviewedAt = input.lastReviewedAt
+      ? normalizedTimestamp(input.lastReviewedAt, `knowledge grant ${profileId} lastReviewedAt`)
+      : undefined;
+    if (input.reviewCycleDays !== undefined && (!Number.isInteger(input.reviewCycleDays) || input.reviewCycleDays < 1 || input.reviewCycleDays > 3650)) {
+      throw new Error(`knowledge grant ${profileId} reviewCycleDays must be an integer from 1 to 3650`);
+    }
+    const prior = previous.get(profileId);
+    const normalizedGrant = {
+      profileId,
+      reason: requireText(input.reason, `knowledge grant ${profileId} reason`),
+      grantedBy: requireText(input.grantedBy, `knowledge grant ${profileId} grantedBy`),
+      grantedAt,
+      expiresAt,
+      reviewCycleDays: input.reviewCycleDays,
+      lastReviewedAt
+    };
+    const unchanged = prior !== undefined
+      && prior.reason === normalizedGrant.reason
+      && prior.grantedBy === normalizedGrant.grantedBy
+      && prior.grantedAt === normalizedGrant.grantedAt
+      && prior.expiresAt === normalizedGrant.expiresAt
+      && prior.reviewCycleDays === normalizedGrant.reviewCycleDays
+      && prior.lastReviewedAt === normalizedGrant.lastReviewedAt;
+    return {
+      ...normalizedGrant,
+      source: unchanged ? prior.source : "explicit" as const
+    };
+  });
+  const expected = [...profileIds].sort();
+  const actual = normalized.map((grant) => grant.profileId).sort();
+  if (!jsonEqual(expected, actual)) {
+    throw new Error("knowledge grant metadata must contain exactly one record for every knowledgeProfileId");
+  }
+  return profileIds.map((profileId) => normalized.find((grant) => grant.profileId === profileId)!);
+}
+
 function normalizeKnowledgeRule(rule: KnowledgeProfileRule): KnowledgeProfileRule {
   const selector: KnowledgeProfileSelector = {
     knowledgeBaseIds: normalizedStringList(rule.selector.knowledgeBaseIds, "knowledge selector knowledgeBaseId")?.map((id) => requireId(id, "knowledge selector knowledgeBaseId")),
@@ -294,12 +380,25 @@ function normalizeKnowledgeDocuments(
   timestamp: string
 ): KnowledgeDocumentDefinition[] {
   const seen = new Set<string>();
-  return documents.map((document) => {
+  const referenceTypes = new Set(["related", "supports", "contradicts", "depends-on", "supersedes"]);
+  const normalized = documents.map((document, index) => {
     const id = requireId(document.id, "knowledge document id");
     if (seen.has(id)) throw new Error(`knowledge document ${id} is repeated`);
     seen.add(id);
     const collectionId = requireId(document.collectionId, `knowledge document ${id} collectionId`);
     if (!collectionIds.has(collectionId)) throw new Error(`knowledge document ${id} references unknown collection ${collectionId}`);
+    const order = document.order ?? index;
+    if (!Number.isInteger(order) || order < 0) throw new Error(`knowledge document ${id} order must be a non-negative integer`);
+    const references = (document.references ?? []).map((reference) => {
+      if (!referenceTypes.has(reference.type)) throw new Error(`knowledge document ${id} has invalid reference type ${String(reference.type)}`);
+      return {
+        type: reference.type,
+        targetDocumentId: requireId(reference.targetDocumentId, `knowledge document ${id} reference target`),
+        note: reference.note?.trim() || undefined
+      };
+    });
+    const referenceKeys = references.map((reference) => `${reference.type}/${reference.targetDocumentId}`);
+    if (new Set(referenceKeys).size !== referenceKeys.length) throw new Error(`knowledge document ${id} repeats an explicit reference`);
     return {
       id,
       title: requireText(document.title, `knowledge document ${id} title`),
@@ -307,10 +406,37 @@ function normalizeKnowledgeDocuments(
       collectionId,
       sourceId: document.sourceId ? requireId(document.sourceId, `knowledge document ${id} sourceId`) : undefined,
       sourceRef: document.sourceRef?.trim() || undefined,
+      order,
+      parentId: document.parentId ? requireId(document.parentId, `knowledge document ${id} parentId`) : undefined,
+      references,
       metadata: document.metadata,
       updatedAt: timestamp
     };
   });
+  const byId = new Map(normalized.map((document) => [document.id, document]));
+  for (const document of normalized) {
+    if (document.parentId) {
+      const parent = byId.get(document.parentId);
+      if (!parent) throw new Error(`knowledge document ${document.id} parent ${document.parentId} is not in this revision`);
+      if (parent.collectionId !== document.collectionId) throw new Error(`knowledge document ${document.id} parent must use the same collection`);
+    }
+    for (const reference of document.references) {
+      if (reference.targetDocumentId === document.id) throw new Error(`knowledge document ${document.id} cannot reference itself`);
+      if (!byId.has(reference.targetDocumentId)) {
+        throw new Error(`knowledge document ${document.id} reference target ${reference.targetDocumentId} is not in this revision`);
+      }
+    }
+  }
+  for (const document of normalized) {
+    const ancestors = new Set([document.id]);
+    let parentId = document.parentId;
+    while (parentId) {
+      if (ancestors.has(parentId)) throw new Error(`knowledge document hierarchy contains a cycle at ${document.id}`);
+      ancestors.add(parentId);
+      parentId = byId.get(parentId)?.parentId;
+    }
+  }
+  return normalized;
 }
 
 function invocationMessage(output: JsonValue | undefined): string {
@@ -362,6 +488,31 @@ function jsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
 
+function documentSourcePage(document: KnowledgeDocumentInput): string | undefined {
+  const metadataPage = document.metadata?.finalUrl ?? document.metadata?.sourceUrl;
+  const value = typeof metadataPage === "string" ? metadataPage : document.sourceRef;
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    parsed.hash = "";
+    return parsed.href;
+  } catch {
+    return value.split("#", 1)[0];
+  }
+}
+
+function uniqueReferences(
+  references: NonNullable<KnowledgeDocumentInput["references"]>
+): NonNullable<KnowledgeDocumentInput["references"]> {
+  const seen = new Set<string>();
+  return references.filter((reference) => {
+    const key = `${reference.type}/${reference.targetDocumentId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function internalProjectId(employee: EmployeeDefinition): string | undefined {
   const value = employee.identity.metadata?.internalProjectId;
   return typeof value === "string" && value.trim() ? value : undefined;
@@ -379,6 +530,201 @@ function stringArray(value: JsonValue | undefined, label: string): string[] {
   return value as string[];
 }
 
+function optionalPayloadText(value: JsonValue | undefined, label: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  return requireText(value, label);
+}
+
+type KnowledgeGrantMutation = Omit<KnowledgeProfileGrantOverride, "profileId">;
+
+function knowledgeGrantMutation(value: JsonObject, label: string): KnowledgeGrantMutation {
+  const reason = optionalPayloadText(value.reason, `${label} reason`);
+  const grantedBy = optionalPayloadText(value.grantedBy, `${label} grantedBy`);
+  const grantedAt = optionalPayloadText(value.grantedAt, `${label} grantedAt`);
+  const expiresAt = optionalPayloadText(value.expiresAt, `${label} expiresAt`);
+  const lastReviewedAt = optionalPayloadText(value.lastReviewedAt, `${label} lastReviewedAt`);
+  let reviewCycleDays: number | undefined;
+  if (value.reviewCycleDays !== undefined && value.reviewCycleDays !== null) {
+    if (typeof value.reviewCycleDays !== "number"
+      || !Number.isInteger(value.reviewCycleDays)
+      || value.reviewCycleDays < 1
+      || value.reviewCycleDays > 3650) {
+      throw new Error(`${label} reviewCycleDays must be an integer from 1 to 3650`);
+    }
+    reviewCycleDays = value.reviewCycleDays;
+  }
+  const mutation: KnowledgeGrantMutation = {};
+  if (reason !== undefined) mutation.reason = reason;
+  if (grantedBy !== undefined) mutation.grantedBy = grantedBy;
+  if (grantedAt !== undefined) mutation.grantedAt = normalizedTimestamp(grantedAt, `${label} grantedAt`);
+  if (expiresAt !== undefined) mutation.expiresAt = normalizedTimestamp(expiresAt, `${label} expiresAt`);
+  if (reviewCycleDays !== undefined) mutation.reviewCycleDays = reviewCycleDays;
+  if (lastReviewedAt !== undefined) mutation.lastReviewedAt = normalizedTimestamp(lastReviewedAt, `${label} lastReviewedAt`);
+  return mutation;
+}
+
+function hasKnowledgeGrantMutation(value: KnowledgeGrantMutation): boolean {
+  return Object.values(value).some((item) => item !== undefined);
+}
+
+function grantOverridesFromSetPayload(payload: JsonObject): KnowledgeProfileGrantOverride[] {
+  if (payload.grantOverrides === undefined || payload.grantOverrides === null) return [];
+  if (!Array.isArray(payload.grantOverrides)) {
+    throw new Error("knowledge grantOverrides must be an array");
+  }
+  const allowedKeys = new Set([
+    "profileId",
+    "reason",
+    "grantedBy",
+    "grantedAt",
+    "expiresAt",
+    "reviewCycleDays",
+    "lastReviewedAt"
+  ]);
+  const seen = new Set<string>();
+  return payload.grantOverrides.map((value, index) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`knowledge grantOverrides[${index}] must be an object`);
+    }
+    const entry = value as JsonObject;
+    const unsupported = Object.keys(entry).filter((key) => !allowedKeys.has(key));
+    if (unsupported.length > 0) {
+      throw new Error(`knowledge grantOverrides[${index}] has unsupported fields: ${unsupported.join(", ")}`);
+    }
+    if (typeof entry.profileId !== "string") {
+      throw new Error(`knowledge grantOverrides[${index}] profileId must be an id`);
+    }
+    const profileId = requireId(entry.profileId, `knowledge grantOverrides[${index}] profileId`);
+    if (seen.has(profileId)) throw new Error(`knowledge grant override ${profileId} is repeated`);
+    seen.add(profileId);
+    const mutation = knowledgeGrantMutation(entry, `knowledge grant override ${profileId}`);
+    if (!hasKnowledgeGrantMutation(mutation)) {
+      throw new Error(`knowledge grant override ${profileId} must change at least one metadata field`);
+    }
+    return { profileId, ...mutation };
+  });
+}
+
+function knowledgeGrantInput(grant: KnowledgeProfileGrant): KnowledgeProfileGrantInput {
+  return {
+    profileId: grant.profileId,
+    reason: grant.reason,
+    grantedBy: grant.grantedBy,
+    grantedAt: grant.grantedAt,
+    expiresAt: grant.expiresAt,
+    reviewCycleDays: grant.reviewCycleDays,
+    lastReviewedAt: grant.lastReviewedAt
+  };
+}
+
+function resolveKnowledgeSetGrants(
+  profileIds: string[],
+  payload: JsonObject,
+  existing: KnowledgeProfileGrant[],
+  fallbackAt: string
+): KnowledgeProfileGrant[] {
+  const globalMutation = knowledgeGrantMutation(payload, "knowledge grant");
+  if (globalMutation.reason === undefined && globalMutation.grantedBy !== undefined) {
+    throw new Error("knowledge grant reason is required when grantedBy is provided");
+  }
+  if (globalMutation.reason !== undefined && globalMutation.grantedBy === undefined) {
+    throw new Error("knowledge grant grantedBy is required when reason is provided");
+  }
+  const overrides = grantOverridesFromSetPayload(payload);
+  const profileIdSet = new Set(profileIds);
+  for (const override of overrides) {
+    if (!profileIdSet.has(override.profileId)) {
+      throw new Error(`knowledge grant override ${override.profileId} is not present in profileIds`);
+    }
+  }
+  const existingById = new Map(existing.map((grant) => [grant.profileId, grant]));
+  const overrideById = new Map(overrides.map((override) => [override.profileId, override]));
+  const globalAppliesToSoleExisting = overrides.length === 0
+    && profileIds.length === 1
+    && existing.length === 1
+    && existing[0]?.profileId === profileIds[0]
+    && hasKnowledgeGrantMutation(globalMutation);
+  const inputs = profileIds.map((profileId): KnowledgeProfileGrantInput => {
+    const prior = existingById.get(profileId);
+    const override = overrideById.get(profileId);
+    const applyGlobal = prior === undefined || override !== undefined || globalAppliesToSoleExisting;
+    const { profileId: _profileId, ...specificMutation } = override ?? { profileId };
+    const mutation: KnowledgeGrantMutation = {
+      ...(applyGlobal ? globalMutation : {}),
+      ...specificMutation
+    };
+    const reason = mutation.reason ?? prior?.reason;
+    const grantedBy = mutation.grantedBy ?? prior?.grantedBy;
+    if (!reason) throw new Error(`knowledge grant ${profileId} reason is required for a new profile`);
+    if (!grantedBy) throw new Error(`knowledge grant ${profileId} grantedBy is required for a new profile`);
+    return {
+      profileId,
+      reason,
+      grantedBy,
+      grantedAt: mutation.grantedAt ?? prior?.grantedAt,
+      expiresAt: mutation.expiresAt ?? prior?.expiresAt,
+      reviewCycleDays: mutation.reviewCycleDays ?? prior?.reviewCycleDays,
+      lastReviewedAt: mutation.lastReviewedAt ?? prior?.lastReviewedAt
+    };
+  });
+  return normalizeKnowledgeGrants(profileIds, inputs, fallbackAt, existing);
+}
+
+function knowledgeGrantReviewId(
+  subject: KnowledgeGrantReviewItem["subject"],
+  profileId: string
+): string {
+  const digest = createHash("sha256")
+    .update([subject.kind, subject.projectId, subject.roleId, subject.employeeId, profileId].filter(Boolean).join("\0"))
+    .digest("hex")
+    .slice(0, 20);
+  return `grant-review-${digest}`;
+}
+
+function knowledgeGrantReviewItem(
+  subject: KnowledgeGrantReviewItem["subject"],
+  grant: KnowledgeProfileGrant,
+  asOfMs: number,
+  dueSoonMs: number
+): KnowledgeGrantReviewItem {
+  const schedules: Array<{ at: string; reason: string }> = [];
+  if (grant.expiresAt) {
+    schedules.push({
+      at: grant.expiresAt,
+      reason: `Authorization expiry review at ${grant.expiresAt}; expiry is reminder-only and does not revoke access.`
+    });
+  }
+  if (grant.reviewCycleDays) {
+    const baseline = Date.parse(grant.lastReviewedAt ?? grant.grantedAt);
+    schedules.push({
+      at: new Date(baseline + grant.reviewCycleDays * 86_400_000).toISOString(),
+      reason: `Periodic review every ${grant.reviewCycleDays} days from ${grant.lastReviewedAt ?? grant.grantedAt}.`
+    });
+  }
+  schedules.sort((left, right) => left.at.localeCompare(right.at) || left.reason.localeCompare(right.reason));
+  const dueAt = schedules[0]?.at;
+  const dueMs = dueAt ? Date.parse(dueAt) : undefined;
+  const status: KnowledgeGrantReviewItem["status"] = dueMs === undefined
+    ? "unscheduled"
+    : dueMs <= asOfMs
+      ? "overdue"
+      : dueMs <= dueSoonMs
+        ? "due-soon"
+        : "current";
+  return {
+    id: knowledgeGrantReviewId(subject, grant.profileId),
+    subject,
+    grant,
+    status,
+    dueAt,
+    reasons: schedules.length > 0
+      ? schedules.map((schedule) => schedule.reason)
+      : ["No expiresAt or reviewCycleDays is configured; access remains active until a human changes it."],
+    reminderOnly: true
+  };
+}
+
 function isInvocationTerminal(status: InvocationStatus): boolean {
   return ["completed", "blocked", "failed", "cancelled"].includes(status);
 }
@@ -391,14 +737,17 @@ export interface WorkbenchServiceOptions {
   dataRoot?: string;
   providers?: ProviderRegistry;
   architectures?: ArchitectureRegistry;
+  knowledgeUrlFetcher?: Pick<RestrictedKnowledgeUrlFetcher, "fetch">;
 }
 
 export class WorkbenchService {
   readonly providers: ProviderRegistry;
   readonly architectures: ArchitectureRegistry;
   readonly knowledge: KnowledgeRuntime;
+  readonly knowledgeUrlFetcher: Pick<RestrictedKnowledgeUrlFetcher, "fetch">;
   private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
+  private readonly backgroundInvocations = new Map<string, Promise<void>>();
 
   private constructor(
     readonly store: WorkbenchStore,
@@ -408,6 +757,7 @@ export class WorkbenchService {
     this.providers = options.providers ?? createDefaultProviderRegistry();
     this.architectures = options.architectures ?? createDefaultArchitectureRegistry();
     this.knowledge = knowledge;
+    this.knowledgeUrlFetcher = options.knowledgeUrlFetcher ?? new RestrictedKnowledgeUrlFetcher();
   }
 
   static defaultDataRoot(): string {
@@ -491,6 +841,27 @@ export class WorkbenchService {
         .filter((instance) => invocationIds.has(instance.invocationId))
         .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
     };
+  }
+
+  async getInvocationDetail(id: string): Promise<InvocationDetail> {
+    const state = this.snapshot();
+    const invocation = state.invocations[id];
+    if (!invocation) throw new Error(`invocation not found: ${id}`);
+    const instances = invocation.instanceIds
+      .map((instanceId) => state.workInstances[instanceId])
+      .filter((instance): instance is WorkInstanceRecord => Boolean(instance));
+    let run: unknown;
+    try {
+      run = await this.getRun(invocation.runId);
+    } catch (error) {
+      if (!/run not found/.test(errorMessage(error))) throw error;
+    }
+    return { invocation, instances, run };
+  }
+
+  async waitForInvocation(id: string): Promise<InvocationDetail> {
+    await this.backgroundInvocations.get(id);
+    return this.getInvocationDetail(id);
   }
 
   private async createInvocationActivity(options: {
@@ -929,6 +1300,202 @@ export class WorkbenchService {
     );
   }
 
+  async getKnowledgeWiki(id: string, revisionValue?: number): Promise<KnowledgeWikiView> {
+    const knowledgeBase = this.getKnowledgeBase(id);
+    const fallback = knowledgeBase.publishedRevision ?? knowledgeBase.latestRevision;
+    if (revisionValue === undefined && fallback === undefined) throw new Error(`knowledge base ${id} has no revision`);
+    const revision = validRevision(revisionValue, fallback, "knowledge wiki revision");
+    const content = await this.knowledge.contentStore.readRevision(id, revision);
+    return buildKnowledgeWiki(
+      content,
+      revision === knowledgeBase.publishedRevision ? "published" : "draft"
+    );
+  }
+
+  async previewKnowledgeUrl(input: KnowledgeUrlPreviewInput): Promise<KnowledgeUrlPreview> {
+    const knowledgeBaseId = requireId(input.knowledgeBaseId, "knowledge URL knowledgeBaseId");
+    const collectionId = requireId(input.collectionId, "knowledge URL collectionId");
+    const knowledgeBase = this.getKnowledgeBase(knowledgeBaseId);
+    if (knowledgeBase.status !== "active") throw new Error(`knowledge base ${knowledgeBaseId} is archived`);
+    if (!knowledgeBase.collections.some((collection) => collection.id === collectionId)) {
+      throw new Error(`knowledge collection not found: ${knowledgeBaseId}/${collectionId}`);
+    }
+    const fetched = await this.knowledgeUrlFetcher.fetch(requireText(input.url, "knowledge URL"));
+    const documents = webpageToKnowledgeDocuments(fetched, collectionId);
+    const normalizedDocuments = normalizeKnowledgeDocuments(
+      documents,
+      new Set(knowledgeBase.collections.map((collection) => collection.id)),
+      fetched.fetchedAt
+    );
+    const currentRevision = knowledgeBase.latestRevision
+      ? await this.knowledge.contentStore.readRevision(knowledgeBaseId, knowledgeBase.latestRevision)
+      : undefined;
+    const sourcePages = new Set(normalizedDocuments.map(documentSourcePage).filter((value): value is string => Boolean(value)));
+    const candidateTargets = (currentRevision?.documents ?? []).filter((document) => {
+      const sourcePage = documentSourcePage(document);
+      return !sourcePage || !sourcePages.has(sourcePage);
+    });
+    const relationCandidates = deriveKnowledgeRelationCandidates(normalizedDocuments, candidateTargets, 5);
+    const frozen = {
+      version: "knowledge-url-preview-v1" as const,
+      knowledgeBaseId,
+      knowledgeBaseVersion: knowledgeBase.version,
+      baseRevision: knowledgeBase.latestRevision,
+      collectionId,
+      requestedUrl: fetched.requestedUrl,
+      finalUrl: fetched.finalUrl,
+      redirects: fetched.redirects,
+      contentType: fetched.contentType,
+      byteLength: fetched.byteLength,
+      contentSha256: fetched.contentSha256,
+      documents,
+      relationCandidates
+    };
+    return {
+      ...frozen,
+      previewHash: knowledgeChangePlanHash(jsonValue(frozen)),
+      fetchedAt: fetched.fetchedAt
+    };
+  }
+
+  async proposeKnowledgeUrl(input: KnowledgeUrlProposeInput): Promise<KnowledgeChangeRequest> {
+    const expectedHash = requireText(input.previewHash, "knowledge URL previewHash");
+    if (!/^[a-f0-9]{64}$/.test(expectedHash)) throw new Error("knowledge URL previewHash must be a sha256 hex digest");
+    const preview = await this.previewKnowledgeUrl(input);
+    if (preview.previewHash !== expectedHash) {
+      throw new Error("knowledge URL changed after preview; review the refreshed content and propose again");
+    }
+    const knowledgeBase = this.getKnowledgeBase(preview.knowledgeBaseId);
+    if (knowledgeBase.version !== preview.knowledgeBaseVersion || knowledgeBase.latestRevision !== preview.baseRevision) {
+      throw new Error("knowledge base changed after URL preview; create a fresh preview");
+    }
+    const selected = input.selectedRelations ?? [];
+    const relationTypes = new Set<KnowledgeReferenceType>(["related", "supports", "contradicts", "depends-on", "supersedes"]);
+    const selectedIds = new Set<string>();
+    const candidates = new Map(preview.relationCandidates.map((candidate) => [candidate.id, candidate]));
+    const selectedBySource = new Map<string, NonNullable<KnowledgeDocumentInput["references"]>>();
+    for (const selection of selected) {
+      const candidateId = requireText(selection.candidateId, "knowledge URL selected candidateId");
+      if (selectedIds.has(candidateId)) throw new Error(`knowledge URL relation candidate ${candidateId} is selected more than once`);
+      selectedIds.add(candidateId);
+      const candidate = candidates.get(candidateId);
+      if (!candidate) throw new Error(`knowledge URL relation candidate is not in the frozen preview: ${candidateId}`);
+      if (!relationTypes.has(selection.type)) throw new Error(`knowledge URL relation type is invalid: ${String(selection.type)}`);
+      const references = selectedBySource.get(candidate.sourceDocumentId) ?? [];
+      references.push({
+        type: selection.type,
+        targetDocumentId: candidate.targetDocumentId,
+        note: selection.note?.trim() || undefined
+      });
+      selectedBySource.set(candidate.sourceDocumentId, references);
+    }
+
+    const previous = preview.baseRevision
+      ? await this.knowledge.contentStore.readRevision(preview.knowledgeBaseId, preview.baseRevision)
+      : undefined;
+    const incomingPages = new Set(preview.documents.map(documentSourcePage).filter((value): value is string => Boolean(value)));
+    const previousBySourceRef = new Map((previous?.documents ?? []).flatMap((document) =>
+      document.sourceRef ? [[document.sourceRef, document] as const] : []
+    ));
+    const importedIdMap = new Map(preview.documents.map((document) => [
+      document.id,
+      document.sourceRef ? previousBySourceRef.get(document.sourceRef)?.id ?? document.id : document.id
+    ]));
+    const retained = (previous?.documents ?? []).filter((document) => {
+      const page = documentSourcePage(document);
+      return !page || !incomingPages.has(page);
+    });
+    const imported = preview.documents.map((document) => {
+      const prior = document.sourceRef ? previousBySourceRef.get(document.sourceRef) : undefined;
+      return {
+        ...document,
+        id: importedIdMap.get(document.id) ?? document.id,
+        parentId: document.parentId ? importedIdMap.get(document.parentId) ?? document.parentId : undefined,
+        references: uniqueReferences([
+          ...(prior?.references ?? []),
+          ...(selectedBySource.get(document.id) ?? [])
+        ]).map((reference) => ({
+          ...reference,
+          targetDocumentId: importedIdMap.get(reference.targetDocumentId) ?? reference.targetDocumentId
+        }))
+      };
+    });
+    const documents = [...retained, ...imported];
+    normalizeKnowledgeDocuments(
+      documents,
+      new Set(knowledgeBase.collections.map((collection) => collection.id)),
+      now()
+    );
+    return this.createKnowledgeChangeRequest({
+      title: requireText(input.title, "knowledge URL proposal title"),
+      reason: requireText(input.reason, "knowledge URL proposal reason"),
+      requestedBy: input.requestedBy?.trim() || "project-knowledge-steward",
+      operation: {
+        type: "knowledge-revision.create",
+        targetId: preview.knowledgeBaseId,
+        expectedVersion: preview.knowledgeBaseVersion,
+        payload: { documents: jsonValue(documents) }
+      }
+    });
+  }
+
+  listKnowledgeGrantReviews(
+    options: { asOf?: string; dueSoonDays?: number } = {}
+  ): KnowledgeGrantReviewLedger {
+    const asOf = normalizedTimestamp(options.asOf ?? now(), "knowledge review asOf");
+    const dueSoonDays = options.dueSoonDays ?? 30;
+    if (!Number.isInteger(dueSoonDays) || dueSoonDays < 0 || dueSoonDays > 3650) {
+      throw new Error("knowledge review dueSoonDays must be an integer from 0 to 3650");
+    }
+    const asOfMs = Date.parse(asOf);
+    const dueSoonMs = asOfMs + dueSoonDays * 86_400_000;
+    const state = this.snapshot();
+    const items: KnowledgeGrantReviewItem[] = [];
+    for (const record of Object.values(state.employees)) {
+      const employee = record.current;
+      const subject: KnowledgeGrantReviewItem["subject"] = { kind: "employee", employeeId: employee.id };
+      for (const grant of employee.knowledgeGrants) {
+        items.push(knowledgeGrantReviewItem(subject, grant, asOfMs, dueSoonMs));
+      }
+    }
+    for (const record of Object.values(state.projectBindings)) {
+      for (const role of record.current.roles) {
+        const subject: KnowledgeGrantReviewItem["subject"] = {
+          kind: "project-role",
+          employeeId: role.employeeId,
+          projectId: record.current.projectId,
+          roleId: role.roleId
+        };
+        for (const grant of role.knowledgeGrants) {
+          items.push(knowledgeGrantReviewItem(subject, grant, asOfMs, dueSoonMs));
+        }
+      }
+    }
+    const statusRank: Record<KnowledgeGrantReviewItem["status"], number> = {
+      overdue: 0,
+      "due-soon": 1,
+      current: 2,
+      unscheduled: 3
+    };
+    items.sort((left, right) => statusRank[left.status] - statusRank[right.status]
+      || (left.dueAt ?? "").localeCompare(right.dueAt ?? "")
+      || left.id.localeCompare(right.id));
+    const counts: KnowledgeGrantReviewLedger["counts"] = {
+      overdue: 0,
+      "due-soon": 0,
+      current: 0,
+      unscheduled: 0
+    };
+    for (const item of items) counts[item.status] += 1;
+    return {
+      asOf,
+      dueSoonDays,
+      policy: "reminder-only-v1",
+      counts,
+      items
+    };
+  }
+
   getKnowledgeImpactSnapshot(): KnowledgeImpactSnapshot {
     return buildKnowledgeImpactSnapshot(this.snapshot());
   }
@@ -999,6 +1566,7 @@ export class WorkbenchService {
     }
     const state = this.snapshot();
     let currentVersion: number | undefined;
+    let existingGrants: KnowledgeProfileGrant[] | undefined;
     if (input.type.startsWith("knowledge-base.") || input.type.startsWith("knowledge-revision.")) {
       currentVersion = input.type === "knowledge-base.create" ? undefined : state.knowledgeBases[targetId!]?.current.version;
       if (input.type !== "knowledge-base.create" && currentVersion === undefined) throw new Error(`knowledge base not found: ${targetId}`);
@@ -1006,18 +1574,30 @@ export class WorkbenchService {
       currentVersion = input.type === "knowledge-profile.create" ? undefined : state.knowledgeProfiles[targetId!]?.current.version;
       if (input.type !== "knowledge-profile.create" && currentVersion === undefined) throw new Error(`knowledge profile not found: ${targetId}`);
     } else if (input.type === "employee-profiles.set") {
-      currentVersion = state.employees[targetId!]?.current.version;
-      if (currentVersion === undefined) throw new Error(`employee not found: ${targetId}`);
+      const employee = state.employees[targetId!]?.current;
+      if (!employee) throw new Error(`employee not found: ${targetId}`);
+      currentVersion = employee.version;
+      existingGrants = employee.knowledgeGrants;
     } else {
       const projectId = requireId(input.projectId ?? "", "knowledge change project id");
       const roleId = requireId(input.roleId ?? "", "knowledge change project role id");
       const binding = state.projectBindings[projectId]?.current;
       if (!binding) throw new Error(`project binding not found: ${projectId}`);
-      if (!binding.roles.some((role) => role.roleId === roleId)) throw new Error(`project role is not assigned: ${projectId}/${roleId}`);
+      const role = binding.roles.find((candidate) => candidate.roleId === roleId);
+      if (!role) throw new Error(`project role is not assigned: ${projectId}/${roleId}`);
       currentVersion = binding.version;
+      existingGrants = role.knowledgeGrants;
     }
     if (input.expectedVersion !== undefined && input.expectedVersion !== currentVersion) {
       throw new Error(`knowledge change expected v${input.expectedVersion}, current version is ${currentVersion ?? "uncreated"}`);
+    }
+    if (input.type === "employee-profiles.set" || input.type === "project-role-profiles.set") {
+      const profileIds = stringArray(payload.profileIds, "knowledge grant profileIds");
+      const grants = resolveKnowledgeSetGrants(profileIds, payload, existingGrants ?? [], now());
+      for (const key of ["reason", "grantedBy", "grantedAt", "expiresAt", "reviewCycleDays", "lastReviewedAt"]) {
+        delete payload[key];
+      }
+      payload.grantOverrides = jsonValue(grants.map(knowledgeGrantInput));
     }
     return {
       type: input.type,
@@ -1168,12 +1748,13 @@ export class WorkbenchService {
       case "employee-profiles.set": {
         const employee = this.getEmployee(targetId!);
         const profileIds = validateKnowledgeProfileIds(state, stringArray(payload.profileIds, "employee profileIds"), `employee ${targetId} knowledge profile`);
-        const updated = { ...employee, knowledgeProfileIds: profileIds, version: employee.version + 1, updatedAt: now() };
+        const grants = resolveKnowledgeSetGrants(profileIds, payload, employee.knowledgeGrants, now());
+        const updated = { ...employee, knowledgeProfileIds: profileIds, knowledgeGrants: grants, version: employee.version + 1, updatedAt: now() };
         hypothetical.employees[targetId!]!.current = updated;
         hypothetical.employees[targetId!]!.versions.push(updated);
         summary = `把员工 ${employee.identity.displayName} 的知识 Profile 调整为 ${profileIds.join("、") || "空"}`;
-        before = jsonValue({ knowledgeProfileIds: employee.knowledgeProfileIds });
-        proposed = jsonValue({ knowledgeProfileIds: profileIds });
+        before = jsonValue({ knowledgeProfileIds: employee.knowledgeProfileIds, knowledgeGrants: employee.knowledgeGrants });
+        proposed = jsonValue({ knowledgeProfileIds: profileIds, knowledgeGrants: grants });
         break;
       }
       case "project-role-profiles.set": {
@@ -1188,11 +1769,14 @@ export class WorkbenchService {
         const binding = hypothetical.projectBindings[projectId]!.current;
         const roleBinding = binding.roles.find((candidate) => candidate.roleId === roleId)!;
         const previous = [...roleBinding.knowledgeProfileIds];
+        const previousGrants = [...roleBinding.knowledgeGrants];
+        const grants = resolveKnowledgeSetGrants(profileIds, payload, roleBinding.knowledgeGrants, now());
         roleBinding.knowledgeProfileIds = profileIds;
+        roleBinding.knowledgeGrants = grants;
         binding.version += 1;
         summary = `调整项目角色 ${project.name}/${role.displayName} 的知识 Profile`;
-        before = jsonValue({ knowledgeProfileIds: previous });
-        proposed = jsonValue({ knowledgeProfileIds: profileIds });
+        before = jsonValue({ knowledgeProfileIds: previous, knowledgeGrants: previousGrants });
+        proposed = jsonValue({ knowledgeProfileIds: profileIds, knowledgeGrants: grants });
         break;
       }
     }
@@ -1271,14 +1855,24 @@ export class WorkbenchService {
       case "knowledge-profile.restore":
         return jsonValue(await this.restoreKnowledgeProfile(operation.targetId!));
       case "employee-profiles.set":
-        return jsonValue(await this.updateEmployee(operation.targetId!, {
-          knowledgeProfileIds: stringArray(payload.profileIds, "employee profileIds")
-        }));
+        {
+          const profileIds = stringArray(payload.profileIds, "employee profileIds");
+          const employee = this.getEmployee(operation.targetId!);
+          const grants = resolveKnowledgeSetGrants(profileIds, payload, employee.knowledgeGrants, now());
+          return jsonValue(await this.updateEmployee(operation.targetId!, {
+            knowledgeProfileIds: profileIds,
+            knowledgeGrants: grants.map(knowledgeGrantInput)
+          }));
+        }
       case "project-role-profiles.set": {
         const projectId = operation.projectId!;
         const roleId = operation.roleId!;
         const binding = this.getProjectBinding(projectId);
         const profileIds = stringArray(payload.profileIds, "project role profileIds");
+        const currentRole = binding.roles.find((role) => role.roleId === roleId);
+        if (!currentRole) throw new Error(`project role is not assigned: ${projectId}/${roleId}`);
+        const knowledgeGrants = resolveKnowledgeSetGrants(profileIds, payload, currentRole.knowledgeGrants, now())
+          .map(knowledgeGrantInput);
         return jsonValue(await this.saveProjectBinding(projectId, {
           roles: binding.roles.map((role) => ({
             roleId: role.roleId,
@@ -1286,6 +1880,7 @@ export class WorkbenchService {
             employeeVersion: role.employeeVersion,
             skills: role.skills,
             knowledgeProfileIds: role.roleId === roleId ? profileIds : role.knowledgeProfileIds,
+            knowledgeGrants: role.roleId === roleId ? knowledgeGrants : undefined,
             updatePolicy: role.updatePolicy
           }))
         }));
@@ -1785,6 +2380,94 @@ export class WorkbenchService {
     });
   }
 
+  async getEmployeeKnowledgePerspective(
+    employeeId: string,
+    input: KnowledgePerspectiveInput
+  ): Promise<KnowledgePerspective> {
+    const projectId = input.projectId ? requireId(input.projectId, "knowledge perspective projectId") : undefined;
+    const projectRoleId = input.projectRoleId
+      ? requireId(input.projectRoleId, "knowledge perspective projectRoleId")
+      : undefined;
+    const taskTags = normalizedStringList(input.taskTags, "knowledge perspective task tag") ?? [];
+    const evidenceLimit = input.evidenceLimit ?? 10;
+    if (!Number.isInteger(evidenceLimit) || evidenceLimit < 1 || evidenceLimit > 50) {
+      throw new Error("knowledge perspective evidenceLimit must be an integer from 1 to 50");
+    }
+    let employee = this.getEmployee(employeeId);
+    if (projectId && projectRoleId) {
+      const resolved = this.resolveProjectEmployee(projectId, projectRoleId);
+      if (resolved.employee.id !== employeeId) {
+        throw new Error(`project role ${projectId}/${projectRoleId} is assigned to ${resolved.employee.id}, not ${employeeId}`);
+      }
+      employee = resolved.employee;
+    }
+    const context = {
+      request: requireText(input.message, "knowledge perspective message"),
+      projectId,
+      projectRoleId,
+      taskTags
+    };
+    const state = this.snapshot();
+    const scope = resolveKnowledgeScope(state, employee, context);
+    const plan = routeKnowledge(scope);
+    const activatedKeys = activatedKnowledgeCollectionKeys(scope);
+    const candidates = Object.values(state.workInstances)
+      .filter((instance) => instance.employeeId === employeeId)
+      .filter((instance) => projectId === undefined || instance.source.project === projectId)
+      .filter((instance) => projectRoleId === undefined || instance.source.projectRole === projectRoleId)
+      .sort((left, right) => (right.completedAt ?? right.updatedAt).localeCompare(left.completedAt ?? left.updatedAt)
+        || right.id.localeCompare(left.id));
+    const scanned = candidates.slice(0, evidenceLimit);
+    const recentEvidence = (await Promise.all(scanned.map(async (instance): Promise<KnowledgeEvidenceUsage | undefined> => {
+      try {
+        const artifact = JSON.parse(await fs.readFile(path.join(
+          this.store.dataRoot,
+          "artifacts",
+          "runs",
+          instance.runId,
+          "knowledge",
+          `${instance.nodeId}.json`
+        ), "utf8")) as Partial<KnowledgeRuntimeResult>;
+        if (!artifact.plan || !Array.isArray(artifact.evidence)) return undefined;
+        return {
+          runId: instance.runId,
+          workInstanceId: instance.id,
+          nodeId: instance.nodeId,
+          status: instance.status,
+          at: instance.completedAt ?? instance.updatedAt,
+          context: artifact.plan.context,
+          evidence: artifact.evidence
+        };
+      } catch {
+        return undefined;
+      }
+    }))).filter((item): item is KnowledgeEvidenceUsage => Boolean(item));
+    return {
+      employee: {
+        id: employee.id,
+        version: employee.version,
+        knowledgeProfileIds: employee.knowledgeProfileIds,
+        grants: employee.knowledgeGrants
+      },
+      context,
+      eligible: scope.eligibleCollections,
+      activated: scope.eligibleCollections.filter((collection) =>
+        activatedKeys.has(`${collection.knowledgeBaseId}/${collection.collection.id}`)
+      ),
+      selected: plan.selectedCollections,
+      exclusions: plan.exclusions,
+      recentEvidence,
+      evidenceWindow: {
+        policy: "recent-work-instances-v1",
+        limit: evidenceLimit,
+        scannedInstances: scanned.length,
+        matchedRuns: new Set(recentEvidence.map((usage) => usage.runId)).size,
+        oldestScannedAt: scanned.at(-1)?.completedAt ?? scanned.at(-1)?.updatedAt,
+        newestScannedAt: scanned[0]?.completedAt ?? scanned[0]?.updatedAt
+      }
+    };
+  }
+
   listArchitectureTemplates(): ArchitectureTemplateDefinition[] {
     return listArchitectureTemplates();
   }
@@ -1995,6 +2678,14 @@ export class WorkbenchService {
       requestedKnowledgeProfiles,
       `project role ${role.id} knowledge profile`
     );
+    const existingGrants = state.projectBindings[project.id]?.current.roles
+      .find((candidate) => candidate.roleId === role.id)?.knowledgeGrants ?? [];
+    const knowledgeGrants = normalizeKnowledgeGrants(
+      knowledgeProfileIds,
+      input.knowledgeGrants,
+      now(),
+      existingGrants
+    );
     return {
       roleId: role.id,
       employeeId: employee.id,
@@ -2002,6 +2693,7 @@ export class WorkbenchService {
       skills: selected,
       skillVersions,
       knowledgeProfileIds,
+      knowledgeGrants,
       updatePolicy: input.updatePolicy ?? "compatible"
     };
   }
@@ -2079,6 +2771,7 @@ export class WorkbenchService {
           employeeVersion: currentEmployee.version,
           skills: roleBinding.skills,
           knowledgeProfileIds: roleBinding.knowledgeProfileIds,
+          knowledgeGrants: roleBinding.knowledgeGrants,
           updatePolicy: roleBinding.updatePolicy
         });
         refreshed.push(next);
@@ -2140,6 +2833,11 @@ export class WorkbenchService {
       const verdict = input.verdict ?? undefined;
       validateVerdict(verdict, `employee ${id}`);
       const timestamp = now();
+      const knowledgeGrants = normalizeKnowledgeGrants(
+        knowledgeProfileIds,
+        input.knowledgeGrants,
+        timestamp
+      );
       const employee: EmployeeDefinition = {
         id,
         version: 1,
@@ -2164,6 +2862,7 @@ export class WorkbenchService {
         skills,
         skillVersions,
         knowledgeProfileIds,
+        knowledgeGrants,
         providerId,
         outputSchema,
         maxAttempts: Math.max(1, Math.min(10, input.maxAttempts ?? 1)),
@@ -2208,6 +2907,13 @@ export class WorkbenchService {
       if (scopedRoleId && internalProjectRoleId({ ...current, identity }) !== scopedRoleId) {
         throw new Error(`employee ${id} internal project role scope ${scopedRoleId} is immutable`);
       }
+      const updatedAt = now();
+      const knowledgeGrants = normalizeKnowledgeGrants(
+        knowledgeProfileIds,
+        input.knowledgeGrants,
+        updatedAt,
+        current.knowledgeGrants
+      );
       const updated: EmployeeDefinition = {
         ...current,
         identity: {
@@ -2224,6 +2930,7 @@ export class WorkbenchService {
         skills,
         skillVersions,
         knowledgeProfileIds,
+        knowledgeGrants,
         providerId,
         outputSchema,
         maxAttempts: input.maxAttempts === undefined ? current.maxAttempts : Math.max(1, Math.min(10, input.maxAttempts)),
@@ -2234,7 +2941,7 @@ export class WorkbenchService {
         },
         presentation: input.presentation ?? current.presentation,
         version: current.version + 1,
-        updatedAt: now()
+        updatedAt
       };
       if (updated.identity.responsibilities.length === 0) throw new Error("employee responsibilities must not be empty");
       record.current = updated;
@@ -2254,6 +2961,15 @@ export class WorkbenchService {
       skills: source.skills,
       skillVersions: source.skillVersions,
       knowledgeProfileIds: source.knowledgeProfileIds,
+      knowledgeGrants: source.knowledgeGrants.map((grant) => ({
+        profileId: grant.profileId,
+        reason: grant.reason,
+        grantedBy: grant.grantedBy,
+        grantedAt: grant.grantedAt,
+        expiresAt: grant.expiresAt,
+        reviewCycleDays: grant.reviewCycleDays,
+        lastReviewedAt: grant.lastReviewedAt
+      })),
       providerId: source.providerId,
       outputSchema: source.outputSchema,
       maxAttempts: source.maxAttempts,
@@ -2354,6 +3070,9 @@ export class WorkbenchService {
       skills: roleBinding.skills,
       skillVersions: roleBinding.skillVersions,
       knowledgeProfileIds: [...new Set([...base.knowledgeProfileIds, ...roleBinding.knowledgeProfileIds])],
+      knowledgeGrants: [...new Map(
+        [...base.knowledgeGrants, ...roleBinding.knowledgeGrants].map((grant) => [grant.profileId, grant])
+      ).values()],
       outputSchema: role.outputSchema ?? base.outputSchema,
       permissions: narrowPermissions(base.permissions, role.permissions)
     };
@@ -2739,6 +3458,19 @@ export class WorkbenchService {
     input: JsonObject = {},
     source: InvocationSource = { kind: "workbench" }
   ): Promise<RunWorkflowResult> {
+    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source);
+    return this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input);
+  }
+
+  private async prepareWorkbenchWorkflowInvocation(
+    id: string,
+    input: JsonObject,
+    source: InvocationSource
+  ): Promise<{
+    invocation: InvocationRecord;
+    workflow: WorkbenchWorkflowDefinition;
+    employees: Map<string, EmployeeDefinition>;
+  }> {
     const workflow = this.getWorkflow(id);
     if (workflow.status !== "active") throw new Error(`workflow ${id} is archived`);
     const employees = this.resolveWorkflowEmployees(workflow);
@@ -2758,7 +3490,24 @@ export class WorkbenchService {
       employees,
       input
     });
-    return this.runTrackedWorkflow(invocation, workflow, employees, input);
+    return { invocation, workflow, employees };
+  }
+
+  async startWorkbenchWorkflow(
+    id: string,
+    input: JsonObject = {},
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<InvocationStartResult> {
+    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source);
+    const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input);
+    const settled = execution.then(() => undefined, () => undefined);
+    this.backgroundInvocations.set(prepared.invocation.id, settled);
+    void settled.finally(() => {
+      if (this.backgroundInvocations.get(prepared.invocation.id) === settled) {
+        this.backgroundInvocations.delete(prepared.invocation.id);
+      }
+    });
+    return { invocation: prepared.invocation, runId: prepared.invocation.runId };
   }
 
   async archiveWorkflow(id: string): Promise<WorkbenchWorkflowDefinition> {
@@ -2892,7 +3641,7 @@ export class WorkbenchService {
   }
 
   async getRun(id: string): Promise<unknown> {
-    requireId(id, "run id");
+    if (!/^run-[A-Za-z0-9-]+$/.test(id)) throw new Error("run id is invalid");
     try {
       return JSON.parse(
         await fs.readFile(path.join(this.store.dataRoot, "artifacts", "runs", id, "run.json"), "utf8")

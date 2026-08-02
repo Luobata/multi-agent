@@ -3,11 +3,35 @@ import { describe, expect, it, vi } from "vitest";
 import {
   KnowledgePage,
   KnowledgeProfilePolicyEditor,
+  KnowledgeReviewBoard,
   KnowledgeStewardConsole,
+  UrlImportModal,
+  buildGrantReviewSetPayload,
+  buildWikiDirectory,
+  buildWikiTree,
+  filterWikiDirectory,
   findKnowledgeStewardProjects,
-  listKnowledgeStewardSessions
+  findWikiDirectoryPath,
+  listKnowledgeStewardSessions,
+  resolveReviewSubject
 } from "./KnowledgePage";
-import type { Bootstrap, KnowledgeChangeRequest, Project, ProjectBinding, Session } from "./types";
+import {
+  KnowledgePerspectiveView,
+  grantScheduleCopy,
+  grantSourceCopy,
+  reviewStatusCopy
+} from "./knowledgePerspective";
+import type {
+  Bootstrap,
+  Employee,
+  KnowledgeChangeRequest,
+  KnowledgeCollection,
+  KnowledgePerspective,
+  KnowledgeWikiDocument,
+  Project,
+  ProjectBinding,
+  Session
+} from "./types";
 
 const timestamp = "2026-08-01T00:00:00.000Z";
 
@@ -49,9 +73,13 @@ describe("Knowledge control plane page", () => {
     expect(html).toContain("知识控制台");
     expect(html).toContain("总览");
     expect(html).toContain("知识目录");
+    expect(html).toContain("全量 Wiki");
     expect(html).toContain("发布车道");
-    expect(html).toContain("员工 Profile");
+    expect(html).toContain("知识 Profile");
+    expect(html).not.toContain("员工 Profile");
     expect(html).toContain("影响与授权");
+    expect(html).toContain("授权复核");
+    expect(html).toContain("从链接导入");
     expect(html).toContain("Workbench Handbook");
     expect(html).toContain("Published R1");
     expect(html).toContain("Latest R2");
@@ -253,5 +281,323 @@ describe("Knowledge steward AI console", () => {
     expect(html).toContain("还没有项目接入知识管家");
     expect(html).toContain("knowledge-steward");
     expect(html).not.toContain("批准并执行");
+  });
+});
+
+const wikiEntry = (id: string, parentId?: string, overrides: Partial<KnowledgeWikiDocument["document"]> = {}): KnowledgeWikiDocument => ({
+  document: {
+    id,
+    title: `文档 ${id}`,
+    content: `正文 ${id}`,
+    collectionId: "quality",
+    updatedAt: timestamp,
+    ...(parentId ? { parentId } : {}),
+    ...overrides
+  },
+  outgoingReferences: [],
+  backlinks: [],
+  candidateRelations: []
+});
+
+describe("全量 Wiki 树", () => {
+  it("groups children under their parents and keeps unknown parents as roots", () => {
+    const roots = buildWikiTree([wikiEntry("root"), wikiEntry("child", "root"), wikiEntry("grand", "child"), wikiEntry("orphan", "missing")]);
+
+    expect(roots.map((node) => node.entry.document.id)).toEqual(["root", "orphan"]);
+    expect(roots[0].children.map((node) => node.entry.document.id)).toEqual(["child"]);
+    expect(roots[0].children[0].children.map((node) => node.entry.document.id)).toEqual(["grand"]);
+  });
+
+  it("derives Collection, source folders and explicit document parents without exposing a flat ID list", () => {
+    const collections: KnowledgeCollection[] = [
+      { id: "quality", displayName: "质量与证据", description: "Quality", authority: "canonical", tags: [] },
+      { id: "empty", displayName: "空分区", description: "Empty", authority: "reference", tags: [] }
+    ];
+    const entries = [
+      wikiEntry("colors", undefined, { title: "colors.md", sourceId: "docs", sourceRef: "/repo/guides/design/colors.md", metadata: { relativePath: "guides/design/colors.md" } }),
+      wikiEntry("manual", undefined, { title: "人工说明" }),
+      wikiEntry("child", "manual", { title: "子条目" }),
+      wikiEntry("legacy", undefined, { title: "legacy.md", collectionId: "legacy", metadata: { relativePath: "archive/legacy.md" } })
+    ];
+
+    const tree = buildWikiDirectory(collections, entries);
+    const quality = tree.find((node) => node.collectionId === "quality")!;
+    const guides = quality.children.find((node) => node.label === "guides")!;
+    const design = guides.children.find((node) => node.label === "design")!;
+    const unclassified = quality.children.find((node) => node.kind === "unclassified")!;
+
+    expect(tree.map((node) => node.label)).toEqual(["质量与证据", "空分区", "未识别 Collection · legacy"]);
+    expect(quality.documentCount).toBe(3);
+    expect(design.children[0]).toMatchObject({ kind: "document", label: "colors.md", entry: { document: { id: "colors" } } });
+    expect(unclassified.children[0]).toMatchObject({ label: "人工说明", children: [{ label: "子条目" }] });
+    expect(tree[1]).toMatchObject({ label: "空分区", documentCount: 0, children: [] });
+    expect(findWikiDirectoryPath(tree, "colors")).toEqual(["质量与证据", "guides", "design", "colors.md"]);
+    expect(findWikiDirectoryPath(tree, "child")).toEqual(["质量与证据", "未编目条目", "人工说明", "子条目"]);
+  });
+
+  it("searches title, path, source reference and hidden ID while retaining only matching ancestors", () => {
+    const collection: KnowledgeCollection = { id: "quality", displayName: "质量", description: "Quality", authority: "canonical", tags: [] };
+    const tree = buildWikiDirectory([collection], [
+      wikiEntry("colors", undefined, { title: "colors.md", sourceRef: "/repo/guides/colors.md", metadata: { relativePath: "guides/colors.md" } }),
+      wikiEntry("doc-internal-42", undefined, { title: "tests.md", sourceRef: "/repo/checks/tests.md", metadata: { relativePath: "checks/tests.md" } })
+    ]);
+
+    expect(filterWikiDirectory(tree, "guides")[0]?.children[0]).toMatchObject({ label: "guides", documentCount: 1 });
+    expect(filterWikiDirectory(tree, "/repo/checks")[0]?.children[0]).toMatchObject({ label: "checks", documentCount: 1 });
+    expect(filterWikiDirectory(tree, "internal-42")[0]?.children[0]?.children[0]).toMatchObject({ entry: { document: { id: "doc-internal-42" } } });
+    expect(filterWikiDirectory(tree, "missing")).toEqual([]);
+  });
+});
+
+const reviewEmployee: Employee = {
+  id: "frontend-developer",
+  version: 3,
+  status: "active",
+  identity: { displayName: "Frontend", background: "UI", responsibilities: ["Build UI"] },
+  description: "Builds UI.",
+  systemPrompt: "prompt",
+  requestPrompt: "request",
+  skills: [],
+  skillVersions: {},
+  knowledgeProfileIds: ["frontend-knowledge", "shared-knowledge"],
+  providerId: "mock",
+  outputSchema: { type: "object" },
+  maxAttempts: 1,
+  permissions: { write: "none", tools: [] },
+  contextPolicy: { historyLimit: 20 },
+  presentation: {},
+  createdAt: timestamp,
+  updatedAt: timestamp
+};
+
+const reviewBinding: ProjectBinding = {
+  ...stewardBinding,
+  roles: [{
+    roleId: "frontend-developer",
+    employeeId: "frontend-developer",
+    employeeVersion: 3,
+    knowledgeProfileIds: ["shared-knowledge"],
+    skills: [],
+    skillVersions: {},
+    updatePolicy: "locked"
+  }]
+};
+
+const reviewItem = {
+  id: "review-1",
+  subject: { kind: "employee" as const, employeeId: "frontend-developer" },
+  grant: {
+    profileId: "frontend-knowledge",
+    reason: "岗位需要",
+    grantedBy: "local-owner",
+    grantedAt: timestamp,
+    source: "explicit" as const
+  },
+  status: "due-soon" as const,
+  reasons: [],
+  reminderOnly: true as const
+};
+
+describe("授权复核台账", () => {
+  it("resolves employee and project-role subjects against bootstrap data", () => {
+    const data: Bootstrap = { ...bootstrap, employees: [reviewEmployee], projectBindings: [reviewBinding] };
+
+    expect(resolveReviewSubject(data, reviewItem)).toEqual({ profileIds: ["frontend-knowledge", "shared-knowledge"], expectedVersion: 3 });
+    expect(resolveReviewSubject(data, { ...reviewItem, subject: { kind: "project-role", employeeId: "frontend-developer", projectId: "local-agent-workbench", roleId: "frontend-developer" } }))
+      .toEqual({ profileIds: ["shared-knowledge"], expectedVersion: reviewBinding.version });
+
+    const missing = resolveReviewSubject(data, { ...reviewItem, subject: { kind: "employee", employeeId: "ghost" } });
+    expect(missing.profileIds).toEqual([]);
+    expect(missing.expectedVersion).toBeUndefined();
+    expect(missing.problem).toContain("无法安全构造提案");
+  });
+
+  it("shows a loading state before the ledger response and never renders write shortcuts", () => {
+    const html = renderToStaticMarkup(<KnowledgeReviewBoard data={bootstrap} refresh={vi.fn()} notify={vi.fn()} />);
+
+    expect(html).toContain("授权复核台账");
+    expect(html).toContain("只提醒、不自动改权");
+    expect(html).toContain("正在读取授权复核台账");
+    expect(html).toContain("已逾期");
+    expect(html).toContain("临近到期");
+  });
+});
+
+describe("授权复核提案 payload", () => {
+  const base = {
+    reviewedProfileId: "frontend-knowledge",
+    profileIds: ["frontend-knowledge", "shared-knowledge"],
+    reason: "复核后保留 frontend-knowledge 授权",
+    grantedBy: "local-owner"
+  };
+
+  it("retain 只对复核对象下发 grantOverride，并写入提交时刻 lastReviewedAt，不改 grantedAt", () => {
+    const payload = buildGrantReviewSetPayload({
+      ...base,
+      mode: "retain",
+      reviewCycleDays: "90",
+      expiresAtDate: "2026-11-01",
+      now: "2026-08-02T10:30:00.000Z"
+    });
+
+    expect(payload.profileIds).toEqual(["frontend-knowledge", "shared-knowledge"]);
+    expect(payload.grantOverrides).toHaveLength(1);
+    expect(payload.grantOverrides?.[0]).toEqual({
+      profileId: "frontend-knowledge",
+      reason: "复核后保留 frontend-knowledge 授权",
+      grantedBy: "local-owner",
+      lastReviewedAt: "2026-08-02T10:30:00.000Z",
+      expiresAt: "2026-11-01T00:00:00.000Z",
+      reviewCycleDays: 90
+    });
+    expect(payload.grantOverrides?.[0]).not.toHaveProperty("grantedAt");
+    expect(payload).not.toHaveProperty("reason");
+    expect(payload).not.toHaveProperty("expiresAt");
+  });
+
+  it("retain 未填到期与复核周期时不携带可选字段", () => {
+    const payload = buildGrantReviewSetPayload({
+      ...base,
+      mode: "retain",
+      reviewCycleDays: "",
+      expiresAtDate: "",
+      now: "2026-08-02T10:30:00.000Z"
+    });
+
+    expect(payload.grantOverrides?.[0]).toEqual({
+      profileId: "frontend-knowledge",
+      reason: "复核后保留 frontend-knowledge 授权",
+      grantedBy: "local-owner",
+      lastReviewedAt: "2026-08-02T10:30:00.000Z"
+    });
+    expect(payload.grantOverrides?.[0]).not.toHaveProperty("expiresAt");
+    expect(payload.grantOverrides?.[0]).not.toHaveProperty("reviewCycleDays");
+  });
+
+  it("narrow 只改变 profileIds，不传 grantOverrides", () => {
+    const payload = buildGrantReviewSetPayload({ ...base, mode: "narrow", keepIds: ["shared-knowledge"] });
+
+    expect(payload).toEqual({ profileIds: ["shared-knowledge"] });
+    expect(payload).not.toHaveProperty("grantOverrides");
+  });
+
+  it("revoke 只移除复核对象，不传 grantOverrides", () => {
+    const payload = buildGrantReviewSetPayload({ ...base, mode: "revoke" });
+
+    expect(payload).toEqual({ profileIds: ["shared-knowledge"] });
+    expect(payload).not.toHaveProperty("grantOverrides");
+  });
+
+  it("retain 未注入 now 时默认使用当前时间", () => {
+    const before = Date.now();
+    const payload = buildGrantReviewSetPayload({ ...base, mode: "retain" });
+    const after = Date.now();
+    const reviewedAt = Date.parse(payload.grantOverrides?.[0]?.lastReviewedAt ?? "");
+
+    expect(reviewedAt).toBeGreaterThanOrEqual(before);
+    expect(reviewedAt).toBeLessThanOrEqual(after);
+  });
+});
+
+describe("员工知识视角", () => {
+  const candidate = {
+    knowledgeBaseId: "workbench-handbook",
+    knowledgeBaseVersion: 4,
+    revision: 1,
+    knowledgeBaseName: "Workbench Handbook",
+    domain: "workbench",
+    classification: "internal" as const,
+    collection: { id: "quality", displayName: "Quality", description: "Quality evidence.", authority: "canonical" as const, tags: ["quality"] },
+    matches: [{
+      profileId: "frontend-knowledge",
+      profileVersion: 2,
+      ruleId: "quality-core",
+      activation: "core" as const,
+      priority: 20,
+      required: false,
+      budget: { maxCollections: 1, maxChunks: 4, maxTokens: 2000 },
+      reason: "核心规则始终参与"
+    }]
+  };
+  const perspective: KnowledgePerspective = {
+    employee: {
+      id: "frontend-developer",
+      version: 3,
+      knowledgeProfileIds: ["frontend-knowledge"],
+      grants: [{
+        profileId: "frontend-knowledge",
+        reason: "岗位需要",
+        grantedBy: "local-owner",
+        grantedAt: timestamp,
+        reviewCycleDays: 90,
+        source: "explicit"
+      }]
+    },
+    context: { request: "检查前端知识", taskTags: [] },
+    eligible: [candidate],
+    activated: [candidate],
+    selected: [{
+      knowledgeBaseId: "workbench-handbook",
+      knowledgeBaseVersion: 4,
+      revision: 1,
+      collectionId: "quality",
+      collectionName: "Quality",
+      profileId: "frontend-knowledge",
+      ruleId: "quality-core",
+      activation: "core",
+      priority: 20,
+      reason: "核心规则始终参与",
+      query: "检查前端知识",
+      budget: { maxCollections: 1, maxChunks: 4, maxTokens: 2000 }
+    }],
+    exclusions: [],
+    recentEvidence: [],
+    evidenceWindow: { policy: "recent-work-instances-v1", limit: 40, scannedInstances: 0, matchedRuns: 0 }
+  };
+
+  it("renders the three stages with grant metadata and rule explanations", () => {
+    const html = renderToStaticMarkup(<KnowledgePerspectiveView perspective={perspective} />);
+
+    expect(html).toContain("授权档案 · frontend-developer v3");
+    expect(html).toContain("已授权 eligible");
+    expect(html).toContain("当前任务 activated");
+    expect(html).toContain("实际 selected");
+    expect(html).toContain("frontend-knowledge");
+    expect(html).toContain("quality-core");
+    expect(html).toContain("核心规则始终参与");
+    expect(html).toContain("显式授权");
+    expect(html).toContain("每 90 天复核");
+    expect(html).toContain("近期 Run 中没有留存的知识证据");
+  });
+
+  it("explains grant source and schedule copy", () => {
+    expect(grantSourceCopy("explicit")).toBe("显式授权");
+    expect(grantSourceCopy("legacy")).toBe("历史遗留授权");
+    expect(grantScheduleCopy({ profileId: "p", reason: "r", grantedBy: "g", grantedAt: timestamp, source: "legacy" })).toBe("未排期复核");
+    expect(reviewStatusCopy("overdue")).toBe("已逾期");
+    expect(reviewStatusCopy("due-soon")).toBe("临近到期");
+    expect(reviewStatusCopy("current")).toBe("复核期内");
+    expect(reviewStatusCopy("unscheduled")).toBe("未排期");
+  });
+});
+
+describe("从链接导入", () => {
+  it("opens on the target step with base and collection pickers and proposal-only copy", () => {
+    const html = renderToStaticMarkup(<UrlImportModal knowledgeBases={bootstrap.knowledgeBases ?? []} notify={vi.fn()} onClose={vi.fn()} onProposed={vi.fn()} />);
+
+    expect(html).toContain("从链接导入知识");
+    expect(html).toContain("选择目标与链接");
+    expect(html).toContain("核对冻结预览");
+    expect(html).toContain("确认关联并提案");
+    expect(html).toContain("目标知识库");
+    expect(html).toContain("目标 Collection");
+    expect(html).toContain("生成冻结预览");
+    expect(html).toContain("不会写入任何知识内容");
+  });
+
+  it("explains the empty state when no active knowledge base exists", () => {
+    const html = renderToStaticMarkup(<UrlImportModal knowledgeBases={[{ ...(bootstrap.knowledgeBases ?? [])[0], status: "archived" as const }]} notify={vi.fn()} onClose={vi.fn()} onProposed={vi.fn()} />);
+
+    expect(html).toContain("没有活动知识库");
   });
 });

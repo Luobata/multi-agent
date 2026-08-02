@@ -6,6 +6,8 @@ export type KnowledgeAuthority = "canonical" | "reference" | "experimental";
 export type KnowledgeSyncStatus = "idle" | "syncing" | "failed";
 export type KnowledgeQualityStatus = "healthy" | "degraded" | "stale";
 export type KnowledgeActivation = "core" | "conditional" | "on-demand";
+export type KnowledgeReferenceType = "related" | "supports" | "contradicts" | "depends-on" | "supersedes";
+export type KnowledgeGrantSource = "explicit" | "legacy";
 
 export type KnowledgeChangeOperationType =
   | "knowledge-base.create"
@@ -150,11 +152,61 @@ export interface KnowledgeDocumentInput {
   collectionId: string;
   sourceId?: string;
   sourceRef?: string;
+  /** Stable order among documents produced from the same source tree. */
+  order?: number;
+  /** Parent document in the same immutable Revision. */
+  parentId?: string;
+  /** Human-confirmed relations only. Candidate relations are never stored here automatically. */
+  references?: KnowledgeDocumentReference[];
   metadata?: JsonObject;
 }
 
 export interface KnowledgeDocumentDefinition extends KnowledgeDocumentInput {
+  order: number;
+  references: KnowledgeDocumentReference[];
   updatedAt: string;
+}
+
+export interface KnowledgeDocumentReference {
+  type: KnowledgeReferenceType;
+  targetDocumentId: string;
+  note?: string;
+}
+
+export interface KnowledgeRelationCandidate {
+  id: string;
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  suggestedType: "related";
+  strength: "candidate";
+  persisted: false;
+  score: number;
+  signals: string[];
+}
+
+export interface KnowledgeWikiReference {
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  type: KnowledgeReferenceType;
+  strength: "explicit";
+  note?: string;
+}
+
+export interface KnowledgeWikiDocument {
+  document: KnowledgeDocumentDefinition;
+  outgoingReferences: KnowledgeWikiReference[];
+  backlinks: KnowledgeWikiReference[];
+  candidateRelations: KnowledgeRelationCandidate[];
+}
+
+export interface KnowledgeWikiView {
+  knowledgeBaseId: string;
+  revision: number;
+  visibility: "published" | "draft";
+  documents: KnowledgeWikiDocument[];
+  references: KnowledgeWikiReference[];
+  candidateRelations: KnowledgeRelationCandidate[];
+  generatedAt: string;
 }
 
 export interface KnowledgeRevision {
@@ -204,6 +256,85 @@ export type KnowledgeBaseUpdateInput = Partial<Omit<KnowledgeBaseCreateInput, "i
 
 export interface KnowledgeRevisionCreateInput {
   documents: KnowledgeDocumentInput[];
+}
+
+export interface KnowledgeUrlPreviewInput {
+  knowledgeBaseId: string;
+  collectionId: string;
+  url: string;
+}
+
+export interface KnowledgeUrlSelectedRelation {
+  candidateId: string;
+  type: KnowledgeReferenceType;
+  note?: string;
+}
+
+export interface KnowledgeUrlProposeInput extends KnowledgeUrlPreviewInput {
+  previewHash: string;
+  title: string;
+  reason: string;
+  requestedBy?: string;
+  selectedRelations?: KnowledgeUrlSelectedRelation[];
+}
+
+export interface KnowledgeUrlPreview {
+  version: "knowledge-url-preview-v1";
+  knowledgeBaseId: string;
+  knowledgeBaseVersion: number;
+  baseRevision?: number;
+  collectionId: string;
+  requestedUrl: string;
+  finalUrl: string;
+  redirects: string[];
+  contentType: string;
+  byteLength: number;
+  contentSha256: string;
+  previewHash: string;
+  documents: KnowledgeDocumentInput[];
+  relationCandidates: KnowledgeRelationCandidate[];
+  fetchedAt: string;
+}
+
+export interface KnowledgeProfileGrantInput {
+  profileId: string;
+  reason: string;
+  grantedBy: string;
+  grantedAt?: string;
+  expiresAt?: string;
+  reviewCycleDays?: number;
+  lastReviewedAt?: string;
+}
+
+export type KnowledgeProfileGrantOverride = Pick<KnowledgeProfileGrantInput, "profileId">
+  & Partial<Omit<KnowledgeProfileGrantInput, "profileId">>;
+
+export interface KnowledgeProfileGrant extends Omit<KnowledgeProfileGrantInput, "grantedAt"> {
+  grantedAt: string;
+  source: KnowledgeGrantSource;
+}
+
+export interface KnowledgeGrantReviewItem {
+  id: string;
+  subject: {
+    kind: "employee" | "project-role";
+    employeeId: string;
+    projectId?: string;
+    roleId?: string;
+  };
+  grant: KnowledgeProfileGrant;
+  status: "overdue" | "due-soon" | "current" | "unscheduled";
+  dueAt?: string;
+  reasons: string[];
+  reminderOnly: true;
+}
+
+export interface KnowledgeGrantReviewLedger {
+  asOf: string;
+  dueSoonDays: number;
+  policy: "reminder-only-v1";
+  counts: Record<KnowledgeGrantReviewItem["status"], number>;
+  items: KnowledgeGrantReviewItem[];
 }
 
 export interface KnowledgeProfileSelector {
@@ -359,6 +490,47 @@ export interface KnowledgeRuntimeResult {
   plan: KnowledgePlan;
   evidence: KnowledgeEvidence[];
   promptSection: string;
+}
+
+export interface KnowledgeEvidenceUsage {
+  runId: string;
+  workInstanceId: string;
+  nodeId: string;
+  status: string;
+  at: string;
+  context: KnowledgeResolutionContext;
+  evidence: KnowledgeEvidence[];
+}
+
+export interface KnowledgePerspectiveInput {
+  message: string;
+  projectId?: string;
+  projectRoleId?: string;
+  taskTags?: string[];
+  evidenceLimit?: number;
+}
+
+export interface KnowledgePerspective {
+  employee: {
+    id: string;
+    version: number;
+    knowledgeProfileIds: string[];
+    grants: KnowledgeProfileGrant[];
+  };
+  context: KnowledgeResolutionContext;
+  eligible: KnowledgeCandidateCollection[];
+  activated: KnowledgeCandidateCollection[];
+  selected: KnowledgeSelectedCollection[];
+  exclusions: KnowledgeExclusion[];
+  recentEvidence: KnowledgeEvidenceUsage[];
+  evidenceWindow: {
+    policy: "recent-work-instances-v1";
+    limit: number;
+    scannedInstances: number;
+    matchedRuns: number;
+    oldestScannedAt?: string;
+    newestScannedAt?: string;
+  };
 }
 
 export interface KnowledgeRevisionWarning {

@@ -12,6 +12,8 @@ import type {
   KnowledgeChangeRequest,
   KnowledgeEvidence,
   KnowledgePlan,
+  KnowledgeProfileGrant,
+  KnowledgeProfileGrantInput,
   KnowledgeProfileRecord
 } from "../knowledge/types.js";
 
@@ -51,6 +53,7 @@ export interface EmployeeDefinition {
   skills: RoleSkillBinding[];
   skillVersions: Record<string, number>;
   knowledgeProfileIds: string[];
+  knowledgeGrants: KnowledgeProfileGrant[];
   providerId: string;
   outputSchema: JsonObject;
   maxAttempts: number;
@@ -210,6 +213,17 @@ export interface ActivitySnapshot {
   instances: WorkInstanceRecord[];
 }
 
+export interface InvocationStartResult {
+  invocation: InvocationRecord;
+  runId: string;
+}
+
+export interface InvocationDetail {
+  invocation: InvocationRecord;
+  instances: WorkInstanceRecord[];
+  run?: unknown;
+}
+
 export type ActivityEvent =
   | { type: "invocation.changed"; at: string; invocation: InvocationRecord }
   | { type: "instance.changed"; at: string; instance: WorkInstanceRecord };
@@ -279,6 +293,7 @@ export interface ProjectRoleBinding {
   skills: RoleSkillBinding[];
   skillVersions: Record<string, number>;
   knowledgeProfileIds: string[];
+  knowledgeGrants: KnowledgeProfileGrant[];
   updatePolicy: ProjectBindingUpdatePolicy;
 }
 
@@ -336,6 +351,7 @@ export interface ProjectRoleBindingInput {
   employeeVersion?: number;
   skills?: RoleSkillBinding[];
   knowledgeProfileIds?: string[];
+  knowledgeGrants?: KnowledgeProfileGrantInput[];
   updatePolicy?: ProjectBindingUpdatePolicy;
 }
 
@@ -362,6 +378,7 @@ export interface EmployeeCreateInput {
   skills?: RoleSkillBinding[];
   skillVersions?: Record<string, number>;
   knowledgeProfileIds?: string[];
+  knowledgeGrants?: KnowledgeProfileGrantInput[];
   providerId?: string;
   outputSchema?: JsonObject;
   maxAttempts?: number;

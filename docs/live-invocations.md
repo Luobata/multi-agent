@@ -37,7 +37,7 @@ Work Instance：
 queued | waiting → running → completed | blocked | failed | skipped | cancelled
 ```
 
-Invocation 和 Work Instance 都持久保存状态迁移。Run Store 另外保存 `run.started`、`node.started`、每次 attempt、节点终态和 Run 终态。daemon 重启时，未完成的持久实例会标记为 `failed/interrupted`，而不会伪装成仍在运行。
+Invocation 和 Work Instance 都持久保存状态迁移。Run Store 另外保存 `run.started`、`node.started`、每次 attempt、节点终态和 Run 终态。daemon 重启时，未完成的 Invocation 与 Work Instance 会标记为 `failed/interrupted`，而不会在活动面伪装成仍在运行；Run Store 的跨重启状态对账和任务续跑仍属于持久执行队列的后续能力。
 
 ## 4. 调用来源
 
@@ -59,6 +59,8 @@ A2A 自动记录 Publication、context ID 和 task ID。MCP 的调用工具接�
 | --- | --- | --- |
 | GET | `/api/activity` | 最近 Invocation 和 Work Instance 快照 |
 | GET | `/api/activity/stream` | SSE 快照、状态迁移和实时节点事件 |
+| POST | `/api/workflows/:id/start` | 异步受理 Workflow 并立即返回 Invocation/Run 编号 |
+| GET | `/api/invocations/:id` | 查询一次异步调用和节点状态 |
 | POST | `/api/publications/:id/invoke` | 通过稳定调用包执行单 Agent 或多 Agent 团队 |
 
 MCP 推荐入口：

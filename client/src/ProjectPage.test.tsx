@@ -1,9 +1,42 @@
+/** @vitest-environment jsdom */
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { ProjectPage } from "./ProjectPage";
-import type { Bootstrap } from "./types";
+import type { Bootstrap, WorkInstanceRecord, WorkInstanceStatus } from "./types";
 
 const timestamp = "2026-08-01T00:00:00.000Z";
+
+function workInstance(id: string, status: WorkInstanceStatus, updatedAt = timestamp): WorkInstanceRecord {
+  return {
+    id,
+    invocationId: `inv-${id}`,
+    employeeId: "xiaomixiang-tester",
+    employeeVersion: 1,
+    workflowId: "town-flow",
+    workflowVersion: 1,
+    nodeId: "node-1",
+    runId: `run-${id}`,
+    providerId: "mock",
+    source: { kind: "mcp", label: "测试会话" },
+    status,
+    phase: "执行",
+    createdAt: timestamp,
+    updatedAt,
+    transitions: []
+  };
+}
+
+function mount(data: Bootstrap): { container: HTMLElement; root: Root } {
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  // roleDrafts are seeded from the saved binding in an effect, so render for real.
+  act(() => root.render(<ProjectPage data={data} refresh={vi.fn()} notify={vi.fn()} />));
+  return { container, root };
+}
 
 const bootstrap: Bootstrap = {
   providers: [{ id: "mock", definition: { adapter: "mock" } }],
@@ -108,8 +141,57 @@ describe("Project connection page", () => {
     expect(html).toContain("aria-label=\"测试验收分派员工\"");
     expect(html).not.toContain("<select");
     expect(html).toContain("项目不需要复制 Prompt");
-    expect(html).toContain("本项目临时追加的 Knowledge Profile");
+    expect(html).toContain("本项目临时追加的知识 Profile");
     expect(html).toContain("Workbench · 质量知识");
     expect(html).toContain("invoke_project_role");
+  });
+
+  it("shows the bound employee runtime status on the role card", () => {
+    const data: Bootstrap = { ...bootstrap, activity: { invocations: [], instances: [workInstance("i-1", "running")] } };
+    const { container, root } = mount(data);
+
+    const preview = container.querySelector(".project-employee-preview");
+    expect(preview).not.toBeNull();
+    expect(preview?.querySelector(".project-employee-flags .runtime-chip--running")?.textContent).toContain("工作中");
+    // 档案 Stamp 与运行 Chip 分别存在
+    expect(container.querySelector(".project-role-row .stamp")).not.toBeNull();
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("omits the runtime chip on the role card while the bound employee is idle", () => {
+    const { container, root } = mount(bootstrap);
+
+    const preview = container.querySelector(".project-employee-preview");
+    expect(preview).not.toBeNull();
+    // 大厅席位之外不做静态噪声：idle 时不渲染运行 Chip，角色 Stamp 独立保留。
+    expect(preview?.querySelector(".runtime-chip")).toBeNull();
+    expect(container.querySelector(".project-role-row .stamp")).not.toBeNull();
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("fades the completed chip on the role card through the page clock", () => {
+    vi.useFakeTimers();
+    const data: Bootstrap = { ...bootstrap, activity: { invocations: [], instances: [workInstance("i-1", "completed", new Date().toISOString())] } };
+    const { container, root } = mount(data);
+    let unmounted = false;
+    try {
+      const preview = container.querySelector(".project-employee-preview");
+      expect(preview?.querySelector(".runtime-chip--completed")?.textContent).toContain("已完成");
+
+      act(() => { vi.advanceTimersByTime(21_000); });
+
+      // The dwell elapsed while staying on the page: the chip fades to idle and hides.
+      expect(container.querySelector(".project-employee-preview .runtime-chip")).toBeNull();
+
+      const timersBeforeUnmount = vi.getTimerCount();
+      act(() => { root.unmount(); unmounted = true; });
+      expect(vi.getTimerCount()).toBeLessThan(timersBeforeUnmount);
+    } finally {
+      if (!unmounted) act(() => root.unmount());
+      container.remove();
+      vi.useRealTimers();
+    }
   });
 });

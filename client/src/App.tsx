@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { EmployeePage } from "./EmployeePage";
 import { KnowledgePage } from "./KnowledgePage";
@@ -27,6 +27,27 @@ function upsertById<T extends { id: string }>(items: T[], value: T): T[] {
   return next;
 }
 
+function mergeRecordsByRevision<T extends { id: string; updatedAt: string }>(current: T[], incoming: T[]): T[] {
+  const byId = new Map<string, T>();
+  for (const item of incoming) byId.set(item.id, item);
+  for (const item of current) {
+    const existing = byId.get(item.id);
+    if (!existing || item.updatedAt > existing.updatedAt) byId.set(item.id, item);
+  }
+  return [...byId.values()];
+}
+
+/**
+ * A bootstrap snapshot is older evidence than any live activity event that
+ * arrived while its request was in flight, so keep the newer record per id.
+ */
+export function mergeActivity(current: ActivitySnapshot, incoming: ActivitySnapshot): ActivitySnapshot {
+  return {
+    invocations: mergeRecordsByRevision(current.invocations, incoming.invocations),
+    instances: mergeRecordsByRevision(current.instances, incoming.instances)
+  };
+}
+
 export function assertKnowledgeControlPlane(bootstrap: Bootstrap): void {
   if (!Array.isArray(bootstrap.knowledgeBases) || !Array.isArray(bootstrap.knowledgeProfiles)) {
     throw new Error("本地运行核心版本早于知识控制台，请重启 Workbench 后重试；现有知识和员工绑定不会丢失。");
@@ -40,6 +61,9 @@ export function App() {
   const [activityStream, setActivityStream] = useState<"connecting" | "live" | "reconnecting" | "offline">("connecting");
   const [notice, setNotice] = useState<{ message: string; kind: "success" | "error" }>();
   const [commandOpen, setCommandOpen] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const bootstrapRequestSeq = useRef(0);
+  const bootstrapLoaded = useRef(false);
 
   const notify = useCallback((message: string, kind: "success" | "error" = "success") => {
     setNotice({ message, kind });
@@ -49,18 +73,36 @@ export function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const seq = ++bootstrapRequestSeq.current;
+    setSyncing(true);
     try {
       const bootstrap = await api<Bootstrap>("/api/bootstrap");
+      if (seq !== bootstrapRequestSeq.current) return; // a newer navigation already superseded this response
       assertKnowledgeControlPlane(bootstrap);
-      setData(bootstrap);
+      // Live SSE events that arrived while this request was in flight are newer
+      // evidence than the snapshot: merge by id + updatedAt so they survive.
+      setData((current) => ({ ...bootstrap, activity: mergeActivity(current.activity, bootstrap.activity) }));
+      bootstrapLoaded.current = true;
       setDaemon("online");
     } catch (error) {
-      setDaemon("offline");
+      if (seq !== bootstrapRequestSeq.current) return; // stale failures must not flip daemon state either
+      // Only an app that never loaded a bootstrap goes read-only offline. A failed
+      // background refresh keeps the data, the online daemon and the activity stream.
+      if (!bootstrapLoaded.current) setDaemon("offline");
       throw error;
+    } finally {
+      if (seq === bootstrapRequestSeq.current) setSyncing(false);
     }
   }, []);
 
-  useEffect(() => { refresh().catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error")); }, [refresh, notify]);
+  const refreshQuietly = useCallback(() => {
+    refresh().catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error"));
+  }, [refresh, notify]);
+
+  // First load and every page entry (side nav, command palette, browser back/forward)
+  // fetch the latest bootstrap. navigate() and the hashchange listener agree on the
+  // same page value, so React runs this effect exactly once per navigation.
+  useEffect(() => { refreshQuietly(); }, [page, refreshQuietly]);
   useEffect(() => {
     if (daemon !== "online") { setActivityStream("offline"); return; }
     setActivityStream("connecting");
@@ -105,7 +147,12 @@ export function App() {
     return () => window.removeEventListener("keydown", handleKey);
   }, []);
 
-  const navigate = (next: Page) => { window.location.hash = next; setPage(next); };
+  // Clicking the already-active tab is an explicit "give me fresh data" gesture.
+  const navigate = (next: Page) => {
+    if (next === page) { refreshQuietly(); return; }
+    window.location.hash = next;
+    setPage(next);
+  };
   const invocationRevision = data.activity.invocations.reduce((latest, invocation) => invocation.updatedAt > latest ? invocation.updatedAt : latest, "");
   const activityRevision = data.activity.instances.reduce((latest, instance) => instance.updatedAt > latest ? instance.updatedAt : latest, invocationRevision);
   const nav = [
@@ -123,7 +170,7 @@ export function App() {
     <a className="skip-link" href="#main-content">跳到主内容</a>
     <header className={`daemon-strip daemon-strip--${daemon}`} aria-live="polite">
       <div><span className="daemon-dot" aria-hidden="true" /><strong>{daemon === "online" ? "小镇运行核心已连接" : daemon === "offline" ? "小镇运行核心未连接" : "正在核对小镇运行核心"}</strong><code>127.0.0.1 · LOOPBACK</code></div>
-      <span>{daemon === "offline" ? "READ ONLY · 写入与运行暂不可用" : "LOCAL GARDEN · EVIDENCE ON"}</span>
+      <span>{daemon === "offline" ? "READ ONLY · 写入与运行暂不可用" : syncing ? "SYNCING · 正在同步最新档案" : "LOCAL GARDEN · EVIDENCE ON"}</span>
     </header>
     <nav className="side-nav" aria-label="主要导航">
       <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>四季档案室</strong><small>HEALING PIXEL DOSSIER</small></div></div>

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ProviderExecutionError } from "../src/core/errors.js";
 import { buildCodexInvocationArgs, createDefaultProviderRegistry, registerProviderAdapter } from "../src/runtime/providers.js";
 
 describe("provider adapters", () => {
@@ -36,6 +37,42 @@ describe("provider adapters", () => {
     });
 
     expect(response.stdout).toBe("request only");
+  });
+
+  it("classifies a Provider budget exit as deterministic and non-retryable", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const failure = await adapter.invoke({
+      providerId: "budget-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", "process.stdout.write(JSON.stringify({ subtype: 'error_max_budget_usd' })); process.exit(1)"]
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {}
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "budget", retryable: false });
+  });
+
+  it("classifies an explicit rate limit exit as retryable", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const failure = await adapter.invoke({
+      providerId: "rate-limited-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", "process.stderr.write('429 rate limit'); process.exit(1)"]
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {}
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "rate-limit", retryable: true });
   });
 
   it("accepts non-empty model metadata and rejects empty declarations", () => {

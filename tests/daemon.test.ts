@@ -1,14 +1,18 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createDaemonApp } from "../src/daemon/server.js";
-import { createWorkbenchMcpServer } from "../src/mcp/server.js";
-import { WorkbenchService } from "../src/workbench/service.js";
+import {
+  WorkbenchService,
+  createDaemonApp,
+  createWorkbenchMcpServer,
+  type KnowledgeFetchedUrl
+} from "../src/index.js";
 
 const directories: string[] = [];
 const servers: Server[] = [];
@@ -18,10 +22,32 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
 
-async function fixture() {
+function fetchedKnowledgePage(): KnowledgeFetchedUrl {
+  const html = `<!doctype html><html><head><title>Desk URL Handbook</title></head><body>
+    <p>Desk reviews preserve traceable evidence.</p>
+    <h2 id="review-steps">Review steps</h2>
+    <p>Review the evidence before approval.</p>
+  </body></html>`;
+  const body = Buffer.from(html);
+  return {
+    requestedUrl: "https://public.example/desk-handbook",
+    finalUrl: "https://public.example/desk-handbook",
+    redirects: [],
+    contentType: "text/html",
+    byteLength: body.length,
+    contentSha256: createHash("sha256").update(body).digest("hex"),
+    html,
+    fetchedAt: "2026-01-15T00:00:00.000Z"
+  };
+}
+
+async function fixture(options: { knowledgeUrlFetcher?: { fetch: (url: string) => Promise<KnowledgeFetchedUrl> } } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-daemon-"));
   directories.push(root);
-  const service = await WorkbenchService.open({ dataRoot: root });
+  const service = await WorkbenchService.open({
+    dataRoot: root,
+    knowledgeUrlFetcher: options.knowledgeUrlFetcher
+  });
   await service.createEmployee({
     id: "desk-agent",
     identity: { displayName: "Desk Agent", background: "A local test agent.", responsibilities: ["Handle requests"] }
@@ -44,8 +70,11 @@ async function fixture() {
   });
   const app = createDaemonApp(service, { baseUrl: "http://127.0.0.1:4318", staticDir: path.join(root, "missing-client") });
   const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
   servers.push(server);
-  await new Promise<void>((resolve) => server.once("listening", resolve));
   const port = (server.address() as AddressInfo).port;
   return { base: `http://127.0.0.1:${port}`, service };
 }
@@ -176,6 +205,165 @@ describe("workbench daemon", () => {
     expect(bootstrap.data.knowledgeProfiles.map((item) => item.id)).toContain("desk-knowledge");
   });
 
+  it("serves governed URL import, Wiki, perspective, and grant-review endpoints", async () => {
+    const fetched = fetchedKnowledgePage();
+    const fetchUrl = vi.fn(async () => fetched);
+    const { base, service } = await fixture({ knowledgeUrlFetcher: { fetch: fetchUrl } });
+    await service.createKnowledgeBase({
+      id: "governed-handbook",
+      description: "Governed desk knowledge.",
+      domain: "desk",
+      collections: [{
+        id: "reviews",
+        displayName: "Reviews",
+        description: "Traceable desk review evidence.",
+        authority: "canonical",
+        tags: ["desk", "review"]
+      }],
+      documents: [{
+        id: "existing-review-guide",
+        title: "Existing review guide",
+        content: "Desk reviews preserve traceable evidence before approval.",
+        collectionId: "reviews"
+      }],
+      publish: true
+    });
+    await service.createKnowledgeProfile({
+      id: "governed-reviews",
+      description: "Governed review knowledge.",
+      rules: [{
+        id: "review-core",
+        selector: { knowledgeBaseIds: ["governed-handbook"], collectionIds: ["reviews"] },
+        activation: "core",
+        priority: 10,
+        required: false,
+        budget: { maxCollections: 1, maxChunks: 3, maxTokens: 1_200 }
+      }]
+    });
+    await service.updateEmployee("desk-agent", {
+      knowledgeProfileIds: ["governed-reviews"],
+      knowledgeGrants: [{
+        profileId: "governed-reviews",
+        reason: "Desk Agent reviews governed evidence.",
+        grantedBy: "desk-owner",
+        grantedAt: "2025-10-01T00:00:00.000Z",
+        expiresAt: "2026-02-01T00:00:00.000Z"
+      }]
+    });
+
+    const health = await fetch(`${base}/api/health`).then((response) => response.json()) as {
+      data: { capabilities: Record<string, unknown> };
+    };
+    expect(health.data.capabilities).toMatchObject({
+      knowledgeUrlImport: "preview-propose-v1",
+      knowledgeWiki: "derived-read-only-v1",
+      knowledgePerspective: "run-evidence-v1",
+      knowledgeGrantReview: "reminder-only-v1"
+    });
+
+    const wikiResponse = await fetch(`${base}/api/knowledge-bases/governed-handbook/wiki?revision=1`);
+    expect(wikiResponse.status).toBe(200);
+    const wiki = await wikiResponse.json() as {
+      data: { revision: number; visibility: string; documents: Array<{ document: { id: string } }> };
+    };
+    expect(wiki.data).toMatchObject({ revision: 1, visibility: "published" });
+    expect(wiki.data.documents.map((item) => item.document.id)).toEqual(["existing-review-guide"]);
+
+    const perspectiveResponse = await fetch(`${base}/api/employees/desk-agent/knowledge-perspective`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Review desk evidence", evidenceLimit: 5 })
+    });
+    expect(perspectiveResponse.status).toBe(200);
+    const perspective = await perspectiveResponse.json() as {
+      data: {
+        eligible: Array<{
+          knowledgeBaseId: string;
+          collection: { id: string };
+          matches: Array<{ profileId: string; ruleId: string; reason: string }>;
+        }>;
+        activated: Array<{ collection: { id: string } }>;
+      };
+    };
+    expect(perspective.data.eligible).toEqual([
+      expect.objectContaining({
+        knowledgeBaseId: "governed-handbook",
+        collection: expect.objectContaining({ id: "reviews" }),
+        matches: [expect.objectContaining({
+          profileId: "governed-reviews",
+          ruleId: "review-core",
+          reason: expect.stringContaining("profile rule review-core")
+        })]
+      })
+    ]);
+    expect(perspective.data.activated.map((item) => item.collection.id)).toEqual(["reviews"]);
+
+    const reviewsResponse = await fetch(`${base}/api/knowledge/reviews?asOf=2026-01-15T00%3A00%3A00.000Z&dueSoonDays=30`);
+    expect(reviewsResponse.status).toBe(200);
+    const reviews = await reviewsResponse.json() as {
+      data: { policy: string; items: Array<{ status: string; reminderOnly: boolean; grant: { profileId: string } }> };
+    };
+    expect(reviews.data.policy).toBe("reminder-only-v1");
+    expect(reviews.data.items).toContainEqual(expect.objectContaining({
+      status: "due-soon",
+      reminderOnly: true,
+      grant: expect.objectContaining({ profileId: "governed-reviews" })
+    }));
+
+    const previewResponse = await fetch(`${base}/api/knowledge/url-preview`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        knowledgeBaseId: "governed-handbook",
+        collectionId: "reviews",
+        url: fetched.requestedUrl
+      })
+    });
+    expect(previewResponse.status).toBe(200);
+    const preview = await previewResponse.json() as {
+      data: { previewHash: string; documents: Array<{ metadata?: { sourceKind?: string } }> };
+    };
+    expect(preview.data.previewHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(preview.data.documents).toContainEqual(expect.objectContaining({
+      metadata: expect.objectContaining({ sourceKind: "url" })
+    }));
+    expect(service.getKnowledgeBase("governed-handbook")).toMatchObject({ latestRevision: 1, publishedRevision: 1 });
+
+    const proposalResponse = await fetch(`${base}/api/knowledge/url-proposals`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        knowledgeBaseId: "governed-handbook",
+        collectionId: "reviews",
+        url: fetched.requestedUrl,
+        previewHash: preview.data.previewHash,
+        title: "Import governed desk handbook",
+        reason: "The frozen URL preview was reviewed."
+      })
+    });
+    expect(proposalResponse.status).toBe(201);
+    const proposal = await proposalResponse.json() as { data: { id: string; status: string } };
+    expect(proposal.data.status).toBe("awaiting-approval");
+    expect(fetchUrl).toHaveBeenCalledTimes(2);
+    expect(service.getKnowledgeBase("governed-handbook")).toMatchObject({ latestRevision: 1, publishedRevision: 1 });
+
+    const approvalResponse = await fetch(`${base}/api/knowledge-changes/${proposal.data.id}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ comment: "Frozen import approved" })
+    });
+    expect(approvalResponse.status).toBe(200);
+    expect(fetchUrl).toHaveBeenCalledTimes(2);
+    expect(service.getKnowledgeBase("governed-handbook")).toMatchObject({ latestRevision: 2, publishedRevision: 1 });
+    const draftWiki = await fetch(`${base}/api/knowledge-bases/governed-handbook/wiki?revision=2`)
+      .then((response) => response.json()) as {
+        data: { visibility: string; references: unknown[]; candidateRelations: Array<{ persisted: boolean }> };
+      };
+    expect(draftWiki.data.visibility).toBe("draft");
+    expect(draftWiki.data.references).toEqual([]);
+    expect(draftWiki.data.candidateRelations.every((candidate) => candidate.persisted === false)).toBe(true);
+  });
+
   it("serves CRUD, Agent Card, and A2A v1 JSON-RPC from loopback", async () => {
     const { base } = await fixture();
     const health = await fetch(`${base}/api/health`).then((response) => response.json()) as { data: { bindPolicy: string } };
@@ -273,8 +461,41 @@ describe("workbench daemon", () => {
     expect(rpc.result?.task?.artifacts?.[0]?.metadata?.domainBlock).toBe(false);
   });
 
+  it("accepts a workflow asynchronously and exposes status without holding the request open", async () => {
+    const { base, service } = await fixture();
+    await service.createWorkflow({
+      id: "desk-flow",
+      nodes: [{ id: "respond", employeeId: "desk-agent" }]
+    });
+
+    const response = await fetch(`${base}/api/workflows/desk-flow/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Run asynchronously" })
+    });
+    expect(response.status).toBe(202);
+    const receipt = await response.json() as {
+      data: { invocation: { id: string; runId: string }; runId: string; statusUrl: string; streamUrl: string };
+    };
+    expect(receipt.data.runId).toBe(receipt.data.invocation.runId);
+    expect(receipt.data.statusUrl).toBe(`/api/invocations/${receipt.data.invocation.id}`);
+    expect(receipt.data.streamUrl).toBe("/api/activity/stream");
+
+    await service.waitForInvocation(receipt.data.invocation.id);
+    const detail = await fetch(`${base}${receipt.data.statusUrl}`).then((result) => result.json()) as {
+      data: { invocation: { status: string }; instances: Array<{ status: string }>; run: { status: string } };
+    };
+    expect(detail.data.invocation.status).toBe("completed");
+    expect(detail.data.instances[0]?.status).toBe("completed");
+    expect(detail.data.run.status).toBe("passed");
+  });
+
   it("exposes the shared daemon registry through MCP tools", async () => {
-    const { base } = await fixture();
+    const { base, service } = await fixture();
+    await service.createWorkflow({
+      id: "mcp-flow",
+      nodes: [{ id: "respond", employeeId: "desk-agent" }]
+    });
     const mcpServer = createWorkbenchMcpServer(base);
     const client = new Client({ name: "workbench-test", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -285,6 +506,8 @@ describe("workbench daemon", () => {
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_employee");
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_publication");
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_project_role");
+      expect(tools.tools.map((tool) => tool.name)).toContain("start_workflow");
+      expect(tools.tools.map((tool) => tool.name)).toContain("get_invocation");
       const result = await client.callTool({
         name: "invoke_employee",
         arguments: { employeeId: "desk-agent", message: "Call through MCP" }
@@ -304,10 +527,24 @@ describe("workbench daemon", () => {
       });
       const projectContent = projectResult.content as Array<{ type: string; text?: string }>;
       expect(projectContent.find((item) => item.type === "text")?.text ?? "").toContain("Desk Agent received");
+      const started = await client.callTool({
+        name: "start_workflow",
+        arguments: { workflowId: "mcp-flow", input: { message: "Start through MCP" } }
+      });
+      const startedText = (started.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "{}";
+      const receipt = JSON.parse(startedText) as { invocation: { id: string } };
+      await service.waitForInvocation(receipt.invocation.id);
+      const status = await client.callTool({
+        name: "get_invocation",
+        arguments: { invocationId: receipt.invocation.id }
+      });
+      const statusText = (status.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
+      expect(statusText).toContain('"status": "completed"');
       const activity = await fetch(`${base}/api/activity`).then((response) => response.json()) as {
         data: { invocations: Array<{ source: { kind: string; project?: string; projectRole?: string; publicationId?: string } }> };
       };
-      expect(activity.data.invocations[0]?.source).toMatchObject({ kind: "mcp", project: "desk-project", projectRole: "reviewer" });
+      expect(activity.data.invocations.find((invocation) => invocation.source.projectRole === "reviewer")?.source)
+        .toMatchObject({ kind: "mcp", project: "desk-project", projectRole: "reviewer" });
     } finally {
       await client.close();
       await mcpServer.close();

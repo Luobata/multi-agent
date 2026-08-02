@@ -39,6 +39,7 @@ export interface Employee {
   skills: SkillBinding[];
   skillVersions: Record<string, number>;
   knowledgeProfileIds?: string[];
+  knowledgeGrants?: KnowledgeProfileGrant[];
   providerId: string;
   outputSchema: JsonObject;
   maxAttempts: number;
@@ -257,6 +258,7 @@ export interface ProjectRoleBinding {
   skills: SkillBinding[];
   skillVersions: Record<string, number>;
   knowledgeProfileIds?: string[];
+  knowledgeGrants?: KnowledgeProfileGrant[];
   updatePolicy: ProjectBindingUpdatePolicy;
 }
 
@@ -272,6 +274,8 @@ export interface ProjectBinding {
 export type KnowledgeClassification = "internal" | "confidential" | "restricted";
 export type KnowledgeAuthority = "canonical" | "reference" | "experimental";
 export type KnowledgeActivation = "core" | "conditional" | "on-demand";
+export type KnowledgeReferenceType = "related" | "supports" | "contradicts" | "depends-on" | "supersedes";
+export type KnowledgeGrantSource = "explicit" | "legacy";
 
 export interface KnowledgeCollection {
   id: string;
@@ -311,6 +315,12 @@ export interface KnowledgeBase {
   updatedAt: string;
 }
 
+export interface KnowledgeDocumentReference {
+  type: KnowledgeReferenceType;
+  targetDocumentId: string;
+  note?: string;
+}
+
 export interface KnowledgeDocument {
   id: string;
   title: string;
@@ -318,8 +328,173 @@ export interface KnowledgeDocument {
   collectionId: string;
   sourceId?: string;
   sourceRef?: string;
+  order?: number;
+  parentId?: string;
+  references?: KnowledgeDocumentReference[];
   metadata?: JsonObject;
   updatedAt: string;
+}
+
+export type KnowledgeDocumentInput = Omit<KnowledgeDocument, "updatedAt">;
+
+export interface KnowledgeRelationCandidate {
+  id: string;
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  suggestedType: "related";
+  strength: "candidate";
+  persisted: false;
+  score: number;
+  signals: string[];
+}
+
+export interface KnowledgeWikiReference {
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  type: KnowledgeReferenceType;
+  strength: "explicit";
+  note?: string;
+}
+
+export interface KnowledgeWikiDocument {
+  document: KnowledgeDocument;
+  outgoingReferences: KnowledgeWikiReference[];
+  backlinks: KnowledgeWikiReference[];
+  candidateRelations: KnowledgeRelationCandidate[];
+}
+
+export interface KnowledgeWikiView {
+  knowledgeBaseId: string;
+  revision: number;
+  visibility: "published" | "draft";
+  documents: KnowledgeWikiDocument[];
+  references: KnowledgeWikiReference[];
+  candidateRelations: KnowledgeRelationCandidate[];
+  generatedAt: string;
+}
+
+export interface KnowledgeUrlPreview {
+  version: "knowledge-url-preview-v1";
+  knowledgeBaseId: string;
+  knowledgeBaseVersion: number;
+  baseRevision?: number;
+  collectionId: string;
+  requestedUrl: string;
+  finalUrl: string;
+  redirects: string[];
+  contentType: string;
+  byteLength: number;
+  contentSha256: string;
+  previewHash: string;
+  documents: KnowledgeDocumentInput[];
+  relationCandidates: KnowledgeRelationCandidate[];
+  fetchedAt: string;
+}
+
+export interface KnowledgeProfileGrant {
+  profileId: string;
+  reason: string;
+  grantedBy: string;
+  grantedAt: string;
+  expiresAt?: string;
+  reviewCycleDays?: number;
+  lastReviewedAt?: string;
+  source: KnowledgeGrantSource;
+}
+
+export interface KnowledgeGrantReviewItem {
+  id: string;
+  subject: {
+    kind: "employee" | "project-role";
+    employeeId: string;
+    projectId?: string;
+    roleId?: string;
+  };
+  grant: KnowledgeProfileGrant;
+  status: "overdue" | "due-soon" | "current" | "unscheduled";
+  dueAt?: string;
+  reasons: string[];
+  reminderOnly: true;
+}
+
+export interface KnowledgeGrantReviewLedger {
+  asOf: string;
+  dueSoonDays: number;
+  policy: "reminder-only-v1";
+  counts: Record<KnowledgeGrantReviewItem["status"], number>;
+  items: KnowledgeGrantReviewItem[];
+}
+
+export interface KnowledgeCandidateMatch {
+  profileId: string;
+  profileVersion: number;
+  ruleId: string;
+  activation: KnowledgeActivation;
+  priority: number;
+  required: boolean;
+  budget: { maxCollections: number; maxChunks: number; maxTokens: number };
+  reason: string;
+}
+
+export interface KnowledgeCandidateCollection {
+  knowledgeBaseId: string;
+  knowledgeBaseVersion: number;
+  revision: number;
+  knowledgeBaseName: string;
+  domain: string;
+  product?: string;
+  projectId?: string;
+  classification: KnowledgeClassification;
+  collection: KnowledgeCollection;
+  matches: KnowledgeCandidateMatch[];
+}
+
+export interface KnowledgeSelectedCollection {
+  knowledgeBaseId: string;
+  knowledgeBaseVersion: number;
+  revision: number;
+  collectionId: string;
+  collectionName: string;
+  profileId: string;
+  ruleId: string;
+  activation: KnowledgeActivation;
+  priority: number;
+  reason: string;
+  query: string;
+  budget: { maxCollections: number; maxChunks: number; maxTokens: number };
+}
+
+export interface KnowledgeEvidenceUsage {
+  runId: string;
+  workInstanceId: string;
+  nodeId: string;
+  status: string;
+  at: string;
+  context: { request: string; projectId?: string; projectRoleId?: string; taskTags: string[] };
+  evidence: KnowledgeEvidence[];
+}
+
+export interface KnowledgePerspective {
+  employee: {
+    id: string;
+    version: number;
+    knowledgeProfileIds: string[];
+    grants: KnowledgeProfileGrant[];
+  };
+  context: { request: string; projectId?: string; projectRoleId?: string; taskTags: string[] };
+  eligible: KnowledgeCandidateCollection[];
+  activated: KnowledgeCandidateCollection[];
+  selected: KnowledgeSelectedCollection[];
+  exclusions: Array<{ knowledgeBaseId?: string; collectionId?: string; profileId?: string; reason: string }>;
+  recentEvidence: KnowledgeEvidenceUsage[];
+  evidenceWindow: {
+    policy: "recent-work-instances-v1";
+    limit: number;
+    scannedInstances: number;
+    matchedRuns: number;
+    oldestScannedAt?: string;
+    newestScannedAt?: string;
+  };
 }
 
 export interface KnowledgeRevision {

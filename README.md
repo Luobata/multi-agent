@@ -150,6 +150,7 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 - [架构与源方案映射](docs/architecture.md)
 - [Architecture Adapter 演进](docs/architecture-adapters.md)
 - [常用多 Agent 模式与可视化编排](docs/multi-agent-patterns-and-composer.md)
+- [Multi-Agent 运行性能与可靠性优化](docs/multi-agent-runtime-performance.md)
 - [Provider Adapter 配置](docs/provider-adapters.md)
 - [多 Agent 设计 Skill](skills/design-multi-agent-workflows/SKILL.md)
 

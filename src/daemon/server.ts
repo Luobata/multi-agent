@@ -89,9 +89,14 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       capabilities: {
         knowledgeControlPlane: "v1",
         knowledgeDraftPreview: true,
+        knowledgeUrlImport: "preview-propose-v1",
+        knowledgeWiki: "derived-read-only-v1",
+        knowledgePerspective: "run-evidence-v1",
+        knowledgeGrantReview: "reminder-only-v1",
         knowledgeImpactAnalysis: true,
         knowledgeConversation: "codex-mcp-v1",
-        knowledgeChangeApproval: true
+        knowledgeChangeApproval: true,
+        asyncWorkflowInvocations: "v1"
       }
     });
   });
@@ -118,6 +123,9 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     const parsed = Number(request.query.limit ?? 100);
     send(response, service.getActivitySnapshot(Number.isFinite(parsed) ? parsed : 100));
   });
+  app.get("/api/invocations/:id", asyncRoute(async (request, response) => {
+    send(response, await service.getInvocationDetail(routeParam(request, "id")));
+  }));
   app.get("/api/activity/stream", (request, response) => {
     response.status(200);
     response.set({
@@ -177,6 +185,10 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.post("/api/knowledge-bases/:id/preview", asyncRoute(async (request, response) => {
     send(response, await service.previewKnowledgeRevision(routeParam(request, "id"), request.body));
   }));
+  app.get("/api/knowledge-bases/:id/wiki", asyncRoute(async (request, response) => {
+    const revision = request.query.revision === undefined ? undefined : Number(request.query.revision);
+    send(response, await service.getKnowledgeWiki(routeParam(request, "id"), revision));
+  }));
   app.patch("/api/knowledge-bases/:id", asyncRoute(async (request, response) => {
     send(response, await service.updateKnowledgeBase(routeParam(request, "id"), request.body));
   }));
@@ -215,6 +227,26 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.post("/api/employees/:id/knowledge-preview", asyncRoute(async (request, response) => {
     send(response, await service.previewEmployeeKnowledge(routeParam(request, "id"), request.body));
   }));
+  app.post("/api/employees/:id/knowledge-perspective", asyncRoute(async (request, response) => {
+    send(response, await service.getEmployeeKnowledgePerspective(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/knowledge/url-preview", asyncRoute(async (request, response) => {
+    send(response, await service.previewKnowledgeUrl(request.body));
+  }));
+  app.post("/api/knowledge/url-proposals", asyncRoute(async (request, response) => {
+    send(response, await service.proposeKnowledgeUrl(request.body), 201);
+  }));
+  app.get("/api/knowledge/reviews", (request, response, next) => {
+    try {
+      const dueSoonDays = request.query.dueSoonDays === undefined ? undefined : Number(request.query.dueSoonDays);
+      send(response, service.listKnowledgeGrantReviews({
+        asOf: typeof request.query.asOf === "string" ? request.query.asOf : undefined,
+        dueSoonDays
+      }));
+    } catch (error) {
+      next(error);
+    }
+  });
   app.get("/api/knowledge/impact", (_request, response) => {
     send(response, service.getKnowledgeImpactSnapshot());
   });
@@ -387,6 +419,18 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       jsonObject(request.body ?? {}, "workflow input"),
       invocationSource(request, "http")
     ));
+  }));
+  app.post("/api/workflows/:id/start", asyncRoute(async (request, response) => {
+    const started = await service.startWorkbenchWorkflow(
+      routeParam(request, "id"),
+      jsonObject(request.body ?? {}, "workflow input"),
+      invocationSource(request, "http")
+    );
+    send(response, {
+      ...started,
+      statusUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}`,
+      streamUrl: "/api/activity/stream"
+    }, 202);
   }));
 
   app.get("/api/runs", asyncRoute(async (request, response) => {

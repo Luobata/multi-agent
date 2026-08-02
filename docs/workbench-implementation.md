@@ -75,7 +75,9 @@
 | GET | `/api/sessions[/:id]` | 版本固定 Session |
 | GET/POST/PATCH | `/api/workflows[/:id]` | Graph Workflow CRUD |
 | GET | `/api/workflows/:id/plan` | 不调用 Provider 的执行计划 |
-| POST | `/api/workflows/:id/run` | 执行 Workflow |
+| POST | `/api/workflows/:id/start` | 异步受理 Workflow，返回 Invocation 与 Run 编号 |
+| POST | `/api/workflows/:id/run` | 等待 Workflow 完成的兼容入口 |
+| GET | `/api/invocations/:id` | 查询异步调用、节点实例与已生成的 Run 证据 |
 | GET | `/api/runs[/:id]` | 不可变 Run 记录 |
 | GET/POST | `/api/publications[/:id]` | A2A Publication |
 | POST | `/api/publications/:id/invoke` | 统一调用单 Agent / 多 Agent 包 |
@@ -120,7 +122,9 @@ MCP server 只把 stdio tool call 转成 daemon HTTP 请求，不持有 Employee
 multi-agent-mcp --daemon-url http://127.0.0.1:4318
 ```
 
-调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包，再用 `invoke_publication` 调用，不必感知包内是单 Employee 还是 Workflow。
+调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包，再用 `invoke_publication` 调用，不必感知包内是单 Employee 还是 Workflow。直接运行长 Workflow 时优先使用 `start_workflow`，再用 `get_invocation` 读取状态；`run_workflow` 仅作为同步兼容入口。
+
+运行时调度、有限重试和异步入口的设计与后续边界见 [Multi-Agent 运行性能与可靠性优化](multi-agent-runtime-performance.md)。
 
 ## 6. A2A v1
 

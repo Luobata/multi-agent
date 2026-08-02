@@ -5,7 +5,7 @@ import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, ReadonlyEvide
 import { layoutTopology } from "./topology";
 import { automaticCanvasPositions, WorkflowCanvas, type CanvasPositions } from "./WorkflowCanvas";
 import { activeWorkflowPublications, buildWorkflowSessionPrompts } from "./workflowSessionPrompts";
-import type { Bootstrap, Employee, InstantiatedArchitectureTemplate, JsonObject, Workflow, WorkflowNode } from "./types";
+import type { Bootstrap, Employee, InstantiatedArchitectureTemplate, InvocationRecord, JsonObject, Workflow, WorkflowNode } from "./types";
 
 interface PageProps {
   data: Bootstrap;
@@ -39,6 +39,14 @@ function parseObject(value: string, label: string): JsonObject {
 
 function nodeDraft(node: WorkflowNode): NodeDraft {
   return { id: node.id, employeeId: node.employeeId, needs: [...node.needs], withText: JSON.stringify(node.with, null, 2) };
+}
+
+/** Receipt returned by POST /api/workflows/:id/start (HTTP 202); the workflow itself keeps running asynchronously. */
+interface WorkflowStartReceipt {
+  invocation: InvocationRecord;
+  runId: string;
+  statusUrl: string;
+  streamUrl: string;
 }
 
 function workflowDraft(workflow?: Workflow, employees: Employee[] = []): WorkflowDraft {
@@ -184,7 +192,12 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
 
   const run = async () => {
     if (!selected) return; setRunning(true);
-    try { const input = parseObject(runInput, "Workflow 输入"); const result = await api<{ run: { id: string; status: string } }>(`/api/workflows/${selected.id}/run`, { ...writeBody(input), headers: { "x-multi-agent-source": "workbench", "x-multi-agent-source-label": "编排调试台" } }); notify(result.run.status === "blocked" ? `Run ${result.run.id} 完成，但存在业务阻塞` : `Run ${result.run.id} · ${result.run.status}`); await refresh(); }
+    try {
+      const input = parseObject(runInput, "Workflow 输入");
+      const receipt = await api<WorkflowStartReceipt>(`/api/workflows/${selected.id}/start`, { ...writeBody(input), headers: { "x-multi-agent-source": "workbench", "x-multi-agent-source-label": "编排调试台" } });
+      notify(`运行工单已受理 · Run ${receipt.runId}（工单 ${receipt.invocation.id}）；进度可到运行卷宗或员工大厅继续观察`);
+      await refresh();
+    }
     catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
     finally { setRunning(false); }
   };
@@ -230,7 +243,7 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
           <ReadonlyEvidence label={`MCP 参数示例 · ${sessionPrompts.tool}`} value={sessionPrompts.mcpJson} mono />
         </div>
       </DossierSection>}
-      <section id="run-workflow" className="run-order"><header><div><p className="record-meta">{selected.id} · v{selected.version}</p><h3>签发运行工单</h3></div><Stamp status={running ? "running" : "pending"} label={running ? "执行中" : "待签发"} /></header><Field label="Workflow 输入 (JSON)"><textarea className="mono" rows={8} disabled={!daemonAvailable} value={runInput} onChange={(event) => setRunInput(event.target.value)} /></Field><div className="run-actions"><span>运行会保存输入、计划、每个节点 Prompt、原始输出与状态事件。</span><button className="button primary" disabled={!daemonAvailable || running || selected.status === "archived"} onClick={() => void run()}>{running ? "正在执行…" : "签发并运行"}</button></div></section>
+      <section id="run-workflow" className="run-order"><header><div><p className="record-meta">{selected.id} · v{selected.version}</p><h3>签发运行工单</h3></div><Stamp status={running ? "running" : "pending"} label={running ? "提交回执" : "待签发"} /></header><Field label="Workflow 输入 (JSON)"><textarea className="mono" rows={8} disabled={!daemonAvailable} value={runInput} onChange={(event) => setRunInput(event.target.value)} /></Field><div className="run-actions"><span>签发后立即返回受理回执，不等待运行完成；输入、计划、节点 Prompt 与状态事件保存在运行卷宗，也可到员工大厅实时观察。</span><button className="button primary" disabled={!daemonAvailable || running || selected.status === "archived"} onClick={() => void run()}>{running ? "提交回执…" : "签发并运行"}</button></div></section>
     </div>}</main>
     {editor && <WorkflowEditor workflow={editor === "edit" ? selected : undefined} data={data} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
     {archiveOpen && selected && <Modal title="归档协作编排" eyebrow={`${selected.id} · 保留历史`} onClose={() => setArchiveOpen(false)}><div className="modal-body"><div className="danger-notice"><b>历史版本与 Run 证据会继续保留。</b><p>归档后不能发起新的运行；已存在的档案与节点输出仍可查阅。</p></div><div className="modal-actions"><button className="button secondary" onClick={() => setArchiveOpen(false)}>取消</button><button className="button danger-filled" disabled={!daemonAvailable} onClick={() => void archive()}>确认归档</button></div></div></Modal>}

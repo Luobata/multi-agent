@@ -40,6 +40,7 @@ const expectedVersion = z.number().int().positive().optional();
 const classification = z.enum(["internal", "confidential", "restricted"]);
 const authority = z.enum(["canonical", "reference", "experimental"]);
 const activation = z.enum(["core", "conditional", "on-demand"]);
+const referenceType = z.enum(["related", "supports", "contradicts", "depends-on", "supersedes"]);
 const knowledgeCollectionSchema = z.object({
   id: resourceId,
   displayName: z.string().min(1),
@@ -61,7 +62,26 @@ const knowledgeDocumentSchema = z.object({
   collectionId: resourceId,
   sourceId: resourceId.optional(),
   sourceRef: z.string().min(1).optional(),
+  order: z.number().int().nonnegative().optional(),
+  parentId: resourceId.optional(),
+  references: z.array(z.object({
+    type: referenceType,
+    targetDocumentId: resourceId,
+    note: z.string().min(1).optional()
+  }).strict()).optional(),
   metadata: z.record(z.string(), z.unknown()).optional()
+}).strict();
+const knowledgeGrantMutationShape = {
+  reason: z.string().min(1).optional(),
+  grantedBy: z.string().min(1).optional(),
+  grantedAt: z.string().min(1).optional(),
+  expiresAt: z.string().min(1).optional(),
+  reviewCycleDays: z.number().int().min(1).max(3650).optional(),
+  lastReviewedAt: z.string().min(1).optional()
+};
+const knowledgeGrantOverrideSchema = z.object({
+  profileId: resourceId,
+  ...knowledgeGrantMutationShape
 }).strict();
 const knowledgeBaseMutableSchema = z.object({
   displayName: z.string().min(1).optional(),
@@ -158,14 +178,22 @@ const knowledgeChangeOperationSchema = z.discriminatedUnion("type", [
     type: z.literal("employee-profiles.set"),
     targetId: resourceId,
     expectedVersion,
-    payload: z.object({ profileIds: z.array(resourceId) }).strict()
+    payload: z.object({
+      profileIds: z.array(resourceId),
+      ...knowledgeGrantMutationShape,
+      grantOverrides: z.array(knowledgeGrantOverrideSchema).optional()
+    }).strict()
   }).strict(),
   z.object({
     type: z.literal("project-role-profiles.set"),
     projectId: resourceId,
     roleId: resourceId,
     expectedVersion,
-    payload: z.object({ profileIds: z.array(resourceId) }).strict()
+    payload: z.object({
+      profileIds: z.array(resourceId),
+      ...knowledgeGrantMutationShape,
+      grantOverrides: z.array(knowledgeGrantOverrideSchema).optional()
+    }).strict()
   }).strict()
 ]);
 
@@ -231,6 +259,89 @@ export function createWorkbenchMcpServer(
       `/api/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/preview`,
       { method: "POST", body: JSON.stringify(input) }
     )));
+
+    server.registerTool("knowledge_url_preview", {
+      title: "Preview a governed knowledge URL import",
+      description: "Fetch one public HTTP(S) page through the SSRF-restricted importer and return deterministic Documents, relation candidates, content hashes, and a frozen preview hash. This tool never persists content.",
+      inputSchema: {
+        knowledgeBaseId: resourceId,
+        collectionId: resourceId,
+        url: z.string().url()
+      }
+    }, async (input) => content(await request(
+      daemonUrl,
+      "/api/knowledge/url-preview",
+      { method: "POST", body: JSON.stringify(input) }
+    )));
+
+    server.registerTool("knowledge_url_propose", {
+      title: "Propose a governed knowledge URL import",
+      description: "Re-fetch a previously previewed public page, require the frozen hash to match, and create an awaiting-approval Revision proposal. This tool never approves or publishes it.",
+      inputSchema: {
+        knowledgeBaseId: resourceId,
+        collectionId: resourceId,
+        url: z.string().url(),
+        previewHash: z.string().regex(/^[a-f0-9]{64}$/),
+        title: z.string().min(1),
+        reason: z.string().min(1),
+        selectedRelations: z.array(z.object({
+          candidateId: z.string().min(1),
+          type: referenceType,
+          note: z.string().min(1).optional()
+        }).strict()).max(5).optional()
+      }
+    }, async (input) => content(await request(
+      daemonUrl,
+      "/api/knowledge/url-proposals",
+      {
+        method: "POST",
+        body: JSON.stringify({ ...input, requestedBy: "project-knowledge-steward" })
+      }
+    )));
+
+    server.registerTool("knowledge_wiki_get", {
+      title: "Inspect derived Knowledge Wiki data",
+      description: "Read ordered Documents, explicit typed references, backlinks, and non-persisted deterministic relation candidates for one immutable Revision.",
+      inputSchema: {
+        knowledgeBaseId: resourceId,
+        revision: z.number().int().positive().optional()
+      }
+    }, async ({ knowledgeBaseId, revision }) => content(await request(
+      daemonUrl,
+      `/api/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/wiki${revision ? `?revision=${revision}` : ""}`
+    )));
+
+    server.registerTool("employee_knowledge_perspective", {
+      title: "Inspect an Employee knowledge perspective",
+      description: "Explain eligible, activated, selected, and excluded knowledge for one context, plus exact evidence from a bounded window of recent Run Store artifacts.",
+      inputSchema: {
+        employeeId: resourceId,
+        message: z.string().min(1),
+        projectId: resourceId.optional(),
+        projectRoleId: resourceId.optional(),
+        taskTags: z.array(z.string().min(1)).optional(),
+        evidenceLimit: z.number().int().min(1).max(50).optional()
+      }
+    }, async ({ employeeId, ...input }) => content(await request(
+      daemonUrl,
+      `/api/employees/${encodeURIComponent(employeeId)}/knowledge-perspective`,
+      { method: "POST", body: JSON.stringify(input) }
+    )));
+
+    server.registerTool("knowledge_review_list", {
+      title: "Inspect knowledge authorization reviews",
+      description: "List Employee and project-role grant reviews, including legacy grants and expiry reminders. Expiry never revokes access automatically.",
+      inputSchema: {
+        asOf: z.string().min(1).optional(),
+        dueSoonDays: z.number().int().min(0).max(3650).optional()
+      }
+    }, async ({ asOf, dueSoonDays }) => {
+      const query = new URLSearchParams();
+      if (asOf) query.set("asOf", asOf);
+      if (dueSoonDays !== undefined) query.set("dueSoonDays", String(dueSoonDays));
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return content(await request(daemonUrl, `/api/knowledge/reviews${suffix}`));
+    });
 
     server.registerTool("knowledge_impact_get", {
       title: "Inspect knowledge authorization impact",
@@ -361,7 +472,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("run_workflow", {
     title: "Run multi-agent workflow",
-    description: "Run a registered Graph workflow with structured JSON input and persist its complete evidence.",
+    description: "Compatibility entry point that waits for a registered Graph workflow to finish. Prefer start_workflow for long-running work.",
     inputSchema: {
       workflowId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
@@ -373,6 +484,31 @@ export function createWorkbenchMcpServer(
     daemonUrl,
     `/api/workflows/${encodeURIComponent(workflowId)}/run`,
     { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
+  )));
+
+  server.registerTool("start_workflow", {
+    title: "Start multi-agent workflow",
+    description: "Start a registered Graph workflow asynchronously and return an invocation id immediately. Use get_invocation to inspect status and final Run evidence.",
+    inputSchema: {
+      workflowId: z.string().min(1),
+      input: z.record(z.string(), z.unknown()).optional(),
+      project: z.string().min(1).optional(),
+      contextId: z.string().min(1).optional(),
+      caller: z.string().min(1).optional()
+    }
+  }, async ({ workflowId, input, project, contextId, caller }) => content(await request(
+    daemonUrl,
+    `/api/workflows/${encodeURIComponent(workflowId)}/start`,
+    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
+  )));
+
+  server.registerTool("get_invocation", {
+    title: "Get invocation status",
+    description: "Read one asynchronous invocation, its work instances, and Run evidence when available.",
+    inputSchema: { invocationId: z.string().min(1) }
+  }, async ({ invocationId }) => content(await request(
+    daemonUrl,
+    `/api/invocations/${encodeURIComponent(invocationId)}`
   )));
 
   server.registerTool("list_publications", {

@@ -7,9 +7,11 @@ import {
   Field,
   Modal,
   ReadonlyEvidence,
+  RuntimeStatusChip,
   SelectControl,
   Stamp,
   UtilityIcon,
+  employeeRuntimeStatus,
   formatTime,
   useDaemonAvailable
 } from "./components";
@@ -99,6 +101,13 @@ function policyLabel(policy: ProjectBindingUpdatePolicy): string {
 
 export function ProjectPage({ data, refresh, notify }: PageProps) {
   const daemonAvailable = useDaemonAvailable();
+  // Lightweight page clock so a short-lived "completed" chip actually fades
+  // after its dwell while someone stays on this page. Cleaned up on unmount.
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
   const activeProjects = data.projects.filter((project) => project.status === "active");
   const assignableEmployees = data.employees.filter((employee) => employee.status === "active");
   const [selectedId, setSelectedId] = useState(activeProjects[0]?.id ?? data.projects[0]?.id ?? "");
@@ -271,6 +280,7 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
           <div className="project-role-list">
             {readiness.map(({ role, draft, employee, ready, label, missing, invalidKnowledgeProfiles }) => {
               const existing = binding?.roles.find((candidate) => candidate.roleId === role.id);
+              const employeeRuntimeState = employee ? employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id), clock) : "idle";
               const selectableSkills = [...new Set([...role.requiredSkills, ...role.optionalSkills])];
               const selectableKnowledgeProfiles = role.knowledgeProfileIds ?? [];
               return <article className={`project-role-row ${ready ? "is-ready" : "is-blocked"}`} key={role.id}>
@@ -317,7 +327,7 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
                     />
                   </Field>
                 </div>
-                {employee && <div className="project-employee-preview"><EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} /><div><strong>{employee.identity.displayName}</strong><code>{employee.id} · 当前 v{employee.version}</code></div>{existing && employee.version > existing.employeeVersion && <span className="project-update-flag">可更新 v{existing.employeeVersion} → v{employee.version}</span>}</div>}
+                {employee && <div className="project-employee-preview"><EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} /><div><strong>{employee.identity.displayName}</strong><code>{employee.id} · 当前 v{employee.version}</code></div><span className="project-employee-flags">{employeeRuntimeState !== "idle" && <RuntimeStatusChip status={employeeRuntimeState} />}{existing && employee.version > existing.employeeVersion && <span className="project-update-flag">可更新 v{existing.employeeVersion} → v{employee.version}</span>}</span></div>}
                 <div className="project-skill-choice"><span>本项目启用的 Skill</span>{selectableSkills.length ? selectableSkills.map((skillId) => {
                   const available = employeeSkillIds(employee).includes(skillId);
                   const required = role.requiredSkills.includes(skillId);
@@ -329,7 +339,7 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
                     return { ...current, [role.id]: { ...currentRole, skillIds } };
                   })} /><span>{skill?.displayName ?? skillId}<small>{required ? "必需" : "可选"}{!available ? " · 员工未配置" : ""}</small></span></label>;
                 }) : <small>此角色不要求额外 Skill，只使用员工稳定身份与项目策略。</small>}</div>
-                <div className="project-knowledge-choice"><span>本项目临时追加的 Knowledge Profile</span>{selectableKnowledgeProfiles.length ? selectableKnowledgeProfiles.map((profileId) => {
+                <div className="project-knowledge-choice"><span>本项目临时追加的知识 Profile</span>{selectableKnowledgeProfiles.length ? selectableKnowledgeProfiles.map((profileId) => {
                   const profile = (data.knowledgeProfiles ?? []).find((candidate) => candidate.id === profileId);
                   const available = profile?.status === "active";
                   const checked = draft?.knowledgeProfileIds.includes(profileId) ?? false;
@@ -347,7 +357,7 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
               </article>;
             })}
           </div>
-          <div className="project-binding-save"><div><strong>{complete ? "所有角色契约已满足" : "还有角色尚未准备好"}</strong><span>保存员工引用、版本策略、Skill 子集和项目临时 Knowledge Profile。</span></div><button type="button" className="button primary" disabled={!daemonAvailable || !complete || saving || selected.status === "archived"} onClick={() => void saveBinding()}>{saving ? "保存中…" : binding ? `保存为任用关系 v${binding.version + 1}` : "建立任用关系"}</button></div>
+          <div className="project-binding-save"><div><strong>{complete ? "所有角色契约已满足" : "还有角色尚未准备好"}</strong><span>保存员工引用、版本策略、Skill 子集和项目临时知识 Profile。</span></div><button type="button" className="button primary" disabled={!daemonAvailable || !complete || saving || selected.status === "archived"} onClick={() => void saveBinding()}>{saving ? "保存中…" : binding ? `保存为任用关系 v${binding.version + 1}` : "建立任用关系"}</button></div>
         </DossierSection>
 
         <DossierSection number="03" title="项目如何调用"><div className="project-callout"><strong>项目不需要复制 Prompt。</strong><p>运行时由 Workbench 合成员工身份、此项目的角色策略、已选 Skill、当前任务与会话历史，并把最终 Prompt 和结果写入 Run 证据。</p></div><ReadonlyEvidence label="MCP · 对话中调用" value={JSON.stringify({ tool: "invoke_project_role", arguments: { projectId: selected.id, roleId: selected.roles[0]?.id ?? "role-id", message: "在这里填写任务" } }, null, 2)} mono /><ReadonlyEvidence label="HTTP / SDK · 项目运行时调用" value={`POST ${origin}/api/projects/${selected.id}/roles/${selected.roles[0]?.id ?? "role-id"}/invoke\nContent-Type: application/json\n\n{"message":"在这里填写任务"}`} mono /></DossierSection>

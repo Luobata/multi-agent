@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api, writeBody } from "./api";
 import {
   DossierSection,
@@ -24,14 +24,27 @@ import type {
   KnowledgeClassification,
   KnowledgeCollection,
   KnowledgeDocument,
+  KnowledgeGrantReviewItem,
+  KnowledgeGrantReviewLedger,
   KnowledgeImpactSnapshot,
   KnowledgeProfile,
+  KnowledgeReferenceType,
   KnowledgeRevisionAssessment,
   KnowledgeRevisionPreview,
   KnowledgeSource,
+  KnowledgeUrlPreview,
+  KnowledgeWikiDocument,
+  KnowledgeWikiView,
   Project,
   Session
 } from "./types";
+import {
+  KnowledgePerspectiveExplorer,
+  ReviewStamp,
+  grantScheduleCopy,
+  grantSourceCopy,
+  reviewSubjectLabel
+} from "./knowledgePerspective";
 
 interface PageProps {
   data: Bootstrap;
@@ -191,7 +204,15 @@ function RevisionEditor({ detail, onClose, onSaved, notify }: {
   return <Modal title="改进知识内容" eyebrow={`${detail.knowledgeBase.id} · DRAFT REVISION`} onClose={onClose} wide><form className="editor-form revision-editor" onSubmit={submit}><fieldset disabled={!daemonAvailable}><div className="revision-editor-grid"><aside><button type="button" className="button secondary full" onClick={add}>新增人工条目</button>{documents.map((document) => <button type="button" className={document.id === selectedId ? "selected" : ""} key={document.id} onClick={() => setSelectedId(document.id)}><strong>{document.title}</strong><code>{document.id}</code><small>{document.sourceId ? `同步自 ${document.sourceId}` : "人工维护"}</small></button>)}</aside><section>{selected ? <><div className="form-grid two"><Field label="Document ID"><input required pattern="[a-z][a-z0-9-]*" value={selected.id} onChange={(event) => { const previous = selected.id; const id = event.target.value; setDocuments((current) => current.map((document) => document.id === previous ? { ...document, id } : document)); setSelectedId(id); }} /></Field><Field label="Collection"><SelectControl ariaLabel="知识条目分区" value={selected.collectionId} options={detail.knowledgeBase.collections.map((collection) => ({ value: collection.id, label: collection.displayName }))} onChange={(collectionId) => patch({ collectionId })} /></Field></div><Field label="标题"><input required value={selected.title} onChange={(event) => patch({ title: event.target.value })} /></Field><Field label="正文"><textarea required rows={16} value={selected.content} onChange={(event) => patch({ content: event.target.value })} /></Field><button type="button" className="text-button danger-text" onClick={() => { const remaining = documents.filter((document) => document.id !== selected.id); setDocuments(remaining); setSelectedId(remaining[0]?.id ?? ""); }}>移除条目</button></> : <div className="mini-empty">新增一条人工知识开始编辑。</div>}</section></div></fieldset><div className="editor-savebar"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={saving || !documents.length}>{saving ? "生成中…" : "生成草稿 Revision"}</button></div></form></Modal>;
 }
 
-type KnowledgeConsoleTab = "overview" | "catalog" | "releases" | "profiles" | "impact" | "assistant";
+type KnowledgeConsoleTab = "overview" | "catalog" | "wiki" | "releases" | "profiles" | "impact" | "reviews" | "assistant";
+
+const REFERENCE_TYPE_COPY: Record<KnowledgeReferenceType, string> = {
+  related: "相关",
+  supports: "支持",
+  contradicts: "矛盾",
+  "depends-on": "依赖",
+  supersedes: "取代"
+};
 
 function assessmentCopy(status: KnowledgeRevisionAssessment["status"] | undefined): string {
   if (status === "ready") return "可发布";
@@ -436,7 +457,7 @@ export function KnowledgeProfilePolicyEditor({ profile, knowledgeBases, onClose,
       setSaving(false);
     }
   };
-  return <Modal title={profile ? `修订 ${profile.displayName}` : "建立 Knowledge Profile"} eyebrow="REUSABLE KNOWLEDGE POLICY · MULTI RULE" onClose={onClose} wide>
+  return <Modal title={profile ? `修订 ${profile.displayName}` : "建立知识 Profile"} eyebrow="REUSABLE KNOWLEDGE POLICY · MULTI RULE" onClose={onClose} wide>
     <form className="editor-form profile-policy-editor" onSubmit={submit}>
       <fieldset disabled={!daemonAvailable}>
         <DossierSection number="01" title="策略身份"><div className="form-grid two"><Field label="Profile ID"><input required disabled={Boolean(profile)} pattern="[a-z][a-z0-9-]*" value={draft.id} onChange={(event) => setDraft({ ...draft, id: event.target.value })} /></Field><Field label="显示名"><input required value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} /></Field></div><Field label="适用边界"><textarea required rows={3} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></Field></DossierSection>
@@ -505,12 +526,12 @@ const OPERATION_COPY: Record<KnowledgeChangeOperationType, string> = {
   "knowledge-base.restore": "恢复知识库",
   "knowledge-revision.create": "生成知识 Revision",
   "knowledge-revision.publish": "发布 / 回滚 Revision",
-  "knowledge-profile.create": "建立 Knowledge Profile",
-  "knowledge-profile.update": "修订 Knowledge Profile",
-  "knowledge-profile.archive": "归档 Knowledge Profile",
-  "knowledge-profile.restore": "恢复 Knowledge Profile",
-  "employee-profiles.set": "调整员工 Profile 授权",
-  "project-role-profiles.set": "调整项目角色 Profile 授权"
+  "knowledge-profile.create": "建立知识 Profile",
+  "knowledge-profile.update": "修订知识 Profile",
+  "knowledge-profile.archive": "归档知识 Profile",
+  "knowledge-profile.restore": "恢复知识 Profile",
+  "employee-profiles.set": "调整员工知识 Profile 授权",
+  "project-role-profiles.set": "调整项目角色知识 Profile 授权"
 };
 
 const RISK_COPY: Record<KnowledgeChangeRequest["risk"], string> = {
@@ -759,6 +780,935 @@ export function KnowledgeStewardConsole({ data, refresh, notify }: PageProps) {
   </div>;
 }
 
+export interface WikiTreeNode {
+  entry: KnowledgeWikiDocument;
+  children: WikiTreeNode[];
+}
+
+export function buildWikiTree(entries: KnowledgeWikiDocument[]): WikiTreeNode[] {
+  const nodes = new Map(entries.map((entry) => [entry.document.id, { entry, children: [] as WikiTreeNode[] }]));
+  const roots: WikiTreeNode[] = [];
+  for (const entry of entries) {
+    const node = nodes.get(entry.document.id);
+    if (!node) continue;
+    const parent = entry.document.parentId ? nodes.get(entry.document.parentId) : undefined;
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+  }
+  return roots;
+}
+
+export type WikiDirectoryNodeKind = "collection" | "folder" | "unclassified" | "document";
+
+export interface WikiDirectoryNode {
+  id: string;
+  kind: WikiDirectoryNodeKind;
+  label: string;
+  collectionId: string;
+  path: string[];
+  documentCount: number;
+  authority?: KnowledgeAuthority;
+  entry?: KnowledgeWikiDocument;
+  children: WikiDirectoryNode[];
+}
+
+interface WikiDirectoryRow {
+  node: WikiDirectoryNode;
+  level: number;
+  posInSet: number;
+  setSize: number;
+}
+
+const wikiDirectoryCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+
+function wikiRelativePath(document: KnowledgeDocument): string | undefined {
+  const value = document.metadata?.relativePath;
+  if (typeof value !== "string") return undefined;
+  const normalized = value
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment && segment !== ".")
+    .join("/");
+  return normalized || undefined;
+}
+
+function finalizeWikiDirectoryNode(node: WikiDirectoryNode, parentPath: string[] = []): WikiDirectoryNode {
+  const path = [...parentPath, node.label];
+  const kindOrder: Record<WikiDirectoryNodeKind, number> = { collection: 0, folder: 0, unclassified: 1, document: 2 };
+  const children = node.children
+    .map((child) => finalizeWikiDirectoryNode(child, path))
+    .sort((left, right) => kindOrder[left.kind] - kindOrder[right.kind]
+      || wikiDirectoryCollator.compare(left.label, right.label)
+      || wikiDirectoryCollator.compare(left.id, right.id));
+  return {
+    ...node,
+    path,
+    children,
+    documentCount: node.kind === "document"
+      ? 1 + children.reduce((total, child) => total + child.documentCount, 0)
+      : children.reduce((total, child) => total + child.documentCount, 0)
+  };
+}
+
+/**
+ * Build a read-only navigation projection without persisting a second Wiki model.
+ * Explicit parentId remains authoritative; otherwise source relativePath supplies
+ * folder hierarchy. Documents with neither signal stay visible under 未编目条目.
+ */
+export function buildWikiDirectory(collections: KnowledgeCollection[], entries: KnowledgeWikiDocument[]): WikiDirectoryNode[] {
+  const roots = collections.map<WikiDirectoryNode>((collection) => ({
+    id: `collection:${collection.id}`,
+    kind: "collection",
+    label: collection.displayName,
+    collectionId: collection.id,
+    path: [],
+    documentCount: 0,
+    authority: collection.authority,
+    children: []
+  }));
+  const rootsByCollection = new Map(roots.map((root) => [root.collectionId, root]));
+  const unknownCollectionIds = [...new Set(entries
+    .map((entry) => entry.document.collectionId)
+    .filter((collectionId) => !rootsByCollection.has(collectionId)))]
+    .sort(wikiDirectoryCollator.compare);
+  for (const collectionId of unknownCollectionIds) {
+    const root: WikiDirectoryNode = {
+      id: `collection:${collectionId}`,
+      kind: "collection",
+      label: `未识别 Collection · ${collectionId}`,
+      collectionId,
+      path: [],
+      documentCount: 0,
+      children: []
+    };
+    roots.push(root);
+    rootsByCollection.set(collectionId, root);
+  }
+
+  const entriesById = new Map(entries.map((entry) => [entry.document.id, entry]));
+  const childrenByParent = new Map<string, KnowledgeWikiDocument[]>();
+  const rootEntries: KnowledgeWikiDocument[] = [];
+  const hasUsableParent = (entry: KnowledgeWikiDocument): boolean => {
+    const parentId = entry.document.parentId;
+    if (!parentId) return false;
+    const immediateParent = entriesById.get(parentId);
+    if (!immediateParent || immediateParent.document.collectionId !== entry.document.collectionId) return false;
+    const seen = new Set([entry.document.id]);
+    let current: KnowledgeWikiDocument | undefined = immediateParent;
+    while (current) {
+      if (seen.has(current.document.id)) return false;
+      seen.add(current.document.id);
+      const nextId = current.document.parentId;
+      if (!nextId) return true;
+      const next = entriesById.get(nextId);
+      if (!next || next.document.collectionId !== entry.document.collectionId) return true;
+      current = next;
+    }
+    return true;
+  };
+
+  for (const entry of entries) {
+    if (hasUsableParent(entry)) {
+      const parentId = entry.document.parentId!;
+      childrenByParent.set(parentId, [...(childrenByParent.get(parentId) ?? []), entry]);
+    } else {
+      rootEntries.push(entry);
+    }
+  }
+
+  const documentNode = (entry: KnowledgeWikiDocument, label = entry.document.title): WikiDirectoryNode => ({
+    id: `document:${entry.document.id}`,
+    kind: "document",
+    label,
+    collectionId: entry.document.collectionId,
+    path: [],
+    documentCount: 1,
+    entry,
+    children: (childrenByParent.get(entry.document.id) ?? []).map((child) => documentNode(child))
+  });
+
+  for (const entry of rootEntries) {
+    const root = rootsByCollection.get(entry.document.collectionId);
+    if (!root) continue;
+    const relativePath = wikiRelativePath(entry.document);
+    let parent = root;
+    let label = entry.document.title;
+    if (relativePath) {
+      const segments = relativePath.split("/");
+      label = segments.at(-1) || entry.document.title;
+      const traversed: string[] = [];
+      for (const segment of segments.slice(0, -1)) {
+        traversed.push(segment);
+        const folderId = `${root.id}/folder:${traversed.map(encodeURIComponent).join("/")}`;
+        let folder = parent.children.find((candidate) => candidate.id === folderId);
+        if (!folder) {
+          folder = {
+            id: folderId,
+            kind: "folder",
+            label: segment,
+            collectionId: entry.document.collectionId,
+            path: [],
+            documentCount: 0,
+            children: []
+          };
+          parent.children.push(folder);
+        }
+        parent = folder;
+      }
+    } else {
+      const unclassifiedId = `${root.id}/unclassified`;
+      let unclassified = root.children.find((candidate) => candidate.id === unclassifiedId);
+      if (!unclassified) {
+        unclassified = {
+          id: unclassifiedId,
+          kind: "unclassified",
+          label: "未编目条目",
+          collectionId: entry.document.collectionId,
+          path: [],
+          documentCount: 0,
+          children: []
+        };
+        root.children.push(unclassified);
+      }
+      parent = unclassified;
+    }
+    parent.children.push(documentNode(entry, label));
+  }
+
+  return roots.map((root) => finalizeWikiDirectoryNode(root));
+}
+
+export function filterWikiDirectory(nodes: WikiDirectoryNode[], query: string): WikiDirectoryNode[] {
+  const normalized = query.trim().toLocaleLowerCase();
+  if (!normalized) return nodes;
+  const visit = (node: WikiDirectoryNode): WikiDirectoryNode | undefined => {
+    let selfMatches = false;
+    if (node.kind === "document") {
+      const document = node.entry?.document;
+      const haystack = [
+        node.label,
+        node.path.join("/"),
+        document?.title,
+        document?.id,
+        document?.sourceRef,
+        document ? wikiRelativePath(document) : undefined
+      ].filter(Boolean).join(" ").toLocaleLowerCase();
+      selfMatches = haystack.includes(normalized);
+    }
+    const children = node.children.map(visit).filter((child): child is WikiDirectoryNode => Boolean(child));
+    if (!selfMatches && !children.length) return undefined;
+    return {
+      ...node,
+      children,
+      documentCount: node.kind === "document" ? 1 + children.reduce((total, child) => total + child.documentCount, 0) : children.reduce((total, child) => total + child.documentCount, 0)
+    };
+  };
+  return nodes.map(visit).filter((node): node is WikiDirectoryNode => Boolean(node));
+}
+
+export function findWikiDirectoryPath(nodes: WikiDirectoryNode[], documentId: string): string[] {
+  const targetId = `document:${documentId}`;
+  const visit = (node: WikiDirectoryNode): string[] | undefined => {
+    if (node.id === targetId) return node.path;
+    for (const child of node.children) {
+      const path = visit(child);
+      if (path) return path;
+    }
+    return undefined;
+  };
+  for (const node of nodes) {
+    const path = visit(node);
+    if (path) return path;
+  }
+  return [];
+}
+
+function collectWikiDirectoryExpandableIds(nodes: WikiDirectoryNode[]): string[] {
+  return nodes.flatMap((node) => node.children.length ? [node.id, ...collectWikiDirectoryExpandableIds(node.children)] : []);
+}
+
+function flattenWikiDirectory(nodes: WikiDirectoryNode[], expanded: Set<string>, forceExpanded: boolean, level = 1): WikiDirectoryRow[] {
+  return nodes.flatMap((node, index) => {
+    const row = { node, level, posInSet: index + 1, setSize: nodes.length };
+    if (!node.children.length || (!forceExpanded && !expanded.has(node.id))) return [row];
+    return [row, ...flattenWikiDirectory(node.children, expanded, forceExpanded, level + 1)];
+  });
+}
+
+function findWikiDirectoryAncestorIds(nodes: WikiDirectoryNode[], documentId: string): string[] {
+  const targetId = `document:${documentId}`;
+  const visit = (node: WikiDirectoryNode, ancestors: string[]): string[] | undefined => {
+    if (node.id === targetId) return ancestors;
+    for (const child of node.children) {
+      const found = visit(child, [...ancestors, node.id]);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  for (const node of nodes) {
+    const found = visit(node, []);
+    if (found) return found;
+  }
+  return [];
+}
+
+export function WikiDirectoryTree({ nodes, selectedId, onSelect }: {
+  nodes: WikiDirectoryNode[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+}) {
+  const treeRef = useRef<HTMLDivElement>(null);
+  const [query, setQuery] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [activeId, setActiveId] = useState("");
+  const filteredNodes = useMemo(() => filterWikiDirectory(nodes, query), [nodes, query]);
+  const forceExpanded = Boolean(query.trim());
+  const rows = useMemo(() => flattenWikiDirectory(filteredNodes, expanded, forceExpanded), [expanded, filteredNodes, forceExpanded]);
+  const expandableIds = useMemo(() => collectWikiDirectoryExpandableIds(nodes), [nodes]);
+  const documentCount = nodes.reduce((total, node) => total + node.documentCount, 0);
+
+  useEffect(() => {
+    setExpanded(new Set(nodes.map((node) => node.id)));
+    setActiveId(nodes[0]?.id ?? "");
+    setQuery("");
+  }, [nodes]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const selectedNodeId = `document:${selectedId}`;
+    setExpanded((current) => new Set([...current, ...findWikiDirectoryAncestorIds(nodes, selectedId)]));
+    setActiveId(selectedNodeId);
+  }, [nodes, selectedId]);
+
+  useEffect(() => {
+    if (rows.some((row) => row.node.id === activeId)) return;
+    const selectedNodeId = selectedId ? `document:${selectedId}` : "";
+    setActiveId(rows.find((row) => row.node.id === selectedNodeId)?.node.id ?? rows[0]?.node.id ?? "");
+  }, [activeId, rows, selectedId]);
+
+  const toggle = (id: string, next?: boolean) => setExpanded((current) => {
+    const updated = new Set(current);
+    const shouldExpand = next ?? !updated.has(id);
+    if (shouldExpand) updated.add(id);
+    else updated.delete(id);
+    return updated;
+  });
+  const focusRow = (index: number) => {
+    const row = rows[Math.min(Math.max(index, 0), rows.length - 1)];
+    if (!row) return;
+    setActiveId(row.node.id);
+    treeRef.current?.querySelectorAll<HTMLButtonElement>("[role='treeitem']")[Math.min(Math.max(index, 0), rows.length - 1)]?.focus();
+  };
+  const activate = (row: WikiDirectoryRow) => {
+    if (row.node.kind === "document" && row.node.entry) onSelect(row.node.entry.document.id);
+    else if (row.node.children.length && !forceExpanded) toggle(row.node.id);
+  };
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+    const row = rows[index];
+    if (!row) return;
+    const isExpanded = forceExpanded || expanded.has(row.node.id);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      focusRow(index + (event.key === "ArrowDown" ? 1 : -1));
+      return;
+    }
+    if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      focusRow(event.key === "Home" ? 0 : rows.length - 1);
+      return;
+    }
+    if (event.key === "ArrowRight" && row.node.children.length) {
+      event.preventDefault();
+      if (!isExpanded) toggle(row.node.id, true);
+      else if (rows[index + 1]?.level === row.level + 1) focusRow(index + 1);
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      if (row.node.children.length && isExpanded && !forceExpanded) {
+        toggle(row.node.id, false);
+        return;
+      }
+      for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
+        if (rows[candidate]!.level < row.level) {
+          focusRow(candidate);
+          return;
+        }
+      }
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      activate(row);
+    }
+  };
+  const glyph = (node: WikiDirectoryNode): { text: string; className: string } => {
+    if (node.kind === "collection") {
+      const text = node.authority === "canonical" ? "正" : node.authority === "reference" ? "参" : node.authority === "experimental" ? "试" : "集";
+      return { text, className: "collection" };
+    }
+    if (node.kind === "folder") return { text: "", className: "folder" };
+    if (node.kind === "unclassified") return { text: "", className: "unclassified" };
+    return { text: "", className: node.entry?.document.sourceId ? "synced" : "manual" };
+  };
+
+  return <>
+    <div className="wiki-directory-tools">
+      <label className="sr-only" htmlFor="wiki-directory-search">搜索当前 Wiki 的文档或路径</label>
+      <input id="wiki-directory-search" type="search" placeholder="搜索文档或路径…" value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape" && query) { event.preventDefault(); setQuery(""); } }} />
+      <div><button type="button" disabled={!expandableIds.length || forceExpanded} onClick={() => setExpanded(new Set(expandableIds))}>全部展开</button><button type="button" disabled={!expandableIds.length || forceExpanded} onClick={() => setExpanded(new Set())}>全部折叠</button></div>
+    </div>
+    <div className="wiki-directory-summary"><span>{documentCount} 篇</span><span>{nodes.length} 个 Collection</span></div>
+    {forceExpanded && !rows.length && <div className="wiki-tree-empty"><strong>没有匹配的文档或路径</strong><span>缩短关键词，或按 Escape 清空搜索。</span></div>}
+    {rows.length > 0 && <div ref={treeRef} className="wiki-directory-tree" role="tree" aria-label="Wiki 内容目录">
+      {rows.map((row, index) => {
+        const expandable = row.node.children.length > 0;
+        const isExpanded = forceExpanded || expanded.has(row.node.id);
+        const selected = row.node.kind === "document" && row.node.entry?.document.id === selectedId;
+        const rowGlyph = glyph(row.node);
+        return <button
+          type="button"
+          role="treeitem"
+          aria-level={row.level}
+          aria-posinset={row.posInSet}
+          aria-setsize={row.setSize}
+          aria-expanded={expandable ? isExpanded : undefined}
+          aria-selected={selected}
+          aria-current={selected ? "page" : undefined}
+          className={`wiki-directory-row kind-${row.node.kind} ${selected ? "selected" : ""}`}
+          style={{ paddingInlineStart: `calc(var(--space-2) + ${(row.level - 1) * 16}px)` }}
+          tabIndex={(activeId ? activeId === row.node.id : index === 0) ? 0 : -1}
+          title={row.node.path.join(" / ")}
+          key={row.node.id}
+          onFocus={() => setActiveId(row.node.id)}
+          onClick={() => { setActiveId(row.node.id); activate(row); }}
+          onKeyDown={(event) => handleKeyDown(event, index)}
+        >
+          {row.level > 1 && <span className="wiki-directory-guides" aria-hidden="true">{Array.from({ length: row.level - 1 }, (_, depth) => <i key={depth} style={{ insetInlineStart: `calc(var(--space-2) + ${depth * 16 + 8}px)` }} />)}</span>}
+          <span className="wiki-directory-caret" aria-hidden="true" />
+          <span className={`wiki-directory-glyph glyph-${rowGlyph.className}`} aria-hidden="true">{rowGlyph.text}</span>
+          <span className="wiki-directory-label">{row.node.label}</span>
+          {row.node.kind !== "document" && <span className="wiki-directory-count">{row.node.documentCount}</span>}
+        </button>;
+      })}
+    </div>}
+    {!forceExpanded && documentCount === 0 && <div className="wiki-directory-empty"><strong>当前 Revision 没有文档</strong><span>空 Collection 仍显示，便于核对分类边界。</span></div>}
+  </>;
+}
+
+export function KnowledgeWikiBrowser({ knowledgeBases, notify }: {
+  knowledgeBases: KnowledgeBase[];
+  notify: PageProps["notify"];
+}) {
+  const [baseId, setBaseId] = useState(knowledgeBases[0]?.id ?? "");
+  const base = knowledgeBases.find((item) => item.id === baseId) ?? knowledgeBases[0];
+  const [revisionChoice, setRevisionChoice] = useState<"published" | "latest">("published");
+  const [wiki, setWiki] = useState<KnowledgeWikiView>();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [selectedId, setSelectedId] = useState("");
+  const revisionValue = base
+    ? (revisionChoice === "published" ? base.publishedRevision : base.latestRevision) ?? base.publishedRevision ?? base.latestRevision
+    : undefined;
+
+  useEffect(() => {
+    if (!base || revisionValue === undefined) { setWiki(undefined); setError(""); return; }
+    let cancelled = false;
+    setLoading(true);
+    setWiki(undefined);
+    setError("");
+    api<KnowledgeWikiView>(`/api/knowledge-bases/${base.id}/wiki?revision=${revisionValue}`)
+      .then((view) => {
+        if (cancelled) return;
+        setWiki(view);
+        setSelectedId((current) => view.documents.some((entry) => entry.document.id === current) ? current : view.documents[0]?.document.id ?? "");
+      })
+      .catch((reason: unknown) => {
+        if (cancelled) return;
+        setWiki(undefined);
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setError(message);
+        notify(message, "error");
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [base?.id, revisionValue, notify]);
+
+  const selected = wiki?.documents.find((entry) => entry.document.id === selectedId) ?? wiki?.documents[0];
+  const titleOf = (id: string) => wiki?.documents.find((entry) => entry.document.id === id)?.document.title ?? id;
+  const directory = useMemo(() => buildWikiDirectory(base?.collections ?? [], wiki?.documents ?? []), [base?.collections, wiki?.documents]);
+  const selectedPath = useMemo(() => selected ? findWikiDirectoryPath(directory, selected.document.id) : [], [directory, selected]);
+
+  return <div className="knowledge-wiki-browser" role="tabpanel">
+    <aside className="wiki-tree">
+      <header className="wiki-tree-header">
+        <span className="console-kicker">FULL WIKI · READ ONLY</span>
+        <Field label="知识库">
+          <SelectControl ariaLabel="选择 Wiki 知识库" value={base?.id ?? ""} emptyLabel="尚无知识库" options={knowledgeBases.map((item) => ({ value: item.id, label: item.displayName, description: `${item.id} · ${item.status === "archived" ? "已归档" : `Published R${item.publishedRevision ?? "—"}`}` }))} onChange={(id) => { setBaseId(id); setSelectedId(""); }} />
+        </Field>
+        <Field label="Revision">
+          <SelectControl ariaLabel="选择 Wiki Revision" value={revisionChoice} disabled={!base || (!base.publishedRevision && !base.latestRevision)} options={[
+            { value: "published", label: `员工发布 R${base?.publishedRevision ?? "—"}`, description: "员工当前读取的版本", disabled: !base?.publishedRevision },
+            { value: "latest", label: `最新草稿 R${base?.latestRevision ?? "—"}`, description: "尚未发布的最新内容", disabled: !base?.latestRevision }
+          ]} onChange={(choice) => setRevisionChoice(choice as "published" | "latest")} />
+        </Field>
+      </header>
+      <div className="wiki-tree-scroll">
+        {wiki && <WikiDirectoryTree nodes={directory} selectedId={selected?.document.id ?? ""} onSelect={setSelectedId} />}
+        {!wiki && !error && revisionValue !== undefined && <div className="wiki-tree-empty" role="status"><strong>正在生成 Wiki 视图…</strong><span>读取所选 Revision 的目录和文档。</span></div>}
+        {!wiki && !error && revisionValue === undefined && <p className="wiki-tree-empty">这座知识库还没有 Revision；生成草稿或发布后这里会出现全量 Wiki。</p>}
+        {error && <div className="inline-error" role="alert">{error}</div>}
+      </div>
+      <footer className="list-footer"><span>{wiki ? `${wiki.documents.length} 篇文档` : "—"}</span><span>{wiki ? `R${wiki.revision}` : "WIKI"}</span></footer>
+    </aside>
+    <main className="wiki-reader" aria-busy={loading}>
+      {selected ? <article className="wiki-document">
+        {selectedPath.length > 0 && <nav className="wiki-document-breadcrumb" aria-label="文档位置"><ol>{selectedPath.map((segment, index) => <li key={`${segment}-${index}`} title={segment}>{segment}</li>)}</ol></nav>}
+        <header className="wiki-document-head">
+          <div className="file-index"><span>WIKI DOCUMENT</span><code>{selected.document.id}</code></div>
+          <div className="wiki-document-title-row"><h2>{selected.document.title}</h2><Stamp status={wiki?.visibility === "published" ? "passed" : "pending"} label={wiki?.visibility === "published" ? "员工发布版" : "草稿版"} /></div>
+          <div className="wiki-document-meta"><span>{selected.document.collectionId}</span><span>{selected.document.sourceId ? `同步自 ${selected.document.sourceId}` : "人工维护"}</span>{selected.document.sourceRef && <code>{selected.document.sourceRef}</code>}{wiki && <span>生成于 {formatTime(wiki.generatedAt)}</span>}</div>
+        </header>
+        <div className="wiki-document-content">{selected.document.content}</div>
+        {selected.document.parentId && <p className="wiki-document-parent">上级文档：<button type="button" className="text-button" onClick={() => setSelectedId(selected.document.parentId ?? "")}>{titleOf(selected.document.parentId)}</button></p>}
+      </article> : <div className="wiki-reader-empty"><strong>{loading ? "正在生成 Wiki 视图…" : "选择左侧文档开始阅读"}</strong><span>{error ? "加载失败，请切换 Revision 或知识库重试。" : "正文按纯文本安全渲染，保留换行，不执行任何标记。"}</span></div>}
+    </main>
+    <aside className="wiki-meta">
+      {selected ? <>
+        <section className="wiki-meta-section"><header><span>METADATA</span><h3>文档元数据</h3></header><dl className="ledger">
+          <dt>Document ID</dt><dd><code>{selected.document.id}</code></dd>
+          <dt>Collection</dt><dd>{selected.document.collectionId}</dd>
+          <dt>排序</dt><dd>{selected.document.order ?? "—"}</dd>
+          <dt>上级</dt><dd>{selected.document.parentId ?? "（根文档）"}</dd>
+          <dt>更新时间</dt><dd>{formatTime(selected.document.updatedAt)}</dd>
+          {Object.entries(selected.document.metadata ?? {}).map(([key, value]) => <Fragment key={key}><dt>{key}</dt><dd><code>{JSON.stringify(value)}</code></dd></Fragment>)}
+        </dl></section>
+        <section className="wiki-meta-section"><header><span>EXPLICIT REFERENCES</span><h3>显式引用 · {selected.outgoingReferences.length}</h3></header>
+          {selected.outgoingReferences.length ? <div className="wiki-ref-list">{selected.outgoingReferences.map((reference) => <button type="button" key={`${reference.targetDocumentId}-${reference.type}`} onClick={() => setSelectedId(reference.targetDocumentId)}>
+            <b>{REFERENCE_TYPE_COPY[reference.type]}</b><span><strong>{titleOf(reference.targetDocumentId)}</strong><code>{reference.targetDocumentId}</code>{reference.note && <small>{reference.note}</small>}</span>
+          </button>)}</div> : <p className="muted">这篇文档没有人工确认的显式引用。</p>}
+        </section>
+        <section className="wiki-meta-section"><header><span>BACKLINKS</span><h3>反向引用 · {selected.backlinks.length}</h3></header>
+          {selected.backlinks.length ? <div className="wiki-ref-list">{selected.backlinks.map((reference) => <button type="button" key={`${reference.sourceDocumentId}-${reference.type}`} onClick={() => setSelectedId(reference.sourceDocumentId)}>
+            <b>{REFERENCE_TYPE_COPY[reference.type]}</b><span><strong>{titleOf(reference.sourceDocumentId)}</strong><code>{reference.sourceDocumentId}</code>{reference.note && <small>{reference.note}</small>}</span>
+          </button>)}</div> : <p className="muted">没有其他文档显式引用这篇文档。</p>}
+        </section>
+        <section className="wiki-meta-section"><header><span>WEAK CANDIDATES · ≤ 5</span><h3>弱关联候选 · {selected.candidateRelations.slice(0, 5).length}</h3></header>
+          <p className="wiki-candidate-note">候选只基于元数据信号推导，不会持久化；需要人工在导入或编辑流程中确认后才会变成显式引用。</p>
+          {selected.candidateRelations.length ? <div className="wiki-candidate-list">{selected.candidateRelations.slice(0, 5).map((candidate) => <article key={candidate.id}>
+            <header><strong>{titleOf(candidate.targetDocumentId)}</strong><code>score {candidate.score.toFixed(1)}</code></header>
+            <code>{candidate.targetDocumentId}</code>
+            <ul>{candidate.signals.map((signal) => <li key={signal}>{signal}</li>)}</ul>
+          </article>)}</div> : <p className="muted">当前没有弱关联候选。</p>}
+        </section>
+      </> : <div className="wiki-meta-empty"><strong>元数据与引用</strong><span>选择文档后显示元数据、显式引用、反向引用和最多 5 条弱关联候选。</span></div>}
+    </aside>
+  </div>;
+}
+
+type ImportStep = 1 | 2 | 3;
+
+const IMPORT_STEPS: Array<{ step: ImportStep; label: string }> = [
+  { step: 1, label: "选择目标与链接" },
+  { step: 2, label: "核对冻结预览" },
+  { step: 3, label: "确认关联并提案" }
+];
+
+export function UrlImportModal({ knowledgeBases, initialBaseId, onClose, onProposed, notify }: {
+  knowledgeBases: KnowledgeBase[];
+  initialBaseId?: string;
+  onClose: () => void;
+  onProposed: (change: KnowledgeChangeRequest) => Promise<void>;
+  notify: PageProps["notify"];
+}) {
+  const daemonAvailable = useDaemonAvailable();
+  const activeBases = knowledgeBases.filter((item) => item.status === "active");
+  const [step, setStep] = useState<ImportStep>(1);
+  const [baseId, setBaseId] = useState(() => initialBaseId && activeBases.some((item) => item.id === initialBaseId) ? initialBaseId : activeBases[0]?.id ?? "");
+  const base = activeBases.find((item) => item.id === baseId);
+  const [collectionId, setCollectionId] = useState(() => base?.collections[0]?.id ?? "");
+  const [url, setUrl] = useState("");
+  const [preview, setPreview] = useState<KnowledgeUrlPreview>();
+  const [fetching, setFetching] = useState(false);
+  const [error, setError] = useState("");
+  const [selectedRelations, setSelectedRelations] = useState<Record<string, { type: KnowledgeReferenceType; note: string }>>({});
+  const [title, setTitle] = useState("");
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const chooseBase = (id: string) => {
+    setBaseId(id);
+    setCollectionId(activeBases.find((item) => item.id === id)?.collections[0]?.id ?? "");
+    setPreview(undefined);
+    setError("");
+  };
+  const candidateSourceTitle = (sourceDocumentId: string) => preview?.documents.find((document) => document.id === sourceDocumentId)?.title ?? sourceDocumentId;
+
+  const runPreview = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!base || !collectionId) return;
+    setFetching(true);
+    setError("");
+    try {
+      const result = await api<KnowledgeUrlPreview>("/api/knowledge/url-preview", writeBody({
+        knowledgeBaseId: base.id,
+        collectionId,
+        url: url.trim()
+      }));
+      setPreview(result);
+      setSelectedRelations({});
+      let host = result.finalUrl;
+      try { host = new URL(result.finalUrl).hostname; } catch { /* keep full URL */ }
+      setTitle(`从 ${host} 导入到 ${base.displayName}`);
+      setReason(`从链接 ${result.finalUrl} 导入 ${result.documents.length} 篇结构化文档到 Collection ${collectionId}（冻结预览 ${result.previewHash.slice(0, 12)}…）。`);
+      setStep(2);
+    } catch (reason_) {
+      setPreview(undefined);
+      setError(reason_ instanceof Error ? reason_.message : String(reason_));
+    } finally {
+      setFetching(false);
+    }
+  };
+
+  const propose = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!base || !preview) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const change = await api<KnowledgeChangeRequest>("/api/knowledge/url-proposals", writeBody({
+        knowledgeBaseId: base.id,
+        collectionId: preview.collectionId,
+        url: url.trim(),
+        previewHash: preview.previewHash,
+        title: title.trim(),
+        reason: reason.trim(),
+        requestedBy: "workbench-operator",
+        selectedRelations: Object.entries(selectedRelations).map(([candidateId, selection]) => ({
+          candidateId,
+          type: selection.type,
+          note: selection.note.trim() || undefined
+        }))
+      }));
+      notify(`已生成待审批提案「${change.title}」；人工批准后也只生成 draft Revision，不会自动发布`);
+      await onProposed(change);
+    } catch (reason_) {
+      setError(reason_ instanceof Error ? reason_.message : String(reason_));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return <Modal title="从链接导入知识" eyebrow="URL IMPORT · FROZEN PREVIEW · PROPOSAL ONLY" onClose={onClose} wide>
+    <div className="modal-body url-import">
+      <ol className="import-steps">{IMPORT_STEPS.map((item) => <li key={item.step} className={item.step === step ? "current" : item.step < step ? "done" : ""} aria-current={item.step === step ? "step" : undefined}><b>{item.step}</b><span>{item.label}</span></li>)}</ol>
+      {step === 1 && <form className="compact-form" onSubmit={runPreview}>
+        <div className="project-connect-note"><strong>抓取在服务端执行，只支持 http/https。</strong><p>预览会冻结内容哈希与结构化文档；只有继续提交才会生成待审批变更提案，这里不会写入任何知识内容。</p></div>
+        {!activeBases.length && <div className="inline-error">没有活动知识库；请先在“知识目录”建立或恢复知识库。</div>}
+        <div className="form-grid two">
+          <Field label="目标知识库"><SelectControl ariaLabel="目标知识库" value={base?.id ?? ""} emptyLabel="尚无活动知识库" options={activeBases.map((item) => ({ value: item.id, label: item.displayName, description: `${item.id} · Published R${item.publishedRevision ?? "—"}` }))} onChange={chooseBase} /></Field>
+          <Field label="目标 Collection"><SelectControl ariaLabel="目标 Collection" value={collectionId} emptyLabel="知识库没有 Collection" options={(base?.collections ?? []).map((collection) => ({ value: collection.id, label: collection.displayName, description: `${collection.id} · ${collection.authority}` }))} onChange={setCollectionId} /></Field>
+        </div>
+        <Field label="链接 URL" hint="以 http:// 或 https:// 开头；页面会被解析为结构化文档并与当前 Revision 对比。">
+          <input required type="url" placeholder="https://example.com/docs/page" disabled={!daemonAvailable || fetching} value={url} onChange={(event) => setUrl(event.target.value)} />
+        </Field>
+        {error && <div className="inline-error" role="alert">{error}</div>}
+        <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={!daemonAvailable || fetching || !base || !collectionId || !url.trim()}>{fetching ? "抓取并解析中…" : "生成冻结预览"}</button></div>
+      </form>}
+      {step === 2 && preview && <div className="url-import-preview">
+        <div className="project-connect-note"><strong>预览已冻结，内容后续变化会让提案失败并要求重新预览。</strong><p>请核对解析出的结构化文档与关联候选；确认后再进入人工勾选。</p></div>
+        <dl className="ledger url-import-hash">
+          <dt>预览哈希</dt><dd><code>{preview.previewHash}</code></dd>
+          <dt>内容 SHA-256</dt><dd><code>{preview.contentSha256}</code></dd>
+          <dt>最终 URL</dt><dd><code>{preview.finalUrl}</code></dd>
+          <dt>抓取信息</dt><dd>{preview.contentType} · {preview.byteLength} B · {formatTime(preview.fetchedAt)}{preview.redirects.length ? ` · ${preview.redirects.length} 次跳转` : ""}</dd>
+          <dt>目标</dt><dd>{preview.knowledgeBaseId} v{preview.knowledgeBaseVersion} · {preview.collectionId} · 基于 R{preview.baseRevision ?? "—"}</dd>
+        </dl>
+        <section className="url-import-docs"><header><span>PARSED DOCUMENTS</span><h3>结构化文档 · {preview.documents.length}</h3></header>
+          {preview.documents.length ? preview.documents.map((document) => <article key={document.id}>
+            <header><strong>{document.title}</strong><code>{document.id}</code></header>
+            <p>{document.content}</p>
+            <footer>{document.sourceRef ?? "—"}{document.parentId ? ` · 上级 ${document.parentId}` : ""}</footer>
+          </article>) : <p className="muted">页面没有解析出可导入的文档；返回更换链接。</p>}
+        </section>
+        <p className="muted">检测到 {preview.relationCandidates.length} 条与现有文档的关联候选，下一步逐条人工确认。</p>
+        <div className="modal-actions"><button type="button" className="button secondary" onClick={() => setStep(1)}>上一步</button><button type="button" className="button primary" disabled={preview.documents.length === 0} onClick={() => setStep(3)}>下一步：人工确认关联</button></div>
+      </div>}
+      {step === 3 && preview && <form className="compact-form" onSubmit={propose}>
+        <div className="project-connect-note"><strong>提交只生成待审批变更提案。</strong><p>即使人工批准，执行结果也只是新的 draft Revision；不会自动发布，员工读取的 Published Revision 不变。</p></div>
+        <fieldset className="url-import-relations" disabled={!daemonAvailable || submitting}>
+          <legend>关联候选 · 人工勾选后才会写入（已选 {Object.keys(selectedRelations).length} / {preview.relationCandidates.length}）</legend>
+          {preview.relationCandidates.length === 0 && <p className="muted">没有关联候选；导入的文档将以孤立条目进入草稿。</p>}
+          {preview.relationCandidates.map((candidate) => {
+            const selection = selectedRelations[candidate.id];
+            return <article className={selection ? "selected" : ""} key={candidate.id}>
+              <label className="url-import-relation-check">
+                <input type="checkbox" checked={Boolean(selection)} onChange={(event) => setSelectedRelations((current) => {
+                  const next = { ...current };
+                  if (event.target.checked) next[candidate.id] = { type: "related", note: "" };
+                  else delete next[candidate.id];
+                  return next;
+                })} />
+                <span><strong>{candidateSourceTitle(candidate.sourceDocumentId)}</strong><small>→ 现有文档 <code>{candidate.targetDocumentId}</code> · score {candidate.score.toFixed(1)} · {candidate.signals.join("；")}</small></span>
+              </label>
+              {selection && <div className="url-import-relation-form">
+                <Field label="关系类型"><SelectControl ariaLabel={`候选 ${candidate.id} 关系类型`} value={selection.type} options={(Object.entries(REFERENCE_TYPE_COPY) as Array<[KnowledgeReferenceType, string]>).map(([value, label]) => ({ value, label }))} onChange={(type) => setSelectedRelations((current) => ({ ...current, [candidate.id]: { ...selection, type: type as KnowledgeReferenceType } }))} /></Field>
+                <Field label="备注（可选）"><input value={selection.note} onChange={(event) => setSelectedRelations((current) => ({ ...current, [candidate.id]: { ...selection, note: event.target.value } }))} /></Field>
+              </div>}
+            </article>;
+          })}
+        </fieldset>
+        <Field label="提案标题"><input required disabled={!daemonAvailable || submitting} value={title} onChange={(event) => setTitle(event.target.value)} /></Field>
+        <Field label="提案理由"><textarea required rows={3} disabled={!daemonAvailable || submitting} value={reason} onChange={(event) => setReason(event.target.value)} /></Field>
+        {error && <div className="inline-error" role="alert">{error}</div>}
+        <div className="modal-actions"><button type="button" className="button secondary" disabled={submitting} onClick={() => setStep(2)}>上一步</button><button className="button primary" disabled={!daemonAvailable || submitting || !title.trim() || !reason.trim()}>{submitting ? "生成提案中…" : "生成待审批变更提案"}</button></div>
+      </form>}
+    </div>
+  </Modal>;
+}
+
+export type ReviewActionMode = "retain" | "narrow" | "revoke";
+
+const REVIEW_ACTION_COPY: Record<ReviewActionMode, { title: string; note: string; confirm: string }> = {
+  retain: {
+    title: "保留授权",
+    note: "保留当前知识 Profile 授权并刷新授权理由与复核安排；原始授权时间 grantedAt 不会被改写。这里只生成待审批的 KnowledgeChangeRequest，批准后由 Core 校验版本并应用。",
+    confirm: "生成保留提案"
+  },
+  narrow: {
+    title: "收窄授权",
+    note: "取消勾选要从授权中移除的知识 Profile。保留授权的到期时间、复核周期等元数据由后端原样保留，这里不修改；只生成待审批提案，不会直接修改员工档案或项目任用。",
+    confirm: "生成收窄提案"
+  },
+  revoke: {
+    title: "撤销授权",
+    note: "把这条知识 Profile 从授权中移除，其余授权的到期时间、复核周期等元数据由后端原样保留，这里不修改。只生成待审批提案，人工批准后才会生效。",
+    confirm: "生成撤销提案"
+  }
+};
+
+interface ReviewSubjectResolution {
+  profileIds: string[];
+  expectedVersion?: number;
+  problem?: string;
+}
+
+export function resolveReviewSubject(data: Bootstrap, item: KnowledgeGrantReviewItem): ReviewSubjectResolution {
+  if (item.subject.kind === "employee") {
+    const employee = data.employees.find((candidate) => candidate.id === item.subject.employeeId);
+    if (!employee) return { profileIds: [], problem: `当前工作台没有员工 ${item.subject.employeeId} 的档案，无法安全构造提案。` };
+    return { profileIds: [...(employee.knowledgeProfileIds ?? [])], expectedVersion: employee.version };
+  }
+  const binding = data.projectBindings.find((candidate) => candidate.projectId === item.subject.projectId);
+  const role = binding?.roles.find((candidate) => candidate.roleId === item.subject.roleId);
+  if (!binding || !role) return { profileIds: [], problem: `当前工作台没有 ${item.subject.projectId}/${item.subject.roleId} 的任用记录，无法安全构造提案。` };
+  return { profileIds: [...(role.knowledgeProfileIds ?? [])], expectedVersion: binding.version };
+}
+
+export type GrantReviewOverride = {
+  profileId: string;
+  reason: string;
+  grantedBy: string;
+  lastReviewedAt: string;
+  expiresAt?: string;
+  reviewCycleDays?: number;
+};
+
+export type GrantReviewSetPayload = {
+  profileIds: string[];
+  grantOverrides?: GrantReviewOverride[];
+};
+
+export function buildGrantReviewSetPayload(input: {
+  mode: ReviewActionMode;
+  reviewedProfileId: string;
+  profileIds: string[];
+  keepIds?: string[];
+  reason?: string;
+  grantedBy?: string;
+  expiresAtDate?: string;
+  reviewCycleDays?: string;
+  now?: string;
+}): GrantReviewSetPayload {
+  // narrow / revoke 只改变 profileIds，不传 grantOverrides；剩余授权的元数据由后端原样保留。
+  if (input.mode === "narrow") return { profileIds: [...(input.keepIds ?? input.profileIds)] };
+  if (input.mode === "revoke") return { profileIds: input.profileIds.filter((id) => id !== input.reviewedProfileId) };
+  // retain 只针对复核对象下发 grantOverride：写入本次理由与授权人、刷新 lastReviewedAt，不改写 grantedAt。
+  const override: GrantReviewOverride = {
+    profileId: input.reviewedProfileId,
+    reason: (input.reason ?? "").trim(),
+    grantedBy: (input.grantedBy ?? "").trim(),
+    lastReviewedAt: input.now ?? new Date().toISOString(),
+    ...(input.expiresAtDate ? { expiresAt: new Date(`${input.expiresAtDate}T00:00:00.000Z`).toISOString() } : {}),
+    ...(input.reviewCycleDays?.trim() ? { reviewCycleDays: Number(input.reviewCycleDays) } : {})
+  };
+  return { profileIds: [...input.profileIds], grantOverrides: [override] };
+}
+
+function GrantReviewActionModal({ item, resolution, mode, onClose, onCreated, notify }: {
+  item: KnowledgeGrantReviewItem;
+  resolution: ReviewSubjectResolution;
+  mode: ReviewActionMode;
+  onClose: () => void;
+  onCreated: () => Promise<void>;
+  notify: PageProps["notify"];
+}) {
+  const daemonAvailable = useDaemonAvailable();
+  const [grantedBy, setGrantedBy] = useState("local-owner");
+  const [reason, setReason] = useState(() => mode === "retain"
+    ? `复核后保留 ${item.grant.profileId} 授权：${item.grant.reason}`
+    : mode === "narrow"
+      ? `复核后收窄 ${reviewSubjectLabel(item)} 的知识 Profile 授权`
+      : `复核后撤销 ${item.grant.profileId} 授权`);
+  const [reviewCycleDays, setReviewCycleDays] = useState(item.grant.reviewCycleDays ? String(item.grant.reviewCycleDays) : "");
+  const [expiresAt, setExpiresAt] = useState(item.grant.expiresAt ? item.grant.expiresAt.slice(0, 10) : "");
+  const [keepIds, setKeepIds] = useState<string[]>(resolution.profileIds);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const nextIds = buildGrantReviewSetPayload({
+    mode,
+    reviewedProfileId: item.grant.profileId,
+    profileIds: resolution.profileIds,
+    keepIds
+  }).profileIds;
+  const narrowValid = mode !== "narrow" || (keepIds.length >= 1 && keepIds.length < resolution.profileIds.length);
+  // grantedBy 只在 retain 时写入 grantOverride；narrow / revoke 不展示、不提交任何 grant 元数据。
+  const metadataComplete = mode !== "retain" || Boolean(grantedBy.trim());
+  const canSubmit = daemonAvailable && !submitting && reason.trim() && metadataComplete && narrowValid && resolution.expectedVersion !== undefined;
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (resolution.expectedVersion === undefined) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const payload: GrantReviewSetPayload = buildGrantReviewSetPayload({
+        mode,
+        reviewedProfileId: item.grant.profileId,
+        profileIds: resolution.profileIds,
+        keepIds,
+        reason,
+        grantedBy,
+        expiresAtDate: expiresAt,
+        reviewCycleDays
+      });
+      const operation = item.subject.kind === "employee"
+        ? { type: "employee-profiles.set" as const, targetId: item.subject.employeeId, expectedVersion: resolution.expectedVersion, payload }
+        : { type: "project-role-profiles.set" as const, projectId: item.subject.projectId, roleId: item.subject.roleId, expectedVersion: resolution.expectedVersion, payload };
+      const change = await api<KnowledgeChangeRequest>("/api/knowledge-changes", writeBody({
+        title: `${REVIEW_ACTION_COPY[mode].title} · ${reviewSubjectLabel(item)}`,
+        reason: reason.trim(),
+        requestedBy: "workbench-operator",
+        operation
+      }));
+      notify(`已生成待审批提案「${change.title}」；人工批准后才会改权`);
+      await onCreated();
+      onClose();
+    } catch (reason_) {
+      setError(reason_ instanceof Error ? reason_.message : String(reason_));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return <Modal title={`${REVIEW_ACTION_COPY[mode].title} · ${item.grant.profileId}`} eyebrow={`${reviewSubjectLabel(item)} · CONTROLLED PROPOSAL ONLY`} onClose={onClose} wide>
+    <form className="modal-body compact-form" onSubmit={submit}>
+      <div className="project-connect-note"><strong>{REVIEW_ACTION_COPY[mode].note}</strong><p>任何改权都只通过 KnowledgeChangeRequest 走人工批准；这里不会直接 PATCH 员工档案或项目任用。</p></div>
+      <dl className="ledger">
+        <dt>当前授权</dt><dd>{resolution.profileIds.length ? resolution.profileIds.join("、") : "（无显式授权）"}</dd>
+        <dt>提案后授权</dt><dd>{nextIds.length ? nextIds.join("、") : "（全部移除）"}</dd>
+        <dt>版本基准</dt><dd>v{resolution.expectedVersion ?? "—"}</dd>
+      </dl>
+      {mode === "narrow" && <fieldset className="knowledge-base-choices review-narrow-choices" disabled={!daemonAvailable || submitting}>
+        <legend>保留的知识 Profile（取消勾选即移除）</legend>
+        {resolution.profileIds.map((profileId) => <label key={profileId}>
+          <input type="checkbox" checked={keepIds.includes(profileId)} onChange={(event) => setKeepIds((current) => event.target.checked ? [...current, profileId] : current.filter((id) => id !== profileId))} />
+          <span><strong>{profileId}</strong><small>{profileId === item.grant.profileId ? "本条复核对象" : "同一主体的其他授权"}</small></span>
+        </label>)}
+        {!narrowValid && <p className="inline-error">收窄需要至少保留一个知识 Profile 且少于当前授权；要全部移除请使用“撤销”。</p>}
+      </fieldset>}
+      {mode === "retain" && <>
+        <div className="form-grid two">
+          <Field label="授权人 grantedBy"><input required disabled={!daemonAvailable || submitting} value={grantedBy} onChange={(event) => setGrantedBy(event.target.value)} /></Field>
+          <Field label="复核周期（天，可选）"><input type="number" min={1} max={3650} disabled={!daemonAvailable || submitting} value={reviewCycleDays} onChange={(event) => setReviewCycleDays(event.target.value)} /></Field>
+        </div>
+        <Field label="到期时间 expiresAt（可选）"><input type="date" disabled={!daemonAvailable || submitting} value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} /></Field>
+      </>}
+      {mode !== "retain" && <p className="review-card-note">其余保留授权的到期时间与复核周期由后端原样保留，本提案不修改 grant 元数据。</p>}
+      <Field label="理由 reason"><textarea required rows={3} disabled={!daemonAvailable || submitting} value={reason} onChange={(event) => setReason(event.target.value)} /></Field>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      <div className="modal-actions"><button type="button" className="button secondary" disabled={submitting} onClick={onClose}>返回</button><button className="button primary" disabled={!canSubmit}>{submitting ? "生成提案中…" : REVIEW_ACTION_COPY[mode].confirm}</button></div>
+    </form>
+  </Modal>;
+}
+
+export function KnowledgeReviewBoard({ data, refresh, notify }: PageProps) {
+  const daemonAvailable = useDaemonAvailable();
+  const [ledger, setLedger] = useState<KnowledgeGrantReviewLedger>();
+  const [error, setError] = useState("");
+  const [action, setAction] = useState<{ mode: ReviewActionMode; item: KnowledgeGrantReviewItem; resolution: ReviewSubjectResolution }>();
+  const load = async () => {
+    try {
+      setError("");
+      setLedger(await api<KnowledgeGrantReviewLedger>("/api/knowledge/reviews"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+  useEffect(() => { void load(); }, []);
+
+  const countOf = (status: KnowledgeGrantReviewItem["status"]) => ledger?.counts[status] ?? 0;
+  return <main className="knowledge-review-board" role="tabpanel">
+    <header className="knowledge-review-header">
+      <div><span className="console-kicker">GRANT REVIEW LEDGER · REMINDER ONLY</span><h2>授权复核台账</h2><p>只提醒、不自动改权。保留、收窄、撤销都只会生成待审批的 KnowledgeChangeRequest，人工批准后由 Core 应用；这里不会直接修改员工档案或项目任用。</p></div>
+      <div className="knowledge-review-counts">
+        <span className="review-count review-count--overdue"><b>{countOf("overdue")}</b>已逾期</span>
+        <span className="review-count review-count--due"><b>{countOf("due-soon")}</b>临近到期</span>
+        <span className="review-count review-count--current"><b>{countOf("current")}</b>复核期内</span>
+        <span className="review-count review-count--unscheduled"><b>{countOf("unscheduled")}</b>未排期</span>
+      </div>
+    </header>
+    {error && <div className="inline-error" role="alert">{error}</div>}
+    {!ledger && !error && <div className="knowledge-review-loading">正在读取授权复核台账…</div>}
+    {ledger && <div className="knowledge-review-list">
+      {ledger.items.map((item) => {
+        const resolution = resolveReviewSubject(data, item);
+        const narrowProblem = resolution.problem ?? (resolution.profileIds.length <= 1 ? "只剩一个知识 Profile，收窄等同撤销，请直接使用“撤销”。" : undefined);
+        const revokeProblem = resolution.problem ?? (!resolution.profileIds.includes(item.grant.profileId) ? `当前授权列表中已经没有 ${item.grant.profileId}；无需撤销，可用“保留”刷新其余授权。` : undefined);
+        const open = (mode: ReviewActionMode) => setAction({ mode, item, resolution });
+        return <article className="review-card" data-status={item.status} key={item.id}>
+          <header className="review-card-head">
+            <div><span className="change-kind">{item.subject.kind === "employee" ? "EMPLOYEE GRANT" : "PROJECT ROLE GRANT"}</span><h3>{item.grant.profileId}</h3><code>{item.id}</code></div>
+            <div className="review-card-badges">{item.grant.source === "legacy" && <span className="grant-source grant-source--legacy">历史遗留</span>}<ReviewStamp status={item.status} /></div>
+          </header>
+          <dl className="ledger review-card-ledger">
+            <dt>授权主体</dt><dd>{reviewSubjectLabel(item)}</dd>
+            <dt>授权人</dt><dd>{item.grant.grantedBy}</dd>
+            <dt>授权时间</dt><dd>{formatTime(item.grant.grantedAt)}</dd>
+            <dt>到期 / 复核</dt><dd>{item.dueAt ? `${formatTime(item.dueAt)} 到期` : grantScheduleCopy(item.grant)}</dd>
+            {item.grant.lastReviewedAt && <><dt>最近复核</dt><dd>{formatTime(item.grant.lastReviewedAt)}</dd></>}
+            <dt>授权来源</dt><dd>{grantSourceCopy(item.grant.source)}</dd>
+          </dl>
+          <p className="review-card-reason"><span>理由</span>{item.grant.reason}</p>
+          {item.reasons.length > 0 && <ul className="change-warnings review-card-signals">{item.reasons.map((signal) => <li key={signal}><strong>提醒</strong>{signal}</li>)}</ul>}
+          {resolution.problem && <p className="inline-error">{resolution.problem} 所有改权入口已禁用。</p>}
+          <footer className="review-card-actions">
+            <button type="button" className="button secondary" disabled={!daemonAvailable || Boolean(resolution.problem)} onClick={() => open("retain")}>保留</button>
+            <button type="button" className="button secondary" disabled={!daemonAvailable || Boolean(narrowProblem)} title={narrowProblem} onClick={() => open("narrow")}>收窄</button>
+            <button type="button" className="button danger" disabled={!daemonAvailable || Boolean(revokeProblem)} title={revokeProblem} onClick={() => open("revoke")}>撤销</button>
+          </footer>
+          {(narrowProblem && !resolution.problem) && <p className="review-card-note">{narrowProblem}</p>}
+          {(revokeProblem && !resolution.problem) && <p className="review-card-note">{revokeProblem}</p>}
+        </article>;
+      })}
+      {ledger.items.length === 0 && <div className="knowledge-all-clear"><strong>台账为空</strong><span>员工或项目角色获得知识 Profile 授权后，复核条目会出现在这里。</span></div>}
+    </div>}
+    <footer className="knowledge-review-footer"><span>策略 {ledger?.policy ?? "reminder-only-v1"} · 基准 {formatTime(ledger?.asOf)} · 临近窗口 {ledger?.dueSoonDays ?? "—"} 天</span><button type="button" className="text-button" onClick={() => void load()}>重新读取</button></footer>
+    {action && <GrantReviewActionModal item={action.item} resolution={action.resolution} mode={action.mode} notify={notify} onClose={() => setAction(undefined)} onCreated={async () => { await refresh(); await load(); }} />}
+  </main>;
+}
+
 export function KnowledgePage({ data, refresh, notify }: PageProps) {
   const daemonAvailable = useDaemonAvailable();
   const knowledgeBases = data.knowledgeBases ?? [];
@@ -775,6 +1725,8 @@ export function KnowledgePage({ data, refresh, notify }: PageProps) {
   const [archiveTarget, setArchiveTarget] = useState<"base" | "profile" | null>(null);
   const [previewRevision, setPreviewRevision] = useState<number>();
   const [publishRevision, setPublishRevision] = useState<number>();
+  const [importOpen, setImportOpen] = useState(false);
+  const [perspectiveEmployeeId, setPerspectiveEmployeeId] = useState("");
   const [busy, setBusy] = useState("");
   const selectedBase = knowledgeBases.find((item) => item.id === selectedBaseId) ?? knowledgeBases[0];
   const selectedProfile = profiles.find((item) => item.id === selectedProfileId) ?? profiles[0];
@@ -836,6 +1788,8 @@ export function KnowledgePage({ data, refresh, notify }: PageProps) {
   ]);
   const unassignedProfiles = activeProfiles.filter((profile) => !assignedProfileIds.has(profile.id));
   const pendingChangeCount = (data.knowledgeChanges ?? []).filter((change) => change.status === "awaiting-approval" || change.status === "needs-reapproval").length;
+  const perspectiveCandidates = data.employees.filter((employee) => employee.status === "active");
+  const perspectiveEmployee = perspectiveCandidates.find((employee) => employee.id === perspectiveEmployeeId) ?? perspectiveCandidates[0];
   const selectedBaseImpact = impact?.knowledgeBases.find((item) => item.knowledgeBaseId === selectedBase?.id);
   const selectedProfileImpact = impact?.profiles.find((item) => item.profileId === selectedProfile?.id);
   const assignedEmployees = selectedProfile ? data.employees.filter((employee) => (employee.knowledgeProfileIds ?? []).includes(selectedProfile.id)) : [];
@@ -843,16 +1797,18 @@ export function KnowledgePage({ data, refresh, notify }: PageProps) {
   const tabs: Array<{ id: KnowledgeConsoleTab; label: string; meta: string }> = [
     { id: "overview", label: "总览", meta: `${draftAhead.length + unhealthy.length} 待办` },
     { id: "catalog", label: "知识目录", meta: `${knowledgeBases.length} 座` },
+    { id: "wiki", label: "全量 Wiki", meta: "只读" },
     { id: "releases", label: "发布车道", meta: `${draftAhead.length} 草稿` },
-    { id: "profiles", label: "员工 Profile", meta: `${profiles.length} 份` },
+    { id: "profiles", label: "知识 Profile", meta: `${profiles.length} 份` },
     { id: "impact", label: "影响与授权", meta: `${impact?.danglingAssignments.length ?? 0} 异常` },
+    { id: "reviews", label: "授权复核", meta: "提醒制" },
     { id: "assistant", label: "AI 管理", meta: `${pendingChangeCount} 待批` }
   ];
 
   return <div className="knowledge-console">
     <header className="knowledge-console-header">
       <div className="knowledge-console-title"><span>KNOWLEDGE CONTROL PLANE</span><h1>知识控制台</h1><p>独立维护内容、版本与索引，通过少量 Profile 把经过筛选的证据交给员工。</p></div>
-      <div className="knowledge-console-actions"><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setTab("profiles"); setProfileEditor("new"); }}>建立 Profile</button><button className="button primary" disabled={!daemonAvailable} onClick={() => { setTab("catalog"); setEditor("new"); }}>建立知识库</button></div>
+      <div className="knowledge-console-actions"><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setTab("profiles"); setProfileEditor("new"); }}>建立 Profile</button><button className="button secondary" disabled={!daemonAvailable || !knowledgeBases.some((item) => item.status === "active")} onClick={() => setImportOpen(true)}>从链接导入</button><button className="button primary" disabled={!daemonAvailable} onClick={() => { setTab("catalog"); setEditor("new"); }}>建立知识库</button></div>
       <div className="knowledge-console-vitals"><span><b>{knowledgeBases.filter((item) => item.status === "active").length}</b>活动知识库</span><span><b>{activeProfiles.length}</b>活动 Profile</span><span><b>{draftAhead.length}</b>待发布草稿</span><span><b>{unhealthy.length + (impact?.danglingAssignments.length ?? 0)}</b>治理提醒</span></div>
     </header>
     <nav className="knowledge-console-tabs" role="tablist" aria-label="知识控制台分区">{tabs.map((item) => <button type="button" role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)}><strong>{item.label}</strong><small>{item.meta}</small></button>)}</nav>
@@ -877,9 +1833,11 @@ export function KnowledgePage({ data, refresh, notify }: PageProps) {
     {tab === "catalog" && <div className="knowledge-console-workspace page-grid page-grid--knowledge" role="tabpanel">
       <aside className="record-list knowledge-record-list"><header className="list-header"><h2>知识目录</h2><button className="square-action" disabled={!daemonAvailable} onClick={() => setEditor("new")} aria-label="建立知识库"><UtilityIcon name="add" /></button></header><div className="list-tools"><input type="search" placeholder="检索知识库…" value={search} onChange={(event) => setSearch(event.target.value)} /></div><div className="record-scroll">{filteredBases.map((item) => <button type="button" className={`knowledge-card ${selectedBase?.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedBaseId(item.id)}><span className="knowledge-card-mark" aria-hidden="true">知</span><span><strong>{item.displayName}</strong><code>{item.id} · R{item.publishedRevision ?? "—"}</code><small>{item.domain} · {item.collections.length} 个 Collection</small></span><Stamp status={item.status} /></button>)}</div><footer className="list-footer"><span>{knowledgeBases.length} 个知识库</span><span>CATALOG</span></footer></aside>
       <main className="detail-pane">{!selectedBase ? <EmptyState title="建立第一座知识花圃" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>建立知识库</button>}>先定义清晰的领域与 Collection，再导入资料并发布 Revision。</EmptyState> : <div className="dossier knowledge-dossier"><header className="dossier-cover knowledge-cover"><div className="file-index"><span>KNOWLEDGE CATALOG RECORD</span><code>No. {selectedBase.id.toUpperCase()}</code></div><div className="dossier-title-row"><div className="knowledge-seal" aria-hidden="true">知</div><div><h2>{selectedBase.displayName}</h2><p>{selectedBase.description}</p></div><Stamp status={selectedBase.status} /></div><div className="knowledge-health-line"><span className={`health-dot health-${selectedBase.qualityStatus}`} />质量 {selectedBase.qualityStatus}<span>定义 v{selectedBase.version}</span><span>Published R{selectedBase.publishedRevision ?? "—"}</span><span>Latest R{selectedBase.latestRevision ?? "—"}</span><span>{selectedBaseImpact?.profileMatches.length ?? 0} Profiles 可见</span></div><div className="dossier-actions">
-        {selectedBase.status === "archived" ? <button className="button primary" disabled={!daemonAvailable || Boolean(busy)} onClick={() => void restoreSelected("base")}>恢复知识库</button> : <><button className="button primary" disabled={!daemonAvailable || !selectedBase.latestRevision || selectedBase.latestRevision === selectedBase.publishedRevision || Boolean(busy)} onClick={() => setPublishRevision(selectedBase.latestRevision)}>发布最新 Revision</button><button className="button secondary" disabled={!daemonAvailable || !selectedBase.latestRevision} onClick={() => selectedBase.latestRevision && setPreviewRevision(selectedBase.latestRevision)}>草稿试跑</button><button className="button secondary" disabled={!daemonAvailable || !selectedBase.sources.length || Boolean(busy)} onClick={() => void act("sync", () => api(`/api/knowledge-bases/${selectedBase.id}/sync`, writeBody({})), "同步完成，已生成待发布 Revision")}>{busy === "sync" ? "同步中…" : "同步来源"}</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setRevisionOpen(true)}>改进内容</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订目录</button><button className="button danger" disabled={!daemonAvailable || Boolean(busy)} onClick={() => setArchiveTarget("base")}>归档</button></>}
+        {selectedBase.status === "archived" ? <button className="button primary" disabled={!daemonAvailable || Boolean(busy)} onClick={() => void restoreSelected("base")}>恢复知识库</button> : <><button className="button primary" disabled={!daemonAvailable || !selectedBase.latestRevision || selectedBase.latestRevision === selectedBase.publishedRevision || Boolean(busy)} onClick={() => setPublishRevision(selectedBase.latestRevision)}>发布最新 Revision</button><button className="button secondary" disabled={!daemonAvailable || !selectedBase.latestRevision} onClick={() => selectedBase.latestRevision && setPreviewRevision(selectedBase.latestRevision)}>草稿试跑</button><button className="button secondary" disabled={!daemonAvailable || !selectedBase.sources.length || Boolean(busy)} onClick={() => void act("sync", () => api(`/api/knowledge-bases/${selectedBase.id}/sync`, writeBody({})), "同步完成，已生成待发布 Revision")}>{busy === "sync" ? "同步中…" : "同步来源"}</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setRevisionOpen(true)}>改进内容</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setImportOpen(true)}>从链接导入</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订目录</button><button className="button danger" disabled={!daemonAvailable || Boolean(busy)} onClick={() => setArchiveTarget("base")}>归档</button></>}
       </div></header><DossierSection number="01" title="发布状态"><div className="knowledge-lane"><article className={selectedBase.latestRevision !== selectedBase.publishedRevision ? "current" : "complete"}><span>最新草稿</span><strong>R{selectedBase.latestRevision ?? "—"}</strong><small>{selectedBase.latestRevision === selectedBase.publishedRevision ? "与员工版本一致" : "等待质检、试跑和发布"}</small></article><i aria-hidden="true" /><article className="complete"><span>员工使用</span><strong>R{selectedBase.publishedRevision ?? "—"}</strong><small>{selectedBase.publishedRevision ? "后续运行固定此版本" : "尚未开放给员工"}</small></article></div>{selectedBase.lastSyncError && <div className="inline-error">最近同步失败：{selectedBase.lastSyncError}</div>}<AssessmentPanel assessment={detail?.latestAssessment} /></DossierSection><DossierSection number="02" title="Collection"><div className="knowledge-collection-grid">{selectedBase.collections.map((collection) => { const assessment = detail?.latestAssessment?.collections.find((item) => item.collectionId === collection.id); return <article key={collection.id}><header><span>{collection.authority === "canonical" ? "正" : collection.authority === "reference" ? "参" : "试"}</span><div><strong>{collection.displayName}</strong><code>{collection.id}</code></div></header><p>{collection.description}</p><div className="tag-row">{collection.tags.map((tag) => <code className="paper-tag" key={tag}>{tag}</code>)}</div><footer>{assessment?.documentCount ?? 0} 文档 · {assessment?.sourceDocumentCount ?? 0} 同步</footer></article>; })}</div></DossierSection><div className="dossier-columns"><DossierSection number="03" title="同步来源"><div className="knowledge-source-list">{selectedBase.sources.length ? selectedBase.sources.map((source) => <article key={source.id}><span>{source.kind === "directory" ? "DIR" : "FILE"}</span><div><strong>{source.id}</strong><code>{source.location}</code><small>→ {source.collectionId}</small></div></article>) : <p className="muted">仅人工维护，尚未配置同步来源。</p>}</div></DossierSection><DossierSection number="04" title="内容与同步"><dl className="ledger"><dt>最新文档</dt><dd>{detail?.latestRevision?.documents.length ?? 0}</dd><dt>发布文档</dt><dd>{detail?.publishedRevision?.documents.length ?? 0}</dd><dt>最近同步</dt><dd>{formatTime(selectedBase.lastSyncedAt)}</dd><dt>同步状态</dt><dd>{selectedBase.syncStatus}</dd><dt>敏感度</dt><dd>{selectedBase.classification}</dd><dt>授权 Profile</dt><dd>{selectedBaseImpact?.profileMatches.length ?? 0}</dd></dl></DossierSection></div><DossierSection number="05" title="最近内容"><div className="knowledge-document-ledger">{detail?.latestRevision?.documents.slice(0, 12).map((document) => <article key={document.id}><span>{document.sourceId ? "源" : "写"}</span><div><strong>{document.title}</strong><code>{document.id} · {document.collectionId}</code></div><small>{document.sourceRef ?? "人工维护"}</small></article>)}{!detail?.latestRevision?.documents.length && <p className="muted">暂无内容。可以添加人工条目或同步来源。</p>}</div></DossierSection></div>}</main>
     </div>}
+
+    {tab === "wiki" && <KnowledgeWikiBrowser knowledgeBases={knowledgeBases} notify={notify} />}
 
     {tab === "releases" && <main className="knowledge-release-console" role="tabpanel">
       <section className="knowledge-release-list"><header><div><span>REVISION LANES</span><h2>发布车道</h2><p>草稿可以独立试跑；只有显式发布才会改变员工读取版本。</p></div><strong>{draftAhead.length}</strong></header><div>{knowledgeBases.map((item) => <article className={selectedBase?.id === item.id ? "selected" : ""} key={item.id} onClick={() => setSelectedBaseId(item.id)}><div className="release-base-name"><span className={`health-dot health-${item.qualityStatus}`} /><div><strong>{item.displayName}</strong><code>{item.id}</code></div></div><div className="release-lane-mini"><span>草稿 <b>R{item.latestRevision ?? "—"}</b></span><i /><span>发布 <b>R{item.publishedRevision ?? "—"}</b></span></div><div className="release-row-actions"><Stamp status={item.status} /><button type="button" className="button secondary" disabled={!item.latestRevision || item.status === "archived"} onClick={(event) => { event.stopPropagation(); setSelectedBaseId(item.id); if (item.latestRevision) setPreviewRevision(item.latestRevision); }}>试跑</button><button type="button" className="button primary" disabled={!item.latestRevision || item.latestRevision === item.publishedRevision || item.status === "archived"} onClick={(event) => { event.stopPropagation(); setSelectedBaseId(item.id); if (item.latestRevision) setPublishRevision(item.latestRevision); }}>检查发布</button></div></article>)}</div></section>
@@ -887,8 +1845,8 @@ export function KnowledgePage({ data, refresh, notify }: PageProps) {
     </main>}
 
     {tab === "profiles" && <div className="knowledge-console-workspace page-grid page-grid--knowledge" role="tabpanel">
-      <aside className="record-list knowledge-record-list"><header className="list-header"><h2>员工 Profile</h2><button className="square-action" disabled={!daemonAvailable} onClick={() => setProfileEditor("new")} aria-label="建立知识配置"><UtilityIcon name="add" /></button></header><div className="list-tools"><input type="search" placeholder="检索 Profile…" value={search} onChange={(event) => setSearch(event.target.value)} /></div><div className="record-scroll">{filteredProfiles.map((item) => <button type="button" className={`knowledge-card profile-card ${selectedProfile?.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedProfileId(item.id)}><span className="knowledge-card-mark" aria-hidden="true">档</span><span><strong>{item.displayName}</strong><code>{item.id} · v{item.version}</code><small>{item.rules.length} 条选择规则</small></span><Stamp status={item.status} /></button>)}</div><footer className="list-footer"><span>{profiles.length} 个 Profile</span><span>POLICY</span></footer></aside>
-      <main className="detail-pane">{!selectedProfile ? <EmptyState title="建立可复用的知识 Profile" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setProfileEditor("new")}>建立 Profile</button>}>员工只绑定少量 Profile；Profile 决定目录范围、信任边界、激活条件和单次预算。</EmptyState> : <div className="dossier knowledge-dossier profile-dossier"><header className="dossier-cover"><div className="file-index"><span>EMPLOYEE KNOWLEDGE POLICY</span><code>No. {selectedProfile.id.toUpperCase()}</code></div><div className="dossier-title-row"><div className="knowledge-seal profile" aria-hidden="true">档</div><div><h2>{selectedProfile.displayName}</h2><p>{selectedProfile.description}</p></div><Stamp status={selectedProfile.status} /></div><div className="knowledge-health-line"><span>{selectedProfileImpact?.knowledgeBases.length ?? 0} 知识库</span><span>{assignedEmployees.length} 员工</span><span>{assignedRoles.length} 项目角色</span><span>策略 v{selectedProfile.version}</span></div><div className="dossier-actions">{selectedProfile.status === "archived" ? <button className="button primary" disabled={!daemonAvailable || Boolean(busy)} onClick={() => void restoreSelected("profile")}>恢复 Profile</button> : <><button className="button primary" disabled={!daemonAvailable} onClick={() => setProfileEditor("edit")}>修订 Profile</button><button className="button secondary" onClick={() => setTab("impact")}>查看影响范围</button><button className="button danger" disabled={!daemonAvailable || Boolean(busy)} onClick={() => setArchiveTarget("profile")}>归档</button></>}</div></header><DossierSection number="01" title="选择与激活规则"><div className="knowledge-rule-list">{selectedProfile.rules.map((rule) => <article key={rule.id}><header><div><code>{rule.id}</code><strong>{rule.activation}</strong></div><span>优先级 {rule.priority}</span></header><dl><dt>知识库</dt><dd>{rule.selector.knowledgeBaseIds?.join(", ") || "按元数据自动选择"}</dd><dt>领域 / 产品</dt><dd>{[...(rule.selector.domains ?? []), ...(rule.selector.products ?? [])].join(", ") || "不限"}</dd><dt>Collection</dt><dd>{rule.selector.collectionIds?.join(", ") || "不限"}</dd><dt>项目 / 角色</dt><dd>{[...(rule.conditions?.projectIds ?? []), ...(rule.conditions?.projectRoleIds ?? [])].join(", ") || "不限"}</dd><dt>权威 / 敏感度</dt><dd>{rule.selector.authorities?.join(", ") || "不限"} · ≤ {rule.selector.maxClassification ?? "restricted"}</dd><dt>预算</dt><dd>{rule.budget.maxCollections} Collections · {rule.budget.maxChunks} Chunks · {rule.budget.maxTokens} Tokens</dd></dl></article>)}</div></DossierSection><DossierSection number="02" title="当前匹配的知识库"><div className="knowledge-profile-base-list">{selectedProfileImpact?.knowledgeBases.map((item) => <article key={item.knowledgeBaseId}><span>{item.rules.some((rule) => rule.matchMode === "metadata") ? "自" : "显"}</span><div><strong>{item.knowledgeBaseName}</strong><code>{item.knowledgeBaseId} · R{item.publishedRevision ?? "—"}</code><small>{item.rules.flatMap((rule) => rule.collectionIds).join("、")}</small></div><Stamp status={item.knowledgeBaseStatus} /></article>)}{!selectedProfileImpact?.knowledgeBases.length && <p className="muted">当前目录中没有知识库匹配这份 Profile。</p>}</div></DossierSection><div className="dossier-columns"><DossierSection number="03" title="员工继承"><div className="knowledge-assignment-list">{assignedEmployees.length ? assignedEmployees.map((employee) => <article key={employee.id}><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code></article>) : <p className="muted">尚未分配给员工。</p>}</div></DossierSection><DossierSection number="04" title="项目角色叠加"><div className="knowledge-assignment-list">{assignedRoles.length ? assignedRoles.map((role) => <article key={role}><strong>{role}</strong><small>仅在项目任用中生效</small></article>) : <p className="muted">尚未由项目角色追加。</p>}</div></DossierSection></div><DossierSection number="05" title="运行原则"><div className="knowledge-principle"><span>授权候选</span><i>→</i><span>条件激活</span><i>→</i><span>路由缩小</span><i>→</i><span>证据注入</span></div><p className="muted">Router 只能从这份 Profile 允许的范围中做减法。每次实际选择会作为 Knowledge Plan 保存到 Run。</p></DossierSection></div>}</main>
+      <aside className="record-list knowledge-record-list"><header className="list-header"><h2>知识 Profile</h2><button className="square-action" disabled={!daemonAvailable} onClick={() => setProfileEditor("new")} aria-label="建立知识 Profile"><UtilityIcon name="add" /></button></header><div className="list-tools"><input type="search" placeholder="检索 Profile…" value={search} onChange={(event) => setSearch(event.target.value)} /><p className="muted list-note">知识 Profile 是可复用的知识授权策略：员工与项目角色只引用少量 Profile，运行时再由 Resolver 与 Router 做减法。</p></div><div className="record-scroll">{filteredProfiles.map((item) => <button type="button" className={`knowledge-card profile-card ${selectedProfile?.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedProfileId(item.id)}><span className="knowledge-card-mark" aria-hidden="true">档</span><span><strong>{item.displayName}</strong><code>{item.id} · v{item.version}</code><small>{item.rules.length} 条选择规则</small></span><Stamp status={item.status} /></button>)}</div><footer className="list-footer"><span>{profiles.length} 个 Profile</span><span>POLICY</span></footer></aside>
+      <main className="detail-pane">{!selectedProfile ? <EmptyState title="建立可复用的知识 Profile" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setProfileEditor("new")}>建立 Profile</button>}>员工只绑定少量 Profile；Profile 决定目录范围、信任边界、激活条件和单次预算。</EmptyState> : <div className="dossier knowledge-dossier profile-dossier"><header className="dossier-cover"><div className="file-index"><span>REUSABLE KNOWLEDGE POLICY</span><code>No. {selectedProfile.id.toUpperCase()}</code></div><div className="dossier-title-row"><div className="knowledge-seal profile" aria-hidden="true">档</div><div><h2>{selectedProfile.displayName}</h2><p>{selectedProfile.description}</p></div><Stamp status={selectedProfile.status} /></div><div className="knowledge-health-line"><span>{selectedProfileImpact?.knowledgeBases.length ?? 0} 知识库</span><span>{assignedEmployees.length} 员工</span><span>{assignedRoles.length} 项目角色</span><span>策略 v{selectedProfile.version}</span></div><div className="dossier-actions">{selectedProfile.status === "archived" ? <button className="button primary" disabled={!daemonAvailable || Boolean(busy)} onClick={() => void restoreSelected("profile")}>恢复 Profile</button> : <><button className="button primary" disabled={!daemonAvailable} onClick={() => setProfileEditor("edit")}>修订 Profile</button><button className="button secondary" onClick={() => setTab("impact")}>查看影响范围</button><button className="button danger" disabled={!daemonAvailable || Boolean(busy)} onClick={() => setArchiveTarget("profile")}>归档</button></>}</div></header><DossierSection number="01" title="选择与激活规则"><div className="knowledge-rule-list">{selectedProfile.rules.map((rule) => <article key={rule.id}><header><div><code>{rule.id}</code><strong>{rule.activation}</strong></div><span>优先级 {rule.priority}</span></header><dl><dt>知识库</dt><dd>{rule.selector.knowledgeBaseIds?.join(", ") || "按元数据自动选择"}</dd><dt>领域 / 产品</dt><dd>{[...(rule.selector.domains ?? []), ...(rule.selector.products ?? [])].join(", ") || "不限"}</dd><dt>Collection</dt><dd>{rule.selector.collectionIds?.join(", ") || "不限"}</dd><dt>项目 / 角色</dt><dd>{[...(rule.conditions?.projectIds ?? []), ...(rule.conditions?.projectRoleIds ?? [])].join(", ") || "不限"}</dd><dt>权威 / 敏感度</dt><dd>{rule.selector.authorities?.join(", ") || "不限"} · ≤ {rule.selector.maxClassification ?? "restricted"}</dd><dt>预算</dt><dd>{rule.budget.maxCollections} Collections · {rule.budget.maxChunks} Chunks · {rule.budget.maxTokens} Tokens</dd></dl></article>)}</div></DossierSection><DossierSection number="02" title="当前匹配的知识库"><div className="knowledge-profile-base-list">{selectedProfileImpact?.knowledgeBases.map((item) => <article key={item.knowledgeBaseId}><span>{item.rules.some((rule) => rule.matchMode === "metadata") ? "自" : "显"}</span><div><strong>{item.knowledgeBaseName}</strong><code>{item.knowledgeBaseId} · R{item.publishedRevision ?? "—"}</code><small>{item.rules.flatMap((rule) => rule.collectionIds).join("、")}</small></div><Stamp status={item.knowledgeBaseStatus} /></article>)}{!selectedProfileImpact?.knowledgeBases.length && <p className="muted">当前目录中没有知识库匹配这份 Profile。</p>}</div></DossierSection><div className="dossier-columns"><DossierSection number="03" title="员工继承"><div className="knowledge-assignment-list">{assignedEmployees.length ? assignedEmployees.map((employee) => <article key={employee.id}><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code></article>) : <p className="muted">尚未分配给员工。</p>}</div></DossierSection><DossierSection number="04" title="项目角色叠加"><div className="knowledge-assignment-list">{assignedRoles.length ? assignedRoles.map((role) => <article key={role}><strong>{role}</strong><small>仅在项目任用中生效</small></article>) : <p className="muted">尚未由项目角色追加。</p>}</div></DossierSection></div><DossierSection number="05" title="运行原则"><div className="knowledge-principle"><span>授权候选</span><i>→</i><span>条件激活</span><i>→</i><span>路由缩小</span><i>→</i><span>证据注入</span></div><p className="muted">Router 只能从这份 Profile 允许的范围中做减法。每次实际选择会作为 Knowledge Plan 保存到 Run。</p></DossierSection></div>}</main>
     </div>}
 
     {tab === "impact" && <main className="knowledge-impact-console" role="tabpanel">
@@ -896,7 +1854,12 @@ export function KnowledgePage({ data, refresh, notify }: PageProps) {
       {impact?.danglingAssignments.length ? <section className="knowledge-dangling"><header><strong>{impact.danglingAssignments.length} 条失效引用</strong><span>这些引用会在 Resolver 中被排除。</span></header>{impact.danglingAssignments.map((item) => <article key={`${item.source}-${item.profileId}-${item.employeeId}`}><Stamp status="blocked" /><strong>{item.profileId}</strong><span>{item.source === "employee" ? `员工 ${item.employeeId}` : `${item.projectId}/${item.roleId} · 员工 ${item.employeeId}`}</span></article>)}</section> : <section className="knowledge-impact-ok"><strong>授权引用完整</strong><span>没有员工或项目角色引用缺失的 Profile。</span></section>}
       <section className="knowledge-impact-map"><header><span>知识库</span><span>Profile 通道</span><span>最终使用方</span></header>{impact?.knowledgeBases.map((baseImpact) => { const base = knowledgeBases.find((item) => item.id === baseImpact.knowledgeBaseId); return <article key={baseImpact.knowledgeBaseId}><div className="impact-base"><span className="knowledge-card-mark">知</span><div><strong>{base?.displayName ?? baseImpact.knowledgeBaseId}</strong><code>{baseImpact.knowledgeBaseId} · {base?.classification ?? "—"}</code><small>Published R{base?.publishedRevision ?? "—"}</small></div></div><div className="impact-profiles">{baseImpact.profileMatches.length ? baseImpact.profileMatches.map((profile) => <button type="button" key={profile.profileId} onClick={() => { setSelectedProfileId(profile.profileId); setTab("profiles"); }}><b>{profile.rules.some((rule) => rule.matchMode === "metadata") ? "自" : "显"}</b><span><strong>{profile.profileName}</strong><small>{profile.rules.flatMap((rule) => rule.collectionIds).join("、")}</small></span></button>) : <span className="impact-none">没有 Profile 纳入</span>}</div><div className="impact-consumers"><span><b>{baseImpact.employees.length}</b>员工</span><span><b>{baseImpact.projectRoles.length}</b>项目角色</span>{baseImpact.employees.slice(0, 3).map((employee) => <small key={employee.employeeId}>{employee.employeeName}</small>)}</div></article>; })}{!impact?.knowledgeBases.length && <div className="knowledge-all-clear"><strong>尚无知识库</strong><span>建立知识库和 Profile 后，这里会形成可解释的授权链。</span></div>}</section>
       <section className="knowledge-profile-governance"><header><div><span>PROFILE GOVERNANCE</span><h2>策略负载</h2></div></header><div>{impact?.profiles.map((profileImpact) => { const profile = profiles.find((item) => item.id === profileImpact.profileId); return <article key={profileImpact.profileId}><header><div><strong>{profile?.displayName ?? profileImpact.profileId}</strong><code>{profileImpact.profileId} · v{profile?.version ?? "—"}</code></div><Stamp status={profile?.status ?? "blocked"} /></header><dl><dt>候选知识库</dt><dd>{profileImpact.knowledgeBases.length}</dd><dt>直接员工</dt><dd>{profileImpact.employees.length}</dd><dt>项目角色</dt><dd>{profileImpact.projectRoles.length}</dd><dt>自动匹配</dt><dd>{profileImpact.knowledgeBases.filter((base) => base.rules.some((rule) => rule.matchMode === "metadata")).length}</dd></dl><button type="button" className="text-button" onClick={() => { setSelectedProfileId(profileImpact.profileId); setTab("profiles"); }}>打开策略档案</button></article>; })}</div></section>
+      <section className="knowledge-perspective-console"><header><div><span>EMPLOYEE PERSPECTIVE · EXPLAINABLE</span><h2>员工知识视角</h2><p>选择一名员工，按模拟任务上下文查看 eligible（已授权）、activated（当前任务激活）与 selected（实际入选）三层差异，以及每条 Profile / rule / reason / matches 解释和授权元数据。</p></div><Field label="选择员工"><SelectControl ariaLabel="选择知识视角员工" value={perspectiveEmployee?.id ?? ""} emptyLabel="尚无活动员工" options={perspectiveCandidates.map((employee) => ({ value: employee.id, label: employee.identity.displayName, description: `${employee.id} · v${employee.version}` }))} onChange={setPerspectiveEmployeeId} /></Field></header>
+        {perspectiveEmployee ? <KnowledgePerspectiveExplorer employee={perspectiveEmployee} bindings={data.projectBindings} notify={notify} /> : <div className="knowledge-all-clear"><strong>没有可查看的员工</strong><span>建立或恢复一名员工后，这里可以检查他的知识视角。</span></div>}
+      </section>
     </main>}
+
+    {tab === "reviews" && <KnowledgeReviewBoard data={data} refresh={refresh} notify={notify} />}
 
     {tab === "assistant" && <KnowledgeStewardConsole data={data} refresh={refresh} notify={notify} />}
 
@@ -905,6 +1868,6 @@ export function KnowledgePage({ data, refresh, notify }: PageProps) {
     {profileEditor && <KnowledgeProfilePolicyEditor profile={profileEditor === "edit" ? selectedProfile : undefined} knowledgeBases={knowledgeBases} notify={notify} onClose={() => setProfileEditor(null)} onSaved={async (id) => { setProfileEditor(null); setSelectedProfileId(id); await reloadDetail(); }} />}
     {previewRevision && selectedBase && <RevisionPreviewModal knowledgeBase={selectedBase} revision={previewRevision} notify={notify} onClose={() => setPreviewRevision(undefined)} />}
     {publishRevision && selectedBase && <PublishReviewModal knowledgeBase={selectedBase} revision={publishRevision} impact={impact} notify={notify} onPublished={reloadDetail} onClose={() => setPublishRevision(undefined)} />}
-    {archiveTarget && <Modal title={archiveTarget === "base" ? "归档知识库" : "归档 Knowledge Profile"} eyebrow="SOFT ARCHIVE · HISTORY KEPT" onClose={() => setArchiveTarget(null)}><div className="modal-body"><div className="danger-notice"><b>后续运行将不再使用这项知识配置。</b><p>{archiveTarget === "base" ? "所有 Revision、索引、发布指针和历史 Run 引用都会保留。引用它的 Profile 会在 Knowledge Plan 中记录排除原因。" : "Profile 版本和现有员工引用会保留；后续调用会在 Knowledge Plan 中明确记录它已归档。"}</p></div><div className="modal-actions"><button className="button secondary" onClick={() => setArchiveTarget(null)}>取消</button><button className="button danger-filled" disabled={!daemonAvailable || Boolean(busy)} onClick={() => void archiveSelected()}>{busy === "archive" ? "归档中…" : "确认归档"}</button></div></div></Modal>}
+    {archiveTarget && <Modal title={archiveTarget === "base" ? "归档知识库" : "归档知识 Profile"} eyebrow="SOFT ARCHIVE · HISTORY KEPT" onClose={() => setArchiveTarget(null)}><div className="modal-body"><div className="danger-notice"><b>后续运行将不再使用这项知识配置。</b><p>{archiveTarget === "base" ? "所有 Revision、索引、发布指针和历史 Run 引用都会保留。引用它的 Profile 会在 Knowledge Plan 中记录排除原因。" : "Profile 版本和现有员工引用会保留；后续调用会在 Knowledge Plan 中明确记录它已归档。"}</p></div><div className="modal-actions"><button className="button secondary" onClick={() => setArchiveTarget(null)}>取消</button><button className="button danger-filled" disabled={!daemonAvailable || Boolean(busy)} onClick={() => void archiveSelected()}>{busy === "archive" ? "归档中…" : "确认归档"}</button></div></div></Modal>}
   </div>;
 }

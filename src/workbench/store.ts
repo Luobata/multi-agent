@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import type { ProviderDefinition } from "../core/types.js";
+import type { KnowledgeProfileGrant } from "../knowledge/types.js";
 import type { WorkbenchState } from "./types.js";
 
 const KNOWLEDGE_CONTROL_TOOLS = [
@@ -12,6 +13,11 @@ const KNOWLEDGE_CONTROL_TOOLS = [
   "knowledge_base_get",
   "knowledge_revision_assess",
   "knowledge_revision_preview",
+  "knowledge_url_preview",
+  "knowledge_url_propose",
+  "knowledge_wiki_get",
+  "employee_knowledge_perspective",
+  "knowledge_review_list",
   "knowledge_impact_get",
   "knowledge_change_list",
   "knowledge_change_get",
@@ -104,6 +110,21 @@ function initialState(): WorkbenchState {
   };
 }
 
+function normalizedStoredGrants(
+  profileIds: string[],
+  grants: KnowledgeProfileGrant[] | undefined,
+  fallbackAt: string
+): KnowledgeProfileGrant[] {
+  const byProfile = new Map((grants ?? []).map((grant) => [grant.profileId, grant]));
+  return profileIds.map((profileId) => byProfile.get(profileId) ?? {
+    profileId,
+    reason: "Legacy knowledgeProfileIds assignment",
+    grantedBy: "legacy-migration",
+    grantedAt: fallbackAt,
+    source: "legacy"
+  });
+}
+
 function normalizeState(state: WorkbenchState): WorkbenchState {
   if (state.providers.mock?.adapter === "mock" && state.providers.mock.model === undefined) {
     state.providers.mock.model = "deterministic-mock";
@@ -137,6 +158,11 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   for (const record of Object.values(state.employees)) {
     for (const employee of record.versions) {
       employee.knowledgeProfileIds ??= [];
+      employee.knowledgeGrants = normalizedStoredGrants(
+        employee.knowledgeProfileIds,
+        employee.knowledgeGrants,
+        employee.createdAt
+      );
       employee.skillVersions ??= Object.fromEntries(
         employee.skills.map((binding) => {
           const id = typeof binding === "string" ? binding : binding.id;
@@ -146,6 +172,11 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     }
     record.current = record.versions.find((employee) => employee.version === record.current.version) ?? record.current;
     record.current.knowledgeProfileIds ??= [];
+    record.current.knowledgeGrants = normalizedStoredGrants(
+      record.current.knowledgeProfileIds,
+      record.current.knowledgeGrants,
+      record.current.createdAt
+    );
     record.current.skillVersions ??= Object.fromEntries(
       record.current.skills.map((binding) => {
         const id = typeof binding === "string" ? binding : binding.id;
@@ -162,8 +193,14 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   for (const record of Object.values(state.projectBindings)) {
     for (const binding of record.versions) {
       for (const role of binding.roles) role.knowledgeProfileIds ??= [];
+      for (const role of binding.roles) {
+        role.knowledgeGrants = normalizedStoredGrants(role.knowledgeProfileIds, role.knowledgeGrants, binding.createdAt);
+      }
     }
-    for (const role of record.current.roles) role.knowledgeProfileIds ??= [];
+    for (const role of record.current.roles) {
+      role.knowledgeProfileIds ??= [];
+      role.knowledgeGrants = normalizedStoredGrants(role.knowledgeProfileIds, role.knowledgeGrants, record.current.createdAt);
+    }
   }
   return state;
 }

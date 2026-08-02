@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadManifest } from "../src/config/loadManifest.js";
+import { ProviderExecutionError } from "../src/core/errors.js";
 import type { ProviderAdapter, ProviderRegistry } from "../src/runtime/providers.js";
 import { runWorkflow } from "../src/runtime/runner.js";
 
@@ -114,5 +115,176 @@ describe("workflow runtime", () => {
     expect(result.run.nodes["design-review"]?.status).toBe("failed");
     expect(result.run.nodes["final-decision"]?.status).toBe("skipped");
     expect(result.run.status).toBe("failed");
+  });
+
+  it("starts newly-ready nodes without waiting for an unrelated node in the same compiled wave", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    loaded.manifest.workflows["dependency-ready"] = {
+      architecture: "graph",
+      config: {
+        maxConcurrency: 2,
+        failFast: false,
+        nodes: [
+          { id: "fast-root", role: "product-manager" },
+          { id: "slow-root", role: "designer" },
+          { id: "fast-child", role: "tester", needs: ["fast-root"] }
+        ]
+      }
+    };
+    const order: string[] = [];
+    let childStarted = () => {};
+    const childGate = new Promise<void>((resolve) => { childStarted = resolve; });
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke(invocation) {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        order.push(`${role}:start`);
+        if (role === "designer") {
+          await Promise.race([childGate, new Promise((resolve) => setTimeout(resolve, 250))]);
+          order.push("designer:end");
+        }
+        if (role === "tester") childStarted();
+        return {
+          stdout: JSON.stringify({ verdict: "Pass", summary: "reviewed", evidence: ["evidence"], risks: [] }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    };
+
+    const result = await runWorkflow(loaded, "dependency-ready", {
+      input,
+      providers: new Map([["command", adapter]])
+    });
+
+    expect(result.run.status).toBe("passed");
+    expect(order.indexOf("tester:start")).toBeLessThan(order.indexOf("designer:end"));
+  });
+
+  it("honors concurrency and stops new work after fail-fast while allowing running siblings to finish", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    loaded.manifest.workflows["fail-fast"] = {
+      architecture: "graph",
+      config: {
+        maxConcurrency: 2,
+        failFast: true,
+        nodes: [
+          { id: "fatal", role: "product-manager" },
+          { id: "running-sibling", role: "designer" },
+          { id: "not-started", role: "tester" }
+        ]
+      }
+    };
+    const started: string[] = [];
+    let active = 0;
+    let peakActive = 0;
+    let siblingStarted = () => {};
+    const siblingGate = new Promise<void>((resolve) => { siblingStarted = resolve; });
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke(invocation) {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        started.push(role);
+        active += 1;
+        peakActive = Math.max(peakActive, active);
+        try {
+          if (role === "product-manager") {
+            await siblingGate;
+            throw new ProviderExecutionError("deterministic failure", "", "", { kind: "exit", retryable: false });
+          }
+          if (role === "designer") {
+            siblingStarted();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          return {
+            stdout: JSON.stringify({ verdict: "Pass", summary: "reviewed", evidence: ["evidence"], risks: [] }),
+            stderr: "",
+            durationMs: 1
+          };
+        } finally {
+          active -= 1;
+        }
+      }
+    };
+
+    const result = await runWorkflow(loaded, "fail-fast", {
+      input,
+      providers: new Map([["command", adapter]])
+    });
+
+    expect(peakActive).toBe(2);
+    expect(started).toEqual(expect.arrayContaining(["product-manager", "designer"]));
+    expect(started).not.toContain("tester");
+    expect(result.run.nodes.fatal?.status).toBe("failed");
+    expect(result.run.nodes["running-sibling"]?.status).toBe("passed");
+    expect(result.run.nodes["not-started"]?.status).toBe("skipped");
+    expect(result.run.status).toBe("failed");
+  });
+
+  it("does not repeat deterministic or budget-style Provider failures", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    loaded.manifest.workflows["single-review"] = {
+      architecture: "graph",
+      config: { nodes: [{ id: "review", role: "product-manager" }] }
+    };
+    loaded.manifest.roles["product-manager"]!.maxAttempts = 3;
+    let calls = 0;
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke() {
+        calls += 1;
+        throw new ProviderExecutionError("budget exhausted", "", "", { kind: "budget", retryable: false });
+      }
+    };
+
+    const result = await runWorkflow(loaded, "single-review", {
+      input,
+      providers: new Map([["command", adapter]])
+    });
+
+    expect(calls).toBe(1);
+    expect(result.run.nodes.review?.attempts).toBe(1);
+    expect(result.run.status).toBe("failed");
+  });
+
+  it("retries only failures explicitly classified as transient", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    loaded.manifest.workflows["single-review"] = {
+      architecture: "graph",
+      config: { nodes: [{ id: "review", role: "product-manager" }] }
+    };
+    loaded.manifest.roles["product-manager"]!.maxAttempts = 3;
+    let calls = 0;
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke() {
+        calls += 1;
+        if (calls === 1) {
+          throw new ProviderExecutionError("upstream overloaded", "", "", { kind: "rate-limit", retryable: true });
+        }
+        return {
+          stdout: JSON.stringify({ verdict: "Pass", summary: "reviewed", evidence: ["evidence"], risks: [] }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    };
+
+    const result = await runWorkflow(loaded, "single-review", {
+      input,
+      providers: new Map([["command", adapter]])
+    });
+
+    expect(calls).toBe(2);
+    expect(result.run.nodes.review?.attempts).toBe(2);
+    expect(result.run.status).toBe("passed");
   });
 });

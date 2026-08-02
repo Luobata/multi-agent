@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { EmployeeAvatar, UtilityIcon, formatTime } from "./components";
+import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeStatus, formatTime } from "./components";
 import type {
   Bootstrap,
   Employee,
@@ -27,13 +27,6 @@ const statusLabels: Record<WorkInstanceStatus | InvocationStatus | "idle", strin
   skipped: "已跳过",
   cancelled: "已取消"
 };
-
-function runtimeState(instances: WorkInstanceRecord[]): WorkInstanceStatus | "idle" {
-  if (instances.some((instance) => instance.status === "running")) return "running";
-  if (instances.some((instance) => instance.status === "waiting")) return "waiting";
-  if (instances.some((instance) => instance.status === "queued")) return "queued";
-  return "idle";
-}
 
 function sourceName(instance: WorkInstanceRecord | InvocationRecord): string {
   const { source } = instance;
@@ -69,13 +62,6 @@ function invocationInstances(invocation: InvocationRecord, instances: WorkInstan
   return instances.filter((instance) => ids.has(instance.id));
 }
 
-function RuntimeBadge({ status, count }: { status: WorkInstanceStatus | "idle"; count?: number }) {
-  return <span className={`runtime-badge runtime-badge--${status}`}>
-    <i aria-hidden="true" />
-    {statusLabels[status]}{count && count > 1 ? ` ×${count}` : ""}
-  </span>;
-}
-
 function WorkInstanceCard({ instance, invocation, clock }: {
   instance: WorkInstanceRecord;
   invocation?: InvocationRecord;
@@ -84,7 +70,7 @@ function WorkInstanceCard({ instance, invocation, clock }: {
   return <article className={`instance-card instance-card--${instance.status}`}>
     <header>
       <div><span>{sourceCode(instance)}</span><strong>{sourceName(instance)}</strong></div>
-      <RuntimeBadge status={instance.status} />
+      <RuntimeStatusChip status={instance.status} />
     </header>
     <p>{invocation?.requestSummary ?? "调用上下文已固定到对应 Run。"}</p>
     <dl>
@@ -97,6 +83,9 @@ function WorkInstanceCard({ instance, invocation, clock }: {
       <dt>Run</dt><dd><code>{instance.runId}</code></dd>
     </dl>
     {instance.error && <div className="instance-error">{instance.error}</div>}
+    {instance.status === "failed" && <div className="instance-evidence">
+      <button type="button" className="instance-evidence-action" onClick={() => { window.location.hash = "runs"; }}>查看运行证据 →</button>
+    </div>}
     <footer>
       <span>{instance.phase}</span>
       <button type="button" onClick={() => { window.location.hash = "runs"; }}>查看运行证据 →</button>
@@ -123,7 +112,7 @@ function EmployeeActivityDrawer({ employee, data, clock, onClose }: {
   }, []);
   const instances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
   const active = instances.filter((instance) => activeInstanceStatuses.has(instance.status));
-  const state = runtimeState(active);
+  const state = employeeRuntimeStatus(instances, clock);
   return <div className="activity-drawer-layer" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <aside className="employee-activity-drawer" role="dialog" aria-modal="true" aria-label={`${employee.identity.displayName} 实时工作台`}>
       <header className="activity-drawer-header">
@@ -132,7 +121,7 @@ function EmployeeActivityDrawer({ employee, data, clock, onClose }: {
         <button type="button" className="icon-button" aria-label="关闭实时工作台" autoFocus onClick={onClose}><UtilityIcon name="close" /></button>
       </header>
       <section className="drawer-capacity">
-        <RuntimeBadge status={state} count={active.length} />
+        <RuntimeStatusChip status={state} count={active.length} />
         <div><span>当前出勤</span><strong>{active.length}</strong></div>
         <div><span>累计实例</span><strong>{instances.length}</strong></div>
         <div><span>当前档案</span><strong>v{employee.version}</strong></div>
@@ -158,10 +147,29 @@ function EmployeeActivityDrawer({ employee, data, clock, onClose }: {
 export function OfficePage({ data, streamStatus }: OfficePageProps) {
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string>();
   const [clock, setClock] = useState(() => Date.now());
+  const [migrationNotice, setMigrationNotice] = useState("");
+  const seenInstanceStatuses = useRef(new Map<string, WorkInstanceStatus>());
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
+  // Announce real status migrations only: keyed and deduped by instance id + status,
+  // so the per-second elapsed-time clock never re-triggers a broadcast.
+  useEffect(() => {
+    const seen = seenInstanceStatuses.current;
+    const names = new Map(data.employees.map((employee) => [employee.id, employee.identity.displayName]));
+    const messages: string[] = [];
+    for (const instance of data.activity.instances) {
+      const previous = seen.get(instance.id);
+      if (previous === instance.status) continue;
+      seen.set(instance.id, instance.status);
+      if (previous === undefined) continue; // first sighting is a snapshot, not a migration
+      const name = names.get(instance.employeeId);
+      if (!name) continue;
+      messages.push(`${name} 的工作实例${statusLabels[instance.status]}`);
+    }
+    if (messages.length > 0) setMigrationNotice(messages.join("；"));
+  }, [data.activity.instances, data.employees]);
 
   const activeEmployees = data.employees.filter((employee) => employee.status === "active");
   const activeInstances = data.activity.instances.filter((instance) => activeInstanceStatuses.has(instance.status));
@@ -183,12 +191,17 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
 
     <div className="office-layout">
       <section className="office-floor" aria-label="员工实时状态">
+        <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{migrationNotice}</p>
         <header className="office-floor-heading"><div><span>SHIFT A</span><h2>本地员工席位</h2></div><p className={`stream-${streamStatus}`}><i /> {streamStatus === "live" ? "实时状态流已连接" : streamStatus === "reconnecting" ? "状态流重连中" : streamStatus === "offline" ? "状态流离线" : "正在连接状态流"}</p></header>
         <div className="office-roster">
           {activeEmployees.map((employee, index) => {
-            const instances = activeInstances.filter((instance) => instance.employeeId === employee.id);
-            const state = runtimeState(instances);
-            const latest = instances[0];
+            const employeeInstances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
+            const active = employeeInstances.filter((instance) => activeInstanceStatuses.has(instance.status));
+            const state = employeeRuntimeStatus(employeeInstances, clock);
+            const terminalLatest = state === "failed" || state === "blocked" || state === "completed"
+              ? [...employeeInstances].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]
+              : undefined;
+            const latest = active[0] ?? terminalLatest;
             const provider = data.providers.find((entry) => entry.id === employee.providerId);
             const publicationCount = data.publications.filter((publication) => {
               if (publication.status !== "active") return false;
@@ -207,13 +220,14 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
               style={{ "--seat-index": index } as CSSProperties}
               onClick={() => setSelectedEmployeeId(employee.id)}
             >
-              <div className="office-seat-top"><span>SEAT {String(index + 1).padStart(2, "0")}</span><RuntimeBadge status={state} count={instances.length} /></div>
+              <i className="seat-status-bar" aria-hidden="true" />
+              <div className="office-seat-top"><span>SEAT {String(index + 1).padStart(2, "0")}</span><RuntimeStatusChip status={state} count={active.length} /></div>
               <div className="office-character-stage">
                 <div className="office-character"><EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} /></div>
                 <i className="character-shadow" aria-hidden="true" />
-                {instances.length > 1 && <span className="instance-count">×{instances.length}</span>}
-                <div className="instance-tokens" aria-label={`${instances.length} 个工作实例`}>
-                  {instances.slice(0, 4).map((instance) => <i key={instance.id} title={`${sourceName(instance)} · ${instance.nodeId}`} />)}
+                {active.length > 1 && <span className="instance-count">×{active.length}</span>}
+                <div className="instance-tokens" aria-label={`${active.length} 个工作实例`}>
+                  {active.slice(0, 4).map((instance) => <i key={instance.id} title={`${sourceName(instance)} · ${instance.nodeId}`} />)}
                 </div>
               </div>
               <div className="office-employee-copy">
@@ -222,7 +236,7 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
                 <p>{employeeRole(employee)}</p>
               </div>
               <div className="office-assignment">
-                {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.workflowId} / {latest.nodeId} · {elapsed(latest.startedAt, latest.completedAt, clock)}</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
+                {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.status === "failed" ? `故障：${latest.error ?? "执行失败"} · 打开实时台查看运行证据` : `${latest.workflowId} / ${latest.nodeId} · ${elapsed(latest.startedAt, latest.completedAt, clock)}`}</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
               </div>
               <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>查看实时台 →</span></footer>
             </button>;

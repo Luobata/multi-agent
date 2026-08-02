@@ -150,21 +150,6 @@ function planFailFast(plan: ExecutionPlan): boolean {
   return plan.data.failFast === true;
 }
 
-async function mapWithConcurrency<T, R>(items: T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-      const item = items[index];
-      if (item !== undefined) results[index] = await task(item);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
 function formatGraphText(plan: ExecutionPlan): string {
   const maxConcurrency = planConcurrency(plan);
   const failFast = planFailFast(plan);
@@ -197,27 +182,50 @@ function formatGraphMermaid(plan: ExecutionPlan): string {
 }
 
 async function executeGraph(context: ArchitectureExecutionContext): Promise<void> {
+  const pending = new Map(context.plan.nodes.map((node) => [node.id, node]));
+  const running = new Map<string, Promise<{ nodeId: string; result: Awaited<ReturnType<typeof context.executeNode>> }>>();
+  const concurrency = planConcurrency(context.plan);
   let halted = false;
-  for (const wave of planWaves(context.plan)) {
-    if (halted) {
-      for (const node of wave) {
-        context.run.nodes[node.id] = {
-          nodeId: node.id,
-          roleId: node.role,
-          status: "skipped",
-          attempts: 0,
-          completedAt: new Date().toISOString(),
-          error: "workflow stopped by fail-fast policy"
-        };
-        await context.emit("node.skipped", node.id, { reason: "fail-fast" });
-      }
-      await context.persist();
-      continue;
+
+  const skipPending = async (): Promise<void> => {
+    for (const node of pending.values()) {
+      context.run.nodes[node.id] = {
+        nodeId: node.id,
+        roleId: node.role,
+        status: "skipped",
+        attempts: 0,
+        completedAt: new Date().toISOString(),
+        error: "workflow stopped by fail-fast policy"
+      };
+      await context.emit("node.skipped", node.id, { reason: "fail-fast" });
     }
-    const results = await mapWithConcurrency(wave, planConcurrency(context.plan), context.executeNode);
-    for (const result of results) context.run.nodes[result.nodeId] = result;
+    pending.clear();
     await context.persist();
-    if (planFailFast(context.plan) && results.some((result) => result.status === "failed")) halted = true;
+  };
+
+  while (pending.size > 0 || running.size > 0) {
+    if (!halted) {
+      const ready = [...pending.values()].filter((node) =>
+        node.needs.every((dependency) => !["pending", "running"].includes(context.run.nodes[dependency]?.status ?? "pending"))
+      );
+      for (const node of ready) {
+        if (running.size >= concurrency) break;
+        pending.delete(node.id);
+        running.set(node.id, context.executeNode(node).then((result) => ({ nodeId: node.id, result })));
+      }
+    }
+
+    if (halted && pending.size > 0) await skipPending();
+    if (running.size === 0) {
+      if (pending.size > 0) throw new Error(`graph scheduler stalled with pending nodes: ${[...pending.keys()].join(", ")}`);
+      break;
+    }
+
+    const completed = await Promise.race(running.values());
+    running.delete(completed.nodeId);
+    context.run.nodes[completed.nodeId] = completed.result;
+    await context.persist();
+    if (planFailFast(context.plan) && completed.result.status === "failed") halted = true;
   }
 }
 

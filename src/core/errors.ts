@@ -12,9 +12,29 @@ export class TemplateRenderError extends Error {
   }
 }
 
+export type ProviderFailureKind = "aborted" | "budget" | "rate-limit" | "start" | "timeout" | "exit" | "unknown";
+
+export interface ProviderExecutionErrorOptions {
+  kind?: ProviderFailureKind;
+  retryable?: boolean;
+  durationMs?: number;
+}
+
 export class ProviderExecutionError extends Error {
-  constructor(message: string, public readonly stdout = "", public readonly stderr = "") {
+  readonly kind: ProviderFailureKind;
+  readonly retryable: boolean;
+  readonly durationMs?: number;
+
+  constructor(
+    message: string,
+    public readonly stdout = "",
+    public readonly stderr = "",
+    options: ProviderExecutionErrorOptions = {}
+  ) {
     super(message);
     this.name = "ProviderExecutionError";
+    this.kind = options.kind ?? "unknown";
+    this.retryable = options.retryable ?? false;
+    this.durationMs = options.durationMs;
   }
 }

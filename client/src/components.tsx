@@ -11,6 +11,7 @@ import {
   type ReactNode
 } from "react";
 import { createPortal } from "react-dom";
+import type { WorkInstanceRecord } from "./types";
 
 export type StampStatus = "active" | "archived" | "running" | "passed" | "completed" | "blocked" | "failed" | "skipped" | "pending";
 export type DaemonStatus = "checking" | "online" | "offline";
@@ -289,6 +290,62 @@ export function scrollRecordIntoView(id: string) {
     behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
     block: "start"
   });
+}
+
+export type RuntimeChipStatus = "idle" | WorkInstanceRecord["status"];
+
+const runtimeChipLabels: Record<RuntimeChipStatus, string> = {
+  idle: "空闲待命",
+  queued: "排队中",
+  waiting: "等待中",
+  running: "工作中",
+  completed: "已完成",
+  blocked: "已阻塞",
+  failed: "故障",
+  skipped: "已跳过",
+  cancelled: "已取消"
+};
+
+/** Terminal success stays visible for a short dwell before the seat returns to idle. */
+export const COMPLETED_STATE_LINGER_MS = 20_000;
+
+/**
+ * Derives one employee-facing runtime status from real Work Instance records.
+ * Archive state is deliberately orthogonal and never folded into this value.
+ */
+export function employeeRuntimeStatus(
+  instances: ReadonlyArray<Pick<WorkInstanceRecord, "status" | "updatedAt">>,
+  now: number = Date.now()
+): RuntimeChipStatus {
+  if (instances.some((instance) => instance.status === "running")) return "running";
+  if (instances.some((instance) => instance.status === "waiting")) return "waiting";
+  if (instances.some((instance) => instance.status === "queued")) return "queued";
+  const terminal = instances
+    .filter((instance) => instance.status === "failed" || instance.status === "blocked" || instance.status === "completed")
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+  if (!terminal) return "idle";
+  if (terminal.status === "failed") return "failed";
+  if (terminal.status === "blocked") return "blocked";
+  return now - new Date(terminal.updatedAt).getTime() <= COMPLETED_STATE_LINGER_MS ? "completed" : "idle";
+}
+
+function RuntimeChipShape({ status }: { status: RuntimeChipStatus }) {
+  if (status === "queued") return <path d="M8 2.5 13.5 8 8 13.5 2.5 8Z" />;
+  if (status === "waiting") return <circle cx="8" cy="8" r="5.25" />;
+  if (status === "running") return <path d="M8 1.5 9.9 6.1 14.5 8 9.9 9.9 8 14.5 6.1 9.9 1.5 8 6.1 6.1Z" fill="currentColor" stroke="none" />;
+  if (status === "completed") return <path d="M4 3h3v2h2V3h3v2h1v5h-1v1h-1v1h-1v1h-1v1H7v-1H6v-1H5v-1H4v-1H3V5h1V3z" fill="currentColor" stroke="none" />;
+  if (status === "failed") return <><path d="M8 2.5 14 13.5H2Z" /><path d="M8 6.5v3" /><path d="M8 11.25v1.5" /></>;
+  if (status === "blocked") return <><rect x="3" y="3" width="10" height="10" /><path d="M5.5 8h5" /></>;
+  if (status === "skipped") return <path d="M2.5 8h8M7.5 4.5 11 8l-3.5 3.5" />;
+  if (status === "cancelled") return <path d="m4.5 4.5 7 7m0-7-7 7" />;
+  return <rect x="5" y="5" width="6" height="6" />;
+}
+
+export function RuntimeStatusChip({ status, count, label }: { status: RuntimeChipStatus; count?: number; label?: string }) {
+  return <span className={`runtime-chip runtime-chip--${status}`}>
+    <svg className="runtime-chip-shape" viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="square" strokeLinejoin="miter" shapeRendering="crispEdges"><RuntimeChipShape status={status} /></svg>
+    <span className="runtime-chip-label">{label ?? `${runtimeChipLabels[status]}${count && count > 1 ? ` ×${count}` : ""}`}</span>
+  </span>;
 }
 
 export function Stamp({ status, label }: { status: StampStatus; label?: string }) {
