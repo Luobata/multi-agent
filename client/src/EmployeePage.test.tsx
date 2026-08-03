@@ -45,6 +45,20 @@ const employee: Employee = {
   updatedAt: timestamp
 };
 
+const systemEmployee: Employee = {
+  ...employee,
+  id: "knowledge-steward",
+  identity: {
+    ...employee.identity,
+    displayName: "小知 · 项目知识管理员",
+    metadata: {
+      internalProjectId: "local-agent-workbench",
+      internalProjectRoleId: "knowledge-steward"
+    }
+  },
+  description: "系统级知识控制员工。"
+};
+
 const bootstrap: Bootstrap = {
   providers: [{ id: "mock", definition: { adapter: "mock", model: "deterministic-mock" } }],
   skills: [humanizer],
@@ -111,6 +125,25 @@ describe("Employee Skill actions", () => {
 
     expect(html).toContain("知识视角");
     expect(html).toContain("查看知识视角");
+  });
+});
+
+describe("Employee access grouping", () => {
+  it("separates system Employees and removes their direct invocation desk while retaining management", () => {
+    const data: Bootstrap = { ...bootstrap, employees: [systemEmployee] };
+    const html = renderToStaticMarkup(<EmployeePage data={data} refresh={vi.fn()} notify={vi.fn()} />);
+
+    expect(html).toContain("外部可调用员工");
+    expect(html).toContain("系统级员工");
+    expect(html).toContain("小知 · 项目知识管理员");
+    expect(html).toContain("仅供内部管理与项目角色调用");
+    expect(html).toContain("local-agent-workbench");
+    expect(html).toContain("knowledge-steward");
+    expect(html).not.toContain('id="direct-desk"');
+    expect(html).not.toContain("<h3>直接交办</h3>");
+    expect(html).toContain("修订档案");
+    expect(html).toContain("管理绑定");
+    expect(html).toContain("调整授权");
   });
 });
 

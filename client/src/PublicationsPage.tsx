@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, writeBody } from "./api";
 import { DossierSection, EmptyState, Field, Modal, ReadonlyEvidence, SelectControl, Stamp, UtilityIcon, formatTime, useDaemonAvailable } from "./components";
+import { isSystemEmployee } from "./employeeAccess";
 import type { Bootstrap, Publication } from "./types";
 
 interface PageProps {
@@ -35,12 +36,14 @@ export function PublicationsPage({ data, refresh, notify }: PageProps) {
     try { await api(`/api/publications/${selected.id}/archive`, writeBody({})); notify(`发布 ${selected.id} 已归档`); setArchiveOpen(false); await refresh(); }
     catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
   };
-  const targets = draft.kind === "employee" ? data.employees.filter((item) => item.status === "active") : data.workflows.filter((item) => item.status === "active");
+  const targets = draft.kind === "employee"
+    ? data.employees.filter((item) => item.status === "active" && !isSystemEmployee(item))
+    : data.workflows.filter((item) => item.status === "active");
   const targetError = draft.id && draft.name && draft.description && !draft.targetId
     ? targets.length
       ? "请选择一个调用目标。"
       : draft.kind === "employee"
-        ? "暂无在册员工，请先建立或恢复员工档案。"
+        ? "暂无对外可调用的在册员工；系统级员工不能发布，请先建立或恢复普通员工档案。"
         : "暂无在用编排，请先建立或恢复协作编排。"
     : undefined;
   const targetOptions = [
@@ -49,7 +52,7 @@ export function PublicationsPage({ data, refresh, notify }: PageProps) {
       label: targets.length ? "选择目标" : "暂无可调用目标",
       description: targets.length
         ? draft.kind === "employee" ? "选择一位在册员工" : "选择一份在用编排"
-        : draft.kind === "employee" ? "请先建立或恢复员工档案" : "请先建立或恢复协作编排",
+        : draft.kind === "employee" ? "系统级员工不可发布；请先建立或恢复普通员工档案" : "请先建立或恢复协作编排",
       disabled: targets.length === 0
     },
     ...targets.map((target) => ({

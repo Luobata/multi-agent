@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { api, writeBody } from "./api";
 import { DossierSection, EmptyState, Field, Modal, Stamp, UtilityIcon, formatTime, useDaemonAvailable } from "./components";
+import { isSystemEmployee } from "./employeeAccess";
 import type {
   Bootstrap,
   EntrancePolicy,
@@ -209,7 +210,9 @@ function PolicyEditor({ policy, data, onClose, onSaved, notify }: {
   const daemonAvailable = useDaemonAvailable();
   const [draft, setDraft] = useState(() => draftFor(policy));
   const [saving, setSaving] = useState(false);
-  const activeEmployees = data.employees.filter((employee) => employee.status === "active" && !employee.identity.metadata?.internalProjectId);
+  // Mirrors the server guard: system-level employees (identity.metadata.internalProjectId)
+  // can only be reached through their internal project role, never as direct specialists.
+  const activeEmployees = data.employees.filter((employee) => employee.status === "active" && !isSystemEmployee(employee));
   const supervisorWorkflows = data.workflows.filter(
     (workflow): workflow is SupervisorWorkflow => workflow.architecture === "supervisor" && workflow.status === "active"
   );

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeStatus, formatTime } from "./components";
+import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
 import type {
   Bootstrap,
   Employee,
@@ -172,18 +173,72 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
   }, [data.activity.instances, data.employees]);
 
   const activeEmployees = data.employees.filter((employee) => employee.status === "active");
+  const externalEmployees = activeEmployees.filter((employee) => !isSystemEmployee(employee));
+  const systemEmployees = activeEmployees.filter(isSystemEmployee);
   const activeInstances = data.activity.instances.filter((instance) => activeInstanceStatuses.has(instance.status));
   const selected = data.employees.find((employee) => employee.id === selectedEmployeeId);
   const recentInvocations = useMemo(
     () => [...data.activity.invocations].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, 12),
     [data.activity.invocations]
   );
+  const renderRoster = (employees: Employee[], systemLevel: boolean) => employees.map((employee, index) => {
+    const employeeInstances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
+    const active = employeeInstances.filter((instance) => activeInstanceStatuses.has(instance.status));
+    const state = employeeRuntimeStatus(employeeInstances, clock);
+    const terminalLatest = state === "failed" || state === "blocked" || state === "completed"
+      ? [...employeeInstances].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]
+      : undefined;
+    const latest = active[0] ?? terminalLatest;
+    const provider = data.providers.find((entry) => entry.id === employee.providerId);
+    const publicationCount = data.publications.filter((publication) => {
+      if (publication.status !== "active") return false;
+      if (publication.target.kind === "employee") return publication.target.id === employee.id;
+      const workflow = data.workflows.find((candidate) => candidate.id === publication.target.id);
+      return workflow?.architecture === "graph"
+        ? workflow.nodes.some((node) => node.employeeId === employee.id)
+        : workflow?.supervisor.employeeId === employee.id || workflow?.members.some((member) => member.employeeId === employee.id);
+    }).length;
+    const projectRoleCount = data.projectBindings.reduce(
+      (count, projectBinding) => count + projectBinding.roles.filter((role) => role.employeeId === employee.id).length,
+      0
+    );
+    const entryCount = systemLevel ? projectRoleCount : publicationCount + projectRoleCount;
+    const scope = systemLevel ? systemEmployeeScope(employee) : undefined;
+    return <button
+      type="button"
+      className={`office-employee${systemLevel ? " office-employee--system" : ""} runtime-${state}`}
+      key={employee.id}
+      style={{ "--seat-index": index } as CSSProperties}
+      onClick={() => setSelectedEmployeeId(employee.id)}
+    >
+      <i className="seat-status-bar" aria-hidden="true" />
+      <div className="office-seat-top"><span>{systemLevel ? "SYSTEM" : "SEAT"} {String(index + 1).padStart(2, "0")}</span>{systemLevel && <span className="system-level-badge">系统级</span>}<RuntimeStatusChip status={state} count={active.length} /></div>
+      <div className="office-character-stage">
+        <div className="office-character"><EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} /></div>
+        <i className="character-shadow" aria-hidden="true" />
+        {active.length > 1 && <span className="instance-count">×{active.length}</span>}
+        <div className="instance-tokens" aria-label={`${active.length} 个工作实例`}>
+          {active.slice(0, 4).map((instance) => <i key={instance.id} title={`${sourceName(instance)} · ${instance.nodeId}`} />)}
+        </div>
+      </div>
+      <div className="office-employee-copy">
+        <span>{employee.id} · v{employee.version}</span>
+        <h3>{employee.identity.displayName}</h3>
+        <p>{employeeRole(employee)}</p>
+      </div>
+      <div className="office-assignment">
+        {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.status === "failed" ? `故障：${latest.error ?? "执行失败"} · 打开实时台查看运行证据` : `${latest.workflowId} / ${latest.nodeId} · ${elapsed(latest.startedAt, latest.completedAt, clock)}`}</small></> : systemLevel ? <><span>INTERNAL ONLY</span><strong>仅接受内部项目角色调度</strong><small>内部项目 {scope?.projectId}{scope?.roleId ? ` · 角色 ${scope.roleId}` : ""} · {entryCount} 个项目角色可触达</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
+      </div>
+      <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>查看实时台 →</span></footer>
+    </button>;
+  });
 
   return <main className="office-page">
     <header className="office-header">
-      <div><p>OPERATIONS FLOOR / LIVE</p><h1>员工大厅</h1><span>这里负责打包与观测；任务主要由其他会话通过 MCP、A2A 或 HTTP 调用。</span></div>
+      <div><p>OPERATIONS FLOOR / LIVE</p><h1>员工大厅</h1><span>外部可调用员工负责接单；系统级员工仅供内部项目角色调度与管理。</span></div>
       <div className="office-metrics">
-        <div><span>在册员工</span><strong>{activeEmployees.length}</strong></div>
+        <div><span>外部员工</span><strong>{externalEmployees.length}</strong></div>
+        <div><span>系统级员工</span><strong>{systemEmployees.length}</strong></div>
         <div className={activeInstances.length ? "metric-live" : ""}><span>出勤实例</span><strong>{activeInstances.length}</strong></div>
         <div><span>调用入口</span><strong>{data.publications.filter((publication) => publication.status === "active").length + data.projectBindings.reduce((count, binding) => count + binding.roles.length, 0)}</strong></div>
       </div>
@@ -192,60 +247,17 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
     <div className="office-layout">
       <section className="office-floor" aria-label="员工实时状态">
         <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{migrationNotice}</p>
-        <header className="office-floor-heading"><div><span>SHIFT A</span><h2>本地员工席位</h2></div><p className={`stream-${streamStatus}`}><i /> {streamStatus === "live" ? "实时状态流已连接" : streamStatus === "reconnecting" ? "状态流重连中" : streamStatus === "offline" ? "状态流离线" : "正在连接状态流"}</p></header>
-        <div className="office-roster">
-          {activeEmployees.map((employee, index) => {
-            const employeeInstances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
-            const active = employeeInstances.filter((instance) => activeInstanceStatuses.has(instance.status));
-            const state = employeeRuntimeStatus(employeeInstances, clock);
-            const terminalLatest = state === "failed" || state === "blocked" || state === "completed"
-              ? [...employeeInstances].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]
-              : undefined;
-            const latest = active[0] ?? terminalLatest;
-            const provider = data.providers.find((entry) => entry.id === employee.providerId);
-            const publicationCount = data.publications.filter((publication) => {
-              if (publication.status !== "active") return false;
-              if (publication.target.kind === "employee") return publication.target.id === employee.id;
-              const workflow = data.workflows.find((candidate) => candidate.id === publication.target.id);
-              return workflow?.architecture === "graph"
-                ? workflow.nodes.some((node) => node.employeeId === employee.id)
-                : workflow?.supervisor.employeeId === employee.id || workflow?.members.some((member) => member.employeeId === employee.id);
-            }).length;
-            const projectRoleCount = data.projectBindings.reduce(
-              (count, projectBinding) => count + projectBinding.roles.filter((role) => role.employeeId === employee.id).length,
-              0
-            );
-            const entryCount = publicationCount + projectRoleCount;
-            return <button
-              type="button"
-              className={`office-employee runtime-${state}`}
-              key={employee.id}
-              style={{ "--seat-index": index } as CSSProperties}
-              onClick={() => setSelectedEmployeeId(employee.id)}
-            >
-              <i className="seat-status-bar" aria-hidden="true" />
-              <div className="office-seat-top"><span>SEAT {String(index + 1).padStart(2, "0")}</span><RuntimeStatusChip status={state} count={active.length} /></div>
-              <div className="office-character-stage">
-                <div className="office-character"><EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} /></div>
-                <i className="character-shadow" aria-hidden="true" />
-                {active.length > 1 && <span className="instance-count">×{active.length}</span>}
-                <div className="instance-tokens" aria-label={`${active.length} 个工作实例`}>
-                  {active.slice(0, 4).map((instance) => <i key={instance.id} title={`${sourceName(instance)} · ${instance.nodeId}`} />)}
-                </div>
-              </div>
-              <div className="office-employee-copy">
-                <span>{employee.id} · v{employee.version}</span>
-                <h3>{employee.identity.displayName}</h3>
-                <p>{employeeRole(employee)}</p>
-              </div>
-              <div className="office-assignment">
-                {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.status === "failed" ? `故障：${latest.error ?? "执行失败"} · 打开实时台查看运行证据` : `${latest.workflowId} / ${latest.nodeId} · ${elapsed(latest.startedAt, latest.completedAt, clock)}`}</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
-              </div>
-              <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>查看实时台 →</span></footer>
-            </button>;
-          })}
-          {activeEmployees.length === 0 && <div className="office-empty">没有在册员工。先在员工档案中建立身份，再将其发布成调用包。</div>}
-        </div>
+        <header className="office-floor-heading"><div><span>SHIFT A</span><h2>实时员工席位</h2></div><p className={`stream-${streamStatus}`}><i /> {streamStatus === "live" ? "实时状态流已连接" : streamStatus === "reconnecting" ? "状态流重连中" : streamStatus === "offline" ? "状态流离线" : "正在连接状态流"}</p></header>
+        <section className="office-roster-section office-roster-section--external" aria-labelledby="office-external-heading">
+          <header><div><span>EXTERNAL ROSTER</span><h3 id="office-external-heading">外部可调用员工</h3></div><p>可由直接交办、调用包、MCP、A2A 或全局编排触达</p></header>
+          <div className="office-roster">{renderRoster(externalEmployees, false)}</div>
+          {externalEmployees.length === 0 && <div className="office-empty">暂无外部可调用员工。可在员工档案中建立普通员工。</div>}
+        </section>
+        <section className="office-roster-section office-roster-section--system" aria-labelledby="office-system-heading">
+          <header><div><span>INTERNAL CONTROL</span><h3 id="office-system-heading">系统级员工</h3></div><p>不能被外部直接调用，仅接受匹配的内部项目角色调度</p></header>
+          <div className="office-roster">{renderRoster(systemEmployees, true)}</div>
+          {systemEmployees.length === 0 && <div className="office-empty">暂无系统级员工。</div>}
+        </section>
       </section>
 
       <aside className="dispatch-board" aria-label="实时调用记录">

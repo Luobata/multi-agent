@@ -37,6 +37,7 @@ import {
 import { providerRuntimeSummary } from "./providerRuntime";
 import { KnowledgePerspectiveExplorer } from "./knowledgePerspective";
 import { EmployeeKnowledgeGrantModal } from "./employeeKnowledgeGrant";
+import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
 
 interface PageProps {
   data: Bootstrap;
@@ -553,8 +554,11 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
     return (showArchived || employee.status === "active") &&
       `${employee.id} ${employee.identity.displayName} ${employee.description} ${employee.providerId} ${runtime.model} ${runtime.launchCommand}`.toLowerCase().includes(search.toLowerCase());
   }), [data.employees, data.providers, search, showArchived]);
+  const visibleExternal = visible.filter((employee) => !isSystemEmployee(employee));
+  const visibleSystem = visible.filter(isSystemEmployee);
   const [selectedId, setSelectedId] = useState(visible[0]?.id ?? "");
   const selected = data.employees.find((employee) => employee.id === selectedId) ?? visible[0];
+  const selectedSystemScope = selected ? systemEmployeeScope(selected) : undefined;
   const selectedProvider = selected ? data.providers.find((provider) => provider.id === selected.providerId) : undefined;
   const selectedRuntime = providerRuntimeSummary(selectedProvider);
   const selectedRuntimeState = selected ? employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === selected.id), clock) : "idle";
@@ -612,23 +616,31 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       <header className="list-header"><h1>员工档案</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setEditor("new")} aria-label="新建员工"><UtilityIcon name="add" /></button></header>
       <div className="list-tools"><input type="search" placeholder="检索姓名、ID 或职责…" value={search} onChange={(e) => setSearch(e.target.value)} /><label className="archive-toggle"><input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />含归档</label><button className="text-button" disabled={!daemonAvailable} onClick={() => setRegistryOpen(true)}>共享注册表</button></div>
       <div className="record-scroll">
-        {visible.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); const runtimeState = employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id), clock); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
-          <EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} />
-          <span className="employee-card-copy"><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><small>{employee.description}</small><span className="employee-runtime"><span>模型 <code>{runtime.model}</code></span><span title={runtime.launchCommand}>启动 <code>{runtime.launchPreview}</code></span></span></span>
-          <span className="employee-card-stamps"><Stamp status={employee.status} />{runtimeState !== "idle" && <RuntimeStatusChip status={runtimeState} />}</span>
-        </button>; })}
-        {visible.length === 0 && <div className="mini-empty">没有符合条件的员工档案。</div>}
+        {[
+          { id: "external", title: "外部可调用员工", note: "可通过直接交办、调用包或全局编排使用", employees: visibleExternal },
+          { id: "system", title: "系统级员工", note: "仅供内部项目角色调用，可在此管理", employees: visibleSystem }
+        ].map((group) => <section className={`employee-roster-group employee-roster-group--${group.id}`} key={group.id} aria-labelledby={`employee-group-${group.id}`}>
+          <header><div><h2 id={`employee-group-${group.id}`}>{group.title}</h2><span>{group.employees.length}</span></div><p>{group.note}</p></header>
+          <div>{group.employees.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); const runtimeState = employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id), clock); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
+            <EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} />
+            <span className="employee-card-copy"><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><small>{employee.description}</small><span className="employee-runtime"><span>模型 <code>{runtime.model}</code></span><span title={runtime.launchCommand}>启动 <code>{runtime.launchPreview}</code></span></span></span>
+            <span className="employee-card-stamps">{group.id === "system" && <span className="system-level-badge">系统级</span>}<Stamp status={employee.status} />{runtimeState !== "idle" && <RuntimeStatusChip status={runtimeState} />}</span>
+          </button>; })}</div>
+          {group.employees.length === 0 && <div className="mini-empty">{search.trim() ? "本组没有符合条件的档案。" : group.id === "system" ? "暂无系统级员工。" : "暂无外部可调用员工。"}</div>}
+        </section>)}
       </div>
-      <footer className="list-footer"><span>{visible.length} 份档案</span><span>LOCAL</span></footer>
+      <footer className="list-footer"><span>{visibleExternal.length} 位员工 · {visibleSystem.length} 位系统员工</span><span>LOCAL</span></footer>
     </aside>
 
     <main className="detail-pane">
-      {!selected ? <EmptyState title="建立第一位本地员工" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>建立档案</button>}>定义他的背景、职责、提示词、共享 Skill、Provider 与权限。之后可以在任意 MCP 会话直接调用，也可以将他放进协作编排。</EmptyState> : <div className="dossier employee-dossier" style={{ "--dossier-accent": selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT } as React.CSSProperties}>
+      {!selected ? <EmptyState title="建立第一位本地员工" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>建立档案</button>}>定义背景、职责、提示词、共享 Skill、Provider 与权限。普通员工可以对外调用；系统级员工只允许通过内部项目角色使用。</EmptyState> : <div className="dossier employee-dossier" style={{ "--dossier-accent": selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT } as React.CSSProperties}>
         <header className="dossier-cover">
-          <div className="file-index"><span>LOCAL PERSONNEL RECORD</span><code>No. {selected.id.toUpperCase()}</code></div>
-          <div className="dossier-title-row"><EmployeeAvatar className="large" displayName={selected.identity.displayName} presentation={selected.presentation} /><div><h2>{selected.identity.displayName}</h2><p>{selected.description}</p></div><div className="dossier-stamps"><Stamp status={selected.status} />{selectedRuntimeState !== "idle" && <RuntimeStatusChip status={selectedRuntimeState} />}</div></div>
-          <div className="dossier-actions"><button className="button primary" disabled={selected.status === "archived"} onClick={() => scrollRecordIntoView("direct-desk")}>直接交办</button>{selectedRuntimeState === "failed" && <button className="button secondary" onClick={() => { window.location.hash = "runs"; }}>查看故障运行证据</button>}<button className="button secondary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setKnowledgePreviewOpen(true)}>知识试跑</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setPerspectiveOpen(true)}>知识视角</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订档案</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setCloneDraft({ id: `${selected.id}-copy`, displayName: `${selected.identity.displayName} 副本` }); setCloneOpen(true); }}>复制</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div>
+          <div className="file-index"><span>{selectedSystemScope ? "SYSTEM PERSONNEL RECORD" : "LOCAL PERSONNEL RECORD"}</span><code>No. {selected.id.toUpperCase()}</code></div>
+          <div className="dossier-title-row"><EmployeeAvatar className="large" displayName={selected.identity.displayName} presentation={selected.presentation} /><div><h2>{selected.identity.displayName}</h2><p>{selected.description}</p></div><div className="dossier-stamps">{selectedSystemScope && <span className="system-level-badge">系统级</span>}<Stamp status={selected.status} />{selectedRuntimeState !== "idle" && <RuntimeStatusChip status={selectedRuntimeState} />}</div></div>
+          <div className="dossier-actions">{!selectedSystemScope && <button className="button primary" disabled={selected.status === "archived"} onClick={() => scrollRecordIntoView("direct-desk")}>直接交办</button>}{selectedRuntimeState === "failed" && <button className="button secondary" onClick={() => { window.location.hash = "runs"; }}>查看故障运行证据</button>}<button className="button secondary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setKnowledgePreviewOpen(true)}>知识试跑</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setPerspectiveOpen(true)}>知识视角</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订档案</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => { setCloneDraft({ id: `${selected.id}-copy`, displayName: `${selected.identity.displayName} 副本` }); setCloneOpen(true); }}>复制</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div>
         </header>
+
+        {selectedSystemScope && <aside className="system-employee-boundary" aria-label="系统级员工调用边界"><span>SYSTEM / INTERNAL ONLY</span><div><strong>仅供内部管理与项目角色调用</strong><p>不会出现在直接交办、调用包或全局 Workflow 的可调用员工中。</p></div><dl><dt>内部项目</dt><dd><code>{selectedSystemScope.projectId}</code></dd><dt>固定角色</dt><dd><code>{selectedSystemScope.roleId ?? "由项目绑定约束"}</code></dd></dl></aside>}
 
         <DossierSection number="01" title="身份"><div className="fact-grid"><div><span>背景</span><p>{selected.identity.background}</p></div><div><span>职责</span><ul>{selected.identity.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul></div><div><span>目标</span><ul>{selected.identity.goals?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div><div><span>约束</span><ul>{selected.identity.constraints?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div></div></DossierSection>
         <DossierSection number="02" title="提示词"><div className="prompt-preview"><div><span>系统指令</span><p>{selected.systemPrompt}</p></div><div><span>请求指令</span><p>{selected.requestPrompt}</p></div></div></DossierSection>
@@ -640,7 +652,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
         <div className="dossier-columns"><DossierSection number="05" title="Provider"><dl className="ledger"><dt>实例</dt><dd><code>{selected.providerId}</code></dd><dt>模型</dt><dd className="provider-model"><code>{selectedRuntime.model}</code></dd><dt>Adapter</dt><dd>{selectedRuntime.adapter}</dd><dt>最大尝试</dt><dd>{selected.maxAttempts}</dd></dl><div className="provider-launch"><span>启动指令模板</span><pre>{selectedRuntime.launchCommand}</pre><small>当前 Provider 配置中的 argv；模板变量会在运行时渲染，敏感参数仅显示为 ***。</small></div></DossierSection><DossierSection number="06" title="权限"><dl className="ledger"><dt>写入</dt><dd>{selected.permissions.write}</dd><dt>声明工具</dt><dd>{selected.permissions.tools?.join(", ") || "无"}</dd><dt>历史窗口</dt><dd>{selected.contextPolicy.historyLimit} 条</dd><dt>Verdict</dt><dd>{selected.verdict ? <code>{selected.verdict.path}: {selected.verdict.pass.join("/")} | {selected.verdict.block.join("/")}</code> : "未配置"}</dd></dl></DossierSection></div>
         <DossierSection number="07" title="外观"><dl className="ledger horizontal"><dt>强调色</dt><dd><span className="color-chip" style={{ background: selected.presentation.accent ?? DEFAULT_EMPLOYEE_ACCENT }} />{selected.presentation.accent ?? "默认朱红"}</dd><dt>首字母</dt><dd>{selected.presentation.initials || selected.identity.displayName.slice(0, 2)}</dd><dt>头像</dt><dd>{selected.presentation.avatarUrl ? <code className="avatar-source">{selected.presentation.avatarUrl}</code> : "未配置，显示首字母"}</dd></dl></DossierSection>
         <DossierSection number="08" title="版本"><div className="version-strip">{versions.map((version) => <div key={version.version} className={version.version === selected.version ? "current" : ""}><code>v{version.version}</code><span>{version.status === "archived" ? "归档" : version.version === selected.version ? "当前" : "历史"}</span><time>{formatTime(version.updatedAt)}</time></div>)}</div></DossierSection>
-        <div id="direct-desk"><DirectDesk employee={selected} sessions={sessions} refresh={refresh} notify={notify} onContext={(sessionId) => { setContextSessionId(sessionId); setContextOpen(true); }} /></div>
+        {!selectedSystemScope && <div id="direct-desk"><DirectDesk employee={selected} sessions={sessions} refresh={refresh} notify={notify} onContext={(sessionId) => { setContextSessionId(sessionId); setContextOpen(true); }} /></div>}
       </div>}
     </main>
 

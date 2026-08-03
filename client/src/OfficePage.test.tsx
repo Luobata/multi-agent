@@ -30,6 +30,20 @@ function employee(id: string, displayName: string): Employee {
   };
 }
 
+function systemEmployee(id: string, displayName: string): Employee {
+  const base = employee(id, displayName);
+  return {
+    ...base,
+    identity: {
+      ...base.identity,
+      metadata: {
+        internalProjectId: "local-agent-workbench",
+        internalProjectRoleId: "knowledge-steward"
+      }
+    }
+  };
+}
+
 function instance(id: string, employeeId: string, status: WorkInstanceStatus, updatedAt = timestamp, error?: string): WorkInstanceRecord {
   return {
     id,
@@ -70,6 +84,24 @@ function bootstrapWith(overrides: Partial<Bootstrap>): Bootstrap {
 }
 
 describe("Office floor runtime status", () => {
+  it("renders external and system Employees in separate rosters with an internal-only standby state", () => {
+    const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
+    const xiaozhi = systemEmployee("knowledge-steward", "小知 · 项目知识管理员");
+    const html = renderToStaticMarkup(<OfficePage
+      streamStatus="live"
+      data={bootstrapWith({ employees: [mihuhu, xiaozhi] })}
+    />);
+
+    expect(html).toContain('id="office-external-heading"');
+    expect(html).toContain('id="office-system-heading"');
+    expect(html).toContain("外部可调用员工");
+    expect(html).toContain("系统级员工");
+    expect(html).toContain("office-employee--system");
+    expect(html).toContain("仅接受内部项目角色调度");
+    expect(html).toContain("内部项目 local-agent-workbench · 角色 knowledge-steward");
+    expect(html).toContain("等待外部会话调度");
+  });
+
   it("renders a permanent status rail and a runtime chip per seat", () => {
     const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
     const xiaomixiang = employee("xiaomixiang-tester", "小米象 · 测试");
