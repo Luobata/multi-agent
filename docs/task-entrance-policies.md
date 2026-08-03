@@ -4,7 +4,7 @@
 
 请求分流策略（底层仍命名为 Entrance Policy）位于外部请求和实际执行目标之间。它解决“这次请求去哪里”这一层选择，不负责执行团队内部的计划、派单或收敛，也不代表任务已经创建。
 
-`evaluate` 只计算分流决策，不创建 Invocation、Work Instance 或 Run。只有真正调用 `dispatch` 且目标是 Employee、Project Role、Graph 或领队协作时，才会创建可在员工大厅和运行卷宗查看的工单/运行；`direct.mode=caller` 会把控制权交还调用方，不创建内部任务。
+`evaluate` 只计算分流决策，不创建 Invocation、Work Instance 或 Run。只有真正调用 `dispatch` 且目标是 Employee、Project Role、Graph 或协作编排时，才会创建可在员工大厅和运行卷宗查看的工单/运行；`direct.mode=caller` 会把控制权交还调用方，不创建内部任务。
 
 ```text
 结构化调用元数据

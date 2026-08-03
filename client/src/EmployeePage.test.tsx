@@ -16,6 +16,8 @@ const humanizer: Skill = {
   description: "Naturalize Chinese copy.",
   instructions: "Preserve facts and edit the copy.",
   tools: [],
+  owner: "user",
+  injection: "none",
   createdAt: timestamp,
   updatedAt: timestamp
 };
@@ -32,6 +34,8 @@ const employee: Employee = {
   description: "Defines products.",
   systemPrompt: "Act as a product manager.",
   requestPrompt: "Return a product specification.",
+  capabilities: [],
+  scope: { kind: "global" },
   skills: [{ id: humanizer.id, config: {}, enabled: true }],
   skillVersions: { [humanizer.id]: 1 },
   knowledgeProfileIds: ["product-knowledge"],
@@ -57,6 +61,16 @@ const systemEmployee: Employee = {
     }
   },
   description: "系统级知识控制员工。"
+};
+
+const projectEmployee: Employee = {
+  ...employee,
+  id: "park-orchestration-owner",
+  identity: { ...employee.identity, displayName: "乐园协作编排负责人" },
+  description: "项目中的真实负责人员工。",
+  capabilities: ["quality.audit"],
+  scope: { kind: "project", projectId: "disney-park", projectVersion: 1 },
+  template: { id: "orchestration-owner", version: 2 }
 };
 
 const bootstrap: Bootstrap = {
@@ -144,6 +158,18 @@ describe("Employee access grouping", () => {
     expect(html).toContain("修订档案");
     expect(html).toContain("管理绑定");
     expect(html).toContain("调整授权");
+  });
+
+  it("keeps project Employees distinct from system Employees and shows pinned provenance", () => {
+    const data: Bootstrap = { ...bootstrap, employees: [projectEmployee] };
+    const html = renderToStaticMarkup(<EmployeePage data={data} refresh={vi.fn()} notify={vi.fn()} />);
+
+    expect(html).toContain("项目员工");
+    expect(html).toContain("乐园协作编排负责人");
+    expect(html).toContain("disney-park · 固定项目 v1");
+    expect(html).toContain("orchestration-owner · 固定模板 v2");
+    expect(html).toContain("quality.audit");
+    expect(html).not.toContain("SYSTEM / INTERNAL ONLY");
   });
 });
 

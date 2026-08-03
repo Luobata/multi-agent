@@ -12,6 +12,8 @@ const employee: Employee = {
   description: "Uses governed knowledge.",
   systemPrompt: "Use evidence.",
   requestPrompt: "Complete the task.",
+  capabilities: [],
+  scope: { kind: "global" },
   skills: [],
   skillVersions: {},
   knowledgeProfileIds: ["existing-profile"],

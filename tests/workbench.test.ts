@@ -730,11 +730,11 @@ describe("Local Agent Workbench", () => {
     await service.createSkill({ id: "recoverable-skill", description: "Recoverable", instructions: "Keep history." });
     const archived = await service.archiveSkill("recoverable-skill");
     expect(archived).toMatchObject({ status: "archived", version: 2 });
-    expect(service.listSkills()).toEqual([]);
-    expect(service.listSkills(true)[0]).toMatchObject({ id: "recoverable-skill", status: "archived" });
+    expect(service.listSkills().filter((skill) => skill.owner === "user")).toEqual([]);
+    expect(service.listSkills(true)).toContainEqual(expect.objectContaining({ id: "recoverable-skill", status: "archived" }));
     const restored = await service.restoreSkill("recoverable-skill");
     expect(restored).toMatchObject({ status: "active", version: 3 });
-    expect(service.listSkills()).toHaveLength(1);
+    expect(service.listSkills().filter((skill) => skill.owner === "user")).toHaveLength(1);
   });
 
   it("persists graph template provenance separately from visual canvas positions", async () => {
@@ -766,8 +766,8 @@ describe("Local Agent Workbench", () => {
       left.createSkill({ id: "left-skill", description: "Left", instructions: "Left instructions" }),
       right.createSkill({ id: "right-skill", description: "Right", instructions: "Right instructions" })
     ]);
-    expect(left.listSkills().map((skill) => skill.id).sort()).toEqual(["left-skill", "right-skill"]);
-    expect(right.listSkills().map((skill) => skill.id).sort()).toEqual(["left-skill", "right-skill"]);
+    expect(left.listSkills().filter((skill) => skill.owner === "user").map((skill) => skill.id).sort()).toEqual(["left-skill", "right-skill"]);
+    expect(right.listSkills().filter((skill) => skill.owner === "user").map((skill) => skill.id).sort()).toEqual(["left-skill", "right-skill"]);
   });
 
   it("refuses to persist plaintext command Provider environment values", async () => {
@@ -782,5 +782,159 @@ describe("Local Agent Workbench", () => {
       command: process.execPath,
       env: { API_TOKEN: "$ENV:MULTI_AGENT_MODEL_TOKEN" }
     })).resolves.toBeUndefined();
+  });
+
+  it("normalizes legacy Skill and Employee fields and protects the deterministic system Skill", async () => {
+    const root = temporaryRoot();
+    let service = await WorkbenchService.open({ dataRoot: root });
+    await service.createSkill({
+      id: "legacy-capability",
+      description: "Legacy user-owned capability.",
+      instructions: "Preserve this user Skill."
+    });
+    await service.createEmployee({
+      id: "legacy-project-worker",
+      identity: {
+        displayName: "Legacy Project Worker",
+        background: "Predates structured scope.",
+        responsibilities: ["Work inside one project"],
+        metadata: { internalProjectId: "legacy-project" }
+      },
+      skills: ["legacy-capability"]
+    });
+
+    const statePath = path.join(root, "state.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      skills: Record<string, Record<string, unknown>>;
+      skillHistory: Record<string, Array<Record<string, unknown>>>;
+      employees: Record<string, { current: Record<string, unknown>; versions: Array<Record<string, unknown>> }>;
+      employeeTemplates?: unknown;
+    };
+    delete state.skills["team-orchestration"];
+    delete state.skillHistory["team-orchestration"];
+    delete state.skills["legacy-capability"]?.owner;
+    delete state.skills["legacy-capability"]?.injection;
+    for (const version of state.skillHistory["legacy-capability"] ?? []) {
+      delete version.owner;
+      delete version.injection;
+    }
+    delete state.employeeTemplates;
+    delete state.employees["legacy-project-worker"]?.current.capabilities;
+    delete state.employees["legacy-project-worker"]?.current.scope;
+    for (const version of state.employees["legacy-project-worker"]?.versions ?? []) {
+      delete version.capabilities;
+      delete version.scope;
+    }
+    fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+    service = await WorkbenchService.open({ dataRoot: root });
+    expect(service.listSkills(true)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "legacy-capability", owner: "user", injection: "none" }),
+      expect.objectContaining({ id: "team-orchestration", owner: "system", injection: "supervisor", status: "active" })
+    ]));
+    expect(service.getEmployee("legacy-project-worker")).toMatchObject({
+      capabilities: [],
+      scope: { kind: "project", projectId: "legacy-project", projectVersion: 1 }
+    });
+    expect(service.snapshot().employeeTemplates).toEqual({});
+
+    await expect(service.updateSkill("team-orchestration", { instructions: "User override" })).rejects.toThrow(/system skill/);
+    await expect(service.archiveSkill("team-orchestration")).rejects.toThrow(/system skill/);
+    await expect(service.restoreSkill("team-orchestration")).rejects.toThrow(/system skill/);
+    await expect(service.createEmployee({
+      id: "manual-supervisor-skill",
+      identity: { displayName: "Manual", background: "Invalid binding.", responsibilities: ["Coordinate"] },
+      skills: ["team-orchestration"]
+    })).rejects.toThrow(/cannot be bound.*manually/);
+  });
+
+  it("keeps Employee Templates non-executable, versioned, and statically copied into Employees", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const templateProjectRoot = temporaryRoot();
+    await service.createProject({
+      id: "template-project",
+      name: "Template Project",
+      rootPath: templateProjectRoot,
+      descriptorPath: "/tmp/template-project/multi-agent.project.yaml",
+      roles: [{ id: "builder", displayName: "Builder", description: "Build project changes.", instructions: "Build safely." }]
+    });
+    const firstTemplate = await service.createEmployeeTemplate({
+      id: "backend-builder",
+      displayName: "Backend builder",
+      description: "Defaults for a project backend employee.",
+      defaults: {
+        identity: { background: "Builds backend systems.", responsibilities: ["Implement backend changes"] },
+        systemPrompt: "BACKEND_TEMPLATE_V1",
+        capabilities: ["code.backend", "quality.audit", "code.backend"],
+        scope: { kind: "project", projectId: "template-project", projectVersion: 1 }
+      }
+    });
+    expect(firstTemplate).toMatchObject({ version: 1, defaults: { capabilities: ["code.backend", "quality.audit"] } });
+
+    const first = await service.createEmployeeFromTemplate("backend-builder", {
+      id: "project-backend-one",
+      identity: { displayName: "Project Backend One" }
+    });
+    expect(first).toMatchObject({
+      version: 1,
+      template: { id: "backend-builder", version: 1 },
+      systemPrompt: "BACKEND_TEMPLATE_V1",
+      scope: { kind: "project", projectId: "template-project", projectVersion: 1 },
+      capabilities: ["code.backend", "quality.audit"]
+    });
+
+    const secondTemplate = await service.updateEmployeeTemplate("backend-builder", {
+      defaults: {
+        ...firstTemplate.defaults,
+        systemPrompt: "BACKEND_TEMPLATE_V2",
+        capabilities: [...(firstTemplate.defaults.capabilities ?? []), "quality.test"]
+      }
+    });
+    const second = await service.createEmployeeFromTemplate("backend-builder", {
+      id: "project-backend-two",
+      templateVersion: secondTemplate.version,
+      identity: { displayName: "Project Backend Two" }
+    });
+    expect(second).toMatchObject({
+      template: { id: "backend-builder", version: 2 },
+      systemPrompt: "BACKEND_TEMPLATE_V2",
+      capabilities: ["code.backend", "quality.audit", "quality.test"]
+    });
+    expect(service.getEmployee(first.id)).toMatchObject({
+      template: { id: "backend-builder", version: 1 },
+      systemPrompt: "BACKEND_TEMPLATE_V1",
+      version: 1
+    });
+    await service.updateEmployee(first.id, { description: "Explicit Employee-only update." });
+    expect(service.getEmployee(first.id)).toMatchObject({
+      template: { id: "backend-builder", version: 1 },
+      systemPrompt: "BACKEND_TEMPLATE_V1",
+      version: 2
+    });
+    await expect(service.createWorkflow({
+      id: "template-is-not-an-employee",
+      nodes: [{ id: "work", employeeId: "backend-builder" }]
+    })).rejects.toThrow(/employee not found/);
+    await service.updateProject("template-project", {
+      id: "template-project",
+      name: "Template Project",
+      description: "Project version two.",
+      rootPath: templateProjectRoot,
+      descriptorPath: "/tmp/template-project/multi-agent.project.yaml",
+      roles: [{ id: "builder", displayName: "Builder", description: "Build project changes.", instructions: "Build safely." }]
+    });
+    await expect(service.saveProjectBinding("template-project", {
+      roles: [{ roleId: "builder", employeeId: first.id }]
+    })).rejects.toThrow(/fixed to project template-project v1, not v2/);
+
+    const archived = await service.archiveEmployeeTemplate("backend-builder");
+    expect(archived).toMatchObject({ status: "archived", version: 3 });
+    await expect(service.createEmployeeFromTemplate("backend-builder", {
+      id: "archived-template-worker",
+      identity: { displayName: "Archived Template Worker" }
+    })).rejects.toThrow(/template backend-builder is archived/);
+    const restored = await service.restoreEmployeeTemplate("backend-builder");
+    expect(restored).toMatchObject({ status: "active", version: 4 });
+    expect(service.getEmployeeTemplateVersions("backend-builder").map((version) => version.version)).toEqual([4, 3, 2, 1]);
   });
 });

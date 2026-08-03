@@ -104,7 +104,10 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
         asyncWorkflowInvocations: "v1",
         supervisorWorkflows: "v1",
         managementPolicies: "versioned-v1",
-        entrancePolicies: "versioned-routing-v1"
+        entrancePolicies: "versioned-routing-v1",
+        employeeTemplates: "versioned-static-v1",
+        employeeScopes: "version-pinned-v1",
+        systemSkills: "read-only-v1"
       }
     });
   });
@@ -118,6 +121,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       knowledgeChanges: service.listKnowledgeChangeRequests(),
       architectureTemplates: service.listArchitectureTemplates(),
       employees: service.listEmployees(true),
+      employeeTemplates: service.listEmployeeTemplates(true),
       managementPolicies: service.listManagementPolicies(true),
       entrancePolicies: service.listEntrancePolicies(true),
       workflows: service.listWorkflows(true),
@@ -343,6 +347,36 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       request.body,
       invocationSource(request, "http")
     ));
+  }));
+
+  app.get("/api/employee-templates", (request, response) => {
+    send(response, service.listEmployeeTemplates(booleanQuery(request.query.includeArchived)));
+  });
+  app.post("/api/employee-templates", asyncRoute(async (request, response) => {
+    send(response, await service.createEmployeeTemplate(request.body), 201);
+  }));
+  app.get("/api/employee-templates/:id", (request, response, next) => {
+    try {
+      const id = routeParam(request, "id");
+      send(response, {
+        template: service.getEmployeeTemplate(id),
+        versions: service.getEmployeeTemplateVersions(id)
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.patch("/api/employee-templates/:id", asyncRoute(async (request, response) => {
+    send(response, await service.updateEmployeeTemplate(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/employee-templates/:id/archive", asyncRoute(async (request, response) => {
+    send(response, await service.archiveEmployeeTemplate(routeParam(request, "id")));
+  }));
+  app.post("/api/employee-templates/:id/restore", asyncRoute(async (request, response) => {
+    send(response, await service.restoreEmployeeTemplate(routeParam(request, "id")));
+  }));
+  app.post("/api/employee-templates/:id/employees", asyncRoute(async (request, response) => {
+    send(response, await service.createEmployeeFromTemplate(routeParam(request, "id"), request.body), 201);
   }));
 
   app.get("/api/employees", (request, response) => {

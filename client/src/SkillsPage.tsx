@@ -103,17 +103,21 @@ function SkillEditor({ skill, onClose, onSaved, notify }: {
 }
 
 function SkillInspector({ skill, data, onClose }: { skill: Skill; data: Bootstrap; onClose: () => void }) {
+  const isSystem = skill.owner === "system";
   const bindings = data.employees.flatMap((employee) => employee.skills
     .filter((binding) => bindingId(binding) === skill.id)
     .map((binding) => ({ employee, enabled: bindingEnabled(binding) })));
-  return <Modal title={skill.displayName} eyebrow={`${skill.id} · v${skill.version}`} onClose={onClose} wide>
+  return <Modal title={skill.displayName} eyebrow={`${skill.id} · v${skill.version}${isSystem ? " · 系统能力" : ""}`} onClose={onClose} wide>
     <div className="skill-inspector">
-      <div className="skill-inspector-head"><Stamp status={skill.status} /><p>{skill.description}</p><time>更新于 {formatTime(skill.updatedAt)}</time></div>
+      <div className="skill-inspector-head"><Stamp status={skill.status} label={isSystem ? "系统 · 自动注入" : undefined} /><p>{skill.description}</p><time>更新于 {formatTime(skill.updatedAt)}</time></div>
+      {isSystem && <div className="system-skill-note" role="note"><strong>系统能力 · 只读</strong><p>{skill.injection === "supervisor" ? "任何被放进领队位置的员工会在运行时临时获得该能力；它不会写入员工档案，也不接受手工修订、归档、恢复或绑定。" : "由系统维护，不接受手工修订、归档、恢复或绑定。"}</p></div>}
       <div className="skill-inspector-grid">
         <section><h3>可复用指令</h3><pre>{skill.instructions}</pre></section>
         <section><h3>配置契约</h3><pre className="mono">{skill.configSchema ? JSON.stringify(skill.configSchema, null, 2) : "未声明配置 Schema"}</pre><h3>工具</h3><div className="tag-row">{skill.tools.length ? skill.tools.map((tool) => <code className="paper-tag" key={tool}>{tool}</code>) : <span className="muted">无工具声明</span>}</div></section>
       </div>
-      <section className="skill-binding-summary"><h3>员工绑定</h3>{bindings.length ? bindings.map(({ employee, enabled }) => <div key={employee.id}><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><Stamp status={enabled ? "active" : "archived"} label={enabled ? "已启用" : "已停用"} /></div>) : <p className="muted">尚未绑定到任何员工。</p>}</section>
+      {isSystem
+        ? <section className="skill-binding-summary"><h3>使用方式</h3><p className="muted">由 Supervisor 编排物化时按领队位置自动注入并固定版本，成员不会获得；注入版本与原因写入 Run 证据。</p></section>
+        : <section className="skill-binding-summary"><h3>员工绑定</h3>{bindings.length ? bindings.map(({ employee, enabled }) => <div key={employee.id}><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><Stamp status={enabled ? "active" : "archived"} label={enabled ? "已启用" : "已停用"} /></div>) : <p className="muted">尚未绑定到任何员工。</p>}</section>}
     </div>
   </Modal>;
 }
@@ -130,8 +134,10 @@ export function SkillsPage({ data, refresh, notify }: PageProps) {
     const haystack = `${skill.id} ${skill.displayName} ${skill.description} ${skill.tools.join(" ")}`.toLowerCase();
     return haystack.includes(search.trim().toLowerCase());
   }), [data.skills, search, showArchived]);
+  const systemSkills = visible.filter((skill) => skill.owner === "system");
+  const customSkills = visible.filter((skill) => skill.owner !== "system");
   const inspect = data.skills.find((skill) => skill.id === inspectId);
-  const editing = editor && editor !== "new" ? data.skills.find((skill) => skill.id === editor) : undefined;
+  const editing = editor && editor !== "new" ? data.skills.find((skill) => skill.id === editor && skill.owner !== "system") : undefined;
   const archived = data.skills.filter((skill) => skill.status === "archived").length;
 
   const archive = async (skill: Skill) => {
@@ -151,11 +157,26 @@ export function SkillsPage({ data, refresh, notify }: PageProps) {
   };
 
   return <main className="library-page">
-    <header className="library-header"><div><p className="record-meta">LIBRARY / LOCAL</p><h1>Skills</h1><p>{data.skills.length} 个可复用能力 · {data.employees.length} 份员工档案 · {archived} 个归档</p></div><button className="button primary library-primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}><UtilityIcon name="add" />注册 Skill</button></header>
+    <header className="library-header"><div><p className="record-meta">LIBRARY / LOCAL</p><h1>Skills</h1><p>{data.skills.length} 个可复用能力 · 系统 {data.skills.filter((skill) => skill.owner === "system").length} · 自定义 {data.skills.filter((skill) => skill.owner !== "system").length} · {data.employees.length} 份员工档案 · {archived} 个归档</p></div><button className="button primary library-primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}><UtilityIcon name="add" />注册 Skill</button></header>
     <section className="library-toolbar"><label className="library-search"><span>检索</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索名称、ID、说明或工具…" /></label><label className="check-line"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} />显示归档</label><span>{visible.length} 条记录</span></section>
-    <section className="skill-ledger" aria-label="Skill 注册表">
+    <section className="skill-group" aria-labelledby="skill-group-system">
+      <header className="skill-group-heading"><div><h2 id="skill-group-system">系统能力</h2><span>{systemSkills.length}</span></div><p>由系统维护并按领队位置自动注入；可查看版本、指令与工具，但不接受修订、归档、恢复或手工绑定。</p></header>
+      <div className="skill-ledger" aria-label="系统能力">
+        {systemSkills.map((skill) => <article className="skill-ledger-row skill-ledger-row--system" key={skill.id}>
+          <button type="button" className="skill-ledger-identity" onClick={() => setInspectId(skill.id)}><span className="skill-book" aria-hidden="true">S</span><span><strong>{skill.displayName}</strong><small>{skill.description}</small></span></button>
+          <div className="skill-source"><code>SYSTEM</code><span>{skill.id}</span><small>revision v{skill.version}</small></div>
+          <div className="skill-bound"><strong>按领队位置注入</strong><span>{skill.injection === "supervisor" ? "仅注入领队运行时" : "由系统注入"}</span></div>
+          <Stamp status={skill.status} label={skill.status === "active" ? "自动注入" : "已归档"} />
+          <div className="skill-row-actions"><button type="button" className="text-button" onClick={() => setInspectId(skill.id)}>查看</button></div>
+        </article>)}
+        {systemSkills.length === 0 && <div className="library-empty">{search.trim() ? "没有符合条件的系统能力。" : "当前核心尚未注册系统能力。"}</div>}
+      </div>
+    </section>
+    <section className="skill-group" aria-labelledby="skill-group-custom">
+      <header className="skill-group-heading"><div><h2 id="skill-group-custom">自定义能力</h2><span>{customSkills.length}</span></div><p>由你注册、版本化修订并绑定到员工的可复用能力。</p></header>
+      <div className="skill-ledger" aria-label="自定义能力">
       <header className="skill-ledger-row skill-ledger-labels"><span>Skill</span><span>来源 / 版本</span><span>员工绑定</span><span>状态</span><span>操作</span></header>
-      {visible.map((skill) => {
+      {customSkills.map((skill) => {
         const bound = data.employees.filter((employee) => employee.skills.some((binding) => bindingId(binding) === skill.id));
         const enabled = data.employees.filter((employee) => employee.skills.some((binding) => bindingId(binding) === skill.id && bindingEnabled(binding))).length;
         return <article className={`skill-ledger-row ${skill.status === "archived" ? "is-archived" : ""}`} key={skill.id}>
@@ -166,9 +187,10 @@ export function SkillsPage({ data, refresh, notify }: PageProps) {
           <div className="skill-row-actions"><button type="button" className="text-button" onClick={() => setInspectId(skill.id)}>查看</button>{skill.status === "active" ? <><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => setEditor(skill.id)}>修订</button><button type="button" className="text-button danger-text" disabled={!daemonAvailable} onClick={() => setArchiveId(skill.id)}>归档</button></> : <button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => void restore(skill)}>恢复</button>}</div>
         </article>;
       })}
-      {visible.length === 0 && <div className="library-empty">没有符合当前条件的 Skill。</div>}
+      {customSkills.length === 0 && <div className="library-empty">没有符合当前条件的自定义 Skill。</div>}
+      </div>
     </section>
-    <footer className="library-footnote"><b>版本策略</b><span>修订会生成新版本；员工继续固定原版本，直到明确重新绑定。归档不会物理删除历史证据。</span></footer>
+    <footer className="library-footnote"><b>版本策略</b><span>修订会生成新版本；员工继续固定原版本，直到明确重新绑定。归档不会物理删除历史证据。系统能力由核心维护，只能查看。</span></footer>
 
     {editor && <SkillEditor skill={editing} notify={notify} onClose={() => setEditor(null)} onSaved={async () => { setEditor(null); await refresh(); }} />}
     {inspect && <SkillInspector skill={inspect} data={data} onClose={() => setInspectId(undefined)} />}

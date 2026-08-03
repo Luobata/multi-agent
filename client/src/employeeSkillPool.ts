@@ -18,6 +18,8 @@ export function filterEmployeeSkillChoices(
   const query = options.search.trim().toLowerCase();
 
   return skills.filter((skill) => {
+    // System-owned skills (e.g. team-orchestration) are injected by position and can never be bound manually.
+    if (skill.owner === "system") return false;
     if (options.mode === "add") {
       if (skill.status !== "active" || initialBoundIds.has(skill.id)) return false;
     } else if (skill.status !== "active" && !selectedIds.has(skill.id)) {

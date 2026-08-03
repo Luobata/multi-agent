@@ -16,6 +16,8 @@ function employee(id: string, displayName: string): Employee {
     description: "Test employee.",
     systemPrompt: "Test.",
     requestPrompt: "Return evidence.",
+    capabilities: [],
+    scope: { kind: "global" },
     skills: [],
     skillVersions: {},
     providerId: "mock",
@@ -73,11 +75,21 @@ const supervisorWorkflow: SupervisorWorkflow = {
   architecture: "supervisor",
   description: "动态组织评审成员。",
   supervisor: { employeeId: "team-manager", employeeVersion: 1 },
+  orchestrationSkill: { id: "team-orchestration", version: 1 },
   managementPolicy: { id: managementPolicy.id, version: 2 },
   members: [
     { roleId: "researcher", description: "收集证据", employeeId: "mihuhu-frontend-engineer", employeeVersion: 1 },
     { roleId: "reviewer", description: "独立审查", employeeId: "xiaomixiang-tester", employeeVersion: 1 }
   ],
+  flow: {
+    version: 1,
+    stages: [
+      { id: "plan", kind: "supervisor", title: "计划" },
+      { id: "delegation-loop", kind: "delegation-loop", title: "动态分工" },
+      { id: "delivery", kind: "delivery", title: "交付" }
+    ],
+    gates: []
+  },
   createdAt: timestamp,
   updatedAt: timestamp
 };
@@ -359,13 +371,16 @@ describe("WorkflowPage async run order", () => {
     await flush();
 
     const supervisorTab = Array.from(container.querySelectorAll<HTMLButtonElement>(".orchestration-switcher button"))
-      .find((button) => button.textContent?.includes("领队协作"));
+      .find((button) => button.textContent?.includes("协作编排"));
     if (!supervisorTab) throw new Error("Supervisor tab not found");
     click(supervisorTab);
     await flush();
     expect(container.textContent).toContain("LEAD TEAM WORKFLOW RECORD");
     expect(container.textContent).toContain("固定 v2 · 最新 v3");
-    expect(container.textContent).toContain("运行中增量生长");
+    expect(container.textContent).toContain("固定流程与动态分工");
+    expect(container.textContent).toContain("领队生成计划");
+    expect(container.textContent).toContain("动态分工");
+    expect(container.textContent).toContain("team-orchestration");
     expect(container.textContent).toContain("researcher");
 
     const editSupervisor = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
@@ -375,6 +390,8 @@ describe("WorkflowPage async run order", () => {
     await flush();
     expect(container.querySelector<HTMLButtonElement>('[aria-label="选择管理策略固定版本"]')?.textContent).toContain("v2 · 历史");
     expect(container.textContent).toContain("升级会按新版本角色槽重建成员清册");
+    expect(container.textContent).toContain("固定流程与交付门禁");
+    expect(container.textContent).toContain("添加能力门禁");
     const closeModal = container.querySelector<HTMLButtonElement>('[aria-label="关闭弹窗"]');
     if (closeModal) click(closeModal);
 
@@ -388,28 +405,32 @@ describe("WorkflowPage async run order", () => {
     expect(container.textContent).toContain("review-supervisor");
 
     const entranceTab = Array.from(container.querySelectorAll<HTMLButtonElement>(".orchestration-switcher button"))
-      .find((button) => button.textContent?.includes("请求分流"));
+      .find((button) => button.textContent?.includes("开始一项工作"));
     if (!entranceTab) throw new Error("Entrance Policy tab not found");
     expect(container.querySelectorAll(".orchestration-switcher nav button")).toHaveLength(4);
     click(entranceTab);
     await flush();
     expect(container.textContent).toContain("REQUEST ROUTING POLICY RECORD");
-    expect(container.textContent).toContain("请求先分流");
-    expect(container.textContent).toContain("evaluate 只返回决策，不创建任何记录");
-    expect(container.textContent).toContain("真正执行 dispatch");
-    expect(container.textContent).toContain("员工大厅");
-    expect(container.textContent).toContain("运行卷宗");
-    expect(container.textContent).toContain("交还主 Agent");
+    expect(container.textContent).toContain("讨论是默认状态");
+    expect(container.textContent).toContain("继续讨论");
+    expect(container.textContent).toContain("交给一位员工");
+    expect(container.textContent).toContain("开始协作编排");
+    expect(container.querySelector(".entrance-advanced")).not.toBeNull();
+    expect(container.querySelector(".entrance-target-cards")).not.toBeNull();
 
+    const employeeIntent = Array.from(container.querySelectorAll<HTMLButtonElement>(".work-intent-grid button"))
+      .find((button) => button.textContent?.includes("交给一位员工"));
+    if (!employeeIntent) throw new Error("Single Employee intent not found");
+    click(employeeIntent);
     const evaluateButton = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.includes("试算分流"));
+      .find((button) => button.textContent?.includes("预览工作去向"));
     if (!evaluateButton) throw new Error("Evaluate Entrance Policy button not found");
     click(evaluateButton);
     await flush();
     const evaluationCall = fetchMock.mock.calls.find(([input]) => String(input) === `/api/entrance-policies/${entrancePolicy.id}/evaluate`);
     expect(evaluationCall?.[1]?.method).toBe("POST");
     const evaluationBody = JSON.parse(String(evaluationCall?.[1]?.body)) as Record<string, unknown>;
-    expect(evaluationBody).toMatchObject({ route: "auto", tags: [], signals: {}, source: { kind: "workbench" } });
+    expect(evaluationBody).toMatchObject({ route: "specialist", specialistKey: "frontend", tags: [], signals: {}, source: { kind: "workbench" } });
     expect(evaluationBody).not.toHaveProperty("message");
     expect(container.textContent).toContain("不会创建内部工单或运行，也不会静默升级给领队");
 
@@ -444,7 +465,7 @@ describe("WorkflowPage async run order", () => {
     await flush();
 
     const entranceTab = Array.from(container.querySelectorAll<HTMLButtonElement>(".orchestration-switcher button"))
-      .find((button) => button.textContent?.includes("请求分流"));
+      .find((button) => button.textContent?.includes("开始一项工作"));
     if (!entranceTab) throw new Error("Request Routing tab not found");
     click(entranceTab);
     await flush();

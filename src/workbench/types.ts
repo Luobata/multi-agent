@@ -19,10 +19,15 @@ import type {
 
 export type RecordStatus = "active" | "archived";
 
+export type SkillOwner = "system" | "user";
+export type SkillInjection = "none" | "supervisor";
+
 export interface WorkbenchSkillDefinition {
   id: string;
   version: number;
   status: RecordStatus;
+  owner: SkillOwner;
+  injection: SkillInjection;
   displayName: string;
   description: string;
   instructions: string;
@@ -42,6 +47,15 @@ export interface EmployeeContextPolicy {
   historyLimit: number;
 }
 
+export type EmployeeScope =
+  | { kind: "global" }
+  | { kind: "project"; projectId: string; projectVersion: number };
+
+export interface EmployeeTemplateSource {
+  id: string;
+  version: number;
+}
+
 export interface EmployeeDefinition {
   id: string;
   version: number;
@@ -50,6 +64,9 @@ export interface EmployeeDefinition {
   description: string;
   systemPrompt: string;
   requestPrompt: string;
+  capabilities: string[];
+  scope: EmployeeScope;
+  template?: EmployeeTemplateSource;
   skills: RoleSkillBinding[];
   skillVersions: Record<string, number>;
   knowledgeProfileIds: string[];
@@ -68,6 +85,26 @@ export interface EmployeeDefinition {
 export interface EmployeeRecord {
   current: EmployeeDefinition;
   versions: EmployeeDefinition[];
+}
+
+export type EmployeeTemplateDefaults = Omit<EmployeeCreateInput, "id" | "identity"> & {
+  identity: Omit<RoleIdentityDefinition, "displayName">;
+};
+
+export interface EmployeeTemplateDefinition {
+  id: string;
+  version: number;
+  status: RecordStatus;
+  displayName: string;
+  description: string;
+  defaults: EmployeeTemplateDefaults;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EmployeeTemplateRecord {
+  current: EmployeeTemplateDefinition;
+  versions: EmployeeTemplateDefinition[];
 }
 
 export type ManagementPolicyWorkerFailure = "observe-and-replan" | "fail-fast";
@@ -149,14 +186,44 @@ export interface SupervisorMemberBinding extends SupervisorEmployeeBinding {
   description: string;
 }
 
+export type SupervisorWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
+
+export type SupervisorFlowStage =
+  | { id: string; kind: "supervisor"; title: string }
+  | { id: string; kind: "delegation-loop"; title: string }
+  | { id: string; kind: "gate"; title: string; gateId: string }
+  | { id: string; kind: "delivery"; title: string };
+
+export interface SupervisorGate {
+  id: string;
+  requiredCapability: string;
+  mode: "after-each-delegation" | "before-completion";
+  required: boolean;
+  instructions: string;
+  fallback: "supervisor" | "block";
+}
+
+export interface SupervisorFlowDefinition {
+  version: number;
+  stages: SupervisorFlowStage[];
+  gates: SupervisorGate[];
+}
+
+export type SupervisorFlowInput = Omit<SupervisorFlowDefinition, "version">;
+
 export interface SupervisorWorkbenchWorkflowDefinition extends WorkbenchWorkflowBase {
   architecture: "supervisor";
   supervisor: SupervisorEmployeeBinding;
+  orchestrationSkill: {
+    id: "team-orchestration";
+    version: number;
+  };
   managementPolicy: {
     id: string;
     version: number;
   };
   members: SupervisorMemberBinding[];
+  flow: SupervisorFlowDefinition;
 }
 
 export type WorkbenchWorkflowDefinition =
@@ -423,7 +490,7 @@ export interface WorkInstanceRecord {
   nodeId: string;
   /** Workflow-local responsibility slot (distinct from Employee identity). */
   roleId?: string;
-  kind?: "graph" | "supervisor" | "member";
+  kind?: "graph" | "supervisor" | "member" | "gate";
   round?: number;
   parentNodeId?: string;
   runId: string;
@@ -553,6 +620,7 @@ export interface WorkbenchState {
   knowledgeProfiles: Record<string, KnowledgeProfileRecord>;
   knowledgeChangeRequests: Record<string, KnowledgeChangeRequest>;
   employees: Record<string, EmployeeRecord>;
+  employeeTemplates: Record<string, EmployeeTemplateRecord>;
   managementPolicies: Record<string, ManagementPolicyRecord>;
   entrancePolicies: Record<string, EntrancePolicyRecord>;
   workflows: Record<string, WorkbenchWorkflowRecord>;
@@ -610,6 +678,8 @@ export interface EmployeeCreateInput {
   description?: string;
   systemPrompt?: string;
   requestPrompt?: string;
+  capabilities?: string[];
+  scope?: EmployeeScope;
   skills?: RoleSkillBinding[];
   skillVersions?: Record<string, number>;
   knowledgeProfileIds?: string[];
@@ -624,6 +694,21 @@ export interface EmployeeCreateInput {
 }
 
 export type EmployeeUpdateInput = Partial<Omit<EmployeeCreateInput, "id">>;
+
+export interface EmployeeTemplateCreateInput {
+  id: string;
+  displayName?: string;
+  description: string;
+  defaults: EmployeeTemplateDefaults;
+}
+
+export type EmployeeTemplateUpdateInput = Partial<Omit<EmployeeTemplateCreateInput, "id">>;
+
+export interface EmployeeFromTemplateCreateInput extends Partial<Omit<EmployeeCreateInput, "id" | "identity">> {
+  id: string;
+  templateVersion?: number;
+  identity: Pick<RoleIdentityDefinition, "displayName"> & Partial<Omit<RoleIdentityDefinition, "displayName">>;
+}
 
 export interface SkillCreateInput {
   id: string;
@@ -715,6 +800,7 @@ export interface SupervisorWorkflowCreateInput extends WorkflowCreateBase {
     employeeId: string;
     employeeVersion?: number;
   }>;
+  flow?: SupervisorFlowInput;
 }
 
 export type WorkflowCreateInput = GraphWorkflowCreateInput | SupervisorWorkflowCreateInput;

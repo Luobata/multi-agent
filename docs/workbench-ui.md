@@ -1,4 +1,4 @@
-# Workbench UI：小镇四季档案室
+# Workbench UI：迪士尼乐园
 
 Workbench 使用原创“治愈像素小镇档案”语言，把 Employee、Project、Workflow、Run 与 Publication 组织为可查阅、可核对的本地记录。视觉规范的完整基线见根目录 [`design.md`](../design.md)。
 

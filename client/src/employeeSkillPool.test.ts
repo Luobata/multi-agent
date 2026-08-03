@@ -11,13 +11,16 @@ function skill(id: string, status: Skill["status"] = "active"): Skill {
     description: `${id} description`,
     instructions: `${id} instructions`,
     tools: [],
+    owner: "user",
+    injection: "none",
     createdAt: "2026-07-31T00:00:00.000Z",
     updatedAt: "2026-07-31T00:00:00.000Z"
   };
 }
 
 describe("employee Skill pool choices", () => {
-  const skills = [skill("humanizer-zh"), skill("backend-review"), skill("legacy-skill", "archived")];
+  const systemSkill = { ...skill("team-orchestration"), owner: "system" as const, injection: "supervisor" as const };
+  const skills = [skill("humanizer-zh"), skill("backend-review"), skill("legacy-skill", "archived"), systemSkill];
 
   it("shows only active, initially unbound Skills in add mode", () => {
     const visible = filterEmployeeSkillChoices(skills, {
@@ -43,5 +46,14 @@ describe("employee Skill pool choices", () => {
 
   it("counts only newly selected bindings", () => {
     expect(countAddedSkillBindings(["humanizer-zh", "backend-review"], ["humanizer-zh"])).toBe(1);
+  });
+
+  it("never exposes system Skills for manual Employee binding", () => {
+    expect(filterEmployeeSkillChoices(skills, {
+      mode: "manage",
+      initialBoundIds: [],
+      selectedIds: [],
+      search: "team"
+    })).toEqual([]);
   });
 });

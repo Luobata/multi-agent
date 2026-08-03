@@ -17,6 +17,8 @@ function employee(id: string, displayName: string): Employee {
     description: "Test employee.",
     systemPrompt: "Test.",
     requestPrompt: "Return evidence.",
+    capabilities: [],
+    scope: { kind: "global" },
     skills: [],
     skillVersions: {},
     providerId: "mock",

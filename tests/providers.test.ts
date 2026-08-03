@@ -48,6 +48,37 @@ describe("provider adapters", () => {
     });
   });
 
+  it("lets the local mock satisfy an explicit Supervisor Gate fallback deterministically", async () => {
+    const adapter = createDefaultProviderRegistry().get("mock")!;
+    const response = await adapter.invoke({
+      providerId: "mock",
+      definition: { adapter: "mock", outputProtocol: "json", latencyMs: 0 },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {
+        role: {
+          id: "supervisor",
+          identity: { displayName: "Local Supervisor" },
+          outputSchema: {
+            oneOf: [
+              { type: "object", properties: { action: { const: "satisfy-gate" } } },
+              { type: "object", properties: { action: { const: "finish" } } }
+            ]
+          }
+        },
+        node: { with: { __gateExecution: { gateId: "audit" } } },
+        input: { message: "coordinate this" },
+        needs: {}
+      }
+    });
+    expect(JSON.parse(response.stdout)).toEqual({
+      action: "satisfy-gate",
+      gateId: "audit",
+      summary: "Local Supervisor satisfied Gate audit with the local mock provider.",
+      evidence: { gateId: "audit", deterministicMock: true }
+    });
+  });
+
   it("renders a provider-specific stdin template", async () => {
     const adapter = createDefaultProviderRegistry().get("command");
     expect(adapter).toBeDefined();

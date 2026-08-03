@@ -167,12 +167,12 @@ function targetLabel(target: EntrancePolicyResolvedTarget): string {
   if (target.kind === "project-role") {
     return `Project Role ${target.projectId}/${target.roleId} · project v${target.projectVersion} · binding v${target.projectBindingVersion} · ${target.employeeId} v${target.employeeVersion}`;
   }
-  return `${target.kind === "graph-workflow" ? "Graph" : "领队协作"} ${target.workflowId} · v${target.workflowVersion}`;
+  return `${target.kind === "graph-workflow" ? "Graph" : "协作编排"} ${target.workflowId} · v${target.workflowVersion}`;
 }
 
 function resultLabel(result: EntrancePolicyRouteResult): string {
   if (result.route === "direct") return "direct · 直达";
-  if (result.route === "leader") return "leader · 领队协作";
+  if (result.route === "leader") return "leader · 协作编排";
   return `specialist · ${result.specialistKey}`;
 }
 
@@ -183,20 +183,13 @@ function decidedByLabel(decision: EntrancePolicyDecision): string {
 }
 
 function RequestLifecycle() {
-  return <section className="entrance-lifecycle" aria-label="请求分流生命周期">
-    <header><span>REQUEST → DECISION → WORK</span><strong>请求先分流；只有进入内部执行目标后，才会产生可查看的工单与运行。</strong></header>
-    <div className="entrance-lifecycle-flow">
-      <article className="entrance-lifecycle-step"><code>01 · REQUEST</code><b>结构化请求</b><small>route、tags、source、signals</small></article>
-      <i aria-hidden="true">→</i>
-      <article className="entrance-lifecycle-step"><code>02 · DECIDE</code><b>显式指定 → 首条规则 → 兜底</b><small>evaluate 只返回决策，不创建任何记录</small></article>
-      <i aria-hidden="true">→</i>
-      <div className="entrance-lifecycle-routes">
-        <article><code>direct · 直达</code><b>交还主 Agent</b><small>caller 不创建内部工单或运行；固定 Employee 才创建</small></article>
-        <article><code>specialist · 专家</code><b>创建工单与 Run</b><small>员工大厅看执行，运行卷宗看证据</small></article>
-        <article><code>leader · 领队</code><b>创建团队 Run</b><small>进入领队控制循环后动态派单</small></article>
-      </div>
+  return <section className="entrance-lifecycle" aria-label="工作启动原则">
+    <header><span>DISCUSS FIRST · START WORK WHEN READY</span><strong>讨论是默认状态。只有你明确交给员工或启动团队，系统才开始执行。</strong></header>
+    <div className="entrance-lifecycle-routes entrance-lifecycle-routes--intent">
+      <article><code>01</code><b>继续讨论</b><small>不建工单，不创建 Run，也不让领队提前介入。</small></article>
+      <article><code>02</code><b>交给一位员工</b><small>目标清楚、无需拆分时，固定一位执行者。</small></article>
+      <article><code>03</code><b>开始协作编排</b><small>需要拆解、分工或交付门禁时，再让领队组织团队。</small></article>
     </div>
-    <footer><b>什么时候可以查看？</b><span>调用方真正执行 dispatch，且去向不是 caller 之后。可到 <a href="#office">员工大厅</a> 查看工单/实例，到 <a href="#runs">运行卷宗</a> 查看完整 Run。</span></footer>
   </section>;
 }
 
@@ -358,7 +351,7 @@ function PolicyEditor({ policy, data, onClose, onSaved, notify }: {
           <div className="form-grid entrance-target-grid">
             <Field label="Direct 目标"><select value={draft.directMode} onChange={(event) => setDraft({ ...draft, directMode: event.target.value as DirectMode })}><option value="caller">交还调用方 · 不建内部工单</option><option value="employee">固定 Employee · 创建工单与 Run</option><option value="none">不配置 direct</option></select></Field>
             {draft.directMode === "employee" && <Field label="Direct Employee"><select required value={draft.directEmployeeId} onChange={(event) => setDraft({ ...draft, directEmployeeId: event.target.value })}><option value="">选择员工</option>{activeEmployees.map((employee) => <option key={employee.id} value={employee.id}>{employee.identity.displayName} · {employee.id} · v{employee.version}</option>)}</select></Field>}
-            <Field label="Leader 领队协作"><select value={draft.leaderWorkflowId} onChange={(event) => setDraft({ ...draft, leaderWorkflowId: event.target.value })}><option value="">不配置 leader</option>{supervisorWorkflows.map((workflow) => <option key={workflow.id} value={workflow.id}>{workflow.id} · v{workflow.version}</option>)}</select></Field>
+            <Field label="Leader 协作编排"><select value={draft.leaderWorkflowId} onChange={(event) => setDraft({ ...draft, leaderWorkflowId: event.target.value })}><option value="">不配置 leader</option>{supervisorWorkflows.map((workflow) => <option key={workflow.id} value={workflow.id}>{workflow.id} · v{workflow.version}</option>)}</select></Field>
           </div>
           <div className="entrance-subsection-heading"><div><span>SPECIALIST TARGETS</span><strong>专家目标</strong><small>每个 key 固定到一种内部执行目标；保存时继续由后端校验并固定版本。</small></div><button type="button" className="button secondary" onClick={addSpecialist}><UtilityIcon name="add" />添加专家目标</button></div>
           <div className="entrance-specialist-editor">
@@ -381,7 +374,7 @@ function PolicyEditor({ policy, data, onClose, onSaved, notify }: {
               <header><span>{String(index + 1).padStart(2, "0")}</span><strong>{row.id || "未命名规则"}</strong><div><button type="button" className="text-button" disabled={index === 0} onClick={() => moveRule(index, -1)}>上移</button><button type="button" className="text-button" disabled={index === draft.rules.length - 1} onClick={() => moveRule(index, 1)}>下移</button><button type="button" className="text-button danger-text" onClick={() => removeRule(row.clientId)}>删除</button></div></header>
               <div className="entrance-rule-fields">
                 <Field label="Rule ID"><input required pattern="[a-z][a-z0-9-]*" aria-invalid={Boolean(ruleIdIssues[index]) || undefined} value={row.id} onChange={(event) => updateRule(row.clientId, { id: event.target.value })} /></Field>
-                <Field label="结果路由"><select aria-invalid={Boolean(ruleResultIssues[index]) || undefined} value={row.route} onChange={(event) => updateRule(row.clientId, { route: event.target.value as DecisionRoute, specialistKey: event.target.value === "specialist" ? row.specialistKey : "" })}><option value="direct">direct · 直达</option><option value="specialist">specialist · 专家</option><option value="leader">leader · 领队协作</option></select></Field>
+                <Field label="结果路由"><select aria-invalid={Boolean(ruleResultIssues[index]) || undefined} value={row.route} onChange={(event) => updateRule(row.clientId, { route: event.target.value as DecisionRoute, specialistKey: event.target.value === "specialist" ? row.specialistKey : "" })}><option value="direct">direct · 直达</option><option value="specialist">specialist · 专家</option><option value="leader">leader · 协作编排</option></select></Field>
                 {row.route === "specialist" && <Field label="Specialist Key"><select required aria-invalid={Boolean(ruleResultIssues[index]) || undefined} value={row.specialistKey} onChange={(event) => updateRule(row.clientId, { specialistKey: event.target.value })}><option value="">选择专家目标</option>{specialistKeys.map((key) => <option key={key} value={key}>{key}</option>)}</select></Field>}
               </div>
               <Field label="when (JSON 对象)" hint="支持 tagsAllOf、tagsAnyOf、source 与 signals；不读取 message。"><textarea className="mono" rows={5} aria-invalid={Boolean(ruleWhenIssues[index]) || undefined} value={row.whenText} onChange={(event) => updateRule(row.clientId, { whenText: event.target.value })} /></Field>
@@ -392,7 +385,7 @@ function PolicyEditor({ policy, data, onClose, onSaved, notify }: {
         </section>
 
         <section className="workflow-contract"><div className="section-kicker"><b>04</b><span>兜底结果</span></div><div className="form-grid entrance-default-grid">
-          <Field label="Default Route"><select value={draft.defaultRoute} onChange={(event) => setDraft({ ...draft, defaultRoute: event.target.value as DecisionRoute, defaultSpecialistKey: event.target.value === "specialist" ? draft.defaultSpecialistKey : "" })}><option value="direct">direct · 直达</option><option value="specialist">specialist · 专家目标</option><option value="leader">leader · 领队协作</option></select></Field>
+          <Field label="Default Route"><select value={draft.defaultRoute} onChange={(event) => setDraft({ ...draft, defaultRoute: event.target.value as DecisionRoute, defaultSpecialistKey: event.target.value === "specialist" ? draft.defaultSpecialistKey : "" })}><option value="direct">direct · 直达</option><option value="specialist">specialist · 专家目标</option><option value="leader">leader · 协作编排</option></select></Field>
           {draft.defaultRoute === "specialist" && <Field label="Default Specialist Key"><select required aria-invalid={Boolean(defaultIssue) || undefined} value={draft.defaultSpecialistKey} onChange={(event) => setDraft({ ...draft, defaultSpecialistKey: event.target.value })}><option value="">选择专家目标</option>{specialistKeys.map((key) => <option key={key} value={key}>{key}</option>)}</select></Field>}
         </div>{defaultIssue && <p className="entrance-inline-error" role="alert">{defaultIssue}</p>}</section>
       </fieldset>
@@ -401,10 +394,12 @@ function PolicyEditor({ policy, data, onClose, onSaved, notify }: {
   </Modal>;
 }
 
-function EvaluationDesk({ policy, notify }: { policy: EntrancePolicy; notify: PageProps["notify"] }) {
+function EvaluationDesk({ policy, data, notify }: { policy: EntrancePolicy; data: Bootstrap; notify: PageProps["notify"] }) {
   const daemonAvailable = useDaemonAvailable();
+  const specialistEntries = Object.entries(policy.specialists);
+  const [intent, setIntent] = useState<"discussion" | "employee" | "team">("discussion");
   const [route, setRoute] = useState<EntrancePolicyRoute>("auto");
-  const [specialistKey, setSpecialistKey] = useState("");
+  const [specialistKey, setSpecialistKey] = useState(specialistEntries[0]?.[0] ?? "");
   const [tags, setTags] = useState("");
   const [sourceKind, setSourceKind] = useState<InvocationSourceKind>("workbench");
   const [sourceLabel, setSourceLabel] = useState("请求分流试算台");
@@ -420,14 +415,20 @@ function EvaluationDesk({ policy, notify }: { policy: EntrancePolicy; notify: Pa
 
   useEffect(() => { setDecision(undefined); }, [policy.id, policy.version]);
 
-  const evaluate = async () => {
+  const evaluate = async (advanced = false) => {
+    if (!advanced && intent === "discussion") {
+      setDecision(undefined);
+      notify("保持讨论状态：没有创建工单、Run 或领队任务");
+      return;
+    }
     if (signalsIssue) return;
     setEvaluating(true);
     try {
       const signals = parseObject(signalsText || "{}", "Signals") as JsonObject;
+      const requestedRoute = advanced ? route : intent === "employee" ? "specialist" : "leader";
       const body = {
-        route,
-        ...(route === "specialist" ? { specialistKey: specialistKey.trim() } : {}),
+        route: requestedRoute,
+        ...(requestedRoute === "specialist" ? { specialistKey: specialistKey.trim() } : {}),
         tags: [...new Set(tags.split(",").map((tag) => tag.trim()).filter(Boolean))],
         signals,
         source: { kind: sourceKind, ...(sourceLabel.trim() ? { label: sourceLabel.trim() } : {}) }
@@ -443,20 +444,29 @@ function EvaluationDesk({ policy, notify }: { policy: EntrancePolicy; notify: Pa
     }
   };
 
+  const specialistTarget = policy.specialists[specialistKey];
+  const specialistName = specialistTarget?.kind === "employee"
+    ? data.employees.find((employee) => employee.id === specialistTarget.employeeId)?.identity.displayName
+    : undefined;
+  const leader = policy.leader ? data.workflows.find((workflow) => workflow.id === policy.leader?.workflowId) : undefined;
   return <div className="entrance-evaluation-desk">
-    <div className="entrance-evaluator-grid">
-      <Field label="分流方式"><select value={route} onChange={(event) => setRoute(event.target.value as EntrancePolicyRoute)}><option value="auto">auto · 按策略试算</option><option value="direct">direct · 显式直达</option><option value="specialist">specialist · 显式专家</option><option value="leader">leader · 显式领队</option></select></Field>
-      {route === "specialist" && <Field label="Specialist Key"><select required value={specialistKey} onChange={(event) => setSpecialistKey(event.target.value)}><option value="">选择专家目标</option>{Object.keys(policy.specialists).map((key) => <option key={key} value={key}>{key}</option>)}</select></Field>}
-      <Field label="Tags（英文逗号分隔）"><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="review, risky" /></Field>
-      <Field label="Source Kind"><select value={sourceKind} onChange={(event) => setSourceKind(event.target.value as InvocationSourceKind)}><option value="workbench">workbench</option><option value="http">http</option><option value="mcp">mcp</option><option value="a2a">a2a</option></select></Field>
-      <Field label="Source Label"><input value={sourceLabel} onChange={(event) => setSourceLabel(event.target.value)} /></Field>
+    <div className="work-intent-grid" role="radiogroup" aria-label="选择工作方式">
+      <button type="button" role="radio" aria-checked={intent === "discussion"} className={intent === "discussion" ? "selected" : ""} onClick={() => { setIntent("discussion"); setDecision(undefined); }}><span>01 · DEFAULT</span><strong>继续讨论</strong><p>还在澄清设计或目标时保持当前对话，不创建任何内部工作。</p><small>无工单 · 无 Run · 无领队</small></button>
+      <button type="button" role="radio" aria-checked={intent === "employee"} className={intent === "employee" ? "selected" : ""} disabled={specialistEntries.length === 0} onClick={() => { setIntent("employee"); setRoute("specialist"); }}><span>02 · SINGLE OWNER</span><strong>交给一位员工</strong><p>事项边界清楚，不需要领队拆解或多人协作。</p><small>{specialistEntries.length ? `${specialistEntries.length} 个可用目标` : "当前策略未配置员工目标"}</small></button>
+      <button type="button" role="radio" aria-checked={intent === "team"} className={intent === "team" ? "selected" : ""} disabled={!policy.leader} onClick={() => { setIntent("team"); setRoute("leader"); }}><span>03 · TEAM FLOW</span><strong>开始协作编排</strong><p>由领队拆解任务，固定 Flow 负责阶段和交付 Gate。</p><small>{leader ? `${leader.id} · v${policy.leader?.workflowVersion}` : "当前策略未配置领队团队"}</small></button>
     </div>
-    <div className="entrance-signal-presets"><span>常用 Signals</span>{presets.map((preset) => <button type="button" className="paper-tag" key={preset.label} onClick={() => setSignalsText(JSON.stringify(preset.value, null, 2))}>{preset.label}</button>)}<button type="button" className="paper-tag" onClick={() => setSignalsText("{}")}>清空</button></div>
-    <Field label="Signals (JSON 对象)" hint="这里只用于决策，不会作为执行消息传给员工。"><textarea className="mono" rows={5} aria-invalid={Boolean(signalsIssue) || undefined} value={signalsText} onChange={(event) => setSignalsText(event.target.value)} /></Field>
-    {signalsIssue && <p className="entrance-inline-error" role="alert">{signalsIssue}</p>}
-    <div className="entrance-evaluate-actions"><span><b>试算不会创建任务。</b>它只返回将要去往哪里；真正的 dispatch 才可能创建 Invocation、Work Instance 和 Run。</span><button type="button" className="button primary" disabled={!daemonAvailable || evaluating || Boolean(signalsIssue) || policy.status === "archived" || (route === "specialist" && !specialistKey)} onClick={() => void evaluate()}>{evaluating ? "试算中…" : "试算分流"}</button></div>
+    {intent === "employee" && <div className="intent-target-picker"><Field label="选择执行目标"><select required value={specialistKey} onChange={(event) => setSpecialistKey(event.target.value)}><option value="">选择一位员工或单目标流程</option>{specialistEntries.map(([key, target]) => <option key={key} value={key}>{target.kind === "employee" ? data.employees.find((employee) => employee.id === target.employeeId)?.identity.displayName ?? target.employeeId : targetLabel(target)}</option>)}</select></Field>{specialistTarget && <p>{specialistName ?? targetLabel(specialistTarget)} · 内部固定版本已由策略保存</p>}</div>}
+    {intent === "team" && policy.leader && <div className="intent-team-preview"><span>LEADER WORKFLOW</span><strong>{leader?.id ?? policy.leader.workflowId}</strong><p>预览只确认去向；真正启动后，才创建团队 Run 并注入领队系统能力。</p></div>}
+    <div className="entrance-evaluate-actions"><span>{intent === "discussion" ? <><b>这是默认项。</b>继续当前对话，不触发后台工作。</> : <><b>先预览，不执行。</b>确认后由真正的 dispatch 创建工单与 Run。</>}</span><button type="button" className="button primary" disabled={!daemonAvailable || evaluating || policy.status === "archived" || (intent === "employee" && !specialistKey) || (intent === "team" && !policy.leader)} onClick={() => void evaluate(false)}>{evaluating ? "预览中…" : intent === "discussion" ? "保持讨论" : "预览工作去向"}</button></div>
+    <details className="entrance-advanced"><summary><span>高级启动规则</span><small>系统集成与确定性路由调试</small><UtilityIcon name="toggle" /></summary><div className="entrance-evaluator-grid">
+      <Field label="内部路由"><select value={route} onChange={(event) => setRoute(event.target.value as EntrancePolicyRoute)}><option value="auto">auto · 按策略</option><option value="direct">direct</option><option value="specialist">specialist</option><option value="leader">leader</option></select></Field>
+      {route === "specialist" && <Field label="目标 Key"><select required value={specialistKey} onChange={(event) => setSpecialistKey(event.target.value)}><option value="">选择目标</option>{specialistEntries.map(([key]) => <option key={key} value={key}>{key}</option>)}</select></Field>}
+      <Field label="任务标签"><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="review, risky" /></Field>
+      <Field label="调用来源"><select value={sourceKind} onChange={(event) => setSourceKind(event.target.value as InvocationSourceKind)}><option value="workbench">workbench</option><option value="http">http</option><option value="mcp">mcp</option><option value="a2a">a2a</option></select></Field>
+      <Field label="来源备注"><input value={sourceLabel} onChange={(event) => setSourceLabel(event.target.value)} /></Field>
+    </div><div className="entrance-signal-presets"><span>常用信号</span>{presets.map((preset) => <button type="button" className="paper-tag" key={preset.label} onClick={() => setSignalsText(JSON.stringify(preset.value, null, 2))}>{preset.label}</button>)}<button type="button" className="paper-tag" onClick={() => setSignalsText("{}")}>清空</button></div><Field label="结构化信号 (JSON)" hint="只用于规则决策，不作为员工执行消息。"><textarea className="mono" rows={5} aria-invalid={Boolean(signalsIssue) || undefined} value={signalsText} onChange={(event) => setSignalsText(event.target.value)} /></Field>{signalsIssue && <p className="entrance-inline-error" role="alert">{signalsIssue}</p>}<div className="entrance-advanced-actions"><span>只返回内部决策，不创建任务。</span><button type="button" className="button secondary" disabled={!daemonAvailable || evaluating || Boolean(signalsIssue) || (route === "specialist" && !specialistKey)} onClick={() => void evaluate(true)}>高级试算</button></div></details>
     {decision && <article className={`entrance-decision-card entrance-decision-card--${decision.target.kind === "caller" ? "caller" : decision.executable ? "ready" : "blocked"}`} role="status">
-      <header><div><span>DECISION · policy v{decision.policyVersion}</span><strong>{resultLabel(decision.result)}</strong></div><Stamp status={decision.target.kind === "caller" ? "pending" : decision.executable ? "passed" : "blocked"} label={decision.target.kind === "caller" ? "交还调用方" : decision.executable ? "目标可执行" : "目标不可执行"} /></header>
+      <header><div><span>去向预览 · policy v{decision.policyVersion}</span><strong>{decision.target.kind === "caller" ? "继续讨论" : targetLabel(decision.target)}</strong></div><Stamp status={decision.target.kind === "caller" ? "pending" : decision.executable ? "passed" : "blocked"} label={decision.target.kind === "caller" ? "不启动工作" : decision.executable ? "可以启动" : "目标不可执行"} /></header>
       <dl className="ledger horizontal"><dt>决策来源</dt><dd>{decidedByLabel(decision)}</dd><dt>固定目标</dt><dd><code>{targetLabel(decision.target)}</code></dd></dl>
       {decision.warnings.length > 0 && <div className="entrance-warnings">{decision.warnings.map((warning, index) => <span key={`${index}-${warning}`}>{decision.target.kind === "caller" && warning === "direct caller route returns control without creating an Invocation or Run" ? "不会创建内部工单或运行，也不会静默升级给领队。" : warning}</span>)}</div>}
     </article>}
@@ -502,12 +512,12 @@ export function EntrancePolicyPage({ data, refresh, notify }: PageProps) {
   };
 
   return <div className="page-grid page-grid--workflows entrance-policy-page">
-    <aside className="record-list"><header className="list-header"><h1>请求分流策略</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setEditor("new")} aria-label="登记请求分流策略"><UtilityIcon name="add" /></button></header><div className="architecture-summary"><span>{policies.filter((policy) => policy.status === "active").length} 条活动策略</span><small>先决策 · 后执行</small></div><div className="record-scroll workflow-list">{policies.map((policy) => <button className={`workflow-card ${selected?.id === policy.id ? "selected" : ""}`} key={policy.id} onClick={() => setSelectedId(policy.id)}><div><strong>{policy.displayName}</strong><span>{policy.description}</span><small>{policy.id} · v{policy.version} · {policy.rules.length} 条顺序规则</small></div><Stamp status={policy.status} /></button>)}{policies.length === 0 && <div className="mini-empty">尚无请求分流策略。</div>}</div><footer className="list-footer"><span>{policies.length} 条分流策略</span><span>DETERMINISTIC</span></footer></aside>
+    <aside className="record-list"><header className="list-header"><h1>开始一项工作</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setEditor("new")} aria-label="登记高级启动策略"><UtilityIcon name="add" /></button></header><div className="architecture-summary"><span>{policies.filter((policy) => policy.status === "active").length} 套启动配置</span><small>默认继续讨论</small></div><div className="record-scroll workflow-list">{policies.map((policy) => <button className={`workflow-card ${selected?.id === policy.id ? "selected" : ""}`} key={policy.id} onClick={() => setSelectedId(policy.id)}><div><strong>{policy.displayName}</strong><span>{policy.description}</span><small>{policy.id} · v{policy.version} · {policy.rules.length} 条高级规则</small></div><Stamp status={policy.status} /></button>)}{policies.length === 0 && <div className="mini-empty">尚无工作启动配置。</div>}</div><footer className="list-footer"><span>{policies.length} 套启动配置</span><span>DISCUSS FIRST</span></footer></aside>
     <main className="detail-pane">{!selected ? <EmptyState title="建立第一条请求分流策略" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setEditor("new")}>登记分流策略</button>}>先用结构化信号决定 direct、specialist 或 leader；此时还没有任务，只有真正分发到内部目标后才会产生运行。</EmptyState> : <div className="dossier workflow-dossier entrance-policy-dossier">
       <header className="dossier-cover entrance-policy-cover"><div className="file-index"><span>REQUEST ROUTING POLICY RECORD</span><code>No. {selected.id.toUpperCase()}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">分</div><div><h2>{selected.displayName}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div><div className="dossier-actions"><button className="button primary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setEditor("edit")}>修订分流策略</button>{selected.status === "active" ? <button className="button danger" disabled={!daemonAvailable} onClick={() => setArchiveOpen(true)}>归档</button> : <button className="button secondary" disabled={!daemonAvailable} onClick={() => void restore()}>恢复并创建 v{selected.version + 1}</button>}</div><RequestLifecycle /></header>
-      <DossierSection number="01" title="分流试算台"><EvaluationDesk policy={selected} notify={notify} /></DossierSection>
-      <DossierSection number="02" title="顺序规则与兜底"><div className="entrance-rules">{selected.rules.map((rule, index) => <article key={rule.id}><header><span>{String(index + 1).padStart(2, "0")}</span><strong>{rule.id}</strong><code>{resultLabel(rule.result)}</code></header><pre>{JSON.stringify(rule.when, null, 2)}</pre></article>)}{selected.rules.length === 0 && <div className="mini-empty">没有顺序规则；auto 始终使用兜底结果。</div>}</div><div className="entrance-default-result"><span>FALLBACK</span><strong>{resultLabel(selected.default)}</strong></div></DossierSection>
-      <DossierSection number="03" title="固定目标清册"><div className="node-ledger entrance-target-ledger"><article><span className="node-number">D</span><div><strong>direct</strong><span>{selected.direct ? selected.direct.mode === "caller" ? "交还调用方 · 不创建内部工单或运行" : `Employee ${selected.direct.employeeId}` : "未配置"}</span></div><code>{selected.direct?.mode === "employee" ? `v${selected.direct.employeeVersion}` : selected.direct?.mode ?? "—"}</code></article>{Object.entries(selected.specialists).map(([key, target], index) => <article key={key}><span className="node-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{key}</strong><span>{targetLabel(target)}</span></div><code>{target.kind}</code></article>)}<article><span className="node-number">L</span><div><strong>leader</strong><span>{selected.leader ? targetLabel(selected.leader) : "未配置"}</span></div><code>{selected.leader ? "supervisor-workflow" : "—"}</code></article></div>{references.length > 0 && <p className="entrance-reference-note">领队路由固定到 {references.map((workflow) => `${workflow.id} v${selected.leader?.workflowVersion}`).join("、")}；进入后才加载该团队固定的 Management Policy。</p>}</DossierSection>
+      <DossierSection number="01" title="选择工作方式"><EvaluationDesk policy={selected} data={data} notify={notify} /></DossierSection>
+      <DossierSection number="02" title="可用工作目标"><div className="entrance-target-cards"><article className="is-discussion"><span>讨论</span><strong>留在当前对话</strong><p>不创建内部工单或运行；这是默认行为。</p><small>无需配置</small></article>{Object.entries(selected.specialists).map(([key, target]) => <article key={key}><span>单人</span><strong>{target.kind === "employee" ? data.employees.find((employee) => employee.id === target.employeeId)?.identity.displayName ?? target.employeeId : target.kind === "project-role" ? `${target.projectId} / ${target.roleId}` : target.workflowId}</strong><p>{targetLabel(target)}</p><small>固定目标 · {key}</small></article>)}<article className={selected.leader ? "is-team" : "is-unavailable"}><span>团队</span><strong>{selected.leader ? references[0]?.id ?? selected.leader.workflowId : "尚未配置协作编排"}</strong><p>{selected.leader ? "领队动态分工，Flow 与 Gate 约束最终交付。" : "修订高级启动策略后可用。"}</p><small>{selected.leader ? `固定 v${selected.leader.workflowVersion}` : "不可启动"}</small></article></div></DossierSection>
+      <DossierSection number="03" title="高级规则与兜底"><details className="entrance-rules-disclosure"><summary><span>查看内部确定性路由规则</span><small>供系统集成和调试使用，正常启动无需理解</small><UtilityIcon name="toggle" /></summary><div className="entrance-rules">{selected.rules.map((rule, index) => <article key={rule.id}><header><span>{String(index + 1).padStart(2, "0")}</span><strong>{rule.id}</strong><code>{resultLabel(rule.result)}</code></header><pre>{JSON.stringify(rule.when, null, 2)}</pre></article>)}{selected.rules.length === 0 && <div className="mini-empty">没有顺序规则；系统集成会使用兜底结果。</div>}</div><div className="entrance-default-result"><span>FALLBACK</span><strong>{resultLabel(selected.default)}</strong></div></details></DossierSection>
       <DossierSection number="04" title="版本记录"><div className="version-strip">{versions.map((version) => <div key={version.version} className={version.version === selected.version ? "current" : ""}><code>v{version.version}</code><span>{version.version === selected.version ? "当前" : version.status === "archived" ? "归档" : "历史"}</span><time>{formatTime(version.updatedAt)}</time></div>)}</div></DossierSection>
     </div>}</main>
     {editor && <PolicyEditor policy={editor === "edit" ? selected : undefined} data={data} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}

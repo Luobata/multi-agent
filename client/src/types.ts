@@ -6,10 +6,17 @@ export interface ProviderEntry {
   definition: { adapter: string; model?: string; [key: string]: unknown };
 }
 
+export type SkillOwner = "system" | "user";
+export type SkillInjection = "none" | "supervisor";
+
 export interface Skill {
   id: string;
   version: number;
   status: "active" | "archived";
+  /** System skills are injected by position (e.g. supervisor) and can never be managed by users. */
+  owner: SkillOwner;
+  /** Where the runtime injects this skill; "supervisor" means it appears only on the supervisor runtime role. */
+  injection: SkillInjection;
   displayName: string;
   description: string;
   instructions: string;
@@ -20,6 +27,15 @@ export interface Skill {
 }
 
 export type SkillBinding = string | { id: string; config?: JsonObject; enabled?: boolean };
+
+export type EmployeeScope =
+  | { kind: "global" }
+  | { kind: "project"; projectId: string; projectVersion: number };
+
+export interface EmployeeTemplateSource {
+  id: string;
+  version: number;
+}
 
 export interface Employee {
   id: string;
@@ -36,6 +52,11 @@ export interface Employee {
   description: string;
   systemPrompt: string;
   requestPrompt: string;
+  /** Structured capability declarations (e.g. code.frontend, quality.test); never role names. */
+  capabilities: string[];
+  scope: EmployeeScope;
+  /** Pinned template source when this employee was derived from an Employee Template. */
+  template?: EmployeeTemplateSource;
   skills: SkillBinding[];
   skillVersions: Record<string, number>;
   knowledgeProfileIds?: string[];
@@ -47,6 +68,48 @@ export interface Employee {
   permissions: { write: "none" | "artifacts-only" | "project"; tools?: string[] };
   contextPolicy: { historyLimit: number };
   presentation: { accent?: string; initials?: string; avatarUrl?: string };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EmployeeRecordVersions {
+  template: EmployeeTemplate;
+  versions: EmployeeTemplate[];
+}
+
+/** Static, version-pinned defaults used to derive a complete Employee; templates never execute. */
+export interface EmployeeTemplateDefaults {
+  identity: {
+    background: string;
+    responsibilities: string[];
+    goals?: string[];
+    constraints?: string[];
+    metadata?: JsonObject;
+  };
+  description?: string;
+  systemPrompt?: string;
+  requestPrompt?: string;
+  capabilities?: string[];
+  scope?: EmployeeScope;
+  skills?: SkillBinding[];
+  skillVersions?: Record<string, number>;
+  knowledgeProfileIds?: string[];
+  providerId?: string;
+  outputSchema?: JsonObject;
+  maxAttempts?: number;
+  permissions?: Employee["permissions"];
+  verdict?: Employee["verdict"];
+  contextPolicy?: { historyLimit: number };
+  presentation?: Employee["presentation"];
+}
+
+export interface EmployeeTemplate {
+  id: string;
+  version: number;
+  status: "active" | "archived";
+  displayName: string;
+  description: string;
+  defaults: EmployeeTemplateDefaults;
   createdAt: string;
   updatedAt: string;
 }
@@ -134,7 +197,7 @@ export interface WorkInstanceRecord {
   workflowVersion: number;
   nodeId: string;
   roleId?: string;
-  kind?: "graph" | "supervisor" | "member";
+  kind?: "graph" | "supervisor" | "member" | "gate";
   round?: number;
   parentNodeId?: string;
   runId: string;
@@ -306,9 +369,37 @@ export interface GraphWorkflow extends WorkflowBase {
   failFast: boolean;
 }
 
+export type SupervisorWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
+
+export type SupervisorFlowStage =
+  | { id: string; kind: "supervisor"; title: string }
+  | { id: string; kind: "delegation-loop"; title: string }
+  | { id: string; kind: "gate"; title: string; gateId: string }
+  | { id: string; kind: "delivery"; title: string };
+
+export type SupervisorGateMode = "after-each-delegation" | "before-completion";
+export type SupervisorGateFallback = "supervisor" | "block";
+
+export interface SupervisorGate {
+  id: string;
+  requiredCapability: string;
+  mode: SupervisorGateMode;
+  required: boolean;
+  instructions: string;
+  fallback: SupervisorGateFallback;
+}
+
+export interface SupervisorFlowDefinition {
+  version: number;
+  stages: SupervisorFlowStage[];
+  gates: SupervisorGate[];
+}
+
 export interface SupervisorWorkflow extends WorkflowBase {
   architecture: "supervisor";
   supervisor: { employeeId: string; employeeVersion: number };
+  /** System skill pinned onto the supervisor position at materialization; members never receive it. */
+  orchestrationSkill: { id: string; version: number };
   managementPolicy: { id: string; version: number };
   members: Array<{
     roleId: string;
@@ -316,6 +407,7 @@ export interface SupervisorWorkflow extends WorkflowBase {
     employeeId: string;
     employeeVersion: number;
   }>;
+  flow: SupervisorFlowDefinition;
 }
 
 export type Workflow = GraphWorkflow | SupervisorWorkflow;
@@ -930,6 +1022,7 @@ export interface Bootstrap {
   knowledgeChanges?: KnowledgeChangeRequest[];
   architectureTemplates: ArchitectureTemplate[];
   employees: Employee[];
+  employeeTemplates?: EmployeeTemplate[];
   managementPolicies?: ManagementPolicy[];
   entrancePolicies?: EntrancePolicy[];
   workflows: Workflow[];

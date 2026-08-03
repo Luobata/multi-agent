@@ -261,11 +261,11 @@ export function WorkflowPage(props: PageProps) {
   const entranceCount = props.data.entrancePolicies?.length ?? 0;
   return <div className="orchestration-workspace">
     <header className="orchestration-switcher" aria-label="协作编排类型">
-      <div><span>WORKFLOW CONTROL PLANE</span><strong>请求先分流，试算不建任务；分发到内部目标后才产生工单与运行</strong></div>
+      <div><span>WORKFLOW CONTROL PLANE</span><strong>默认继续讨论；明确交给员工或启动协作编排后，才创建工单与运行</strong></div>
       <nav>
-        <button type="button" className={section === "entrance" ? "active" : ""} aria-pressed={section === "entrance"} onClick={() => setSection("entrance")}>请求分流 <small>{entranceCount}</small></button>
+        <button type="button" className={section === "entrance" ? "active" : ""} aria-pressed={section === "entrance"} onClick={() => setSection("entrance")}>开始一项工作 <small>{entranceCount}</small></button>
         <button type="button" className={section === "graph" ? "active" : ""} aria-pressed={section === "graph"} onClick={() => setSection("graph")}>Graph 编排 <small>{graphCount}</small></button>
-        <button type="button" className={section === "supervisor" ? "active" : ""} aria-pressed={section === "supervisor"} onClick={() => setSection("supervisor")}>领队协作 <small>{supervisorCount}</small></button>
+        <button type="button" className={section === "supervisor" ? "active" : ""} aria-pressed={section === "supervisor"} onClick={() => setSection("supervisor")}>协作编排 <small>{supervisorCount}</small></button>
         <button type="button" className={section === "policies" ? "active" : ""} aria-pressed={section === "policies"} onClick={() => setSection("policies")}>管理策略库 <small>{policyCount}</small></button>
       </nav>
     </header>

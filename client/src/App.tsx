@@ -53,7 +53,7 @@ export function assertKnowledgeControlPlane(bootstrap: Bootstrap): void {
     throw new Error("本地运行核心版本早于知识控制台，请重启 Workbench 后重试；现有知识和员工绑定不会丢失。");
   }
   if (!Array.isArray(bootstrap.entrancePolicies)) {
-    throw new Error("本地运行核心版本早于请求分流策略，请重新构建并重启 Workbench 后重试；现有编排、策略和运行证据不会丢失。");
+    throw new Error("本地运行核心版本早于工作启动策略，请重新构建并重启 Workbench 后重试；现有编排、策略和运行证据不会丢失。");
   }
 }
 
@@ -176,7 +176,7 @@ export function App() {
       <span>{daemon === "offline" ? "READ ONLY · 写入与运行暂不可用" : syncing ? "SYNCING · 正在同步最新档案" : "LOCAL GARDEN · EVIDENCE ON"}</span>
     </header>
     <nav className="side-nav" aria-label="主要导航">
-      <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>四季档案室</strong><small>HEALING PIXEL DOSSIER</small></div></div>
+      <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>迪士尼乐园</strong><small>HEALING PIXEL DOSSIER</small></div></div>
       <div className="nav-items">{nav.map((item) => <button type="button" className={page === item.id ? "active" : ""} aria-current={page === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
       <button type="button" className="command-hint" title="命令入口" onClick={() => setCommandOpen(true)}><Icon name="command" /><span>命令面板</span><kbd>⌘K</kbd></button>
       <div className="nav-foot"><span>HP</span><div><strong>Town Workbench</strong><small>四季在册 · A2A 1.0</small></div></div>

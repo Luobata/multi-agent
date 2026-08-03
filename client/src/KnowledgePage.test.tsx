@@ -357,6 +357,8 @@ const reviewEmployee: Employee = {
   description: "Builds UI.",
   systemPrompt: "prompt",
   requestPrompt: "request",
+  capabilities: [],
+  scope: { kind: "global" },
   skills: [],
   skillVersions: {},
   knowledgeProfileIds: ["frontend-knowledge", "shared-knowledge"],

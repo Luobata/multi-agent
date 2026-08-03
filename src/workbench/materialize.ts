@@ -20,7 +20,11 @@ export function supervisorMemberRuntimeRoleId(roleId: string): string {
   return `member-${safeId(roleId)}`;
 }
 
-export function supervisorDecisionSchema(roleIds: string[], maxParallelDelegations: number): JsonObject {
+export function supervisorDecisionSchema(
+  roleIds: string[],
+  gateIds: string[],
+  maxParallelDelegations: number
+): JsonObject {
   return {
     oneOf: [
       {
@@ -41,12 +45,30 @@ export function supervisorDecisionSchema(roleIds: string[], maxParallelDelegatio
               properties: {
                 roleId: { type: "string", enum: roleIds },
                 task: { type: "string", minLength: 1 },
+                requiredCapabilities: {
+                  type: "array",
+                  uniqueItems: true,
+                  items: { type: "string", minLength: 1 }
+                },
+                workKind: { enum: ["discussion", "code", "test", "audit", "integration", "other"] },
+                changeSet: { type: "string", minLength: 1 },
                 context: { type: "object" }
               }
             }
           }
         }
       },
+      ...(gateIds.length > 0 ? [{
+        type: "object",
+        additionalProperties: false,
+        required: ["action", "gateId", "summary", "evidence"],
+        properties: {
+          action: { const: "satisfy-gate" },
+          gateId: { type: "string", enum: gateIds },
+          summary: { type: "string", minLength: 1 },
+          evidence: {}
+        }
+      }] : []),
       {
         type: "object",
         additionalProperties: false,
@@ -94,6 +116,15 @@ function policyVersion(state: WorkbenchState, workflow: SupervisorWorkbenchWorkf
   return found;
 }
 
+function skillVersion(state: WorkbenchState, id: string, version: number): WorkbenchSkillDefinition {
+  const current = state.skills[id];
+  const found = current?.version === version
+    ? current
+    : state.skillHistory[id]?.find((candidate) => candidate.version === version);
+  if (!found) throw new Error(`workbench skill ${id} version ${version} not found`);
+  return found;
+}
+
 function requestTemplateFor(
   workflow: WorkbenchWorkflowDefinition,
   runtimeRoleId: string,
@@ -103,9 +134,9 @@ function requestTemplateFor(
     return `${employee.requestPrompt.trim()}\n\n## Knowledge evidence\n\n{{node.with.__knowledgeEvidence}}\n\n## Current input\n\n{{input}}\n\n## Dependency evidence\n\n{{needs}}\n`;
   }
   if (runtimeRoleId === SUPERVISOR_RUNTIME_ROLE_ID) {
-    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself.\n\nManagement policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nAvailable member role slots:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nPrior decision and delegation ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn exactly one JSON decision matching the supplied output schema. Use action \"delegate\" with one or more assignments, or action \"finish\" with the final result.\n`;
+    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself.\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\nManagement policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nAvailable member role slots and explicit capabilities:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, and Gate ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn exactly one JSON decision matching the supplied output schema. Use action \"delegate\" with one or more assignments, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
   }
-  return `${employee.requestPrompt.trim()}\n\n## Delegation from the workflow supervisor\n\nYour workflow-local role slot:\n{{node.with.__delegatedRoleId}}\n\nDelegated task:\n{{node.with.__delegatedTask}}\n\nDelegated context:\n{{node.with.__delegatedContext}}\n\nSupervisor summary:\n{{node.with.__supervisorSummary}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn the requested specialist result using your normal output contract.\n`;
+  return `${employee.requestPrompt.trim()}\n\n## Delegation from the workflow supervisor\n\nYour workflow-local role slot:\n{{node.with.__delegatedRoleId}}\n\nDelegated task:\n{{node.with.__delegatedTask}}\n\nRequired capabilities:\n{{node.with.__requiredCapabilities}}\n\nWork kind and change set:\n{{node.with.__workKind}} / {{node.with.__changeSet}}\n\nGate execution request, when present:\n{{node.with.__gateExecution}}\n\nDelegated context:\n{{node.with.__delegatedContext}}\n\nSupervisor summary:\n{{node.with.__supervisorSummary}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn the requested specialist result using your normal output contract.\n`;
 }
 
 export async function materializeWorkflow(options: MaterializeOptions): Promise<MaterializedWorkflow> {
@@ -114,6 +145,17 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
   await fs.mkdir(path.join(bundleDir, "roles"), { recursive: true });
   await fs.mkdir(path.join(bundleDir, "skills"), { recursive: true });
   await fs.mkdir(path.join(bundleDir, "schemas"), { recursive: true });
+
+  const supervisorWorkflow = options.workflow.architecture === "supervisor" ? options.workflow : undefined;
+  const supervisorPolicy = supervisorWorkflow
+    ? policyVersion(options.state, supervisorWorkflow)
+    : undefined;
+  const orchestrationSkill = supervisorWorkflow
+    ? skillVersion(options.state, supervisorWorkflow.orchestrationSkill.id, supervisorWorkflow.orchestrationSkill.version)
+    : undefined;
+  if (orchestrationSkill && (orchestrationSkill.owner !== "system" || orchestrationSkill.injection !== "supervisor")) {
+    throw new Error(`workbench skill ${orchestrationSkill.id} v${orchestrationSkill.version} is not a supervisor system injection`);
+  }
 
   const requiredSkills = new Map<string, WorkbenchSkillDefinition>();
   for (const employee of options.employees.values()) {
@@ -129,6 +171,9 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
       if (!skill) throw new Error(`unknown workbench skill ${skillId} version ${version}`);
       requiredSkills.set(`${skillId}-v${version}`, skill);
     }
+  }
+  if (orchestrationSkill) {
+    requiredSkills.set(`${orchestrationSkill.id}-v${orchestrationSkill.version}`, orchestrationSkill);
   }
 
   const skills: Record<string, SkillDefinition> = {};
@@ -150,10 +195,6 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
   }
 
   const roles: Record<string, RoleDefinition> = {};
-  const supervisorWorkflow = options.workflow.architecture === "supervisor" ? options.workflow : undefined;
-  const supervisorPolicy = supervisorWorkflow
-    ? policyVersion(options.state, supervisorWorkflow)
-    : undefined;
   for (const [runtimeRoleId, employee] of options.employees) {
     const roleDir = path.join(bundleDir, "roles", safeId(runtimeRoleId));
     await fs.mkdir(roleDir, { recursive: true });
@@ -166,30 +207,46 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
     await writeJson(
       path.join(bundleDir, outputSchema),
       isSupervisor
-        ? supervisorDecisionSchema(supervisorWorkflow!.members.map((member) => member.roleId), supervisorPolicy!.limits.maxParallelDelegations)
+        ? supervisorDecisionSchema(
+            supervisorWorkflow!.members.map((member) => member.roleId),
+            supervisorWorkflow!.flow.gates.map((gate) => gate.id),
+            supervisorPolicy!.limits.maxParallelDelegations
+          )
         : employee.outputSchema
     );
+    const employeeSkills = employee.skills.filter((binding) => typeof binding === "string" || binding.enabled !== false).map((binding) => {
+      const id = typeof binding === "string" ? binding : binding.id;
+      const version = employee.skillVersions[id] ?? options.state.skills[id]?.version;
+      if (!version) throw new Error(`unknown workbench skill ${id}`);
+      return {
+        id: `${id}-v${version}`,
+        config: typeof binding === "string" ? {} : binding.config ?? {}
+      };
+    });
+    if (isSupervisor) {
+      employeeSkills.push({ id: `${orchestrationSkill!.id}-v${orchestrationSkill!.version}`, config: {} });
+    }
     roles[runtimeRoleId] = {
       identity: {
         ...employee.identity,
         metadata: {
           ...(employee.identity.metadata ?? {}),
           employeeId: employee.id,
-          employeeVersion: employee.version
+          employeeVersion: employee.version,
+          capabilities: employee.capabilities,
+          ...(isSupervisor ? {
+            runtimeSkillInjections: [{
+              skillId: orchestrationSkill!.id,
+              version: orchestrationSkill!.version,
+              reason: "supervisor-runtime"
+            }]
+          } : {})
         }
       },
       description: employee.description,
       provider: employee.providerId,
       instructions,
-      skills: employee.skills.filter((binding) => typeof binding === "string" || binding.enabled !== false).map((binding) => {
-        const id = typeof binding === "string" ? binding : binding.id;
-        const version = employee.skillVersions[id] ?? options.state.skills[id]?.version;
-        if (!version) throw new Error(`unknown workbench skill ${id}`);
-        return {
-          id: `${id}-v${version}`,
-          config: typeof binding === "string" ? {} : binding.config ?? {}
-        };
-      }),
+      skills: employeeSkills,
       requestTemplate,
       outputSchema,
       maxAttempts: employee.maxAttempts,
@@ -219,7 +276,15 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
         }))
       }
     : {
-        supervisor: { role: SUPERVISOR_RUNTIME_ROLE_ID },
+        supervisor: {
+          role: SUPERVISOR_RUNTIME_ROLE_ID,
+          capabilities: [...options.employees.get(SUPERVISOR_RUNTIME_ROLE_ID)!.capabilities],
+          skillInjection: {
+            id: orchestrationSkill!.id,
+            version: orchestrationSkill!.version,
+            reason: "supervisor-runtime"
+          }
+        },
         policy: {
           id: supervisorPolicy!.id,
           version: supervisorPolicy!.version,
@@ -232,8 +297,14 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
         members: supervisorWorkflow!.members.map((member) => ({
           roleId: member.roleId,
           role: supervisorMemberRuntimeRoleId(member.roleId),
-          description: member.description
-        }))
+          description: member.description,
+          capabilities: [...options.employees.get(supervisorMemberRuntimeRoleId(member.roleId))!.capabilities]
+        })),
+        flow: {
+          version: supervisorWorkflow!.flow.version,
+          stages: supervisorWorkflow!.flow.stages.map((stage) => ({ ...stage })),
+          gates: supervisorWorkflow!.flow.gates.map((gate) => ({ ...gate }))
+        }
       };
   const manifest: MultiAgentManifest = {
     version: 1,

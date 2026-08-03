@@ -28,6 +28,6 @@ describe("Workbench capability compatibility", () => {
 
   it("rejects a stale daemon that does not expose task entrance policies", () => {
     expect(() => assertKnowledgeControlPlane({ ...bootstrap(), knowledgeBases: [], knowledgeProfiles: [] }))
-      .toThrow(/运行核心版本早于请求分流策略/);
+      .toThrow(/运行核心版本早于工作启动策略/);
   });
 });

@@ -48,6 +48,8 @@ const bootstrap: Bootstrap = {
     description: "Validate browser behavior.",
     instructions: "Validate in a browser.",
     tools: [],
+    owner: "user",
+    injection: "none",
     createdAt: timestamp,
     updatedAt: timestamp
   }],
@@ -77,6 +79,8 @@ const bootstrap: Bootstrap = {
     description: "Independent tester.",
     systemPrompt: "Test.",
     requestPrompt: "Return evidence.",
+    capabilities: [],
+    scope: { kind: "global" },
     skills: ["browser-e2e-validation"],
     skillVersions: { "browser-e2e-validation": 1 },
     providerId: "mock",

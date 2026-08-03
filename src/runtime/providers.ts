@@ -75,12 +75,34 @@ class MockProviderAdapter implements ProviderAdapter {
     const suffix = dependencyCount > 0 ? ` I also received evidence from ${dependencyCount} upstream node(s).` : "";
     const punctuation = /[.!?。！？]$/.test(request) ? "" : ".";
     const variants = Array.isArray(role?.outputSchema?.oneOf) ? role.outputSchema.oneOf : [];
+    const node = invocation.templateContext.node as { with?: { __gateExecution?: unknown } } | undefined;
+    const gateExecution = typeof node?.with?.__gateExecution === "object" && node.with.__gateExecution !== null
+      ? node.with.__gateExecution as { gateId?: unknown }
+      : undefined;
+    const supportsSupervisorGate = variants.some((variant) => {
+      if (typeof variant !== "object" || variant === null || Array.isArray(variant)) return false;
+      const properties = (variant as { properties?: Record<string, unknown> }).properties;
+      const action = properties?.action;
+      return typeof action === "object" && action !== null && (action as { const?: unknown }).const === "satisfy-gate";
+    });
     const supportsSupervisorFinish = variants.some((variant) => {
       if (typeof variant !== "object" || variant === null || Array.isArray(variant)) return false;
       const properties = (variant as { properties?: Record<string, unknown> }).properties;
       const action = properties?.action;
       return typeof action === "object" && action !== null && (action as { const?: unknown }).const === "finish";
     });
+    if (gateExecution && supportsSupervisorGate && typeof gateExecution.gateId === "string") {
+      return {
+        stdout: JSON.stringify({
+          action: "satisfy-gate",
+          gateId: gateExecution.gateId,
+          summary: `${displayName} satisfied Gate ${gateExecution.gateId} with the local mock provider.`,
+          evidence: { gateId: gateExecution.gateId, deterministicMock: true }
+        }),
+        stderr: "",
+        durationMs: Date.now() - started
+      };
+    }
     if (supportsSupervisorFinish) {
       return {
         stdout: JSON.stringify({

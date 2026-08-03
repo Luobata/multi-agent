@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import type { ProviderDefinition } from "../core/types.js";
 import type { KnowledgeProfileGrant } from "../knowledge/types.js";
-import type { WorkbenchState } from "./types.js";
+import type { EmployeeDefinition, WorkbenchSkillDefinition, WorkbenchState } from "./types.js";
+import { defaultSupervisorFlow } from "./supervisorFlow.js";
 
 const KNOWLEDGE_CONTROL_TOOLS = [
   "knowledge_control_snapshot",
@@ -24,6 +25,44 @@ const KNOWLEDGE_CONTROL_TOOLS = [
   "knowledge_change_propose"
 ];
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const SYSTEM_SKILL_TIMESTAMP = "1970-01-01T00:00:00.000Z";
+
+function teamOrchestrationSkill(version = 1, createdAt = SYSTEM_SKILL_TIMESTAMP): WorkbenchSkillDefinition {
+  return {
+    id: "team-orchestration",
+    version,
+    status: "active",
+    owner: "system",
+    injection: "supervisor",
+    displayName: "Team orchestration",
+    description: "System-owned guidance for a Supervisor runtime that plans, delegates, verifies, and delivers team work.",
+    instructions: "Coordinate the assigned team within the Supervisor workflow policy. Delegate explicit work, preserve evidence, respect runtime limits and gates, and finish only when the required work is complete.",
+    tools: [],
+    createdAt,
+    updatedAt: SYSTEM_SKILL_TIMESTAMP
+  };
+}
+
+function ensureSystemSkills(state: WorkbenchState): void {
+  const existing = state.skills["team-orchestration"];
+  if (!existing) {
+    const skill = teamOrchestrationSkill();
+    state.skills[skill.id] = skill;
+    state.skillHistory[skill.id] = [skill];
+    return;
+  }
+  if (existing.owner === "system" && existing.injection === "supervisor") return;
+  const skill = teamOrchestrationSkill(existing.version + 1, existing.createdAt);
+  state.skills[skill.id] = skill;
+  (state.skillHistory[skill.id] ??= [existing]).push(skill);
+}
+
+function legacyProjectScope(employee: EmployeeDefinition): EmployeeDefinition["scope"] {
+  const projectId = employee.identity.metadata?.internalProjectId;
+  return typeof projectId === "string" && projectId.trim()
+    ? { kind: "project", projectId: projectId.trim(), projectVersion: 1 }
+    : { kind: "global" };
+}
 
 function executable(filePath: string): boolean {
   try {
@@ -94,12 +133,13 @@ function initialState(): WorkbenchState {
       },
       "codex-knowledge-control": codexKnowledgeControlProvider()
     },
-    skills: {},
-    skillHistory: {},
+    skills: { "team-orchestration": teamOrchestrationSkill() },
+    skillHistory: { "team-orchestration": [teamOrchestrationSkill()] },
     knowledgeBases: {},
     knowledgeProfiles: {},
     knowledgeChangeRequests: {},
     employees: {},
+    employeeTemplates: {},
     managementPolicies: {},
     entrancePolicies: {},
     workflows: {},
@@ -148,6 +188,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   state.workInstances ??= {};
   state.projects ??= {};
   state.projectBindings ??= {};
+  state.employeeTemplates ??= {};
   for (const activity of [...Object.values(state.invocations), ...Object.values(state.workInstances)]) {
     const source = activity.source;
     if (source.label) source.label = decodeUtf8HeaderValue(source.label);
@@ -155,12 +196,43 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     if (source.caller) source.caller = decodeUtf8HeaderValue(source.caller);
     if (source.contextId) source.contextId = decodeUtf8HeaderValue(source.contextId);
   }
-  for (const skill of Object.values(state.skills)) skill.status ??= "active";
+  for (const skill of Object.values(state.skills)) {
+    skill.status ??= "active";
+    skill.owner ??= "user";
+    skill.injection ??= "none";
+  }
   for (const versions of Object.values(state.skillHistory)) {
-    for (const skill of versions) skill.status ??= "active";
+    for (const skill of versions) {
+      skill.status ??= "active";
+      skill.owner ??= "user";
+      skill.injection ??= "none";
+    }
+  }
+  ensureSystemSkills(state);
+  const orchestrationSkillVersion = state.skills["team-orchestration"]!.version;
+  for (const record of Object.values(state.workflows)) {
+    for (const workflow of record.versions) {
+      if (workflow.architecture !== "supervisor") continue;
+      workflow.orchestrationSkill ??= { id: "team-orchestration", version: orchestrationSkillVersion };
+      workflow.flow ??= defaultSupervisorFlow();
+      workflow.flow.version ??= 1;
+      workflow.flow.stages ??= defaultSupervisorFlow().stages;
+      workflow.flow.gates ??= [];
+    }
+    record.current = record.versions.find((workflow) => workflow.version === record.current.version) ?? record.current;
+    if (record.current.architecture === "supervisor") {
+      record.current.orchestrationSkill ??= { id: "team-orchestration", version: orchestrationSkillVersion };
+      record.current.flow ??= defaultSupervisorFlow();
+    }
   }
   for (const record of Object.values(state.employees)) {
     for (const employee of record.versions) {
+      employee.capabilities ??= [];
+      employee.scope ??= legacyProjectScope(employee);
+      employee.skills = employee.skills.filter((binding) => {
+        const id = typeof binding === "string" ? binding : binding.id;
+        return state.skills[id]?.owner !== "system";
+      });
       employee.knowledgeProfileIds ??= [];
       employee.knowledgeGrants = normalizedStoredGrants(
         employee.knowledgeProfileIds,
@@ -173,9 +245,16 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
           return [id, state.skills[id]?.version ?? 1];
         })
       );
+      for (const skillId of Object.keys(employee.skillVersions)) {
+        if (!employee.skills.some((binding) => (typeof binding === "string" ? binding : binding.id) === skillId)) {
+          delete employee.skillVersions[skillId];
+        }
+      }
     }
     record.current = record.versions.find((employee) => employee.version === record.current.version) ?? record.current;
     record.current.knowledgeProfileIds ??= [];
+    record.current.capabilities ??= [];
+    record.current.scope ??= legacyProjectScope(record.current);
     record.current.knowledgeGrants = normalizedStoredGrants(
       record.current.knowledgeProfileIds,
       record.current.knowledgeGrants,

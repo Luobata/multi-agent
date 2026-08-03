@@ -12,7 +12,13 @@ import {
 } from "../architectures/templates.js";
 import type { ArchitectureRegistry } from "../architectures/types.js";
 import { compilePlan } from "../core/plan.js";
-import type { JsonObject, JsonValue, RolePermissionDefinition, RoleSkillBinding } from "../core/types.js";
+import type {
+  JsonObject,
+  JsonValue,
+  RoleIdentityDefinition,
+  RolePermissionDefinition,
+  RoleSkillBinding
+} from "../core/types.js";
 import { KnowledgeRuntime } from "../knowledge/runtime.js";
 import { assessKnowledgeRevision } from "../knowledge/assessment.js";
 import { knowledgeChangePlanHash, knowledgeChangeRisk } from "../knowledge/change.js";
@@ -71,6 +77,7 @@ import {
 } from "./materialize.js";
 import { loadProjectDescriptor } from "./projectDescriptor.js";
 import { WorkbenchStore } from "./store.js";
+import { normalizeSupervisorFlow } from "./supervisorFlow.js";
 import {
   evaluateEntrancePolicyDefinition,
   normalizeEntrancePolicyRouteResult,
@@ -86,6 +93,14 @@ import {
   type EmployeeContextView,
   type EmployeeCreateInput,
   type EmployeeDefinition,
+  type EmployeeFromTemplateCreateInput,
+  type EmployeeScope,
+  type EmployeeTemplateCreateInput,
+  type EmployeeTemplateDefaults,
+  type EmployeeTemplateDefinition,
+  type EmployeeTemplateRecord,
+  type EmployeeTemplateSource,
+  type EmployeeTemplateUpdateInput,
   type EmployeeUpdateInput,
   type EmployeeInvocationInput,
   type EmployeeInvocationResult,
@@ -214,6 +229,9 @@ function validateSkillBindings(
     if (seen.has(normalized.id)) throw new Error(`skill ${normalized.id} is bound more than once`);
     seen.add(normalized.id);
     const skill = resolveSkillVersion(state, normalized.id, versions[normalized.id]);
+    if (skill.owner === "system") {
+      throw new Error(`system skill ${normalized.id} cannot be bound to an Employee manually`);
+    }
     if (skill.configSchema) {
       const validate = new Ajv({ allErrors: true, strict: false }).compile(skill.configSchema);
       if (!validate(normalized.config)) {
@@ -230,6 +248,13 @@ function employeeVersion(record: EmployeeRecord, version?: number): EmployeeDefi
   if (version === undefined) return record.current;
   const found = record.versions.find((candidate) => candidate.version === version);
   if (!found) throw new Error(`employee ${record.current.id} version ${version} not found`);
+  return found;
+}
+
+function employeeTemplateVersion(record: EmployeeTemplateRecord, version?: number): EmployeeTemplateDefinition {
+  if (version === undefined) return record.current;
+  const found = record.versions.find((candidate) => candidate.version === version);
+  if (!found) throw new Error(`employee template ${record.current.id} version ${version} not found`);
   return found;
 }
 
@@ -277,6 +302,46 @@ function normalizedStringList(values: string[] | undefined, label: string): stri
   if (values === undefined) return undefined;
   const normalized = values.map((value) => requireText(value, label));
   return [...new Set(normalized)];
+}
+
+function normalizeCapabilities(values: string[] | undefined, label: string): string[] {
+  return normalizedStringList(values ?? [], label) ?? [];
+}
+
+function legacyMetadataProjectId(identity: RoleIdentityDefinition): string | undefined {
+  const value = identity.metadata?.internalProjectId;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeEmployeeScope(
+  state: WorkbenchState,
+  scope: EmployeeScope | undefined,
+  identity: RoleIdentityDefinition,
+  label: string
+): EmployeeScope {
+  const legacyProjectId = scope === undefined ? legacyMetadataProjectId(identity) : undefined;
+  const normalized = scope ?? (legacyProjectId
+    ? { kind: "project" as const, projectId: legacyProjectId, projectVersion: 1 }
+    : { kind: "global" as const });
+  if (normalized.kind === "global") return normalized;
+  const projectId = requireId(normalized.projectId, `${label} project id`);
+  const projectVersionValue = validRevision(normalized.projectVersion, undefined, `${label} project version`);
+  if (!legacyProjectId) {
+    const project = state.projects[projectId];
+    if (!project) throw new Error(`project not found: ${projectId}`);
+    if (!project.versions.some((candidate) => candidate.version === projectVersionValue)) {
+      throw new Error(`project ${projectId} version ${projectVersionValue} not found`);
+    }
+  }
+  return { kind: "project", projectId, projectVersion: projectVersionValue };
+}
+
+function sameEmployeeScope(left: EmployeeScope, right: EmployeeScope): boolean {
+  return left.kind === right.kind && (left.kind === "global" || (
+    right.kind === "project"
+    && left.projectId === right.projectId
+    && left.projectVersion === right.projectVersion
+  ));
 }
 
 function boundedNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
@@ -355,6 +420,103 @@ function normalizeKnowledgeGrants(
     throw new Error("knowledge grant metadata must contain exactly one record for every knowledgeProfileId");
   }
   return profileIds.map((profileId) => normalized.find((grant) => grant.profileId === profileId)!);
+}
+
+function buildEmployeeDefinition(
+  state: WorkbenchState,
+  input: EmployeeCreateInput,
+  timestamp: string,
+  template?: EmployeeTemplateSource
+): EmployeeDefinition {
+  const id = requireId(input.id, "employee id");
+  const providerId = input.providerId ?? "mock";
+  if (!state.providers[providerId]) throw new Error(`unknown provider ${providerId}`);
+  const identity: RoleIdentityDefinition = {
+    displayName: requireText(input.identity.displayName, "employee displayName"),
+    background: requireText(input.identity.background, "employee background"),
+    responsibilities: input.identity.responsibilities.map((value) => requireText(value, "employee responsibility")),
+    goals: input.identity.goals?.map((value) => requireText(value, "employee goal")),
+    constraints: input.identity.constraints?.map((value) => requireText(value, "employee constraint")),
+    metadata: input.identity.metadata
+  };
+  if (identity.responsibilities.length === 0) throw new Error("employee responsibilities must not be empty");
+  const skills = input.skills ?? [];
+  const skillVersions = pinSkillVersions(state, skills, input.skillVersions);
+  validateSkillBindings(state, skills, skillVersions);
+  const knowledgeProfileIds = validateKnowledgeProfileIds(
+    state,
+    input.knowledgeProfileIds ?? [],
+    `employee ${id} knowledge profile`
+  );
+  const outputSchema = input.outputSchema ?? DEFAULT_EMPLOYEE_OUTPUT_SCHEMA;
+  validateSchema(outputSchema, `employee ${id} outputSchema`);
+  const verdict = input.verdict ?? undefined;
+  validateVerdict(verdict, `employee ${id}`);
+  return {
+    id,
+    version: 1,
+    status: "active",
+    identity,
+    description: requireText(input.description ?? identity.background, "employee description"),
+    systemPrompt: requireText(
+      input.systemPrompt ?? "Act within the assigned identity, preserve evidence, and state uncertainty explicitly.",
+      "employee systemPrompt"
+    ),
+    requestPrompt: requireText(
+      input.requestPrompt ?? "Complete the current request using the available context and return the required structured output.",
+      "employee requestPrompt"
+    ),
+    capabilities: normalizeCapabilities(input.capabilities, `employee ${id} capability`),
+    scope: normalizeEmployeeScope(state, input.scope, identity, `employee ${id} scope`),
+    template,
+    skills,
+    skillVersions,
+    knowledgeProfileIds,
+    knowledgeGrants: normalizeKnowledgeGrants(knowledgeProfileIds, input.knowledgeGrants, timestamp),
+    providerId,
+    outputSchema,
+    maxAttempts: Math.max(1, Math.min(10, input.maxAttempts ?? 1)),
+    permissions: input.permissions ?? { write: "none", tools: [] },
+    verdict,
+    contextPolicy: { historyLimit: Math.max(0, Math.min(100, input.contextPolicy?.historyLimit ?? 20)) },
+    presentation: input.presentation ?? {},
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+}
+
+function normalizeEmployeeTemplateDefaults(
+  state: WorkbenchState,
+  id: string,
+  displayName: string,
+  defaults: EmployeeTemplateDefaults,
+  timestamp: string
+): EmployeeTemplateDefaults {
+  const employee = buildEmployeeDefinition(state, {
+    ...defaults,
+    id: `template-${id}`,
+    identity: { ...defaults.identity, displayName }
+  }, timestamp);
+  const { displayName: _displayName, ...identity } = employee.identity;
+  return {
+    identity,
+    description: employee.description,
+    systemPrompt: employee.systemPrompt,
+    requestPrompt: employee.requestPrompt,
+    capabilities: employee.capabilities,
+    scope: employee.scope,
+    skills: employee.skills,
+    skillVersions: employee.skillVersions,
+    knowledgeProfileIds: employee.knowledgeProfileIds,
+    knowledgeGrants: employee.knowledgeGrants.map(({ source: _source, ...grant }) => grant),
+    providerId: employee.providerId,
+    outputSchema: employee.outputSchema,
+    maxAttempts: employee.maxAttempts,
+    permissions: employee.permissions,
+    verdict: employee.verdict,
+    contextPolicy: employee.contextPolicy,
+    presentation: employee.presentation
+  };
 }
 
 function normalizeKnowledgeRule(rule: KnowledgeProfileRule): KnowledgeProfileRule {
@@ -547,8 +709,11 @@ function uniqueReferences(
 }
 
 function internalProjectId(employee: EmployeeDefinition): string | undefined {
-  const value = employee.identity.metadata?.internalProjectId;
-  return typeof value === "string" && value.trim() ? value : undefined;
+  return employee.scope.kind === "project" ? employee.scope.projectId : undefined;
+}
+
+function internalProjectVersion(employee: EmployeeDefinition): number | undefined {
+  return employee.scope.kind === "project" ? employee.scope.projectVersion : undefined;
 }
 
 function internalProjectRoleId(employee: EmployeeDefinition): string | undefined {
@@ -1020,7 +1185,9 @@ export class WorkbenchService {
         workflowVersion: invocation.executionSnapshot?.workflow.version ?? invocation.target.version,
         nodeId,
         roleId: typeof metadata.roleId === "string" ? metadata.roleId : runtimeRole,
-        kind: metadata.kind === "supervisor" || metadata.kind === "member" ? metadata.kind : undefined,
+        kind: metadata.kind === "supervisor" || metadata.kind === "member" || metadata.kind === "gate"
+          ? metadata.kind
+          : undefined,
         round: typeof metadata.round === "number" ? metadata.round : undefined,
         parentNodeId: typeof metadata.parentNodeId === "string" ? metadata.parentNodeId : undefined,
         runId: invocation.runId,
@@ -1286,6 +1453,8 @@ export class WorkbenchService {
         id,
         version: 1,
         status: "active",
+        owner: "user",
+        injection: "none",
         displayName: requireText(input.displayName ?? id, "skill displayName"),
         description: requireText(input.description, "skill description"),
         instructions: requireText(input.instructions, "skill instructions"),
@@ -1305,6 +1474,7 @@ export class WorkbenchService {
     return this.store.mutate((state) => {
       const current = state.skills[id];
       if (!current) throw new Error(`skill not found: ${id}`);
+      if (current.owner === "system") throw new Error(`system skill ${id} cannot be updated`);
       const updated: WorkbenchSkillDefinition = {
         ...current,
         displayName: input.displayName === undefined ? current.displayName : requireText(input.displayName, "skill displayName"),
@@ -1325,6 +1495,7 @@ export class WorkbenchService {
     return this.store.mutate((state) => {
       const current = state.skills[id];
       if (!current) throw new Error(`skill not found: ${id}`);
+      if (current.owner === "system") throw new Error(`system skill ${id} cannot be archived`);
       if (current.status === "archived") return current;
       const archived: WorkbenchSkillDefinition = {
         ...current,
@@ -1342,6 +1513,7 @@ export class WorkbenchService {
     return this.store.mutate((state) => {
       const current = state.skills[id];
       if (!current) throw new Error(`skill not found: ${id}`);
+      if (current.owner === "system") throw new Error(`system skill ${id} cannot be restored`);
       if (current.status === "active") return current;
       const restored: WorkbenchSkillDefinition = {
         ...current,
@@ -1351,6 +1523,107 @@ export class WorkbenchService {
       };
       state.skills[id] = restored;
       (state.skillHistory[id] ??= [current]).push(restored);
+      return restored;
+    });
+  }
+
+  listEmployeeTemplates(includeArchived = false): EmployeeTemplateDefinition[] {
+    return Object.values(this.snapshot().employeeTemplates)
+      .map((record) => record.current)
+      .filter((template) => includeArchived || template.status === "active")
+      .sort((left, right) => left.displayName.localeCompare(right.displayName));
+  }
+
+  getEmployeeTemplate(id: string, version?: number): EmployeeTemplateDefinition {
+    const record = this.snapshot().employeeTemplates[id];
+    if (!record) throw new Error(`employee template not found: ${id}`);
+    return employeeTemplateVersion(record, version);
+  }
+
+  getEmployeeTemplateVersions(id: string): EmployeeTemplateDefinition[] {
+    const record = this.snapshot().employeeTemplates[id];
+    if (!record) throw new Error(`employee template not found: ${id}`);
+    return [...record.versions].sort((left, right) => right.version - left.version);
+  }
+
+  async createEmployeeTemplate(input: EmployeeTemplateCreateInput): Promise<EmployeeTemplateDefinition> {
+    const id = requireId(input.id, "employee template id");
+    return this.store.mutate((state) => {
+      if (state.employeeTemplates[id]) throw new Error(`employee template already exists: ${id}`);
+      const timestamp = now();
+      const displayName = requireText(input.displayName ?? id, "employee template displayName");
+      const template: EmployeeTemplateDefinition = {
+        id,
+        version: 1,
+        status: "active",
+        displayName,
+        description: requireText(input.description, "employee template description"),
+        defaults: normalizeEmployeeTemplateDefaults(state, id, displayName, input.defaults, timestamp),
+        createdAt: timestamp,
+        updatedAt: timestamp
+      };
+      state.employeeTemplates[id] = { current: template, versions: [template] };
+      return template;
+    });
+  }
+
+  async updateEmployeeTemplate(id: string, input: EmployeeTemplateUpdateInput): Promise<EmployeeTemplateDefinition> {
+    return this.store.mutate((state) => {
+      const record = state.employeeTemplates[id];
+      if (!record) throw new Error(`employee template not found: ${id}`);
+      const current = record.current;
+      const timestamp = now();
+      const displayName = input.displayName === undefined
+        ? current.displayName
+        : requireText(input.displayName, "employee template displayName");
+      const updated: EmployeeTemplateDefinition = {
+        ...current,
+        version: current.version + 1,
+        displayName,
+        description: input.description === undefined
+          ? current.description
+          : requireText(input.description, "employee template description"),
+        defaults: input.defaults === undefined
+          ? current.defaults
+          : normalizeEmployeeTemplateDefaults(state, id, displayName, input.defaults, timestamp),
+        updatedAt: timestamp
+      };
+      record.current = updated;
+      record.versions.push(updated);
+      return updated;
+    });
+  }
+
+  async archiveEmployeeTemplate(id: string): Promise<EmployeeTemplateDefinition> {
+    return this.store.mutate((state) => {
+      const record = state.employeeTemplates[id];
+      if (!record) throw new Error(`employee template not found: ${id}`);
+      if (record.current.status === "archived") return record.current;
+      const archived = {
+        ...record.current,
+        status: "archived" as const,
+        version: record.current.version + 1,
+        updatedAt: now()
+      };
+      record.current = archived;
+      record.versions.push(archived);
+      return archived;
+    });
+  }
+
+  async restoreEmployeeTemplate(id: string): Promise<EmployeeTemplateDefinition> {
+    return this.store.mutate((state) => {
+      const record = state.employeeTemplates[id];
+      if (!record) throw new Error(`employee template not found: ${id}`);
+      if (record.current.status === "active") return record.current;
+      const restored = {
+        ...record.current,
+        status: "active" as const,
+        version: record.current.version + 1,
+        updatedAt: now()
+      };
+      record.current = restored;
+      record.versions.push(restored);
       return restored;
     });
   }
@@ -2782,6 +3055,10 @@ export class WorkbenchService {
     if (scopedProjectId && scopedProjectId !== project.id) {
       throw new Error(`employee ${employee.id} is internal to project ${scopedProjectId}`);
     }
+    const scopedProjectVersion = internalProjectVersion(employee);
+    if (scopedProjectVersion !== undefined && scopedProjectVersion !== project.version) {
+      throw new Error(`employee ${employee.id} is fixed to project ${project.id} v${scopedProjectVersion}, not v${project.version}`);
+    }
     const scopedRoleId = internalProjectRoleId(employee);
     if (scopedRoleId && scopedRoleId !== role.id) {
       throw new Error(`employee ${employee.id} is internal to project role ${scopedRoleId}`);
@@ -2968,58 +3245,46 @@ export class WorkbenchService {
     const id = requireId(input.id, "employee id");
     return this.store.mutate((state) => {
       if (state.employees[id]) throw new Error(`employee already exists: ${id}`);
-      const providerId = input.providerId ?? "mock";
-      if (!state.providers[providerId]) throw new Error(`unknown provider ${providerId}`);
-      const skills = input.skills ?? [];
-      const skillVersions = pinSkillVersions(state, skills, input.skillVersions);
-      validateSkillBindings(state, skills, skillVersions);
-      const knowledgeProfileIds = validateKnowledgeProfileIds(state, input.knowledgeProfileIds ?? [], `employee ${id} knowledge profile`);
-      const outputSchema = input.outputSchema ?? DEFAULT_EMPLOYEE_OUTPUT_SCHEMA;
-      validateSchema(outputSchema, `employee ${id} outputSchema`);
-      const verdict = input.verdict ?? undefined;
-      validateVerdict(verdict, `employee ${id}`);
       const timestamp = now();
-      const knowledgeGrants = normalizeKnowledgeGrants(
-        knowledgeProfileIds,
-        input.knowledgeGrants,
-        timestamp
-      );
-      const employee: EmployeeDefinition = {
+      const employee = buildEmployeeDefinition(state, input, timestamp);
+      state.employees[id] = { current: employee, versions: [employee] };
+      return employee;
+    });
+  }
+
+  async createEmployeeFromTemplate(
+    templateId: string,
+    input: EmployeeFromTemplateCreateInput
+  ): Promise<EmployeeDefinition> {
+    requireId(templateId, "employee template id");
+    const id = requireId(input.id, "employee id");
+    return this.store.mutate((state) => {
+      if (state.employees[id]) throw new Error(`employee already exists: ${id}`);
+      const record = state.employeeTemplates[templateId];
+      if (!record) throw new Error(`employee template not found: ${templateId}`);
+      if (record.current.status !== "active") throw new Error(`employee template ${templateId} is archived`);
+      const template = employeeTemplateVersion(record, input.templateVersion);
+      if (template.status !== "active") {
+        throw new Error(`employee template ${templateId} v${template.version} is archived`);
+      }
+      const { templateVersion: _templateVersion, id: _id, identity: identityInput, ...overrides } = input;
+      const employeeInput: EmployeeCreateInput = {
+        ...structuredClone(template.defaults),
+        ...overrides,
         id,
-        version: 1,
-        status: "active",
         identity: {
-          displayName: requireText(input.identity.displayName, "employee displayName"),
-          background: requireText(input.identity.background, "employee background"),
-          responsibilities: input.identity.responsibilities.map((value) => requireText(value, "employee responsibility")),
-          goals: input.identity.goals?.map((value) => requireText(value, "employee goal")),
-          constraints: input.identity.constraints?.map((value) => requireText(value, "employee constraint")),
-          metadata: input.identity.metadata
-        },
-        description: requireText(input.description ?? input.identity.background, "employee description"),
-        systemPrompt: requireText(
-          input.systemPrompt ?? "Act within the assigned identity, preserve evidence, and state uncertainty explicitly.",
-          "employee systemPrompt"
-        ),
-        requestPrompt: requireText(
-          input.requestPrompt ?? "Complete the current request using the available context and return the required structured output.",
-          "employee requestPrompt"
-        ),
-        skills,
-        skillVersions,
-        knowledgeProfileIds,
-        knowledgeGrants,
-        providerId,
-        outputSchema,
-        maxAttempts: Math.max(1, Math.min(10, input.maxAttempts ?? 1)),
-        permissions: input.permissions ?? { write: "none", tools: [] },
-        verdict,
-        contextPolicy: { historyLimit: Math.max(0, Math.min(100, input.contextPolicy?.historyLimit ?? 20)) },
-        presentation: input.presentation ?? {},
-        createdAt: timestamp,
-        updatedAt: timestamp
+          ...structuredClone(template.defaults.identity),
+          ...identityInput,
+          displayName: identityInput.displayName
+        }
       };
-      if (employee.identity.responsibilities.length === 0) throw new Error("employee responsibilities must not be empty");
+      const timestamp = now();
+      const employee = buildEmployeeDefinition(
+        state,
+        employeeInput,
+        timestamp,
+        { id: template.id, version: template.version }
+      );
       state.employees[id] = { current: employee, versions: [employee] };
       return employee;
     });
@@ -3045,9 +3310,9 @@ export class WorkbenchService {
       const verdict = input.verdict === undefined ? current.verdict : input.verdict ?? undefined;
       validateVerdict(verdict, `employee ${id}`);
       const identity = input.identity ?? current.identity;
-      const scopedProjectId = internalProjectId(current);
-      if (scopedProjectId && internalProjectId({ ...current, identity }) !== scopedProjectId) {
-        throw new Error(`employee ${id} internal project scope ${scopedProjectId} is immutable`);
+      const legacyScopedProjectId = legacyMetadataProjectId(current.identity);
+      if (legacyScopedProjectId && legacyMetadataProjectId(identity) !== legacyScopedProjectId) {
+        throw new Error(`employee ${id} internal project scope ${legacyScopedProjectId} is immutable`);
       }
       const scopedRoleId = internalProjectRoleId(current);
       if (scopedRoleId && internalProjectRoleId({ ...current, identity }) !== scopedRoleId) {
@@ -3060,6 +3325,10 @@ export class WorkbenchService {
         updatedAt,
         current.knowledgeGrants
       );
+      const scope = input.scope === undefined
+        ? current.scope
+        : normalizeEmployeeScope(state, input.scope, identity, `employee ${id} scope`);
+      if (!sameEmployeeScope(current.scope, scope)) throw new Error(`employee ${id} scope is immutable`);
       const updated: EmployeeDefinition = {
         ...current,
         identity: {
@@ -3073,6 +3342,10 @@ export class WorkbenchService {
         description: input.description === undefined ? current.description : requireText(input.description, "employee description"),
         systemPrompt: input.systemPrompt === undefined ? current.systemPrompt : requireText(input.systemPrompt, "employee systemPrompt"),
         requestPrompt: input.requestPrompt === undefined ? current.requestPrompt : requireText(input.requestPrompt, "employee requestPrompt"),
+        capabilities: input.capabilities === undefined
+          ? current.capabilities
+          : normalizeCapabilities(input.capabilities, `employee ${id} capability`),
+        scope,
         skills,
         skillVersions,
         knowledgeProfileIds,
@@ -3104,6 +3377,8 @@ export class WorkbenchService {
       description: source.description,
       systemPrompt: source.systemPrompt,
       requestPrompt: source.requestPrompt,
+      capabilities: source.capabilities,
+      scope: source.scope,
       skills: source.skills,
       skillVersions: source.skillVersions,
       knowledgeProfileIds: source.knowledgeProfileIds,
@@ -4147,6 +4422,15 @@ export class WorkbenchService {
       return employee;
     };
     const supervisor = resolveEmployee(input.supervisor.employeeId, input.supervisor.employeeVersion, "supervisor");
+    const orchestrationSkill = state.skills["team-orchestration"];
+    if (
+      !orchestrationSkill
+      || orchestrationSkill.status !== "active"
+      || orchestrationSkill.owner !== "system"
+      || orchestrationSkill.injection !== "supervisor"
+    ) {
+      throw new Error("system supervisor Skill team-orchestration is unavailable");
+    }
     const policyRecord = state.managementPolicies[input.managementPolicy.id];
     if (!policyRecord) throw new Error(`management policy not found: ${input.managementPolicy.id}`);
     if (policyRecord.current.status !== "active") throw new Error(`management policy ${input.managementPolicy.id} is archived`);
@@ -4180,8 +4464,13 @@ export class WorkbenchService {
       architecture: "supervisor",
       description: input.description?.trim() || `Supervisor workflow ${id}`,
       supervisor: { employeeId: supervisor.id, employeeVersion: supervisor.version },
+      orchestrationSkill: current?.orchestrationSkill ?? {
+        id: "team-orchestration",
+        version: orchestrationSkill.version
+      },
       managementPolicy: { id: policy.id, version: policy.version },
       members,
+      flow: normalizeSupervisorFlow(input.flow, current?.flow),
       inputSchema: input.inputSchema ?? current?.inputSchema,
       createdAt: current?.createdAt ?? timestamp,
       updatedAt: timestamp
@@ -4246,6 +4535,7 @@ export class WorkbenchService {
           managementPolicy:
             "managementPolicy" in input && input.managementPolicy ? input.managementPolicy : current.managementPolicy,
           members: "members" in input && input.members ? input.members : current.members,
+          flow: "flow" in input ? input.flow : undefined,
           inputSchema: input.inputSchema ?? current.inputSchema,
           presentation: input.presentation ?? current.presentation
         }, current);

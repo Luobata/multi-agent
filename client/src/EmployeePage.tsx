@@ -22,6 +22,7 @@ import type {
   Bootstrap,
   ContextView,
   Employee,
+  EmployeeTemplate,
   JsonObject,
   KnowledgeRuntimeResult,
   ProviderEntry,
@@ -37,7 +38,7 @@ import {
 import { providerRuntimeSummary } from "./providerRuntime";
 import { KnowledgePerspectiveExplorer } from "./knowledgePerspective";
 import { EmployeeKnowledgeGrantModal } from "./employeeKnowledgeGrant";
-import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
+import { isProjectEmployee, isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
 
 interface PageProps {
   data: Bootstrap;
@@ -56,6 +57,9 @@ interface EmployeeDraft {
   description: string;
   systemPrompt: string;
   requestPrompt: string;
+  capabilities: string;
+  scopeKind: "global" | "project";
+  scopeProjectId: string;
   providerId: string;
   selectedSkills: string[];
   skillConfigs: Record<string, string>;
@@ -100,6 +104,9 @@ function draftFrom(employee?: Employee): EmployeeDraft {
     description: employee?.description ?? "",
     systemPrompt: employee?.systemPrompt ?? "保持证据边界，明确说明不确定性，并严格履行被分配的职责。",
     requestPrompt: employee?.requestPrompt ?? "完成当前交办事项，并按约定的结构化输出返回结果。",
+    capabilities: employee?.capabilities.join(", ") ?? "",
+    scopeKind: employee?.scope.kind ?? "global",
+    scopeProjectId: employee?.scope.kind === "project" ? employee.scope.projectId : "",
     providerId: employee?.providerId ?? "mock",
     selectedSkills: employee?.skills.map(bindingId) ?? [],
     skillConfigs: Object.fromEntries((employee?.skills ?? []).map((binding) => [
@@ -131,6 +138,47 @@ function parseObject(value: string, label: string): JsonObject {
   return parsed as JsonObject;
 }
 
+function capabilityList(value: string): string[] {
+  return [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))];
+}
+
+function draftFromTemplate(template: EmployeeTemplate): EmployeeDraft {
+  const draft = draftFrom();
+  const defaults = template.defaults;
+  return {
+    ...draft,
+    background: defaults.identity.background,
+    responsibilities: defaults.identity.responsibilities.join("\n"),
+    goals: defaults.identity.goals?.join("\n") ?? "",
+    constraints: defaults.identity.constraints?.join("\n") ?? "",
+    metadata: JSON.stringify(defaults.identity.metadata ?? {}, null, 2),
+    description: defaults.description ?? template.description,
+    systemPrompt: defaults.systemPrompt ?? draft.systemPrompt,
+    requestPrompt: defaults.requestPrompt ?? draft.requestPrompt,
+    capabilities: defaults.capabilities?.join(", ") ?? "",
+    scopeKind: defaults.scope?.kind ?? "global",
+    scopeProjectId: defaults.scope?.kind === "project" ? defaults.scope.projectId : "",
+    providerId: defaults.providerId ?? draft.providerId,
+    selectedSkills: defaults.skills?.map(bindingId) ?? [],
+    skillConfigs: Object.fromEntries((defaults.skills ?? []).map((binding) => [
+      bindingId(binding),
+      JSON.stringify(typeof binding === "string" ? {} : binding.config ?? {}, null, 2)
+    ])),
+    skillEnabled: Object.fromEntries((defaults.skills ?? []).map((binding) => [bindingId(binding), bindingEnabled(binding)])),
+    write: defaults.permissions?.write ?? draft.write,
+    tools: defaults.permissions?.tools?.join(", ") ?? "",
+    outputSchema: JSON.stringify(defaults.outputSchema ?? JSON.parse(defaultOutputSchema), null, 2),
+    verdictPath: defaults.verdict?.path ?? "",
+    verdictPass: defaults.verdict?.pass.map(String).join(", ") ?? "",
+    verdictBlock: defaults.verdict?.block.map(String).join(", ") ?? "",
+    maxAttempts: defaults.maxAttempts ?? draft.maxAttempts,
+    historyLimit: defaults.contextPolicy?.historyLimit ?? draft.historyLimit,
+    accent: defaults.presentation?.accent ?? draft.accent,
+    initials: defaults.presentation?.initials ?? "",
+    avatarUrl: defaults.presentation?.avatarUrl ?? ""
+  };
+}
+
 function payloadFrom(draft: EmployeeDraft) {
   const skills = draft.selectedSkills.map((id) => ({
     id,
@@ -150,6 +198,7 @@ function payloadFrom(draft: EmployeeDraft) {
     description: draft.description.trim(),
     systemPrompt: draft.systemPrompt.trim(),
     requestPrompt: draft.requestPrompt.trim(),
+    capabilities: capabilityList(draft.capabilities),
     skills,
     providerId: draft.providerId,
     outputSchema: parseObject(draft.outputSchema, "Output Schema"),
@@ -169,15 +218,19 @@ function payloadFrom(draft: EmployeeDraft) {
   };
 }
 
-function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify }: {
+function EmployeeEditor({ employee, data, onClose, onSaved, notify }: {
   employee?: Employee;
-  providers: ProviderEntry[];
-  skills: Skill[];
+  data: Bootstrap;
   onClose: () => void;
   onSaved: (employee: Employee) => void;
   notify: PageProps["notify"];
 }) {
+  const providers = data.providers;
+  const skills = data.skills.filter((skill) => skill.owner !== "system");
+  const templates = (data.employeeTemplates ?? []).filter((template) => template.status === "active");
+  const projects = data.projects.filter((project) => project.status === "active");
   const [draft, setDraft] = useState(() => draftFrom(employee));
+  const [templateId, setTemplateId] = useState("");
   const [saving, setSaving] = useState(false);
   const daemonAvailable = useDaemonAvailable();
   const patch = <K extends keyof EmployeeDraft>(key: K, value: EmployeeDraft[K]) => setDraft((current) => ({ ...current, [key]: value }));
@@ -187,9 +240,18 @@ function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify 
     setSaving(true);
     try {
       const payload = payloadFrom(draft);
+      const project = projects.find((candidate) => candidate.id === draft.scopeProjectId);
+      const scopedPayload = {
+        ...payload,
+        scope: employee ? employee.scope : draft.scopeKind === "project"
+          ? { kind: "project" as const, projectId: draft.scopeProjectId, projectVersion: project?.version ?? 1 }
+          : { kind: "global" as const }
+      };
       const saved = employee
-        ? await api<Employee>(`/api/employees/${employee.id}`, writeBody(payload, "PATCH"))
-        : await api<Employee>("/api/employees", writeBody(payload));
+        ? await api<Employee>(`/api/employees/${employee.id}`, writeBody(scopedPayload, "PATCH"))
+        : templateId
+          ? await api<Employee>(`/api/employee-templates/${templateId}/employees`, writeBody({ ...scopedPayload, templateVersion: templates.find((template) => template.id === templateId)?.version }))
+          : await api<Employee>("/api/employees", writeBody(scopedPayload));
       notify(employee ? `已另存为 v${saved.version}` : `已建立员工档案 ${saved.id}`);
       onSaved(saved);
     } catch (error) {
@@ -202,6 +264,17 @@ function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify 
   return <Modal title={employee ? `修订 ${employee.identity.displayName}` : "建立员工档案"} onClose={onClose} wide>
     <form className="editor-form" onSubmit={submit}>
       <fieldset className="daemon-write-surface" disabled={!daemonAvailable}>
+      {!employee && <section className="employee-template-picker" aria-label="员工模板与作用域">
+        <div><span>EMPLOYEE BLUEPRINT</span><strong>从通用模板派生项目员工</strong><p>模板只在创建时复制默认值并固定版本；之后员工独立演进，不会随模板静默变化。</p></div>
+        <Field label="员工模板（可选）"><select value={templateId} onChange={(event) => {
+          const nextId = event.target.value;
+          setTemplateId(nextId);
+          const template = templates.find((candidate) => candidate.id === nextId);
+          if (!template) return;
+          const next = draftFromTemplate(template);
+          setDraft({ ...next, id: draft.id, displayName: draft.displayName });
+        }}><option value="">空白档案</option>{templates.map((template) => <option value={template.id} key={template.id}>{template.displayName} · 固定 v{template.version}</option>)}</select></Field>
+      </section>}
       <DossierSection number="01" title="身份">
         <div className="form-grid two">
           <Field label="员工 ID" hint="小写字母开头，只能使用字母、数字和连字符。">
@@ -217,6 +290,11 @@ function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify 
         </div>
         <Field label="Identity metadata (JSON)"><textarea className="mono" rows={4} value={draft.metadata} onChange={(e) => patch("metadata", e.target.value)} /></Field>
         <Field label="档案摘要"><input required value={draft.description} onChange={(e) => patch("description", e.target.value)} /></Field>
+        <div className="form-grid two">
+          <Field label="所属范围" hint={employee ? "创建后不可变。" : "项目员工只能在固定项目版本内调用。"}><select disabled={Boolean(employee)} value={draft.scopeKind} onChange={(event) => patch("scopeKind", event.target.value as EmployeeDraft["scopeKind"])}><option value="global">全局员工</option><option value="project">项目员工</option></select></Field>
+          {draft.scopeKind === "project" && <Field label="所属项目"><select required disabled={Boolean(employee)} value={draft.scopeProjectId} onChange={(event) => patch("scopeProjectId", event.target.value)}><option value="">选择项目</option>{projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.id} · 固定 v{project.version}</option>)}</select></Field>}
+        </div>
+        <Field label="结构化能力" hint="逗号分隔，例如 code.frontend、quality.test；协作编排按能力而不是角色名分工。"><input value={draft.capabilities} onChange={(event) => patch("capabilities", event.target.value)} placeholder="code.frontend, quality.audit" /></Field>
       </DossierSection>
 
       <DossierSection number="02" title="提示词">
@@ -225,7 +303,7 @@ function EmployeeEditor({ employee, providers, skills, onClose, onSaved, notify 
       </DossierSection>
 
       <DossierSection number="03" title="共享技能">
-        {skills.length === 0 ? <p className="muted">共享 Skill 注册表为空。可先关闭本页并打开“注册表”新建 Skill。</p> : <div className="skill-selector">
+        {skills.length === 0 ? <p className="muted">自定义 Skill 注册表为空。系统能力按运行位置自动注入，不能在这里手工绑定。</p> : <div className="skill-selector">
           {skills.filter((skill) => skill.status === "active" || draft.selectedSkills.includes(skill.id)).map((skill) => {
             const selected = draft.selectedSkills.includes(skill.id);
             return <div className={`skill-option ${selected ? "selected" : ""}`} key={skill.id}>
@@ -555,6 +633,8 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       `${employee.id} ${employee.identity.displayName} ${employee.description} ${employee.providerId} ${runtime.model} ${runtime.launchCommand}`.toLowerCase().includes(search.toLowerCase());
   }), [data.employees, data.providers, search, showArchived]);
   const visibleExternal = visible.filter((employee) => !isSystemEmployee(employee));
+  const visibleProject = visible.filter(isProjectEmployee);
+  const visibleGlobal = visibleExternal.filter((employee) => !isProjectEmployee(employee));
   const visibleSystem = visible.filter(isSystemEmployee);
   const [selectedId, setSelectedId] = useState(visible[0]?.id ?? "");
   const selected = data.employees.find((employee) => employee.id === selectedId) ?? visible[0];
@@ -617,7 +697,8 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       <div className="list-tools"><input type="search" placeholder="检索姓名、ID 或职责…" value={search} onChange={(e) => setSearch(e.target.value)} /><label className="archive-toggle"><input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />含归档</label><button className="text-button" disabled={!daemonAvailable} onClick={() => setRegistryOpen(true)}>共享注册表</button></div>
       <div className="record-scroll">
         {[
-          { id: "external", title: "外部可调用员工", note: "可通过直接交办、调用包或全局编排使用", employees: visibleExternal },
+          { id: "external", title: "外部可调用员工", note: "可通过直接交办、调用包或全局编排使用", employees: visibleGlobal },
+          { id: "project", title: "项目员工", note: "真实可执行员工；只在固定项目范围内工作，可由通用模板派生", employees: visibleProject },
           { id: "system", title: "系统级员工", note: "仅供内部项目角色调用，可在此管理", employees: visibleSystem }
         ].map((group) => <section className={`employee-roster-group employee-roster-group--${group.id}`} key={group.id} aria-labelledby={`employee-group-${group.id}`}>
           <header><div><h2 id={`employee-group-${group.id}`}>{group.title}</h2><span>{group.employees.length}</span></div><p>{group.note}</p></header>
@@ -629,7 +710,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
           {group.employees.length === 0 && <div className="mini-empty">{search.trim() ? "本组没有符合条件的档案。" : group.id === "system" ? "暂无系统级员工。" : "暂无外部可调用员工。"}</div>}
         </section>)}
       </div>
-      <footer className="list-footer"><span>{visibleExternal.length} 位员工 · {visibleSystem.length} 位系统员工</span><span>LOCAL</span></footer>
+      <footer className="list-footer"><span>{visibleGlobal.length} 位全局 · {visibleProject.length} 位项目 · {visibleSystem.length} 位系统员工</span><span>LOCAL</span></footer>
     </aside>
 
     <main className="detail-pane">
@@ -642,7 +723,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
 
         {selectedSystemScope && <aside className="system-employee-boundary" aria-label="系统级员工调用边界"><span>SYSTEM / INTERNAL ONLY</span><div><strong>仅供内部管理与项目角色调用</strong><p>不会出现在直接交办、调用包或全局 Workflow 的可调用员工中。</p></div><dl><dt>内部项目</dt><dd><code>{selectedSystemScope.projectId}</code></dd><dt>固定角色</dt><dd><code>{selectedSystemScope.roleId ?? "由项目绑定约束"}</code></dd></dl></aside>}
 
-        <DossierSection number="01" title="身份"><div className="fact-grid"><div><span>背景</span><p>{selected.identity.background}</p></div><div><span>职责</span><ul>{selected.identity.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul></div><div><span>目标</span><ul>{selected.identity.goals?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div><div><span>约束</span><ul>{selected.identity.constraints?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div></div></DossierSection>
+        <DossierSection number="01" title="身份"><div className="employee-provenance"><span>{selected.scope.kind === "project" ? "PROJECT EMPLOYEE" : "GLOBAL EMPLOYEE"}</span><strong>{selected.scope.kind === "project" ? `${selected.scope.projectId} · 固定项目 v${selected.scope.projectVersion}` : "全局范围"}</strong><small>{selected.template ? `派生自 ${selected.template.id} · 固定模板 v${selected.template.version}` : "独立建立的员工档案"}</small></div><div className="employee-capability-row"><b>结构化能力</b>{selected.capabilities.length ? selected.capabilities.map((capability) => <code className="paper-tag" key={capability}>{capability}</code>) : <span className="muted">尚未声明；领队不会按名称猜测能力。</span>}</div><div className="fact-grid"><div><span>背景</span><p>{selected.identity.background}</p></div><div><span>职责</span><ul>{selected.identity.responsibilities.map((item) => <li key={item}>{item}</li>)}</ul></div><div><span>目标</span><ul>{selected.identity.goals?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div><div><span>约束</span><ul>{selected.identity.constraints?.map((item) => <li key={item}>{item}</li>) ?? <li>未声明</li>}</ul></div></div></DossierSection>
         <DossierSection number="02" title="提示词"><div className="prompt-preview"><div><span>系统指令</span><p>{selected.systemPrompt}</p></div><div><span>请求指令</span><p>{selected.requestPrompt}</p></div></div></DossierSection>
         <DossierSection number="03" title="技能" action={<div className="skill-section-actions">
           <button type="button" className="text-button icon-text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setSkillManagerMode("add")}><UtilityIcon name="add" />从技能池添加</button>
@@ -656,7 +737,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       </div>}
     </main>
 
-    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} providers={data.providers} skills={data.skills} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
+    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} data={data} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
     {registryOpen && <RegistryModal data={data} onClose={() => setRegistryOpen(false)} refresh={refresh} notify={notify} />}
     {skillManagerMode && selected && <EmployeeSkillManager employee={selected} skills={data.skills} mode={skillManagerMode} notify={notify} onClose={() => setSkillManagerMode(null)} onSaved={async () => { setSkillManagerMode(null); await refresh(); }} />}
     {knowledgePreviewOpen && selected && <KnowledgePreviewModal employee={selected} notify={notify} onClose={() => setKnowledgePreviewOpen(false)} />}

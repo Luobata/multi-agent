@@ -163,6 +163,83 @@ describe("workbench daemon", () => {
     expect((await fetch(`${base}/api/management-policies/desk-supervision/restore`, { method: "POST" })).status).toBe(200);
   });
 
+  it("exposes read-only system Skills and versioned Employee Template APIs in bootstrap", async () => {
+    const { base } = await fixture();
+    const createdTemplate = await fetch(`${base}/api/employee-templates`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "desk-project-worker",
+        displayName: "Desk project worker",
+        description: "Project-scoped desk defaults.",
+        defaults: {
+          identity: { background: "Works in the desk project.", responsibilities: ["Handle project work"] },
+          capabilities: ["code.backend"],
+          scope: { kind: "project", projectId: "desk-project", projectVersion: 1 }
+        }
+      })
+    });
+    expect(createdTemplate.status).toBe(201);
+    expect(await createdTemplate.json()).toMatchObject({
+      data: { id: "desk-project-worker", version: 1, status: "active" }
+    });
+
+    const createdEmployee = await fetch(`${base}/api/employee-templates/desk-project-worker/employees`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "desk-backend", identity: { displayName: "Desk Backend" } })
+    });
+    expect(createdEmployee.status).toBe(201);
+    expect(await createdEmployee.json()).toMatchObject({
+      data: {
+        id: "desk-backend",
+        capabilities: ["code.backend"],
+        scope: { kind: "project", projectId: "desk-project", projectVersion: 1 },
+        template: { id: "desk-project-worker", version: 1 }
+      }
+    });
+
+    const detail = await fetch(`${base}/api/employee-templates/desk-project-worker`).then((response) => response.json()) as {
+      data: { template: { id: string }; versions: Array<{ version: number }> };
+    };
+    expect(detail.data).toMatchObject({ template: { id: "desk-project-worker" }, versions: [{ version: 1 }] });
+
+    const bootstrap = await fetch(`${base}/api/bootstrap`).then((response) => response.json()) as {
+      data: {
+        skills: Array<{ id: string; owner: string; injection: string }>;
+        employees: Array<{ id: string; capabilities: string[]; scope: { kind: string }; template?: { id: string; version: number } }>;
+        employeeTemplates: Array<{ id: string; version: number }>;
+      };
+    };
+    expect(bootstrap.data.skills).toContainEqual(expect.objectContaining({
+      id: "team-orchestration",
+      owner: "system",
+      injection: "supervisor"
+    }));
+    expect(bootstrap.data.employeeTemplates).toContainEqual(expect.objectContaining({ id: "desk-project-worker", version: 1 }));
+    expect(bootstrap.data.employees).toContainEqual(expect.objectContaining({
+      id: "desk-backend",
+      capabilities: ["code.backend"],
+      scope: expect.objectContaining({ kind: "project" }),
+      template: { id: "desk-project-worker", version: 1 }
+    }));
+
+    expect((await fetch(`${base}/api/skills/team-orchestration`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ instructions: "Override system behavior." })
+    })).status).toBe(400);
+    expect((await fetch(`${base}/api/employees`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "manual-system-skill-worker",
+        identity: { displayName: "Manual", background: "Invalid.", responsibilities: ["Coordinate"] },
+        skills: ["team-orchestration"]
+      })
+    })).status).toBe(400);
+  });
+
   it("exposes deterministic Entrance Policy CRUD, evaluation, and dispatch through HTTP", async () => {
     const { base, service } = await fixture();
     const createdResponse = await fetch(`${base}/api/entrance-policies`, {
