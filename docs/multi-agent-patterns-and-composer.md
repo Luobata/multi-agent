@@ -2,9 +2,9 @@
 
 ## 1. 结论
 
-当前项目的运行核心属于 **Graph / Workflow**：节点在编译期确定，`needs[]` 声明一个静态 DAG。员工档案又提供了 **Role-playing / SOP** 的身份层；员工可被 MCP 或 A2A 单独调用时，使用方式接近 **Agents-as-tools**。
+当前项目有两类运行核心：**Graph Workflow** 的节点在编译期确定，`needs[]` 声明静态 DAG；**Supervisor Workflow** 由主管在有界控制循环中动态派工，并把每轮决策展开为运行时 DAG。员工档案继续提供 **Role-playing / SOP** 的身份层；员工可被 MCP 或 A2A 单独调用时，使用方式接近 **Agents-as-tools**。
 
-因此，v1 不为每一种常见模式新增 Architecture Adapter。能被静态 DAG 忠实表达的模式做成 **Graph Template**；只有动态路由、循环收敛、运行时 handoff 等 Graph 不能表达的语义，未来才增加新的 Adapter。
+项目不为每一种常见模式新增 Architecture Adapter。能被静态 DAG 忠实表达的模式做成 **Graph Template**；中心主管反复观察、派工和收敛由 `supervisor` Adapter 承担。只有控制权转交、开放群聊等两者都不能表达的语义，才考虑后续 Adapter。
 
 参考分类：[Multi-Agent Patterns Wiki](https://multi-agent.wiki/patterns)。
 
@@ -17,7 +17,7 @@
 | Debate / Judge、Review Council | 固定评审轮次支持 | v1 固定 DAG 模板 |
 | Plan–Execute–Synthesize | 固定执行线支持 | v1 模板 |
 | Generator–Critic | 单轮支持 | 可由顺序模板手工改造，后续模板扩展 |
-| Supervisor / Manager | 只支持固定派单 | 固定派单可做模板；动态派单留给未来 Adapter |
+| Supervisor / Manager | Graph 只支持固定派单 | 固定派单用 Graph 模板；动态派单用 Supervisor Workflow + Management Policy |
 | Conditional Router / Handoff | 不完整 | 未来 Adapter |
 | Refinement Loop | 不支持动态收敛循环 | 未来 Adapter |
 | Group Chat / Blackboard | 需要共享状态与发言调度 | 未来 Adapter |

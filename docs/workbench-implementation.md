@@ -33,10 +33,12 @@
 | 模块 | 责任 |
 | --- | --- |
 | `src/workbench/store.ts` | Workbench state 原子持久化 |
-| `src/workbench/service.ts` | Employee、Project、ProjectBinding、Skill、Provider、Workflow、Session、Publication、Invocation 与 Work Instance 领域操作 |
+| `src/workbench/service.ts` | Employee、Project、Policy、Workflow、Session、Publication、Invocation 与 Work Instance 领域操作 |
+| `src/workbench/entrancePolicy.ts` | 请求分流结构校验、顺序规则匹配与纯决策 |
 | `src/workbench/materialize.ts` | 把版本化 Workbench 数据编译为现有 manifest/prompt/schema |
 | `src/runtime/runner.ts` | Provider 调用、重试、Schema、verdict、Run Store |
 | `src/architectures/graph.ts` | DAG 校验、计划、并行与依赖控制 |
+| `src/architectures/supervisor.ts` | 主管观察、派单、收敛与动态执行图控制循环 |
 | `src/daemon/server.ts` | loopback HTTP 与静态客户端 |
 | `src/mcp/server.ts` | daemon 的 stdio MCP 代理 |
 | `src/protocols/a2a.ts` | Publication 到 A2A Agent Card/Task/Artifact 的映射 |
@@ -73,10 +75,14 @@
 | GET/PUT | `/api/projects/:id`、`/api/projects/:id/binding` | 项目详情与版本化员工任用 |
 | POST | `/api/projects/:id/roles/:roleId/invoke` | 解析任用关系并调用项目角色 |
 | GET | `/api/sessions[/:id]` | 版本固定 Session |
-| GET/POST/PATCH | `/api/workflows[/:id]` | Graph Workflow CRUD |
+| GET/POST/PATCH | `/api/workflows[/:id]` | Graph / Supervisor Workflow CRUD |
 | GET | `/api/workflows/:id/plan` | 不调用 Provider 的执行计划 |
 | POST | `/api/workflows/:id/start` | 异步受理 Workflow，返回 Invocation 与 Run 编号 |
 | POST | `/api/workflows/:id/run` | 等待 Workflow 完成的兼容入口 |
+| GET/POST/PATCH | `/api/management-policies[/:id]` | 主管管理边界的版本化资源 |
+| GET/POST/PATCH | `/api/entrance-policies[/:id]` | 请求分流策略、详情与版本历史 |
+| POST | `/api/entrance-policies/:id/evaluate` | 只按结构化元数据试算，不创建运行 |
+| POST | `/api/entrance-policies/:id/dispatch` | 按试算结果交还调用方、直达专家或异步启动 Workflow |
 | GET | `/api/invocations/:id` | 查询异步调用、节点实例与已生成的 Run 证据 |
 | GET | `/api/runs[/:id]` | 不可变 Run 记录 |
 | GET/POST | `/api/publications[/:id]` | A2A Publication |
@@ -122,7 +128,7 @@ MCP server 只把 stdio tool call 转成 daemon HTTP 请求，不持有 Employee
 multi-agent-mcp --daemon-url http://127.0.0.1:4318
 ```
 
-调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包，再用 `invoke_publication` 调用，不必感知包内是单 Employee 还是 Workflow。直接运行长 Workflow 时优先使用 `start_workflow`，再用 `get_invocation` 读取状态；`run_workflow` 仅作为同步兼容入口。
+调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包，再用 `invoke_publication` 调用，不必感知包内是单 Employee 还是 Workflow。需要先决定是否启用领队时，使用 `evaluate_entrance_policy` 做无副作用试算，或用 `dispatch_entrance_policy` 执行固定目标；消息正文不参与路由。直接运行长 Workflow 时优先使用 `start_workflow`，再用 `get_invocation` 读取状态；`run_workflow` 仅作为同步兼容入口。
 
 运行时调度、有限重试和异步入口的设计与后续边界见 [Multi-Agent 运行性能与可靠性优化](multi-agent-runtime-performance.md)。
 

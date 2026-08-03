@@ -127,6 +127,7 @@ export type WorkflowRunStatus = "running" | "passed" | "blocked" | "failed";
 export interface NodeRunResult {
   nodeId: string;
   roleId: string;
+  metadata?: JsonObject;
   status: NodeRunStatus;
   attempts: number;
   startedAt?: string;
@@ -145,6 +146,8 @@ export interface WorkflowRunRecord {
   status: WorkflowRunStatus;
   createdAt: string;
   completedAt?: string;
+  output?: JsonValue;
+  error?: string;
   nodes: Record<string, NodeRunResult>;
 }
 
@@ -154,6 +157,7 @@ export interface ExecutionPlanNode {
   provider: string;
   needs: string[];
   with: JsonObject;
+  metadata?: JsonObject;
 }
 
 export interface ExecutionPlan {

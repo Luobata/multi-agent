@@ -100,6 +100,8 @@ function initialState(): WorkbenchState {
     knowledgeProfiles: {},
     knowledgeChangeRequests: {},
     employees: {},
+    managementPolicies: {},
+    entrancePolicies: {},
     workflows: {},
     sessions: {},
     publications: {},
@@ -140,6 +142,8 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   state.knowledgeBases ??= {};
   state.knowledgeProfiles ??= {};
   state.knowledgeChangeRequests ??= {};
+  state.managementPolicies ??= {};
+  state.entrancePolicies ??= {};
   state.invocations ??= {};
   state.workInstances ??= {};
   state.projects ??= {};

@@ -19,6 +19,35 @@ describe("provider adapters", () => {
     expect(JSON.parse(response.stdout)).toEqual({ message: "Local Analyst received: inspect this." });
   });
 
+  it("lets the local mock finish a Supervisor decision contract deterministically", async () => {
+    const adapter = createDefaultProviderRegistry().get("mock")!;
+    const response = await adapter.invoke({
+      providerId: "mock",
+      definition: { adapter: "mock", outputProtocol: "json", latencyMs: 0 },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {
+        role: {
+          id: "supervisor",
+          identity: { displayName: "Local Supervisor" },
+          outputSchema: {
+            oneOf: [
+              { type: "object", properties: { action: { const: "delegate" } } },
+              { type: "object", properties: { action: { const: "finish" } } }
+            ]
+          }
+        },
+        input: { message: "coordinate this" },
+        needs: {}
+      }
+    });
+    expect(JSON.parse(response.stdout)).toEqual({
+      action: "finish",
+      summary: "Local Supervisor completed the supervisor decision loop with the local mock provider.",
+      result: { message: "Local Supervisor received: coordinate this." }
+    });
+  });
+
   it("renders a provider-specific stdin template", async () => {
     const adapter = createDefaultProviderRegistry().get("command");
     expect(adapter).toBeDefined();

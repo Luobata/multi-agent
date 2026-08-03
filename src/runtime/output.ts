@@ -63,10 +63,20 @@ export function validateStructuredOutput(schema: Record<string, unknown>, output
   throw new Error(`${label} output schema validation failed: ${issues.join("; ")}`);
 }
 
+function verdictPathSegments(expression: string): string[] {
+  if (!expression.startsWith("/")) return expression.split(".");
+  return expression.slice(1).split("/").map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
 function readPath(value: JsonValue, expression: string): JsonValue | undefined {
   let current: JsonValue | undefined = value;
-  for (const segment of expression.split(".")) {
-    if (typeof current !== "object" || current === null || Array.isArray(current)) return undefined;
+  for (const segment of verdictPathSegments(expression)) {
+    if (Array.isArray(current)) {
+      if (!/^(0|[1-9][0-9]*)$/.test(segment)) return undefined;
+      current = current[Number(segment)];
+      continue;
+    }
+    if (typeof current !== "object" || current === null) return undefined;
     current = current[segment];
   }
   return current;

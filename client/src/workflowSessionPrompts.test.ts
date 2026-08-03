@@ -4,9 +4,9 @@ import {
   buildWorkflowSessionPrompts,
   workflowInputExample
 } from "./workflowSessionPrompts";
-import type { Publication, Workflow } from "./types";
+import type { GraphWorkflow, Publication } from "./types";
 
-function workflow(overrides: Partial<Workflow> = {}): Workflow {
+function workflow(overrides: Partial<GraphWorkflow> = {}): GraphWorkflow {
   return {
     id: "review-team",
     version: 2,

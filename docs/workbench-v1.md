@@ -2,7 +2,7 @@
 
 ## 1. Outcome
 
-The first release turns the existing workflow kit into a local employee workbench. A user can create, edit, clone, archive, inspect, and directly invoke addressable employees; connect project-owned role contracts without copying prompts; combine employees into a Graph workflow; call the same registry from MCP-capable conversations; and publish an employee or workflow through an A2A v1 facade.
+The first release turns the existing workflow kit into a local employee workbench. A user can create, edit, clone, archive, inspect, and directly invoke addressable employees; connect project-owned role contracts without copying prompts; combine employees into a static Graph or dynamic Supervisor workflow; call the same registry from MCP-capable conversations; and publish an employee or workflow through an A2A v1 facade.
 
 The release remains local-first. The daemon binds to loopback by default, definitions are exportable JSON/YAML-shaped data, and every invocation still uses the existing validation, Architecture Adapter, Provider Adapter, and Run Store.
 
@@ -15,14 +15,16 @@ The release remains local-first. The daemon binds to loopback by default, defini
 | Employee | Addressable runnable instance | Versioned, cloneable, archivable record |
 | Project / Binding | Project-owned demand and local Employee assignment | Descriptor plus version-pinned Employee/Skill selection |
 | Session | Conversation-scoped context | Append-only messages with a pinned Employee version |
-| Architecture | Collaboration control flow | Existing `graph` adapter plus deterministic Graph templates |
+| Architecture | Collaboration control flow | Static `graph` and dynamic `supervisor` adapters |
+| Entrance Policy | Structured first-hop routing to direct, specialist, or leader execution | Versioned deterministic registry with dry-run evaluation |
+| Management Policy | Versioned Supervisor limits and delegation rules | Independent registry pinned by Supervisor Workflow versions |
 | Provider | Model/runtime invocation | Existing command adapter plus deterministic mock adapter |
 | Run Store | Immutable execution evidence | Existing filesystem artifacts, prompts, output, and events |
 | MCP | Conversation-to-workbench tools | Local stdio proxy to the daemon API |
 | A2A | Agent-to-agent publication | A2A v1 JSON-RPC facade for an Employee or Workflow |
 | Client | Authoring and operations UI | Local React workbench served by the daemon |
 
-A2A is not an Architecture Adapter. Graph decides how employees collaborate; A2A only exposes or reaches an independently running agentic system.
+A2A is not an Architecture Adapter. The selected Workflow Architecture decides how employees collaborate; A2A only exposes or reaches an independently running agentic system.
 
 ## 3. Core model
 
@@ -89,6 +91,8 @@ The loopback daemon owns CRUD and execution:
 - `/api/skills` plus archive/restore and `/api/providers`;
 - `/api/projects`, descriptor connection, versioned binding, refresh, and role invocation;
 - `/api/architecture-templates`, `/api/workflows`, plan, and run;
+- `/api/management-policies` plus version detail, archive, and restore;
+- `/api/entrance-policies` plus version detail, pure evaluation, dispatch, archive, and restore;
 - `/api/sessions` and `/api/runs`;
 - `/api/publications` and generated A2A endpoint metadata.
 
@@ -129,8 +133,8 @@ The v1 facade binds to loopback without authentication. LAN/public exposure and 
 - Long-term autonomous memory extraction.
 - LAN/public deployment and production authentication.
 - Durable A2A task recovery across daemon restarts.
-- Arbitrary node runtimes beyond Employee-backed Graph nodes.
-- Supervisor, handoff, group-chat, or other Architecture Adapters.
+- Arbitrary node runtimes beyond Employee-backed Graph and Supervisor nodes.
+- Nested Supervisor, handoff, group-chat, or other Architecture Adapters.
 - 3D offices, animated avatars, or human-like emotional state.
 
 ## 8. Acceptance criteria
@@ -146,3 +150,5 @@ The v1 facade binds to loopback without authentication. LAN/public exposure and 
 9. Run all bundled examples with the deterministic mock Provider.
 10. Disable an Employee Skill binding without losing its configuration or pinned version.
 11. Generate a workflow from a common architecture template and persist visual positions independently of `needs`.
+12. Create a versioned Management Policy and a Supervisor Workflow that pins its manager, policy, and member Employee versions.
+13. Persist dynamically scheduled Supervisor nodes as WorkInstances and keep policy exhaustion (`blocked`) distinct from technical failure.

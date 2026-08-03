@@ -100,6 +100,175 @@ describe("workbench daemon", () => {
       .toEqual(["小狐整体档案设计", "直接交办调试台"]);
   });
 
+  it("creates version-pinned Management Policies and Supervisor Workflows through HTTP", async () => {
+    const { base, service } = await fixture();
+    const createPolicy = await fetch(`${base}/api/management-policies`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "desk-supervision",
+        displayName: "Desk Supervision",
+        description: "Coordinate one desk role.",
+        allowedRoleIds: ["reviewer"],
+        instructions: "Delegate when needed, then finish with evidence."
+      })
+    });
+    expect(createPolicy.status).toBe(201);
+    const policy = await createPolicy.json() as { data: { id: string; version: number } };
+    expect(policy.data).toMatchObject({ id: "desk-supervision", version: 1 });
+
+    const createWorkflow = await fetch(`${base}/api/workflows`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "desk-supervisor",
+        architecture: "supervisor",
+        description: "A local supervisor team.",
+        supervisor: { employeeId: "desk-agent" },
+        managementPolicy: { id: "desk-supervision" },
+        members: [{ roleId: "reviewer", employeeId: "desk-agent" }]
+      })
+    });
+    expect(createWorkflow.status).toBe(201);
+    const workflow = await createWorkflow.json() as { data: { architecture: string; managementPolicy: { version: number } } };
+    expect(workflow.data).toMatchObject({ architecture: "supervisor", managementPolicy: { version: 1 } });
+    await service.updateManagementPolicy("desk-supervision", { instructions: "A newer policy version." });
+    expect(service.getWorkflow("desk-supervisor")).toMatchObject({ managementPolicy: { version: 1 } });
+
+    const start = await fetch(`${base}/api/workflows/desk-supervisor/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Coordinate the desk" })
+    });
+    expect(start.status).toBe(202);
+    const receipt = await start.json() as { data: { invocation: { id: string } } };
+    const completed = await service.waitForInvocation(receipt.data.invocation.id);
+    expect(completed.invocation.status).toBe("completed");
+    expect(completed.instances).toEqual([expect.objectContaining({ kind: "supervisor", nodeId: "supervisor-r1" })]);
+    expect(completed.run).toMatchObject({
+      architecture: "supervisor",
+      status: "passed",
+      output: { rounds: 1, delegations: 0 }
+    });
+
+    const bootstrap = await fetch(`${base}/api/bootstrap`).then((response) => response.json()) as {
+      data: { managementPolicies: Array<{ id: string; version: number }>; workflows: Array<{ id: string; architecture: string }> };
+    };
+    expect(bootstrap.data.managementPolicies).toContainEqual(expect.objectContaining({ id: "desk-supervision", version: 2 }));
+    expect(bootstrap.data.workflows).toContainEqual(expect.objectContaining({ id: "desk-supervisor", architecture: "supervisor" }));
+    const rejectedArchive = await fetch(`${base}/api/management-policies/desk-supervision/archive`, { method: "POST" });
+    expect(rejectedArchive.status).toBe(400);
+    await fetch(`${base}/api/workflows/desk-supervisor/archive`, { method: "POST" });
+    expect((await fetch(`${base}/api/management-policies/desk-supervision/archive`, { method: "POST" })).status).toBe(200);
+    expect((await fetch(`${base}/api/management-policies/desk-supervision/restore`, { method: "POST" })).status).toBe(200);
+  });
+
+  it("exposes deterministic Entrance Policy CRUD, evaluation, and dispatch through HTTP", async () => {
+    const { base, service } = await fixture();
+    const createdResponse = await fetch(`${base}/api/entrance-policies`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "desk-entrance",
+        displayName: "Desk Entrance",
+        direct: { mode: "caller" },
+        specialists: {
+          reviewer: { kind: "project-role", projectId: "desk-project", roleId: "reviewer" }
+        },
+        rules: [{
+          id: "structured-review",
+          when: { tagsAnyOf: ["review"], signals: { risk: { gte: 5 } } },
+          result: { route: "specialist", specialistKey: "reviewer" }
+        }],
+        default: { route: "direct" }
+      })
+    });
+    expect(createdResponse.status).toBe(201);
+    const created = await createdResponse.json() as {
+      data: { id: string; version: number; specialists: { reviewer: { projectVersion: number; projectBindingVersion: number } } };
+    };
+    expect(created.data).toMatchObject({
+      id: "desk-entrance",
+      version: 1,
+      specialists: { reviewer: { projectVersion: 1, projectBindingVersion: 1 } }
+    });
+
+    const before = service.getActivitySnapshot().invocations.length;
+    const evaluated = await fetch(`${base}/api/entrance-policies/desk-entrance/evaluate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ route: "auto", tags: ["review"], signals: { risk: 7 }, source: { kind: "http" } })
+    });
+    expect(evaluated.status).toBe(200);
+    const decision = await evaluated.json() as {
+      data: { decidedBy: string; target: { kind: string; projectVersion: number; projectBindingVersion: number } };
+    };
+    expect(decision.data).toMatchObject({
+      decidedBy: "rule",
+      target: { kind: "project-role", projectVersion: 1, projectBindingVersion: 1 }
+    });
+    expect(service.getActivitySnapshot().invocations).toHaveLength(before);
+
+    const invalidEvaluation = await fetch(`${base}/api/entrance-policies/desk-entrance/evaluate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ route: "auto", message: "review risk leader", source: { kind: "http" } })
+    });
+    expect(invalidEvaluation.status).toBe(400);
+    expect(await invalidEvaluation.text()).toContain("unsupported fields: message");
+
+    const returned = await fetch(`${base}/api/entrance-policies/desk-entrance/dispatch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ route: "auto", message: "review risk leader" })
+    });
+    expect(returned.status).toBe(200);
+    const returnedBody = await returned.json() as { data: { dispatch: { kind: string; invocationCreated: boolean } } };
+    expect(returnedBody.data.dispatch).toEqual({ kind: "return-to-caller", invocationCreated: false });
+    expect(service.getActivitySnapshot().invocations).toHaveLength(before);
+
+    const dispatched = await fetch(`${base}/api/entrance-policies/desk-entrance/dispatch`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-multi-agent-caller": "http-root" },
+      body: JSON.stringify({ route: "specialist", specialistKey: "reviewer", message: "Review through the project role." })
+    });
+    expect(dispatched.status).toBe(200);
+    const invocation = service.getActivitySnapshot().invocations[0];
+    expect(invocation).toMatchObject({
+      source: { kind: "http", caller: "http-root", project: "desk-project", projectRole: "reviewer" },
+      executionSnapshot: {
+        entrance: {
+          policyId: "desk-entrance",
+          policyVersion: 1,
+          decidedBy: "explicit",
+          target: { kind: "project-role", projectVersion: 1, projectBindingVersion: 1 }
+        }
+      }
+    });
+
+    const detail = await fetch(`${base}/api/entrance-policies/desk-entrance`).then((response) => response.json()) as {
+      data: { policy: { id: string }; versions: Array<{ version: number }> };
+    };
+    expect(detail.data.policy.id).toBe("desk-entrance");
+    expect(detail.data.versions.map((version) => version.version)).toEqual([1]);
+    expect((await fetch(`${base}/api/entrance-policies/desk-entrance`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ description: "Updated through HTTP." })
+    })).status).toBe(200);
+    expect((await fetch(`${base}/api/entrance-policies/desk-entrance/archive`, { method: "POST" })).status).toBe(200);
+    expect((await fetch(`${base}/api/entrance-policies/desk-entrance/restore`, { method: "POST" })).status).toBe(200);
+
+    const health = await fetch(`${base}/api/health`).then((response) => response.json()) as {
+      data: { capabilities: Record<string, unknown> };
+    };
+    expect(health.data.capabilities.entrancePolicies).toBe("versioned-routing-v1");
+    const bootstrap = await fetch(`${base}/api/bootstrap`).then((response) => response.json()) as {
+      data: { entrancePolicies: Array<{ id: string; version: number }> };
+    };
+    expect(bootstrap.data.entrancePolicies).toContainEqual(expect.objectContaining({ id: "desk-entrance", version: 4 }));
+  });
+
   it("streams live invocation and work-instance changes over SSE", async () => {
     const { base } = await fixture();
     const controller = new AbortController();
@@ -496,6 +665,11 @@ describe("workbench daemon", () => {
       id: "mcp-flow",
       nodes: [{ id: "respond", employeeId: "desk-agent" }]
     });
+    await service.createEntrancePolicy({
+      id: "mcp-entrance",
+      direct: { mode: "employee", employeeId: "desk-agent" },
+      default: { route: "direct" }
+    });
     const mcpServer = createWorkbenchMcpServer(base);
     const client = new Client({ name: "workbench-test", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -508,6 +682,10 @@ describe("workbench daemon", () => {
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_project_role");
       expect(tools.tools.map((tool) => tool.name)).toContain("start_workflow");
       expect(tools.tools.map((tool) => tool.name)).toContain("get_invocation");
+      expect(tools.tools.map((tool) => tool.name)).toContain("list_entrance_policies");
+      expect(tools.tools.map((tool) => tool.name)).toContain("get_entrance_policy");
+      expect(tools.tools.map((tool) => tool.name)).toContain("evaluate_entrance_policy");
+      expect(tools.tools.map((tool) => tool.name)).toContain("dispatch_entrance_policy");
       const result = await client.callTool({
         name: "invoke_employee",
         arguments: { employeeId: "desk-agent", message: "Call through MCP" }
@@ -540,11 +718,46 @@ describe("workbench daemon", () => {
       });
       const statusText = (status.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
       expect(statusText).toContain('"status": "completed"');
+      const entranceList = await client.callTool({
+        name: "list_entrance_policies",
+        arguments: {}
+      });
+      expect((entranceList.content as Array<{ type: string; text?: string }>)[0]?.text).toContain("mcp-entrance");
+      const entranceDetail = await client.callTool({
+        name: "get_entrance_policy",
+        arguments: { entrancePolicyId: "mcp-entrance" }
+      });
+      expect((entranceDetail.content as Array<{ type: string; text?: string }>)[0]?.text).toContain('"employeeVersion": 1');
+      const entranceDecision = await client.callTool({
+        name: "evaluate_entrance_policy",
+        arguments: { entrancePolicyId: "mcp-entrance", route: "auto", tags: [], signals: {} }
+      });
+      expect((entranceDecision.content as Array<{ type: string; text?: string }>)[0]?.text).toContain('"decidedBy": "default"');
+      const entranceDispatch = await client.callTool({
+        name: "dispatch_entrance_policy",
+        arguments: {
+          entrancePolicyId: "mcp-entrance",
+          route: "auto",
+          message: "Dispatch through MCP Entrance Policy",
+          source: { kind: "mcp", caller: "mcp-root", contextId: "entrance-context" }
+        }
+      });
+      expect((entranceDispatch.content as Array<{ type: string; text?: string }>)[0]?.text).toContain('"kind": "employee"');
       const activity = await fetch(`${base}/api/activity`).then((response) => response.json()) as {
-        data: { invocations: Array<{ source: { kind: string; project?: string; projectRole?: string; publicationId?: string } }> };
+        data: {
+          invocations: Array<{
+            source: { kind: string; project?: string; projectRole?: string; publicationId?: string; caller?: string };
+            executionSnapshot?: { entrance?: { policyId: string; target: { employeeVersion?: number } } };
+          }>;
+        };
       };
       expect(activity.data.invocations.find((invocation) => invocation.source.projectRole === "reviewer")?.source)
         .toMatchObject({ kind: "mcp", project: "desk-project", projectRole: "reviewer" });
+      expect(activity.data.invocations.find((invocation) => invocation.source.caller === "mcp-root"))
+        .toMatchObject({
+          source: { kind: "mcp", caller: "mcp-root" },
+          executionSnapshot: { entrance: { policyId: "mcp-entrance", target: { employeeVersion: 1 } } }
+        });
     } finally {
       await client.close();
       await mcpServer.close();

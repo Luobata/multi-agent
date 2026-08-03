@@ -7,7 +7,12 @@ import type { JsonObject, ProviderDefinition } from "../core/types.js";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
-import type { InvocationSource, InvocationSourceKind } from "../workbench/types.js";
+import type {
+  EntrancePolicyDispatchInput,
+  EntrancePolicyEvaluationInput,
+  InvocationSource,
+  InvocationSourceKind
+} from "../workbench/types.js";
 
 type AsyncHandler = (request: Request, response: Response, next: NextFunction) => Promise<void>;
 
@@ -96,7 +101,10 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
         knowledgeImpactAnalysis: true,
         knowledgeConversation: "codex-mcp-v1",
         knowledgeChangeApproval: true,
-        asyncWorkflowInvocations: "v1"
+        asyncWorkflowInvocations: "v1",
+        supervisorWorkflows: "v1",
+        managementPolicies: "versioned-v1",
+        entrancePolicies: "versioned-routing-v1"
       }
     });
   });
@@ -110,6 +118,8 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       knowledgeChanges: service.listKnowledgeChangeRequests(),
       architectureTemplates: service.listArchitectureTemplates(),
       employees: service.listEmployees(true),
+      managementPolicies: service.listManagementPolicies(true),
+      entrancePolicies: service.listEntrancePolicies(true),
       workflows: service.listWorkflows(true),
       sessions: service.listSessions(),
       publications: service.listPublications(true),
@@ -430,6 +440,89 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       ...started,
       statusUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}`,
       streamUrl: "/api/activity/stream"
+    }, 202);
+  }));
+
+  app.get("/api/management-policies", (request, response) => {
+    send(response, service.listManagementPolicies(booleanQuery(request.query.includeArchived)));
+  });
+  app.post("/api/management-policies", asyncRoute(async (request, response) => {
+    send(response, await service.createManagementPolicy(request.body), 201);
+  }));
+  app.get("/api/management-policies/:id", (request, response, next) => {
+    try {
+      const id = routeParam(request, "id");
+      send(response, {
+        policy: service.getManagementPolicy(id),
+        versions: service.getManagementPolicyVersions(id)
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.patch("/api/management-policies/:id", asyncRoute(async (request, response) => {
+    send(response, await service.updateManagementPolicy(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/management-policies/:id/archive", asyncRoute(async (request, response) => {
+    send(response, await service.archiveManagementPolicy(routeParam(request, "id")));
+  }));
+  app.post("/api/management-policies/:id/restore", asyncRoute(async (request, response) => {
+    send(response, await service.restoreManagementPolicy(routeParam(request, "id")));
+  }));
+
+  app.get("/api/entrance-policies", (request, response) => {
+    send(response, service.listEntrancePolicies(booleanQuery(request.query.includeArchived)));
+  });
+  app.post("/api/entrance-policies", asyncRoute(async (request, response) => {
+    send(response, await service.createEntrancePolicy(request.body), 201);
+  }));
+  app.get("/api/entrance-policies/:id", (request, response, next) => {
+    try {
+      const id = routeParam(request, "id");
+      send(response, {
+        policy: service.getEntrancePolicy(id),
+        versions: service.getEntrancePolicyVersions(id)
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.patch("/api/entrance-policies/:id", asyncRoute(async (request, response) => {
+    send(response, await service.updateEntrancePolicy(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/entrance-policies/:id/archive", asyncRoute(async (request, response) => {
+    send(response, await service.archiveEntrancePolicy(routeParam(request, "id")));
+  }));
+  app.post("/api/entrance-policies/:id/restore", asyncRoute(async (request, response) => {
+    send(response, await service.restoreEntrancePolicy(routeParam(request, "id")));
+  }));
+  app.post("/api/entrance-policies/:id/evaluate", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "entrance policy evaluation");
+    const input = {
+      ...body,
+      source: body.source ?? invocationSource(request, "http")
+    } as unknown as EntrancePolicyEvaluationInput;
+    send(response, service.evaluateEntrancePolicy(routeParam(request, "id"), input));
+  }));
+  app.post("/api/entrance-policies/:id/dispatch", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "entrance policy dispatch");
+    const input = {
+      ...body,
+      source: body.source ?? invocationSource(request, "http")
+    } as unknown as EntrancePolicyDispatchInput;
+    const result = await service.dispatchEntrancePolicy(routeParam(request, "id"), input);
+    if (result.dispatch.kind !== "invocation-started") {
+      send(response, result);
+      return;
+    }
+    const invocationId = result.dispatch.receipt.invocation.id;
+    send(response, {
+      ...result,
+      dispatch: {
+        ...result.dispatch,
+        statusUrl: `/api/invocations/${encodeURIComponent(invocationId)}`,
+        streamUrl: "/api/activity/stream"
+      }
     }, 202);
   }));
 

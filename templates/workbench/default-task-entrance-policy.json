@@ -1,0 +1,152 @@
+{
+  "id": "default-task-entrance-policy",
+  "displayName": "默认请求分流策略",
+  "description": "简单任务交还调用方，单角色任务直达项目专家，多角色协作、动态重规划或独立验收进入小米汪领队团队。",
+  "direct": {
+    "mode": "caller"
+  },
+  "specialists": {
+    "product-manager": {
+      "kind": "project-role",
+      "projectId": "local-agent-workbench",
+      "roleId": "product-manager"
+    },
+    "product-designer": {
+      "kind": "project-role",
+      "projectId": "local-agent-workbench",
+      "roleId": "product-designer"
+    },
+    "frontend-developer": {
+      "kind": "project-role",
+      "projectId": "local-agent-workbench",
+      "roleId": "frontend-developer"
+    },
+    "backend-developer": {
+      "kind": "project-role",
+      "projectId": "local-agent-workbench",
+      "roleId": "backend-developer"
+    },
+    "test-engineer": {
+      "kind": "project-role",
+      "projectId": "local-agent-workbench",
+      "roleId": "test-engineer"
+    }
+  },
+  "leader": {
+    "workflowId": "xiaomiwang-development-team"
+  },
+  "rules": [
+    {
+      "id": "dynamic-replanning",
+      "when": {
+        "signals": {
+          "requiresDynamicReplanning": {
+            "eq": true
+          }
+        }
+      },
+      "result": {
+        "route": "leader"
+      }
+    },
+    {
+      "id": "independent-validation",
+      "when": {
+        "signals": {
+          "requiresIndependentValidation": {
+            "eq": true
+          }
+        }
+      },
+      "result": {
+        "route": "leader"
+      }
+    },
+    {
+      "id": "multi-role-collaboration",
+      "when": {
+        "signals": {
+          "requiredRoleCount": {
+            "gte": 2
+          }
+        }
+      },
+      "result": {
+        "route": "leader"
+      }
+    },
+    {
+      "id": "product-manager-specialist",
+      "when": {
+        "signals": {
+          "requiredRole": {
+            "eq": "product-manager"
+          }
+        }
+      },
+      "result": {
+        "route": "specialist",
+        "specialistKey": "product-manager"
+      }
+    },
+    {
+      "id": "product-designer-specialist",
+      "when": {
+        "signals": {
+          "requiredRole": {
+            "eq": "product-designer"
+          }
+        }
+      },
+      "result": {
+        "route": "specialist",
+        "specialistKey": "product-designer"
+      }
+    },
+    {
+      "id": "frontend-developer-specialist",
+      "when": {
+        "signals": {
+          "requiredRole": {
+            "eq": "frontend-developer"
+          }
+        }
+      },
+      "result": {
+        "route": "specialist",
+        "specialistKey": "frontend-developer"
+      }
+    },
+    {
+      "id": "backend-developer-specialist",
+      "when": {
+        "signals": {
+          "requiredRole": {
+            "eq": "backend-developer"
+          }
+        }
+      },
+      "result": {
+        "route": "specialist",
+        "specialistKey": "backend-developer"
+      }
+    },
+    {
+      "id": "test-engineer-specialist",
+      "when": {
+        "signals": {
+          "requiredRole": {
+            "eq": "test-engineer"
+          }
+        }
+      },
+      "result": {
+        "route": "specialist",
+        "specialistKey": "test-engineer"
+      }
+    }
+  ],
+  "default": {
+    "route": "direct"
+  }
+}

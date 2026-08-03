@@ -41,6 +41,24 @@ const classification = z.enum(["internal", "confidential", "restricted"]);
 const authority = z.enum(["canonical", "reference", "experimental"]);
 const activation = z.enum(["core", "conditional", "on-demand"]);
 const referenceType = z.enum(["related", "supports", "contradicts", "depends-on", "supersedes"]);
+const entranceSourceSchema = z.object({
+  kind: z.enum(["workbench", "http", "mcp", "a2a"]),
+  label: z.string().min(1).optional(),
+  project: z.string().min(1).optional(),
+  projectRole: z.string().min(1).optional(),
+  projectBindingVersion: z.number().int().positive().optional(),
+  caller: z.string().min(1).optional(),
+  contextId: z.string().min(1).optional(),
+  taskId: z.string().min(1).optional(),
+  publicationId: z.string().min(1).optional()
+}).strict();
+const entranceEvaluationShape = {
+  route: z.enum(["auto", "direct", "specialist", "leader"]),
+  specialistKey: resourceId.optional(),
+  tags: z.array(z.string().min(1)).optional(),
+  signals: z.record(z.string(), z.unknown()).optional(),
+  source: entranceSourceSchema.optional()
+};
 const knowledgeCollectionSchema = z.object({
   id: resourceId,
   displayName: z.string().min(1),
@@ -384,6 +402,67 @@ export function createWorkbenchMcpServer(
     return server;
   }
 
+  server.registerTool("list_entrance_policies", {
+    title: "List task entrance policies",
+    description: "List deterministic, versioned Entrance Policies without evaluating or starting work.",
+    inputSchema: { includeArchived: z.boolean().optional() }
+  }, async ({ includeArchived }) => content(await request(
+    daemonUrl,
+    `/api/entrance-policies?includeArchived=${includeArchived ? "true" : "false"}`
+  )));
+
+  server.registerTool("get_entrance_policy", {
+    title: "Get task entrance policy",
+    description: "Read one Entrance Policy and its immutable version history, including pinned route targets.",
+    inputSchema: { entrancePolicyId: resourceId }
+  }, async ({ entrancePolicyId }) => content(await request(
+    daemonUrl,
+    `/api/entrance-policies/${encodeURIComponent(entrancePolicyId)}`
+  )));
+
+  server.registerTool("evaluate_entrance_policy", {
+    title: "Evaluate task entrance policy",
+    description: "Evaluate only structured route, tag, source, and signal fields. This never creates an Invocation or Run and never reads message text.",
+    inputSchema: {
+      entrancePolicyId: resourceId,
+      ...entranceEvaluationShape
+    }
+  }, async ({ entrancePolicyId, route, specialistKey, tags, signals, source }) => content(await request(
+    daemonUrl,
+    `/api/entrance-policies/${encodeURIComponent(entrancePolicyId)}/evaluate`,
+    {
+      method: "POST",
+      body: JSON.stringify({ route, specialistKey, tags, signals, source: source ?? { kind: "mcp" } }),
+      headers: invocationHeaders()
+    }
+  )));
+
+  server.registerTool("dispatch_entrance_policy", {
+    title: "Dispatch through task entrance policy",
+    description: "Evaluate structured routing metadata, then return to the caller, invoke a pinned Employee or project role, or asynchronously start a pinned workflow. Message text is execution-only.",
+    inputSchema: {
+      entrancePolicyId: resourceId,
+      ...entranceEvaluationShape,
+      message: z.string().min(1).optional(),
+      sessionId: z.string().min(1).optional()
+    }
+  }, async ({ entrancePolicyId, route, specialistKey, tags, signals, source, message, sessionId }) => {
+    const dispatchSource = { ...source, kind: "mcp" as const };
+    return content(await request(
+      daemonUrl,
+      `/api/entrance-policies/${encodeURIComponent(entrancePolicyId)}/dispatch`,
+      {
+        method: "POST",
+        body: JSON.stringify({ route, specialistKey, tags, signals, source: dispatchSource, message, sessionId }),
+        headers: invocationHeaders({
+          project: dispatchSource.project,
+          contextId: dispatchSource.contextId,
+          caller: dispatchSource.caller
+        })
+      }
+    ));
+  });
+
   server.registerTool("list_employees", {
     title: "List local employees",
     description: "List addressable Employee identities registered in the local workbench.",
@@ -463,7 +542,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("list_workflows", {
     title: "List multi-agent workflows",
-    description: "List Graph workflows registered in the local workbench.",
+    description: "List Graph and Supervisor workflows registered in the local workbench.",
     inputSchema: { includeArchived: z.boolean().optional() }
   }, async ({ includeArchived }) => content(await request(
     daemonUrl,
@@ -472,7 +551,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("run_workflow", {
     title: "Run multi-agent workflow",
-    description: "Compatibility entry point that waits for a registered Graph workflow to finish. Prefer start_workflow for long-running work.",
+    description: "Compatibility entry point that waits for a registered Graph or Supervisor workflow to finish. Prefer start_workflow for long-running work.",
     inputSchema: {
       workflowId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
@@ -488,7 +567,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("start_workflow", {
     title: "Start multi-agent workflow",
-    description: "Start a registered Graph workflow asynchronously and return an invocation id immediately. Use get_invocation to inspect status and final Run evidence.",
+    description: "Start a registered Graph or Supervisor workflow asynchronously and return an invocation id immediately. Use get_invocation to inspect status and final Run evidence.",
     inputSchema: {
       workflowId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),

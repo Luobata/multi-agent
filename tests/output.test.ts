@@ -39,4 +39,14 @@ describe("provider output contracts", () => {
     );
     expect(statusFromVerdict(output, { path: "verdict", pass: ["Pass"], block: ["Block"] })).toBe("blocked");
   });
+
+  it("accepts JSON Pointer verdict paths emitted by versioned Employee records", () => {
+    const output = {
+      verdict: "Pass",
+      nested: { "review/status": ["Block", "Pass"] }
+    };
+
+    expect(statusFromVerdict(output, { path: "/verdict", pass: ["Pass"], block: ["Block"] })).toBe("passed");
+    expect(statusFromVerdict(output, { path: "/nested/review~1status/0", pass: ["Pass"], block: ["Block"] })).toBe("blocked");
+  });
 });

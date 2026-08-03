@@ -2,7 +2,7 @@
 
 ## 1. 当前实现
 
-项目目前只注册 `graph`。这不是把未来架构锁死为 DAG，而是先完成一条可运行路径，同时把架构相关行为收敛到统一接口：
+项目默认注册 `graph` 与 `supervisor`。两者共用执行、Provider、证据和 WorkInstance 底座，但控制程序不同：Graph 在运行前声明完整 DAG，Supervisor 在每轮决策后增量生成 execution graph。
 
 ```ts
 interface ArchitectureAdapter {
@@ -11,9 +11,11 @@ interface ArchitectureAdapter {
   compile(manifest, workflowId): ExecutionPlan;
   formatText(plan): string;
   formatMermaid(plan): string;
-  execute(context): Promise<void>;
+  execute(context): Promise<{ status?, output? } | void>;
 }
 ```
+
+执行上下文同时提供 `scheduleNode(node)` 与 `executeNode(node, options)`。Graph 继续执行编译期节点；Supervisor 用 `scheduleNode` 幂等追加动态节点，并在下一轮主管节点上使用 `dependencyFailure: "observe"` 读取失败成员证据。
 
 通用 Runtime 负责 Role 解析、Provider 调用、输出校验、重试和证据落盘；Architecture Adapter 只负责协作模式特有的配置、计划、状态推进与调度。这样新增架构不需要给通用 runner 增加一串 `if (architecture === ...)`。
 
@@ -24,6 +26,16 @@ interface ArchitectureAdapter {
 - 多依赖节点的 gather/synthesis；
 - 有界并发；
 - collect-evidence 或 fail-fast 失败策略。
+
+`supervisor` 当前支持：
+
+- 固定一位 Supervisor Employee、一个 Management Policy 版本和多个成员角色绑定；
+- `delegate` / `finish` 结构化决策协议；
+- 每轮有界并行派单与动态 WorkInstance；
+- 成员失败后交给主管观察和重规划，或按策略 fail-fast；
+- 轮次、派单数、单轮并行数和持续时间硬限制；
+- 策略上限耗尽映射为 `blocked`，主管或 Provider 技术故障映射为 `failed`；
+- 最终 Workflow 输出由 Adapter 显式返回，不由失败成员状态机械覆盖。
 
 ## 2. 不把 Wiki 中每个模式都做成 Adapter
 
@@ -56,7 +68,7 @@ interface ArchitectureAdapter {
 ## 4. 推荐演进顺序
 
 1. 先在 `graph` 上补齐条件边、gate/HITL 节点和可复用 workflow 模板。
-2. 出现中心调度者反复观察和派工的需求时，实现 `supervisor` Adapter。
+2. 中心调度者反复观察和派工使用内置 `supervisor` Adapter；固定派单仍应使用 Graph 模板。
 3. 出现 Agent 自主转交控制权、下一执行者运行时才确定的需求时，实现 `handoff` Adapter。
 4. 出现开放式发言队列、动态成员或终止条件时，实现 `group-chat` Adapter。
 5. 共享状态、远程协议和持久队列分别扩展 backend/Provider/MCP 层，不与控制流 Adapter 混写。
@@ -76,10 +88,10 @@ import {
 } from "multi-agent-architecture-kit";
 
 const architectures = createDefaultArchitectureRegistry();
-registerArchitectureAdapter(architectures, mySupervisorAdapter);
+registerArchitectureAdapter(architectures, myHandoffAdapter);
 
 const loaded = loadManifest("multi-agent.yaml", { architectures });
 await runWorkflow(loaded, "supervised-review", { architectures });
 ```
 
-默认 CLI 只注册 `graph`。未来 Plugin 或专用 CLI 可以在启动时装载更多 Adapter，而无需修改 manifest loader 或通用 Runtime。
+默认 CLI 注册 `graph` 与 `supervisor`。未来 Plugin 或专用 CLI 可以在启动时装载更多 Adapter，而无需修改 manifest loader 或通用 Runtime。

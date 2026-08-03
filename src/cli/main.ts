@@ -19,6 +19,12 @@ import { startDaemon } from "../daemon/server.js";
 import { WorkbenchService } from "../workbench/service.js";
 import type {
   EmployeeCreateInput,
+  EntrancePolicyCreateInput,
+  EntrancePolicyDispatchInput,
+  EntrancePolicyEvaluationInput,
+  EntrancePolicyUpdateInput,
+  ManagementPolicyCreateInput,
+  ManagementPolicyUpdateInput,
   PublicationDefinition,
   ProjectBindingInput,
   SkillCreateInput,
@@ -442,7 +448,101 @@ workbenchProject
     }), null, 2)}\n`);
   });
 
-const workbenchWorkflow = workbench.command("workflow").description("Create and run Employee Graph workflows");
+const managementPolicy = workbench.command("management-policy").description("Manage versioned Supervisor policies");
+managementPolicy
+  .command("list")
+  .option("--all", "include archived Management Policies")
+  .action(async (options: { all?: boolean }) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).listManagementPolicies(Boolean(options.all)), null, 2)}\n`);
+  });
+managementPolicy
+  .command("create")
+  .argument("<file>", "Management Policy JSON definition")
+  .action(async (file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).createManagementPolicy(readJsonFile<ManagementPolicyCreateInput>(file)), null, 2)}\n`);
+  });
+managementPolicy
+  .command("get")
+  .argument("<id>", "Management Policy id")
+  .action(async (id: string) => {
+    const service = await workbenchService();
+    process.stdout.write(`${JSON.stringify({ policy: service.getManagementPolicy(id), versions: service.getManagementPolicyVersions(id) }, null, 2)}\n`);
+  });
+managementPolicy
+  .command("update")
+  .argument("<id>", "Management Policy id")
+  .argument("<file>", "Management Policy update JSON")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).updateManagementPolicy(id, readJsonFile<ManagementPolicyUpdateInput>(file)), null, 2)}\n`);
+  });
+managementPolicy
+  .command("archive")
+  .argument("<id>", "Management Policy id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).archiveManagementPolicy(id), null, 2)}\n`);
+  });
+managementPolicy
+  .command("restore")
+  .argument("<id>", "Management Policy id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).restoreManagementPolicy(id), null, 2)}\n`);
+  });
+
+const entrancePolicy = workbench.command("entrance-policy").description("Manage and execute versioned task entrance policies");
+entrancePolicy
+  .command("list")
+  .option("--all", "include archived Entrance Policies")
+  .action(async (options: { all?: boolean }) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).listEntrancePolicies(Boolean(options.all)), null, 2)}\n`);
+  });
+entrancePolicy
+  .command("create")
+  .argument("<file>", "Entrance Policy JSON definition")
+  .action(async (file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).createEntrancePolicy(readJsonFile<EntrancePolicyCreateInput>(file)), null, 2)}\n`);
+  });
+entrancePolicy
+  .command("get")
+  .argument("<id>", "Entrance Policy id")
+  .action(async (id: string) => {
+    const service = await workbenchService();
+    process.stdout.write(`${JSON.stringify({ policy: service.getEntrancePolicy(id), versions: service.getEntrancePolicyVersions(id) }, null, 2)}\n`);
+  });
+entrancePolicy
+  .command("update")
+  .argument("<id>", "Entrance Policy id")
+  .argument("<file>", "Entrance Policy update JSON")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).updateEntrancePolicy(id, readJsonFile<EntrancePolicyUpdateInput>(file)), null, 2)}\n`);
+  });
+entrancePolicy
+  .command("archive")
+  .argument("<id>", "Entrance Policy id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).archiveEntrancePolicy(id), null, 2)}\n`);
+  });
+entrancePolicy
+  .command("restore")
+  .argument("<id>", "Entrance Policy id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).restoreEntrancePolicy(id), null, 2)}\n`);
+  });
+entrancePolicy
+  .command("evaluate")
+  .argument("<id>", "Entrance Policy id")
+  .argument("<file>", "structured Entrance Policy evaluation JSON")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).evaluateEntrancePolicy(id, readJsonFile<EntrancePolicyEvaluationInput>(file)), null, 2)}\n`);
+  });
+entrancePolicy
+  .command("dispatch")
+  .argument("<id>", "Entrance Policy id")
+  .argument("<file>", "structured Entrance Policy dispatch JSON")
+  .action(async (id: string, file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).dispatchEntrancePolicy(id, readJsonFile<EntrancePolicyDispatchInput>(file)), null, 2)}\n`);
+  });
+
+const workbenchWorkflow = workbench.command("workflow").description("Create and run Graph or Supervisor workflows");
 workbenchWorkflow
   .command("create")
   .argument("<file>", "Workflow JSON definition")

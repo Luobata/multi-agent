@@ -206,7 +206,10 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
             const publicationCount = data.publications.filter((publication) => {
               if (publication.status !== "active") return false;
               if (publication.target.kind === "employee") return publication.target.id === employee.id;
-              return data.workflows.find((workflow) => workflow.id === publication.target.id)?.nodes.some((node) => node.employeeId === employee.id);
+              const workflow = data.workflows.find((candidate) => candidate.id === publication.target.id);
+              return workflow?.architecture === "graph"
+                ? workflow.nodes.some((node) => node.employeeId === employee.id)
+                : workflow?.supervisor.employeeId === employee.id || workflow?.members.some((member) => member.employeeId === employee.id);
             }).length;
             const projectRoleCount = data.projectBindings.reduce(
               (count, projectBinding) => count + projectBinding.roles.filter((role) => role.employeeId === employee.id).length,

@@ -4,8 +4,11 @@ import { api, writeBody } from "./api";
 import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, ReadonlyEvidence, SelectControl, Stamp, UtilityIcon, formatTime, scrollRecordIntoView, useDaemonAvailable } from "./components";
 import { layoutTopology } from "./topology";
 import { automaticCanvasPositions, WorkflowCanvas, type CanvasPositions } from "./WorkflowCanvas";
+import { ManagementPolicyPage } from "./ManagementPolicyPage";
+import { EntrancePolicyPage } from "./EntrancePolicyPage";
+import { SupervisorWorkflowPage } from "./SupervisorWorkflowPage";
 import { activeWorkflowPublications, buildWorkflowSessionPrompts } from "./workflowSessionPrompts";
-import type { Bootstrap, Employee, InstantiatedArchitectureTemplate, InvocationRecord, JsonObject, Workflow, WorkflowNode } from "./types";
+import type { Bootstrap, Employee, GraphWorkflow, InstantiatedArchitectureTemplate, InvocationRecord, JsonObject, Workflow, WorkflowNode } from "./types";
 
 interface PageProps {
   data: Bootstrap;
@@ -49,7 +52,7 @@ interface WorkflowStartReceipt {
   streamUrl: string;
 }
 
-function workflowDraft(workflow?: Workflow, employees: Employee[] = []): WorkflowDraft {
+function workflowDraft(workflow?: GraphWorkflow, employees: Employee[] = []): WorkflowDraft {
   const initialNodes: WorkflowNode[] = workflow?.nodes ?? [{ id: "step-1", employeeId: employees.find((item) => item.status === "active")?.id ?? "", needs: [], with: {} }];
   return {
     id: workflow?.id ?? "",
@@ -84,10 +87,10 @@ function Topology({ nodes, employees }: { nodes: WorkflowNode[]; employees: Empl
 }
 
 function WorkflowEditor({ workflow, data, onClose, onSaved, notify }: {
-  workflow?: Workflow;
+  workflow?: GraphWorkflow;
   data: Bootstrap;
   onClose: () => void;
-  onSaved: (workflow: Workflow) => void;
+  onSaved: (workflow: GraphWorkflow) => void;
   notify: PageProps["notify"];
 }) {
   const [draft, setDraft] = useState(() => workflowDraft(workflow, data.employees));
@@ -139,7 +142,7 @@ function WorkflowEditor({ workflow, data, onClose, onSaved, notify }: {
     setSaving(true);
     try {
       const payload = { id: draft.id.trim(), description: draft.description.trim(), patternId: draft.patternId, nodes: draftNodes(draft), presentation: { positions: draft.positions }, maxConcurrency: Number(draft.maxConcurrency), failFast: draft.failFast, inputSchema: parseObject(draft.inputSchema || "{}", "Input Schema") };
-      const saved = workflow ? await api<Workflow>(`/api/workflows/${workflow.id}`, writeBody(payload, "PATCH")) : await api<Workflow>("/api/workflows", writeBody(payload));
+      const saved = workflow ? await api<GraphWorkflow>(`/api/workflows/${workflow.id}`, writeBody(payload, "PATCH")) : await api<GraphWorkflow>("/api/workflows", writeBody(payload));
       notify(workflow ? `协作编排已另存为 v${saved.version}` : `协作编排 ${saved.id} 已建立`);
       onSaved(saved);
     } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
@@ -163,12 +166,12 @@ function WorkflowEditor({ workflow, data, onClose, onSaved, notify }: {
   </Modal>;
 }
 
-export function WorkflowPage({ data, refresh, notify }: PageProps) {
+function GraphWorkflowPage({ data, refresh, notify }: PageProps) {
   const daemonAvailable = useDaemonAvailable();
-  const visible = data.workflows;
+  const visible = data.workflows.filter((workflow): workflow is GraphWorkflow => workflow.architecture === "graph");
   const [selectedId, setSelectedId] = useState(visible.find((item) => item.status === "active")?.id ?? visible[0]?.id ?? "");
   const selected = visible.find((item) => item.id === selectedId) ?? visible[0];
-  const [versions, setVersions] = useState<Workflow[]>([]);
+  const [versions, setVersions] = useState<GraphWorkflow[]>([]);
   const [editor, setEditor] = useState<"new" | "edit" | null>(null);
   const [runInput, setRunInput] = useState("{\n  \"message\": \"请完成这项协作任务\"\n}");
   const [running, setRunning] = useState(false);
@@ -178,7 +181,7 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
     [data.publications, selected?.id]
   );
   const [publicationId, setPublicationId] = useState("");
-  useEffect(() => { if (!selected) { setVersions([]); return; } api<{ versions: Workflow[] }>(`/api/workflows/${selected.id}`).then((detail) => setVersions(detail.versions)).catch(() => setVersions([selected])); }, [selected?.id, selected?.version]);
+  useEffect(() => { if (!selected) { setVersions([]); return; } api<{ versions: Workflow[] }>(`/api/workflows/${selected.id}`).then((detail) => setVersions(detail.versions.filter((version): version is GraphWorkflow => version.architecture === "graph"))).catch(() => setVersions([selected])); }, [selected?.id, selected?.version]);
   useEffect(() => {
     setPublicationId((current) => workflowPublications.some((publication) => publication.id === current)
       ? current
@@ -247,5 +250,28 @@ export function WorkflowPage({ data, refresh, notify }: PageProps) {
     </div>}</main>
     {editor && <WorkflowEditor workflow={editor === "edit" ? selected : undefined} data={data} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
     {archiveOpen && selected && <Modal title="归档协作编排" eyebrow={`${selected.id} · 保留历史`} onClose={() => setArchiveOpen(false)}><div className="modal-body"><div className="danger-notice"><b>历史版本与 Run 证据会继续保留。</b><p>归档后不能发起新的运行；已存在的档案与节点输出仍可查阅。</p></div><div className="modal-actions"><button className="button secondary" onClick={() => setArchiveOpen(false)}>取消</button><button className="button danger-filled" disabled={!daemonAvailable} onClick={() => void archive()}>确认归档</button></div></div></Modal>}
+  </div>;
+}
+
+export function WorkflowPage(props: PageProps) {
+  const [section, setSection] = useState<"entrance" | "graph" | "supervisor" | "policies">("graph");
+  const graphCount = props.data.workflows.filter((workflow) => workflow.architecture === "graph").length;
+  const supervisorCount = props.data.workflows.filter((workflow) => workflow.architecture === "supervisor").length;
+  const policyCount = props.data.managementPolicies?.length ?? 0;
+  const entranceCount = props.data.entrancePolicies?.length ?? 0;
+  return <div className="orchestration-workspace">
+    <header className="orchestration-switcher" aria-label="协作编排类型">
+      <div><span>WORKFLOW CONTROL PLANE</span><strong>请求先分流，试算不建任务；分发到内部目标后才产生工单与运行</strong></div>
+      <nav>
+        <button type="button" className={section === "entrance" ? "active" : ""} aria-pressed={section === "entrance"} onClick={() => setSection("entrance")}>请求分流 <small>{entranceCount}</small></button>
+        <button type="button" className={section === "graph" ? "active" : ""} aria-pressed={section === "graph"} onClick={() => setSection("graph")}>Graph 编排 <small>{graphCount}</small></button>
+        <button type="button" className={section === "supervisor" ? "active" : ""} aria-pressed={section === "supervisor"} onClick={() => setSection("supervisor")}>领队协作 <small>{supervisorCount}</small></button>
+        <button type="button" className={section === "policies" ? "active" : ""} aria-pressed={section === "policies"} onClick={() => setSection("policies")}>管理策略库 <small>{policyCount}</small></button>
+      </nav>
+    </header>
+    {section === "entrance" && <EntrancePolicyPage {...props} />}
+    {section === "graph" && <GraphWorkflowPage {...props} />}
+    {section === "supervisor" && <SupervisorWorkflowPage {...props} />}
+    {section === "policies" && <ManagementPolicyPage {...props} />}
   </div>;
 }

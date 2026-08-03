@@ -29,6 +29,10 @@ export interface RunWorkflowOptions {
   providers?: ProviderRegistry;
   architectures?: ArchitectureRegistry;
   initialArtifacts?: Record<string, JsonValue>;
+  prepareNode?: (node: ExecutionPlanNode) => Promise<{
+    node: ExecutionPlanNode;
+    artifacts?: Record<string, JsonValue>;
+  }>;
   onEvent?: (event: ObservedRunEvent) => void | Promise<void>;
   signal?: AbortSignal;
 }
@@ -45,6 +49,30 @@ export interface RunWorkflowResult {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function nodeRoleId(node: ExecutionPlanNode): string {
+  const roleId = node.metadata?.roleId;
+  return typeof roleId === "string" && roleId ? roleId : node.role;
+}
+
+function providerCallSignal(
+  signal: AbortSignal | undefined,
+  deadlineAt: number | undefined
+): { signal?: AbortSignal; clear: () => void } {
+  if (deadlineAt === undefined) return { signal, clear: () => undefined };
+  const deadline = new AbortController();
+  const remaining = deadlineAt - Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (remaining <= 0) deadline.abort();
+  else {
+    timer = setTimeout(() => deadline.abort(), remaining);
+    timer.unref();
+  }
+  return {
+    signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal,
+    clear: () => { if (timer) clearTimeout(timer); }
+  };
 }
 
 function validateInput(loaded: LoadedManifest, workflowId: string, input: JsonObject): void {
@@ -110,7 +138,8 @@ function buildPromptBundle(
     skills,
     node: {
       id: node.id,
-      with: node.with
+      with: node.with,
+      metadata: node.metadata ?? {}
     },
     role: roleContext,
     run: {
@@ -149,7 +178,8 @@ async function executeNode(
   registry: ProviderRegistry,
   emit: (type: string, nodeId?: string, detail?: JsonValue) => Promise<void>,
   providerCwd: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options: { dependencyFailure?: "skip" | "observe"; deadlineAt?: number } = {}
 ): Promise<NodeRunResult> {
   const role = loaded.manifest.roles[node.role];
   if (!role) throw new Error(`role not found: ${node.role}`);
@@ -158,10 +188,11 @@ async function executeNode(
   const adapter = registry.get(provider.adapter);
   if (!adapter) throw new Error(`provider adapter not registered: ${provider.adapter}`);
   const failedDependency = node.needs.find((nodeId) => ["failed", "skipped"].includes(run.nodes[nodeId]?.status ?? "pending"));
-  if (failedDependency) {
+  if (failedDependency && options.dependencyFailure !== "observe") {
     const skipped: NodeRunResult = {
       nodeId: node.id,
-      roleId: node.role,
+      roleId: nodeRoleId(node),
+      metadata: node.metadata,
       status: "skipped",
       attempts: 0,
       completedAt: now(),
@@ -175,7 +206,8 @@ async function executeNode(
 
   const result: NodeRunResult = {
     nodeId: node.id,
-    roleId: node.role,
+    roleId: nodeRoleId(node),
+    metadata: node.metadata,
     status: "running",
     attempts: 0,
     startedAt: now()
@@ -187,27 +219,59 @@ async function executeNode(
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    if (signal?.aborted) throw new ProviderExecutionError("workflow execution was aborted", "", "", {
-      kind: "aborted",
-      retryable: false
-    });
     result.attempts = attempt;
     const attemptDir = await store.createAttempt(node.id, attempt);
     result.artifactDir = path.relative(store.runDir, attemptDir).split(path.sep).join("/");
     try {
+      if (signal?.aborted || (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt)) {
+        throw new ProviderExecutionError(
+          options.deadlineAt !== undefined && Date.now() >= options.deadlineAt
+            ? "workflow execution deadline was reached"
+            : "workflow execution was aborted",
+          "",
+          "",
+          { kind: "aborted", retryable: false }
+        );
+      }
       const bundle = buildPromptBundle(loaded, run, node, input, attemptDir, providerCwd);
       await store.writeText(attemptDir, "system-prompt.md", bundle.systemPrompt);
       await store.writeText(attemptDir, "request-prompt.md", bundle.requestPrompt);
       await store.writeText(attemptDir, "prompt.md", bundle.prompt);
       await emit("node.attempt.started", node.id, { attempt });
-      const response = await adapter.invoke({
-        providerId: role.provider,
-        definition: provider,
-        cwd: providerCwd,
-        prompt: bundle.prompt,
-        templateContext: bundle.context,
-        signal
-      });
+      const callSignal = providerCallSignal(signal, options.deadlineAt);
+      let response: Awaited<ReturnType<typeof adapter.invoke>>;
+      try {
+        if (callSignal.signal?.aborted) {
+          throw new ProviderExecutionError(
+            options.deadlineAt !== undefined && Date.now() >= options.deadlineAt
+              ? "workflow execution deadline was reached"
+              : "workflow execution was aborted",
+            "",
+            "",
+            { kind: "aborted", retryable: false }
+          );
+        }
+        response = await adapter.invoke({
+          providerId: role.provider,
+          definition: provider,
+          cwd: providerCwd,
+          prompt: bundle.prompt,
+          templateContext: bundle.context,
+          signal: callSignal.signal
+        });
+        if (callSignal.signal?.aborted) {
+          throw new ProviderExecutionError(
+            options.deadlineAt !== undefined && Date.now() >= options.deadlineAt
+              ? "workflow execution deadline was reached"
+              : "workflow execution was aborted",
+            response.stdout,
+            response.stderr,
+            { kind: "aborted", retryable: false, durationMs: response.durationMs }
+          );
+        }
+      } finally {
+        callSignal.clear();
+      }
       await store.writeText(attemptDir, "stdout.txt", response.stdout);
       await store.writeText(attemptDir, "stderr.txt", response.stderr);
       const output = parseProviderOutput(provider.outputProtocol ?? "json", response.stdout);
@@ -285,7 +349,13 @@ export async function runWorkflow(
     status: "running",
     createdAt: now(),
     nodes: Object.fromEntries(
-      plan.nodes.map((node) => [node.id, { nodeId: node.id, roleId: node.role, status: "pending", attempts: 0 }])
+      plan.nodes.map((node) => [node.id, {
+        nodeId: node.id,
+        roleId: nodeRoleId(node),
+        metadata: node.metadata,
+        status: "pending",
+        attempts: 0
+      }])
     )
   };
   const registry = options.providers ?? createDefaultProviderRegistry();
@@ -302,22 +372,97 @@ export async function runWorkflow(
   await store.writeRun(run);
   await emit("run.started", undefined, { workflow: workflowId, architecture: plan.architecture });
 
-  await architecture.execute({
-    loaded,
-    input,
-    plan,
-    run,
-    executeNode: (node) => executeNode(loaded, run, node, input, store, registry, emit, providerCwd, options.signal),
-    persist: () => store.writeRun(run),
-    emit
-  });
+  const scheduled = new Set<string>();
+  const scheduleNode = async (node: ExecutionPlanNode): Promise<void> => {
+    const existing = plan.nodes.find((candidate) => candidate.id === node.id);
+    if (existing && existing.role !== node.role) throw new Error(`execution node ${node.id} is already assigned to role ${existing.role}`);
+    if (!existing) plan.nodes.push(node);
+    if (!run.nodes[node.id]) {
+      run.nodes[node.id] = {
+        nodeId: node.id,
+        roleId: nodeRoleId(node),
+        metadata: node.metadata,
+        status: "pending",
+        attempts: 0
+      };
+    }
+    await store.writePlan(plan);
+    await store.writeRun(run);
+    if (!scheduled.has(node.id)) {
+      scheduled.add(node.id);
+      await emit("node.scheduled", node.id, {
+        role: node.role,
+        needs: node.needs,
+        metadata: node.metadata ?? {}
+      });
+    }
+  };
+  const executePreparedNode = async (
+    node: ExecutionPlanNode,
+    executionOptions?: { dependencyFailure?: "skip" | "observe"; deadlineAt?: number }
+  ): Promise<NodeRunResult> => {
+    let prepared: { node: ExecutionPlanNode; artifacts?: Record<string, JsonValue> };
+    try {
+      prepared = options.prepareNode ? await options.prepareNode(node) : { node };
+      for (const [relativePath, value] of Object.entries(prepared.artifacts ?? {})) {
+        await store.writeArtifact(relativePath, value);
+      }
+    } catch (error) {
+      const failed: NodeRunResult = {
+        nodeId: node.id,
+        roleId: nodeRoleId(node),
+        metadata: node.metadata,
+        status: "failed",
+        attempts: 0,
+        completedAt: now(),
+        error: error instanceof Error ? error.message : String(error)
+      };
+      run.nodes[node.id] = failed;
+      await store.writeRun(run);
+      await emit("node.failed", node.id, { error: failed.error ?? "node preparation failed", phase: "prepare" });
+      return failed;
+    }
+    return executeNode(
+      loaded,
+      run,
+      prepared.node,
+      input,
+      store,
+      registry,
+      emit,
+      providerCwd,
+      options.signal,
+      executionOptions
+    );
+  };
+  let executionResult: Awaited<ReturnType<typeof architecture.execute>>;
+  try {
+    executionResult = await architecture.execute({
+      loaded,
+      input,
+      plan,
+      run,
+      scheduleNode,
+      executeNode: executePreparedNode,
+      persist: () => store.writeRun(run),
+      emit
+    });
+  } catch (error) {
+    run.status = "failed";
+    run.error = error instanceof Error ? error.message : String(error);
+    run.completedAt = now();
+    await store.writeRun(run);
+    await emit("run.failed", undefined, { error: run.error });
+    throw error;
+  }
 
   const statuses = Object.values(run.nodes).map((node) => node.status);
-  run.status = statuses.some((status) => status === "failed" || status === "skipped")
+  run.status = executionResult?.status ?? (statuses.some((status) => status === "failed" || status === "skipped")
     ? "failed"
     : statuses.some((status) => status === "blocked")
       ? "blocked"
-      : "passed";
+      : "passed");
+  if (executionResult?.output !== undefined) run.output = executionResult.output;
   run.completedAt = now();
   await store.writeRun(run);
   await emit(`run.${run.status}`);

@@ -96,6 +96,7 @@ function resultSummary(value: Awaited<ReturnType<WorkbenchService["invokePublica
     data: {
       runId: value.run.id,
       status: value.run.status,
+      output: value.run.output ?? null,
       outputs
     }
   };

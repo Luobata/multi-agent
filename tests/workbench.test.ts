@@ -420,6 +420,311 @@ describe("Local Agent Workbench", () => {
     expect(providerInvocations.every((invocation) => invocation.projectRoot === projectRoot)).toBe(true);
   });
 
+  it("versions Management Policies and runs a Supervisor Workflow as a dynamic execution graph", async () => {
+    const providers: ProviderRegistry = new Map([["scripted-supervisor", {
+      id: "scripted-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role === "supervisor" && round === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Collect specialist evidence.",
+              assignments: [{ roleId: "researcher", task: "Research the supplied request." }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (role === "supervisor") {
+          return {
+            stdout: JSON.stringify({ action: "finish", summary: "Evidence accepted.", result: { answer: "complete" } }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return { stdout: JSON.stringify({ message: "Research complete." }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("scripted-provider", {
+      adapter: "scripted-supervisor",
+      model: "supervisor-test-model",
+      outputProtocol: "json"
+    });
+    const manager = await service.createEmployee({
+      id: "team-manager",
+      identity: { displayName: "Team Manager", background: "Coordinates specialists.", responsibilities: ["Delegate", "Synthesize"] },
+      providerId: "scripted-provider"
+    });
+    const researcher = await service.createEmployee({
+      id: "team-researcher",
+      identity: { displayName: "Team Researcher", background: "Collects evidence.", responsibilities: ["Research"] },
+      providerId: "scripted-provider"
+    });
+    const policy = await service.createManagementPolicy({
+      id: "evidence-manager",
+      displayName: "Evidence Manager",
+      description: "Delegate research before synthesis.",
+      allowedRoleIds: ["researcher"],
+      instructions: "Delegate evidence collection and finish only after reviewing it.",
+      limits: { maxRounds: 4, maxDelegations: 4, maxParallelDelegations: 2, maxDurationMs: 60_000 }
+    });
+    const workflow = await service.createWorkflow({
+      id: "supervised-research",
+      architecture: "supervisor",
+      description: "A dynamically managed research team.",
+      supervisor: { employeeId: manager.id },
+      managementPolicy: { id: policy.id },
+      members: [{ roleId: "researcher", description: "Collect evidence.", employeeId: researcher.id }]
+    });
+    expect(workflow).toMatchObject({
+      architecture: "supervisor",
+      managementPolicy: { id: policy.id, version: 1 },
+      supervisor: { employeeVersion: 1 }
+    });
+    const policyV2 = await service.updateManagementPolicy(policy.id, { instructions: "A newer policy that is not auto-adopted." });
+    expect(policyV2.version).toBe(2);
+    expect(service.getWorkflow(workflow.id)).toMatchObject({ managementPolicy: { id: policy.id, version: 1 } });
+
+    const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Investigate this topic" });
+    expect(result.run).toMatchObject({
+      architecture: "supervisor",
+      status: "passed",
+      output: { summary: "Evidence accepted.", result: { answer: "complete" }, rounds: 2, delegations: 1 }
+    });
+    expect(Object.keys(result.run.nodes)).toEqual(["supervisor-r1", "researcher-r1-1", "supervisor-r2"]);
+    const invocation = service.getActivitySnapshot().invocations.find((item) => item.runId === result.run.id)!;
+    const detail = await service.getInvocationDetail(invocation.id);
+    expect(detail.invocation.status).toBe("completed");
+    expect(detail.invocation.executionSnapshot).toMatchObject({
+      workflow: { id: workflow.id, version: 1, architecture: "supervisor" },
+      managementPolicy: { id: policy.id, version: 1 }
+    });
+    expect(detail.instances.map((instance) => [instance.nodeId, instance.kind, instance.roleId, instance.round])).toEqual([
+      ["supervisor-r1", "supervisor", "supervisor", 1],
+      ["researcher-r1-1", "member", "researcher", 1],
+      ["supervisor-r2", "supervisor", "supervisor", 2]
+    ]);
+    const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8");
+    expect(events.match(/"type":"node.scheduled"/g)).toHaveLength(3);
+    await expect(service.archiveManagementPolicy(policy.id)).rejects.toThrow(/used by active workflows: supervised-research/);
+    await service.archiveWorkflow(workflow.id);
+    await expect(service.archiveManagementPolicy(policy.id)).resolves.toMatchObject({ status: "archived", version: 3 });
+    await expect(service.restoreManagementPolicy(policy.id)).resolves.toMatchObject({ status: "active", version: 4 });
+  });
+
+  it("marks Supervisor policy exhaustion as blocked instead of a technical failure", async () => {
+    const providers: ProviderRegistry = new Map([["non-converging", {
+      id: "non-converging",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        return role === "supervisor"
+          ? {
+              stdout: JSON.stringify({ action: "delegate", assignments: [{ roleId: "worker", task: "Continue." }] }),
+              stderr: "",
+              durationMs: 1
+            }
+          : { stdout: JSON.stringify({ message: "Worked." }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("non-converging-provider", { adapter: "non-converging", outputProtocol: "json" });
+    for (const id of ["loop-manager", "loop-worker"]) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Exercises policy limits.", responsibilities: ["Work"] },
+        providerId: "non-converging-provider"
+      });
+    }
+    const policy = await service.createManagementPolicy({
+      id: "one-round",
+      allowedRoleIds: ["worker"],
+      instructions: "Try to delegate.",
+      limits: { maxRounds: 1, maxDelegations: 2, maxParallelDelegations: 1, maxDurationMs: 60_000 }
+    });
+    await service.createWorkflow({
+      id: "bounded-supervisor",
+      architecture: "supervisor",
+      supervisor: { employeeId: "loop-manager" },
+      managementPolicy: { id: policy.id },
+      members: [{ roleId: "worker", employeeId: "loop-worker" }]
+    });
+    const result = await service.runWorkbenchWorkflow("bounded-supervisor", { message: "Never converge" });
+    expect(result.run.status).toBe("blocked");
+    expect(result.run.output).toMatchObject({ reason: expect.stringContaining("round limit"), rounds: 1, delegations: 0 });
+    const invocation = service.getActivitySnapshot().invocations.find((item) => item.runId === result.run.id);
+    expect(invocation?.status).toBe("blocked");
+    expect(service.getActivitySnapshot().instances.find((item) => item.runId === result.run.id)?.status).toBe("completed");
+  });
+
+  it("enforces the Supervisor duration deadline even when a Provider returns after ignoring abort", async () => {
+    const providers: ProviderRegistry = new Map([["slow-supervisor", {
+      id: "slow-supervisor",
+      validate: () => [],
+      invoke: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_050));
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Late result.", result: { accepted: true } }),
+          stderr: "",
+          durationMs: 1_050
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("slow-supervisor-provider", { adapter: "slow-supervisor", outputProtocol: "json" });
+    for (const id of ["deadline-manager", "deadline-worker"]) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Exercises duration limits.", responsibilities: ["Work"] },
+        providerId: "slow-supervisor-provider"
+      });
+    }
+    await service.createManagementPolicy({
+      id: "one-second-supervision",
+      allowedRoleIds: ["worker"],
+      instructions: "Respect the bounded control-loop duration.",
+      limits: { maxDurationMs: 1_000 }
+    });
+    await service.createWorkflow({
+      id: "deadline-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "deadline-manager" },
+      managementPolicy: { id: "one-second-supervision" },
+      members: [{ roleId: "worker", employeeId: "deadline-worker" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("deadline-team", { message: "Respect the deadline" });
+    expect(result.run.status).toBe("blocked");
+    expect(result.run.output).toMatchObject({ reason: expect.stringContaining("duration limit"), rounds: 1 });
+    expect(result.run.nodes["supervisor-r1"]).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining("deadline")
+    });
+  });
+
+  it("allows a Supervisor to recover from a failed member while preserving the failed WorkInstance", async () => {
+    const providers: ProviderRegistry = new Map([["recovering-supervisor", {
+      id: "recovering-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role === "member-worker") throw new Error("worker provider unavailable");
+        return round === 1
+          ? {
+              stdout: JSON.stringify({ action: "delegate", assignments: [{ roleId: "worker", task: "Attempt the task." }] }),
+              stderr: "",
+              durationMs: 1
+            }
+          : {
+              stdout: JSON.stringify({ action: "finish", summary: "Recovered with a bounded fallback.", result: { fallback: true } }),
+              stderr: "",
+              durationMs: 1
+            };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("recovering-provider", { adapter: "recovering-supervisor", outputProtocol: "json" });
+    for (const id of ["recovery-manager", "recovery-worker"]) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Tests recovery.", responsibilities: ["Work"] },
+        providerId: "recovering-provider"
+      });
+    }
+    await service.createManagementPolicy({
+      id: "recover-worker",
+      allowedRoleIds: ["worker"],
+      instructions: "Observe worker failure and choose a fallback.",
+      failure: { workerFailure: "observe-and-replan" }
+    });
+    await service.createWorkflow({
+      id: "recovering-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "recovery-manager" },
+      managementPolicy: { id: "recover-worker" },
+      members: [{ roleId: "worker", employeeId: "recovery-worker" }]
+    });
+    const result = await service.runWorkbenchWorkflow("recovering-team", { message: "Recover this task" });
+    expect(result.run.status).toBe("passed");
+    expect(result.run.nodes["worker-r1-1"]?.status).toBe("failed");
+    expect(result.run.nodes["supervisor-r2"]?.status).toBe("passed");
+    expect(result.run.output).toMatchObject({ summary: "Recovered with a bounded fallback.", result: { fallback: true } });
+    const invocation = service.getActivitySnapshot().invocations.find((item) => item.runId === result.run.id)!;
+    expect(invocation.status).toBe("completed");
+    expect(service.getActivitySnapshot().instances.find((instance) => instance.runId === result.run.id && instance.kind === "member")?.status).toBe("failed");
+  });
+
+  it("does not treat a blocked delegation as successful when the Management Policy requires every delegation to pass", async () => {
+    const providers: ProviderRegistry = new Map([["blocking-supervisor", {
+      id: "blocking-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role === "supervisor") {
+          return round === 1
+            ? {
+                stdout: JSON.stringify({ action: "delegate", assignments: [{ roleId: "reviewer", task: "Review the evidence." }] }),
+                stderr: "",
+                durationMs: 1
+              }
+            : {
+                stdout: JSON.stringify({ action: "finish", summary: "Review considered.", result: { accepted: true } }),
+                stderr: "",
+                durationMs: 1
+              };
+        }
+        return {
+          stdout: JSON.stringify({ message: "Required evidence is missing.", verdict: "Block" }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("blocking-provider", { adapter: "blocking-supervisor", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "strict-manager",
+      identity: { displayName: "Strict Manager", background: "Coordinates review.", responsibilities: ["Manage"] },
+      providerId: "blocking-provider"
+    });
+    await service.createEmployee({
+      id: "blocking-reviewer",
+      identity: { displayName: "Blocking Reviewer", background: "Reviews evidence.", responsibilities: ["Review"] },
+      providerId: "blocking-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message", "verdict"],
+        properties: { message: { type: "string" }, verdict: { enum: ["Pass", "Block"] } }
+      },
+      verdict: { path: "verdict", pass: ["Pass"], block: ["Block"] }
+    });
+    await service.createManagementPolicy({
+      id: "all-delegations-must-pass",
+      allowedRoleIds: ["reviewer"],
+      instructions: "Delegate review and finish only if every delegation passes.",
+      completion: { requireAllDelegationsSuccessful: true }
+    });
+    await service.createWorkflow({
+      id: "strict-review-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "strict-manager" },
+      managementPolicy: { id: "all-delegations-must-pass" },
+      members: [{ roleId: "reviewer", employeeId: "blocking-reviewer" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("strict-review-team", { message: "Approve the release" });
+    expect(result.run.nodes["reviewer-r1-1"]?.status).toBe("blocked");
+    expect(result.run.status).toBe("blocked");
+    expect(result.run.output).toMatchObject({ reason: expect.stringContaining("every delegation"), rounds: 2, delegations: 1 });
+  });
+
   it("archives and restores shared Skills while preserving version history", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     await service.createSkill({ id: "recoverable-skill", description: "Recoverable", instructions: "Keep history." });

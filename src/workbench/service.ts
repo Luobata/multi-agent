@@ -63,9 +63,22 @@ import type {
 } from "../knowledge/types.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
-import { materializeWorkflow, resolveSkillBinding } from "./materialize.js";
+import {
+  materializeWorkflow,
+  resolveSkillBinding,
+  SUPERVISOR_RUNTIME_ROLE_ID,
+  supervisorMemberRuntimeRoleId
+} from "./materialize.js";
 import { loadProjectDescriptor } from "./projectDescriptor.js";
 import { WorkbenchStore } from "./store.js";
+import {
+  evaluateEntrancePolicyDefinition,
+  normalizeEntrancePolicyRouteResult,
+  normalizeEntrancePolicyRules,
+  parseEntrancePolicyDispatchInput,
+  parseEntrancePolicyEvaluationInput,
+  resolveEntrancePolicyTarget
+} from "./entrancePolicy.js";
 import {
   DEFAULT_EMPLOYEE_OUTPUT_SCHEMA,
   type ActivityEvent,
@@ -73,10 +86,24 @@ import {
   type EmployeeContextView,
   type EmployeeCreateInput,
   type EmployeeDefinition,
+  type EmployeeUpdateInput,
   type EmployeeInvocationInput,
   type EmployeeInvocationResult,
   type EmployeeRecord,
   type EmployeeSession,
+  type EntrancePolicyCreateInput,
+  type EntrancePolicyDecision,
+  type EntrancePolicyDefinition,
+  type EntrancePolicyDirectRoute,
+  type EntrancePolicyDispatchInput,
+  type EntrancePolicyDispatchResult,
+  type EntrancePolicyEvaluationInput,
+  type EntrancePolicyExecutionSnapshot,
+  type EntrancePolicyLeaderInput,
+  type EntrancePolicyProjectRoleTarget,
+  type EntrancePolicySpecialistTarget,
+  type EntrancePolicySpecialistTargetInput,
+  type EntrancePolicyUpdateInput,
   type InvocationDetail,
   type InvocationRecord,
   type InvocationStartResult,
@@ -92,16 +119,22 @@ import {
   type ProjectRecord,
   type ProjectRoleBinding,
   type ProjectRoleBindingInput,
+  type GraphWorkbenchWorkflowDefinition,
+  type GraphWorkflowCreateInput,
+  type ManagementPolicyCreateInput,
+  type ManagementPolicyDefinition,
+  type ManagementPolicyUpdateInput,
   type SkillCreateInput,
   type SkillUpdateInput,
   type WorkbenchSkillDefinition,
   type WorkbenchState,
   type WorkbenchWorkflowDefinition,
+  type SupervisorWorkbenchWorkflowDefinition,
+  type SupervisorWorkflowCreateInput,
   type WorkInstanceRecord,
   type WorkInstanceStatus,
   type WorkflowCreateInput,
-  type WorkflowUpdateInput,
-  type EmployeeUpdateInput
+  type WorkflowUpdateInput
 } from "./types.js";
 
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
@@ -871,12 +904,14 @@ export class WorkbenchService {
     employees: Map<string, EmployeeDefinition>;
     input: JsonObject;
     sessionId?: string;
+    entrance?: EntrancePolicyExecutionSnapshot;
   }): Promise<InvocationRecord> {
     const timestamp = now();
     const runId = runIdentifier();
     const invocationId = `inv-${randomUUID()}`;
     const state = this.snapshot();
-    const instances: WorkInstanceRecord[] = options.workflow.nodes.map((node) => {
+    const graphNodes = options.workflow.architecture === "graph" ? options.workflow.nodes : [];
+    const instances: WorkInstanceRecord[] = graphNodes.map((node) => {
       const employee = options.employees.get(node.employeeId);
       if (!employee) throw new Error(`employee ${node.employeeId} is not materialized`);
       const waiting = node.needs.length > 0;
@@ -890,6 +925,8 @@ export class WorkbenchService {
         workflowId: options.workflow.id,
         workflowVersion: options.workflow.version,
         nodeId: node.id,
+        roleId: node.id,
+        kind: "graph",
         runId,
         sessionId: options.sessionId,
         providerId: employee.providerId,
@@ -912,6 +949,35 @@ export class WorkbenchService {
       runId,
       sessionId: options.sessionId,
       instanceIds: instances.map((instance) => instance.id),
+      executionSnapshot: {
+        workflow: {
+          id: options.workflow.id,
+          version: options.workflow.version,
+          architecture: options.workflow.architecture
+        },
+        managementPolicy: options.workflow.architecture === "supervisor"
+          ? options.workflow.managementPolicy
+          : undefined,
+        entrance: options.entrance,
+        employees: options.workflow.architecture === "graph"
+          ? options.workflow.nodes.map((node) => ({
+              roleId: node.id,
+              employeeId: node.employeeId,
+              employeeVersion: node.employeeVersion ?? options.employees.get(node.employeeId)!.version
+            }))
+          : [
+              {
+                roleId: "supervisor",
+                employeeId: options.workflow.supervisor.employeeId,
+                employeeVersion: options.workflow.supervisor.employeeVersion
+              },
+              ...options.workflow.members.map((member) => ({
+                roleId: member.roleId,
+                employeeId: member.employeeId,
+                employeeVersion: member.employeeVersion
+              }))
+            ]
+      },
       createdAt: timestamp,
       updatedAt: timestamp,
       transitions: [{ at: timestamp, status: "queued", phase: "queued" }]
@@ -923,6 +989,63 @@ export class WorkbenchService {
     this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
     for (const instance of instances) this.emitActivity({ type: "instance.changed", at: timestamp, instance });
     return invocation;
+  }
+
+  private async createScheduledInstance(
+    invocationId: string,
+    nodeId: string,
+    detail: { role?: string; metadata?: JsonObject } | undefined,
+    employees: Map<string, EmployeeDefinition>
+  ): Promise<WorkInstanceRecord | undefined> {
+    const runtimeRole = detail?.role;
+    if (!runtimeRole) return undefined;
+    const employee = employees.get(runtimeRole);
+    if (!employee) throw new Error(`runtime role ${runtimeRole} is not bound to an Employee`);
+    const timestamp = now();
+    let created = false;
+    const instance = await this.store.mutate((state) => {
+      const invocation = state.invocations[invocationId];
+      if (!invocation) throw new Error(`invocation not found: ${invocationId}`);
+      const existing = invocation.instanceIds
+        .map((id) => state.workInstances[id])
+        .find((candidate) => candidate?.nodeId === nodeId);
+      if (existing) return existing;
+      const metadata = detail?.metadata ?? {};
+      const next: WorkInstanceRecord = {
+        id: `work-${randomUUID()}`,
+        invocationId,
+        employeeId: employee.id,
+        employeeVersion: employee.version,
+        workflowId: invocation.executionSnapshot?.workflow.id ?? invocation.target.id,
+        workflowVersion: invocation.executionSnapshot?.workflow.version ?? invocation.target.version,
+        nodeId,
+        roleId: typeof metadata.roleId === "string" ? metadata.roleId : runtimeRole,
+        kind: metadata.kind === "supervisor" || metadata.kind === "member" ? metadata.kind : undefined,
+        round: typeof metadata.round === "number" ? metadata.round : undefined,
+        parentNodeId: typeof metadata.parentNodeId === "string" ? metadata.parentNodeId : undefined,
+        runId: invocation.runId,
+        sessionId: invocation.sessionId,
+        providerId: employee.providerId,
+        model: state.providers[employee.providerId]?.model,
+        source: invocation.source,
+        status: "queued",
+        phase: "queued",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        transitions: [{ at: timestamp, status: "queued", phase: "queued" }]
+      };
+      state.workInstances[next.id] = next;
+      invocation.instanceIds.push(next.id);
+      invocation.updatedAt = timestamp;
+      created = true;
+      return next;
+    });
+    if (created) {
+      this.emitActivity({ type: "instance.changed", at: timestamp, instance });
+      const invocation = this.snapshot().invocations[invocationId];
+      if (invocation) this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+    }
+    return instance;
   }
 
   private async transitionInvocation(
@@ -981,9 +1104,22 @@ export class WorkbenchService {
     return instance;
   }
 
-  private async observeRunEvent(invocationId: string, event: ObservedRunEvent): Promise<void> {
+  private async observeRunEvent(
+    invocationId: string,
+    event: ObservedRunEvent,
+    employees: Map<string, EmployeeDefinition>
+  ): Promise<void> {
     if (event.type === "run.started") {
       await this.transitionInvocation(invocationId, "running", "executing");
+      return;
+    }
+    if (event.type === "node.scheduled" && event.nodeId) {
+      await this.createScheduledInstance(
+        invocationId,
+        event.nodeId,
+        event.detail as { role?: string; metadata?: JsonObject } | undefined,
+        employees
+      );
       return;
     }
     if (event.nodeId) {
@@ -1009,10 +1145,16 @@ export class WorkbenchService {
     if (event.type === "run.failed") {
       const state = this.snapshot();
       const invocation = state.invocations[invocationId];
+      const detail = event.detail as { error?: string } | undefined;
       const failure = invocation?.instanceIds
         .map((id) => state.workInstances[id]?.error)
         .find((message): message is string => Boolean(message));
-      await this.transitionInvocation(invocationId, "failed", "error", failure ?? "One or more work instances failed.");
+      await this.transitionInvocation(
+        invocationId,
+        "failed",
+        "error",
+        failure ?? detail?.error ?? "One or more work instances failed."
+      );
     }
   }
 
@@ -1039,33 +1181,10 @@ export class WorkbenchService {
   ): Promise<RunWorkflowResult> {
     await this.transitionInvocation(invocation.id, "running", "materializing");
     try {
-      const knowledgeArtifacts: Record<string, JsonValue> = {};
       const inputTaskTags = (Array.isArray(input.taskTags) ? input.taskTags : [])
         .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
         .map((value) => value.trim());
-      const request = typeof input.message === "string" ? input.message : JSON.stringify(input);
-      const enrichedWorkflow: WorkbenchWorkflowDefinition = {
-        ...workflow,
-        nodes: await Promise.all(workflow.nodes.map(async (node) => {
-          const employee = employees.get(node.employeeId);
-          if (!employee) throw new Error(`employee ${node.employeeId} is not materialized`);
-          const nodeTaskTags = (Array.isArray(node.with.taskTags) ? node.with.taskTags : [])
-            .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
-            .map((value) => value.trim());
-          const knowledge = await this.knowledge.prepare(this.snapshot(), employee, {
-            request,
-            projectId: invocation.source.project,
-            projectRoleId: invocation.source.projectRole,
-            taskTags: [...new Set([...inputTaskTags, ...nodeTaskTags])]
-          });
-          knowledgeArtifacts[`knowledge/${node.id}.json`] = JSON.parse(JSON.stringify(knowledge)) as JsonValue;
-          return {
-            ...node,
-            with: { ...node.with, __knowledgeEvidence: knowledge.promptSection }
-          };
-        }))
-      };
-      const materialized = await this.materialize(enrichedWorkflow, employees);
+      const materialized = await this.materialize(workflow, employees);
       return await runWorkflow(materialized.loaded, materialized.workflowId, {
         runId: invocation.runId,
         input,
@@ -1073,8 +1192,35 @@ export class WorkbenchService {
         architectures: this.architectures,
         artifactRoot: path.join(this.store.dataRoot, "artifacts"),
         providerCwd,
-        initialArtifacts: knowledgeArtifacts,
-        onEvent: (event) => this.observeRunEvent(invocation.id, event)
+        prepareNode: async (node) => {
+          const employee = employees.get(node.role);
+          if (!employee) throw new Error(`runtime role ${node.role} is not materialized`);
+          const nodeTaskTags = (Array.isArray(node.with.taskTags) ? node.with.taskTags : [])
+            .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+            .map((value) => value.trim());
+          const delegatedTask = node.with.__delegatedTask;
+          const request = typeof delegatedTask === "string"
+            ? delegatedTask
+            : typeof input.message === "string"
+              ? input.message
+              : JSON.stringify(input);
+          const knowledge = await this.knowledge.prepare(this.snapshot(), employee, {
+            request,
+            projectId: invocation.source.project,
+            projectRoleId: invocation.source.projectRole,
+            taskTags: [...new Set([...inputTaskTags, ...nodeTaskTags])]
+          });
+          return {
+            node: {
+              ...node,
+              with: { ...node.with, __knowledgeEvidence: knowledge.promptSection }
+            },
+            artifacts: {
+              [`knowledge/${node.id}.json`]: JSON.parse(JSON.stringify(knowledge)) as JsonValue
+            }
+          };
+        },
+        onEvent: (event) => this.observeRunEvent(invocation.id, event, employees)
       });
     } catch (error) {
       await this.failInvocationActivity(invocation.id, error);
@@ -3007,7 +3153,7 @@ export class WorkbenchService {
   private directWorkflow(
     employee: EmployeeDefinition,
     context?: { id: string; version: number; description: string }
-  ): WorkbenchWorkflowDefinition {
+  ): GraphWorkbenchWorkflowDefinition {
     const timestamp = now();
     return {
       id: context?.id ?? `direct-${employee.id}`,
@@ -3098,6 +3244,7 @@ export class WorkbenchService {
     assignment?: EmployeeSession["assignment"];
     workflow?: { id: string; version: number; description: string };
     providerCwd?: string;
+    entrance?: EntrancePolicyExecutionSnapshot;
   }): Promise<EmployeeInvocationResult> {
     const { employee, input, source } = options;
     let session = options.session;
@@ -3127,7 +3274,8 @@ export class WorkbenchService {
       workflow,
       employees,
       input: { message: input.message.trim() },
-      sessionId: session.id
+      sessionId: session.id,
+      entrance: options.entrance
     });
     const sessionId = session.id;
     return this.inSessionQueue(sessionId, async () => {
@@ -3191,6 +3339,34 @@ export class WorkbenchService {
     return this.invokeResolvedEmployee({ employee, input: { ...input, message: input.message.trim() }, source, session });
   }
 
+  private async invokePinnedEmployee(
+    employeeId: string,
+    employeeVersionValue: number,
+    input: EmployeeInvocationInput,
+    source: InvocationSource,
+    entrance: EntrancePolicyExecutionSnapshot
+  ): Promise<EmployeeInvocationResult> {
+    requireText(input.message, "message");
+    const current = this.getEmployee(employeeId);
+    if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
+    const scopedProjectId = internalProjectId(current);
+    if (scopedProjectId) throw new Error(`employee ${employeeId} is internal to project ${scopedProjectId}; invoke it through a project role`);
+    const employee = this.getEmployee(employeeId, employeeVersionValue);
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
+    if (session?.assignment) throw new Error(`session ${session.id} belongs to project ${session.assignment.projectId}/${session.assignment.roleId}`);
+    if (session && session.employeeVersion !== employee.version) {
+      throw new Error(`session ${session.id} pins employee ${employeeId} v${session.employeeVersion}, not v${employee.version}`);
+    }
+    return this.invokeResolvedEmployee({
+      employee,
+      input: { ...input, message: input.message.trim() },
+      source,
+      session,
+      entrance
+    });
+  }
+
   async invokeProjectRole(
     projectId: string,
     roleId: string,
@@ -3237,6 +3413,66 @@ export class WorkbenchService {
         version: resolved.binding.version,
         description: `${resolved.project.name} / ${resolved.project.roles.find((role) => role.id === roleId)?.displayName ?? roleId}`
       }
+    });
+  }
+
+  private async invokePinnedProjectRole(
+    target: EntrancePolicyProjectRoleTarget,
+    input: EmployeeInvocationInput,
+    source: InvocationSource,
+    entrance: EntrancePolicyExecutionSnapshot
+  ): Promise<EmployeeInvocationResult> {
+    requireText(input.message, "message");
+    const currentProject = this.getProject(target.projectId);
+    if (currentProject.status !== "active") throw new Error(`project ${target.projectId} is archived`);
+    const resolved = this.resolveProjectEmployee(
+      target.projectId,
+      target.roleId,
+      target.projectVersion,
+      target.projectBindingVersion
+    );
+    if (resolved.employee.id !== target.employeeId || resolved.employee.version !== target.employeeVersion) {
+      throw new Error(
+        `entrance policy project role target ${target.projectId}/${target.roleId} no longer matches its pinned Employee`
+      );
+    }
+    const currentEmployee = this.getEmployee(resolved.employee.id);
+    if (currentEmployee.status !== "active") throw new Error(`employee ${resolved.employee.id} is archived`);
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    if (session && (
+      !session.assignment
+      || session.assignment.projectId !== target.projectId
+      || session.assignment.roleId !== target.roleId
+      || session.assignment.projectVersion !== target.projectVersion
+      || session.assignment.projectBindingVersion !== target.projectBindingVersion
+      || session.employeeVersion !== target.employeeVersion
+    )) {
+      throw new Error(`session ${session.id} belongs to another project assignment or pinned version`);
+    }
+    const assignment = session?.assignment ?? {
+      projectId: target.projectId,
+      projectVersion: target.projectVersion,
+      projectBindingVersion: target.projectBindingVersion,
+      roleId: target.roleId
+    };
+    return this.invokeResolvedEmployee({
+      employee: resolved.employee,
+      input: { ...input, message: input.message.trim() },
+      source: {
+        ...source,
+        project: target.projectId,
+        projectRole: target.roleId,
+        projectBindingVersion: target.projectBindingVersion
+      },
+      session,
+      assignment,
+      providerCwd: resolved.project.rootPath,
+      workflow: {
+        id: `project-${target.projectId}-${target.roleId}`,
+        version: target.projectBindingVersion,
+        description: `${resolved.project.name} / ${resolved.project.roles.find((role) => role.id === target.roleId)?.displayName ?? target.roleId}`
+      },
+      entrance
     });
   }
 
@@ -3311,6 +3547,502 @@ export class WorkbenchService {
     return view;
   }
 
+  listEntrancePolicies(includeArchived = false): EntrancePolicyDefinition[] {
+    return Object.values(this.snapshot().entrancePolicies)
+      .map((record) => record.current)
+      .filter((policy) => includeArchived || policy.status === "active")
+      .sort((left, right) => left.displayName.localeCompare(right.displayName));
+  }
+
+  getEntrancePolicy(id: string, version?: number): EntrancePolicyDefinition {
+    const record = this.snapshot().entrancePolicies[id];
+    if (!record) throw new Error(`entrance policy not found: ${id}`);
+    if (version === undefined) return record.current;
+    const found = record.versions.find((candidate) => candidate.version === version);
+    if (!found) throw new Error(`entrance policy ${id} version ${version} not found`);
+    return found;
+  }
+
+  getEntrancePolicyVersions(id: string): EntrancePolicyDefinition[] {
+    const record = this.snapshot().entrancePolicies[id];
+    if (!record) throw new Error(`entrance policy not found: ${id}`);
+    return [...record.versions].sort((left, right) => right.version - left.version);
+  }
+
+  private resolveEntranceEmployeeTarget(
+    input: { employeeId: string; employeeVersion?: number },
+    label: string
+  ): EntrancePolicySpecialistTarget & { kind: "employee" } {
+    const state = this.snapshot();
+    const employeeId = requireId(input.employeeId, `${label} employee id`);
+    const record = state.employees[employeeId];
+    if (!record) throw new Error(`employee not found: ${employeeId}`);
+    if (record.current.status !== "active") throw new Error(`${label} employee ${employeeId} is archived`);
+    const employee = employeeVersion(record, input.employeeVersion);
+    if (employee.status !== "active") throw new Error(`${label} employee ${employeeId} v${employee.version} is archived`);
+    const scopedProjectId = internalProjectId(employee);
+    if (scopedProjectId) {
+      throw new Error(`${label} employee ${employeeId} is internal to project ${scopedProjectId}; use a project-role target`);
+    }
+    return { kind: "employee", employeeId, employeeVersion: employee.version };
+  }
+
+  private resolveEntranceProjectRoleTarget(
+    input: Extract<EntrancePolicySpecialistTargetInput, { kind: "project-role" }>,
+    label: string
+  ): EntrancePolicyProjectRoleTarget {
+    const projectId = requireId(input.projectId, `${label} project id`);
+    const roleId = requireId(input.roleId, `${label} role id`);
+    const currentProject = this.getProject(projectId);
+    if (currentProject.status !== "active") throw new Error(`${label} project ${projectId} is archived`);
+    const project = this.getProject(projectId, input.projectVersion);
+    if (project.status !== "active") throw new Error(`${label} project ${projectId} v${project.version} is archived`);
+    const binding = this.getProjectBinding(projectId, input.projectBindingVersion);
+    if (binding.projectVersion !== project.version) {
+      throw new Error(
+        `${label} project binding v${binding.version} targets project v${binding.projectVersion}, not v${project.version}`
+      );
+    }
+    if (!project.roles.some((role) => role.id === roleId)) throw new Error(`project role not found: ${projectId}/${roleId}`);
+    const roleBinding = binding.roles.find((candidate) => candidate.roleId === roleId);
+    if (!roleBinding) throw new Error(`project role is not assigned: ${projectId}/${roleId}`);
+    const currentEmployee = this.getEmployee(roleBinding.employeeId);
+    if (currentEmployee.status !== "active") throw new Error(`${label} employee ${roleBinding.employeeId} is archived`);
+    const employee = this.getEmployee(roleBinding.employeeId, roleBinding.employeeVersion);
+    if (employee.status !== "active") {
+      throw new Error(`${label} employee ${roleBinding.employeeId} v${roleBinding.employeeVersion} is archived`);
+    }
+    return {
+      kind: "project-role",
+      projectId,
+      projectVersion: project.version,
+      projectBindingVersion: binding.version,
+      roleId,
+      employeeId: employee.id,
+      employeeVersion: employee.version
+    };
+  }
+
+  private resolveEntranceWorkflowTarget(
+    workflowIdValue: string,
+    workflowVersionValue: number | undefined,
+    architecture: "graph" | "supervisor",
+    label: string
+  ): EntrancePolicySpecialistTarget | EntrancePolicyDefinition["leader"] {
+    const workflowId = requireId(workflowIdValue, `${label} workflow id`);
+    const current = this.getWorkflow(workflowId);
+    if (current.status !== "active") throw new Error(`${label} workflow ${workflowId} is archived`);
+    const workflow = this.getWorkflow(workflowId, workflowVersionValue);
+    if (workflow.status !== "active") throw new Error(`${label} workflow ${workflowId} v${workflow.version} is archived`);
+    if (workflow.architecture !== architecture) {
+      throw new Error(`${label} workflow ${workflowId} must use architecture=${architecture}, got ${workflow.architecture}`);
+    }
+    if (workflow.architecture === "supervisor") {
+      const currentPolicy = this.getManagementPolicy(workflow.managementPolicy.id);
+      if (currentPolicy.status !== "active") throw new Error(`management policy ${currentPolicy.id} is archived`);
+      this.getManagementPolicy(workflow.managementPolicy.id, workflow.managementPolicy.version);
+    }
+    for (const employee of this.resolveWorkflowEmployees(workflow).values()) {
+      if (this.getEmployee(employee.id).status !== "active") throw new Error(`${label} employee ${employee.id} is archived`);
+    }
+    return architecture === "graph"
+      ? { kind: "graph-workflow", workflowId, workflowVersion: workflow.version }
+      : { kind: "supervisor-workflow", workflowId, workflowVersion: workflow.version };
+  }
+
+  private resolveEntranceSpecialistTarget(
+    input: EntrancePolicySpecialistTargetInput,
+    label: string
+  ): EntrancePolicySpecialistTarget {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`${label} must be a JSON object`);
+    if (input.kind === "employee") return this.resolveEntranceEmployeeTarget(input, label);
+    if (input.kind === "project-role") return this.resolveEntranceProjectRoleTarget(input, label);
+    if (input.kind === "graph-workflow") {
+      return this.resolveEntranceWorkflowTarget(input.workflowId, input.workflowVersion, "graph", label) as EntrancePolicySpecialistTarget;
+    }
+    throw new Error(`${label} kind must be employee, project-role, or graph-workflow`);
+  }
+
+  private resolveEntranceDirectRoute(
+    input: EntrancePolicyCreateInput["direct"],
+    label: string
+  ): EntrancePolicyDirectRoute | undefined {
+    if (input === undefined) return undefined;
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`${label} must be a JSON object`);
+    if (input.mode === "caller") return { mode: "caller" };
+    if (input.mode === "employee") {
+      const target = this.resolveEntranceEmployeeTarget(input, label);
+      return { mode: "employee", employeeId: target.employeeId, employeeVersion: target.employeeVersion };
+    }
+    throw new Error(`${label}.mode must be caller or employee`);
+  }
+
+  private resolveEntranceLeader(
+    input: EntrancePolicyLeaderInput | undefined,
+    label: string
+  ): EntrancePolicyDefinition["leader"] {
+    if (input === undefined) return undefined;
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`${label} must be a JSON object`);
+    return this.resolveEntranceWorkflowTarget(
+      input.workflowId,
+      input.workflowVersion,
+      "supervisor",
+      label
+    ) as NonNullable<EntrancePolicyDefinition["leader"]>;
+  }
+
+  private normalizeEntrancePolicy(
+    input: EntrancePolicyCreateInput | (EntrancePolicyUpdateInput & { id: string }),
+    current?: EntrancePolicyDefinition
+  ): EntrancePolicyDefinition {
+    const id = requireId(input.id, "entrance policy id");
+    const direct = input.direct === undefined
+      ? current?.direct
+      : input.direct === null
+        ? undefined
+        : this.resolveEntranceDirectRoute(input.direct, `entrance policy ${id} direct`);
+    const specialists = input.specialists === undefined
+      ? current?.specialists ?? {}
+      : Object.fromEntries(Object.entries(input.specialists).map(([key, target]) => {
+          const specialistKey = requireId(key, `entrance policy ${id} specialist key`);
+          return [specialistKey, this.resolveEntranceSpecialistTarget(target, `entrance policy ${id} specialist ${specialistKey}`)];
+        }));
+    const leader = input.leader === undefined
+      ? current?.leader
+      : input.leader === null
+        ? undefined
+        : this.resolveEntranceLeader(input.leader, `entrance policy ${id} leader`);
+    const rules = input.rules === undefined
+      ? current?.rules ?? []
+      : normalizeEntrancePolicyRules(input.rules, `entrance policy ${id} rules`);
+    const defaultResult = input.default === undefined
+      ? current?.default ?? (() => { throw new Error(`entrance policy ${id} default is required`); })()
+      : normalizeEntrancePolicyRouteResult(input.default, `entrance policy ${id} default`);
+    const timestamp = now();
+    const policy: EntrancePolicyDefinition = {
+      id,
+      version: current ? current.version + 1 : 1,
+      status: current?.status ?? "active",
+      displayName: requireText(input.displayName ?? current?.displayName ?? id, "entrance policy displayName"),
+      description: requireText(
+        input.description ?? current?.description ?? `Task entrance policy ${id}.`,
+        "entrance policy description"
+      ),
+      direct,
+      specialists,
+      leader,
+      rules,
+      default: defaultResult,
+      createdAt: current?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+    resolveEntrancePolicyTarget(policy, policy.default);
+    for (const rule of policy.rules) resolveEntrancePolicyTarget(policy, rule.result);
+    return policy;
+  }
+
+  async createEntrancePolicy(input: EntrancePolicyCreateInput): Promise<EntrancePolicyDefinition> {
+    const policy = this.normalizeEntrancePolicy(input);
+    return this.store.mutate((state) => {
+      if (state.entrancePolicies[policy.id]) throw new Error(`entrance policy already exists: ${policy.id}`);
+      state.entrancePolicies[policy.id] = { current: policy, versions: [policy] };
+      return policy;
+    });
+  }
+
+  async updateEntrancePolicy(id: string, input: EntrancePolicyUpdateInput): Promise<EntrancePolicyDefinition> {
+    const current = this.getEntrancePolicy(id);
+    const policy = this.normalizeEntrancePolicy({ id, ...input }, current);
+    return this.store.mutate((state) => {
+      const record = state.entrancePolicies[id];
+      if (!record) throw new Error(`entrance policy not found: ${id}`);
+      record.current = policy;
+      record.versions.push(policy);
+      return policy;
+    });
+  }
+
+  async archiveEntrancePolicy(id: string): Promise<EntrancePolicyDefinition> {
+    return this.store.mutate((state) => {
+      const record = state.entrancePolicies[id];
+      if (!record) throw new Error(`entrance policy not found: ${id}`);
+      if (record.current.status === "archived") return record.current;
+      const archived = {
+        ...record.current,
+        status: "archived" as const,
+        version: record.current.version + 1,
+        updatedAt: now()
+      };
+      record.current = archived;
+      record.versions.push(archived);
+      return archived;
+    });
+  }
+
+  async restoreEntrancePolicy(id: string): Promise<EntrancePolicyDefinition> {
+    return this.store.mutate((state) => {
+      const record = state.entrancePolicies[id];
+      if (!record) throw new Error(`entrance policy not found: ${id}`);
+      if (record.current.status === "active") return record.current;
+      const restored = {
+        ...record.current,
+        status: "active" as const,
+        version: record.current.version + 1,
+        updatedAt: now()
+      };
+      record.current = restored;
+      record.versions.push(restored);
+      return restored;
+    });
+  }
+
+  private entranceTargetWarnings(target: EntrancePolicyDecision["target"]): string[] {
+    if (target.kind === "caller") return [];
+    try {
+      if (target.kind === "employee") {
+        const current = this.getEmployee(target.employeeId);
+        if (current.status !== "active") throw new Error(`employee ${target.employeeId} is archived`);
+        const employee = this.getEmployee(target.employeeId, target.employeeVersion);
+        if (employee.status !== "active") throw new Error(`employee ${target.employeeId} v${target.employeeVersion} is archived`);
+      } else if (target.kind === "project-role") {
+        const current = this.getProject(target.projectId);
+        if (current.status !== "active") throw new Error(`project ${target.projectId} is archived`);
+        const resolved = this.resolveProjectEmployee(
+          target.projectId,
+          target.roleId,
+          target.projectVersion,
+          target.projectBindingVersion
+        );
+        if (resolved.employee.id !== target.employeeId || resolved.employee.version !== target.employeeVersion) {
+          throw new Error(`project role ${target.projectId}/${target.roleId} does not match the pinned Employee`);
+        }
+        if (this.getEmployee(target.employeeId).status !== "active") throw new Error(`employee ${target.employeeId} is archived`);
+      } else {
+        const current = this.getWorkflow(target.workflowId);
+        if (current.status !== "active") throw new Error(`workflow ${target.workflowId} is archived`);
+        const workflow = this.getWorkflow(target.workflowId, target.workflowVersion);
+        const expected = target.kind === "graph-workflow" ? "graph" : "supervisor";
+        if (workflow.architecture !== expected) {
+          throw new Error(`workflow ${target.workflowId} no longer has expected architecture ${expected}`);
+        }
+        if (workflow.architecture === "supervisor") {
+          const policy = this.getManagementPolicy(workflow.managementPolicy.id);
+          if (policy.status !== "active") throw new Error(`management policy ${policy.id} is archived`);
+          this.getManagementPolicy(workflow.managementPolicy.id, workflow.managementPolicy.version);
+        }
+        for (const employee of this.resolveWorkflowEmployees(workflow).values()) {
+          if (this.getEmployee(employee.id).status !== "active") throw new Error(`employee ${employee.id} is archived`);
+        }
+      }
+      return [];
+    } catch (error) {
+      return [`pinned entrance target is not executable: ${errorMessage(error)}`];
+    }
+  }
+
+  evaluateEntrancePolicy(id: string, input: EntrancePolicyEvaluationInput): EntrancePolicyDecision {
+    const policy = this.getEntrancePolicy(id);
+    if (policy.status !== "active") throw new Error(`entrance policy ${id} is archived`);
+    const parsed = parseEntrancePolicyEvaluationInput(input);
+    const decision = evaluateEntrancePolicyDefinition(policy, parsed);
+    const targetWarnings = this.entranceTargetWarnings(decision.target);
+    return {
+      ...decision,
+      executable: decision.executable && targetWarnings.length === 0,
+      warnings: [...decision.warnings, ...targetWarnings]
+    };
+  }
+
+  private entranceExecutionSnapshot(decision: EntrancePolicyDecision): EntrancePolicyExecutionSnapshot {
+    return {
+      policyId: decision.policyId,
+      policyVersion: decision.policyVersion,
+      result: decision.result,
+      decidedBy: decision.decidedBy,
+      target: decision.target
+    };
+  }
+
+  async dispatchEntrancePolicy(
+    id: string,
+    input: EntrancePolicyDispatchInput
+  ): Promise<EntrancePolicyDispatchResult> {
+    const parsed = parseEntrancePolicyDispatchInput(input);
+    const { message: dispatchMessage, sessionId, ...evaluationInput } = parsed;
+    const decision = this.evaluateEntrancePolicy(id, evaluationInput);
+    if (decision.target.kind === "caller") {
+      return { decision, dispatch: { kind: "return-to-caller", invocationCreated: false } };
+    }
+    if (!decision.executable) {
+      throw new Error(`entrance policy ${id} target is not executable: ${decision.warnings.join("; ")}`);
+    }
+    const message = requireText(dispatchMessage ?? "", "entrance policy dispatch message");
+    const entrance = this.entranceExecutionSnapshot(decision);
+    if (decision.target.kind === "employee") {
+      const result = await this.invokePinnedEmployee(
+        decision.target.employeeId,
+        decision.target.employeeVersion,
+        { message, sessionId },
+        parsed.source,
+        entrance
+      );
+      return { decision, dispatch: { kind: "employee", result } };
+    }
+    if (decision.target.kind === "project-role") {
+      const result = await this.invokePinnedProjectRole(
+        decision.target,
+        { message, sessionId },
+        parsed.source,
+        entrance
+      );
+      return { decision, dispatch: { kind: "project-role", result } };
+    }
+    const receipt = await this.startWorkbenchWorkflow(
+      decision.target.workflowId,
+      { message },
+      parsed.source,
+      { workflowVersion: decision.target.workflowVersion, entrance }
+    );
+    return { decision, dispatch: { kind: "invocation-started", receipt } };
+  }
+
+  listManagementPolicies(includeArchived = false): ManagementPolicyDefinition[] {
+    return Object.values(this.snapshot().managementPolicies)
+      .map((record) => record.current)
+      .filter((policy) => includeArchived || policy.status === "active")
+      .sort((left, right) => left.displayName.localeCompare(right.displayName));
+  }
+
+  getManagementPolicy(id: string, version?: number): ManagementPolicyDefinition {
+    const record = this.snapshot().managementPolicies[id];
+    if (!record) throw new Error(`management policy not found: ${id}`);
+    if (version === undefined) return record.current;
+    const found = record.versions.find((candidate) => candidate.version === version);
+    if (!found) throw new Error(`management policy ${id} version ${version} not found`);
+    return found;
+  }
+
+  getManagementPolicyVersions(id: string): ManagementPolicyDefinition[] {
+    const record = this.snapshot().managementPolicies[id];
+    if (!record) throw new Error(`management policy not found: ${id}`);
+    return [...record.versions].sort((left, right) => right.version - left.version);
+  }
+
+  private normalizeManagementPolicy(
+    input: ManagementPolicyCreateInput,
+    current?: ManagementPolicyDefinition
+  ): ManagementPolicyDefinition {
+    const id = requireId(input.id, "management policy id");
+    const allowedRoleIds = [...new Set(input.allowedRoleIds.map((roleId) => requireId(roleId, "management policy role id")))];
+    if (allowedRoleIds.length === 0) throw new Error(`management policy ${id} must allow at least one member role`);
+    const limits = {
+      maxRounds: input.limits?.maxRounds ?? current?.limits.maxRounds ?? 6,
+      maxDelegations: input.limits?.maxDelegations ?? current?.limits.maxDelegations ?? 12,
+      maxParallelDelegations: input.limits?.maxParallelDelegations ?? current?.limits.maxParallelDelegations ?? 3,
+      maxDurationMs: input.limits?.maxDurationMs ?? current?.limits.maxDurationMs ?? 600_000
+    };
+    const bounds: Array<[keyof typeof limits, number, number]> = [
+      ["maxRounds", 1, 32],
+      ["maxDelegations", 1, 256],
+      ["maxParallelDelegations", 1, 32],
+      ["maxDurationMs", 1_000, 86_400_000]
+    ];
+    for (const [key, minimum, maximum] of bounds) {
+      if (!Number.isInteger(limits[key]) || limits[key] < minimum || limits[key] > maximum) {
+        throw new Error(`management policy ${key} must be an integer between ${minimum} and ${maximum}`);
+      }
+    }
+    if (limits.maxParallelDelegations > limits.maxDelegations) {
+      throw new Error("management policy maxParallelDelegations cannot exceed maxDelegations");
+    }
+    const workerFailure = input.failure?.workerFailure ?? current?.failure.workerFailure ?? "observe-and-replan";
+    if (workerFailure !== "observe-and-replan" && workerFailure !== "fail-fast") {
+      throw new Error(`management policy workerFailure is invalid: ${String(workerFailure)}`);
+    }
+    const timestamp = now();
+    return {
+      id,
+      version: current ? current.version + 1 : 1,
+      status: current?.status ?? "active",
+      displayName: requireText(input.displayName ?? current?.displayName ?? id, "management policy displayName"),
+      description: requireText(input.description ?? current?.description ?? `Management policy ${id}.`, "management policy description"),
+      allowedRoleIds,
+      instructions: requireText(input.instructions, "management policy instructions"),
+      limits,
+      failure: { workerFailure },
+      completion: {
+        requireDelegation: input.completion?.requireDelegation ?? current?.completion.requireDelegation ?? false,
+        requireAllDelegationsSuccessful:
+          input.completion?.requireAllDelegationsSuccessful
+          ?? current?.completion.requireAllDelegationsSuccessful
+          ?? false
+      },
+      createdAt: current?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+  }
+
+  async createManagementPolicy(input: ManagementPolicyCreateInput): Promise<ManagementPolicyDefinition> {
+    const policy = this.normalizeManagementPolicy(input);
+    return this.store.mutate((state) => {
+      if (state.managementPolicies[policy.id]) throw new Error(`management policy already exists: ${policy.id}`);
+      state.managementPolicies[policy.id] = { current: policy, versions: [policy] };
+      return policy;
+    });
+  }
+
+  async updateManagementPolicy(id: string, input: ManagementPolicyUpdateInput): Promise<ManagementPolicyDefinition> {
+    const current = this.getManagementPolicy(id);
+    const policy = this.normalizeManagementPolicy({
+      id,
+      displayName: input.displayName ?? current.displayName,
+      description: input.description ?? current.description,
+      allowedRoleIds: input.allowedRoleIds ?? current.allowedRoleIds,
+      instructions: input.instructions ?? current.instructions,
+      limits: input.limits ?? current.limits,
+      failure: input.failure ?? current.failure,
+      completion: input.completion ?? current.completion
+    }, current);
+    return this.store.mutate((state) => {
+      const record = state.managementPolicies[id];
+      if (!record) throw new Error(`management policy not found: ${id}`);
+      record.current = policy;
+      record.versions.push(policy);
+      return policy;
+    });
+  }
+
+  async archiveManagementPolicy(id: string): Promise<ManagementPolicyDefinition> {
+    const references = this.listWorkflows().filter(
+      (workflow): workflow is SupervisorWorkbenchWorkflowDefinition =>
+        workflow.architecture === "supervisor" && workflow.managementPolicy.id === id
+    );
+    if (references.length > 0) {
+      throw new Error(`management policy ${id} is used by active workflows: ${references.map((workflow) => workflow.id).join(", ")}`);
+    }
+    return this.store.mutate((state) => {
+      const record = state.managementPolicies[id];
+      if (!record) throw new Error(`management policy not found: ${id}`);
+      if (record.current.status === "archived") return record.current;
+      const archived = { ...record.current, status: "archived" as const, version: record.current.version + 1, updatedAt: now() };
+      record.current = archived;
+      record.versions.push(archived);
+      return archived;
+    });
+  }
+
+  async restoreManagementPolicy(id: string): Promise<ManagementPolicyDefinition> {
+    return this.store.mutate((state) => {
+      const record = state.managementPolicies[id];
+      if (!record) throw new Error(`management policy not found: ${id}`);
+      if (record.current.status === "active") return record.current;
+      const restored = { ...record.current, status: "active" as const, version: record.current.version + 1, updatedAt: now() };
+      record.current = restored;
+      record.versions.push(restored);
+      return restored;
+    });
+  }
+
   listWorkflows(includeArchived = false): WorkbenchWorkflowDefinition[] {
     return Object.values(this.snapshot().workflows)
       .map((record) => record.current)
@@ -3333,10 +4065,10 @@ export class WorkbenchService {
     return [...record.versions].sort((left, right) => right.version - left.version);
   }
 
-  private normalizeWorkflow(
-    input: WorkflowCreateInput,
-    current?: WorkbenchWorkflowDefinition
-  ): WorkbenchWorkflowDefinition {
+  private normalizeGraphWorkflow(
+    input: GraphWorkflowCreateInput,
+    current?: GraphWorkbenchWorkflowDefinition
+  ): GraphWorkbenchWorkflowDefinition {
     const id = requireId(input.id, "workflow id");
     if (input.nodes.length === 0) throw new Error("workflow nodes must not be empty");
     const state = this.snapshot();
@@ -3397,6 +4129,88 @@ export class WorkbenchService {
     };
   }
 
+  private normalizeSupervisorWorkflow(
+    input: SupervisorWorkflowCreateInput,
+    current?: SupervisorWorkbenchWorkflowDefinition
+  ): SupervisorWorkbenchWorkflowDefinition {
+    const id = requireId(input.id, "workflow id");
+    const state = this.snapshot();
+    const resolveEmployee = (employeeId: string, requestedVersion: number | undefined, label: string): EmployeeDefinition => {
+      const record = state.employees[employeeId];
+      if (!record) throw new Error(`employee not found: ${employeeId}`);
+      if (record.current.status !== "active") throw new Error(`${label} employee ${employeeId} is archived`);
+      const employee = employeeVersion(record, requestedVersion);
+      const scopedProjectId = internalProjectId(employee);
+      if (scopedProjectId) {
+        throw new Error(`employee ${employee.id} is internal to project ${scopedProjectId} and cannot be used in a global workflow`);
+      }
+      return employee;
+    };
+    const supervisor = resolveEmployee(input.supervisor.employeeId, input.supervisor.employeeVersion, "supervisor");
+    const policyRecord = state.managementPolicies[input.managementPolicy.id];
+    if (!policyRecord) throw new Error(`management policy not found: ${input.managementPolicy.id}`);
+    if (policyRecord.current.status !== "active") throw new Error(`management policy ${input.managementPolicy.id} is archived`);
+    const policy = input.managementPolicy.version === undefined
+      ? policyRecord.current
+      : policyRecord.versions.find((candidate) => candidate.version === input.managementPolicy.version);
+    if (!policy) throw new Error(`management policy ${input.managementPolicy.id} version ${input.managementPolicy.version} not found`);
+    const seen = new Set<string>();
+    const allowed = new Set(policy.allowedRoleIds);
+    const members = input.members.map((member) => {
+      const roleId = requireId(member.roleId, "supervisor member role id");
+      if (seen.has(roleId)) throw new Error(`duplicate supervisor member role ${roleId}`);
+      seen.add(roleId);
+      if (!allowed.has(roleId)) {
+        throw new Error(`supervisor member role ${roleId} is not allowed by management policy ${policy.id} v${policy.version}`);
+      }
+      const employee = resolveEmployee(member.employeeId, member.employeeVersion, `member ${roleId}`);
+      return {
+        roleId,
+        description: requireText(member.description ?? `Delegated ${roleId} work.`, `supervisor member ${roleId} description`),
+        employeeId: employee.id,
+        employeeVersion: employee.version
+      };
+    });
+    if (members.length === 0) throw new Error("supervisor workflow members must not be empty");
+    const timestamp = now();
+    return {
+      id,
+      version: current ? current.version + 1 : 1,
+      status: current?.status ?? "active",
+      architecture: "supervisor",
+      description: input.description?.trim() || `Supervisor workflow ${id}`,
+      supervisor: { employeeId: supervisor.id, employeeVersion: supervisor.version },
+      managementPolicy: { id: policy.id, version: policy.version },
+      members,
+      inputSchema: input.inputSchema ?? current?.inputSchema,
+      createdAt: current?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    };
+  }
+
+  private normalizeWorkflow(
+    input: WorkflowCreateInput,
+    current?: WorkbenchWorkflowDefinition
+  ): WorkbenchWorkflowDefinition {
+    const architecture = input.architecture ?? current?.architecture ?? "graph";
+    if (current && architecture !== current.architecture) {
+      throw new Error(`workflow architecture cannot change from ${current.architecture} to ${architecture}`);
+    }
+    if (architecture === "supervisor") {
+      return this.normalizeSupervisorWorkflow(
+        input as SupervisorWorkflowCreateInput,
+        current as SupervisorWorkbenchWorkflowDefinition | undefined
+      );
+    }
+    return this.normalizeGraphWorkflow(
+      input as GraphWorkflowCreateInput,
+      current as GraphWorkbenchWorkflowDefinition | undefined
+    );
+  }
+
+  async createWorkflow(input: GraphWorkflowCreateInput): Promise<GraphWorkbenchWorkflowDefinition>;
+  async createWorkflow(input: SupervisorWorkflowCreateInput): Promise<SupervisorWorkbenchWorkflowDefinition>;
+  async createWorkflow(input: WorkflowCreateInput): Promise<WorkbenchWorkflowDefinition>;
   async createWorkflow(input: WorkflowCreateInput): Promise<WorkbenchWorkflowDefinition> {
     const workflow = this.normalizeWorkflow(input);
     await this.validateWorkflow(workflow);
@@ -3409,16 +4223,32 @@ export class WorkbenchService {
 
   async updateWorkflow(id: string, input: WorkflowUpdateInput): Promise<WorkbenchWorkflowDefinition> {
     const current = this.getWorkflow(id);
-    const workflow = this.normalizeWorkflow({
-      id,
-      description: input.description ?? current.description,
-      nodes: input.nodes ?? current.nodes,
-      maxConcurrency: input.maxConcurrency ?? current.maxConcurrency,
-      failFast: input.failFast ?? current.failFast,
-      inputSchema: input.inputSchema ?? current.inputSchema,
-      patternId: input.patternId ?? current.patternId,
-      presentation: input.presentation ?? current.presentation
-    }, current);
+    if (input.architecture && input.architecture !== current.architecture) {
+      throw new Error(`workflow architecture cannot change from ${current.architecture} to ${input.architecture}`);
+    }
+    const workflow = current.architecture === "graph"
+      ? this.normalizeWorkflow({
+          id,
+          architecture: "graph",
+          description: input.description ?? current.description,
+          nodes: "nodes" in input && input.nodes ? input.nodes : current.nodes,
+          maxConcurrency: "maxConcurrency" in input ? input.maxConcurrency ?? current.maxConcurrency : current.maxConcurrency,
+          failFast: "failFast" in input ? input.failFast ?? current.failFast : current.failFast,
+          inputSchema: input.inputSchema ?? current.inputSchema,
+          patternId: "patternId" in input ? input.patternId ?? current.patternId : current.patternId,
+          presentation: input.presentation ?? current.presentation
+        }, current)
+      : this.normalizeWorkflow({
+          id,
+          architecture: "supervisor",
+          description: input.description ?? current.description,
+          supervisor: "supervisor" in input && input.supervisor ? input.supervisor : current.supervisor,
+          managementPolicy:
+            "managementPolicy" in input && input.managementPolicy ? input.managementPolicy : current.managementPolicy,
+          members: "members" in input && input.members ? input.members : current.members,
+          inputSchema: input.inputSchema ?? current.inputSchema,
+          presentation: input.presentation ?? current.presentation
+        }, current);
     await this.validateWorkflow(workflow);
     return this.store.mutate((state) => {
       const record = state.workflows[id];
@@ -3431,13 +4261,26 @@ export class WorkbenchService {
 
   private resolveWorkflowEmployees(workflow: WorkbenchWorkflowDefinition): Map<string, EmployeeDefinition> {
     const employees = new Map<string, EmployeeDefinition>();
-    for (const node of workflow.nodes) {
-      const employee = this.getEmployee(node.employeeId, node.employeeVersion);
-      const existing = employees.get(employee.id);
-      if (existing && existing.version !== employee.version) {
-        throw new Error(`workflow cannot use two versions of employee ${employee.id} in v1`);
+    if (workflow.architecture === "graph") {
+      for (const node of workflow.nodes) {
+        const employee = this.getEmployee(node.employeeId, node.employeeVersion);
+        const existing = employees.get(employee.id);
+        if (existing && existing.version !== employee.version) {
+          throw new Error(`workflow cannot use two versions of employee ${employee.id} in v1`);
+        }
+        employees.set(employee.id, employee);
       }
-      employees.set(employee.id, employee);
+      return employees;
+    }
+    employees.set(
+      SUPERVISOR_RUNTIME_ROLE_ID,
+      this.getEmployee(workflow.supervisor.employeeId, workflow.supervisor.employeeVersion)
+    );
+    for (const member of workflow.members) {
+      employees.set(
+        supervisorMemberRuntimeRoleId(member.roleId),
+        this.getEmployee(member.employeeId, member.employeeVersion)
+      );
     }
     return employees;
   }
@@ -3465,14 +4308,24 @@ export class WorkbenchService {
   private async prepareWorkbenchWorkflowInvocation(
     id: string,
     input: JsonObject,
-    source: InvocationSource
+    source: InvocationSource,
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot } = {}
   ): Promise<{
     invocation: InvocationRecord;
     workflow: WorkbenchWorkflowDefinition;
     employees: Map<string, EmployeeDefinition>;
   }> {
-    const workflow = this.getWorkflow(id);
-    if (workflow.status !== "active") throw new Error(`workflow ${id} is archived`);
+    const currentWorkflow = this.getWorkflow(id);
+    if (currentWorkflow.status !== "active") throw new Error(`workflow ${id} is archived`);
+    const workflow = this.getWorkflow(id, options.workflowVersion);
+    if (workflow.status !== "active") throw new Error(`workflow ${id} v${workflow.version} is archived`);
+    if (workflow.architecture === "supervisor") {
+      const currentPolicy = this.getManagementPolicy(workflow.managementPolicy.id);
+      if (currentPolicy.status !== "active") {
+        throw new Error(`management policy ${workflow.managementPolicy.id} is archived`);
+      }
+      this.getManagementPolicy(workflow.managementPolicy.id, workflow.managementPolicy.version);
+    }
     const employees = this.resolveWorkflowEmployees(workflow);
     for (const employee of employees.values()) {
       if (this.getEmployee(employee.id).status !== "active") throw new Error(`employee ${employee.id} is archived`);
@@ -3488,7 +4341,8 @@ export class WorkbenchService {
       source,
       workflow,
       employees,
-      input
+      input,
+      entrance: options.entrance
     });
     return { invocation, workflow, employees };
   }
@@ -3496,9 +4350,10 @@ export class WorkbenchService {
   async startWorkbenchWorkflow(
     id: string,
     input: JsonObject = {},
-    source: InvocationSource = { kind: "workbench" }
+    source: InvocationSource = { kind: "workbench" },
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot } = {}
   ): Promise<InvocationStartResult> {
-    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source);
+    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, options);
     const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input);
     const settled = execution.then(() => undefined, () => undefined);
     this.backgroundInvocations.set(prepared.invocation.id, settled);

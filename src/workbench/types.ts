@@ -70,6 +70,42 @@ export interface EmployeeRecord {
   versions: EmployeeDefinition[];
 }
 
+export type ManagementPolicyWorkerFailure = "observe-and-replan" | "fail-fast";
+
+export interface ManagementPolicyLimits {
+  maxRounds: number;
+  maxDelegations: number;
+  maxParallelDelegations: number;
+  maxDurationMs: number;
+}
+
+export interface ManagementPolicyDefinition {
+  id: string;
+  version: number;
+  status: RecordStatus;
+  displayName: string;
+  description: string;
+  /** Stable workflow-local role slots that a supervisor may delegate to. */
+  allowedRoleIds: string[];
+  /** Soft management guidance injected into every supervisor decision turn. */
+  instructions: string;
+  limits: ManagementPolicyLimits;
+  failure: {
+    workerFailure: ManagementPolicyWorkerFailure;
+  };
+  completion: {
+    requireDelegation: boolean;
+    requireAllDelegationsSuccessful: boolean;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ManagementPolicyRecord {
+  current: ManagementPolicyDefinition;
+  versions: ManagementPolicyDefinition[];
+}
+
 export interface WorkbenchWorkflowNode {
   id: string;
   employeeId: string;
@@ -78,24 +114,54 @@ export interface WorkbenchWorkflowNode {
   with: JsonObject;
 }
 
-export interface WorkbenchWorkflowDefinition {
+export interface WorkbenchWorkflowPresentation {
+  positions?: Record<string, { x: number; y: number }>;
+}
+
+interface WorkbenchWorkflowBase {
   id: string;
   version: number;
   status: RecordStatus;
-  architecture: "graph";
-  /** The graph template used to create this workflow. Runtime behavior is still owned by Graph. */
-  patternId?: string;
   description: string;
-  nodes: WorkbenchWorkflowNode[];
-  maxConcurrency: number;
-  failFast: boolean;
   inputSchema?: JsonObject;
-  presentation?: {
-    positions?: Record<string, { x: number; y: number }>;
-  };
+  presentation?: WorkbenchWorkflowPresentation;
   createdAt: string;
   updatedAt: string;
 }
+
+export interface GraphWorkbenchWorkflowDefinition extends WorkbenchWorkflowBase {
+  architecture: "graph";
+  /** The graph template used to create this workflow. Runtime behavior is still owned by Graph. */
+  patternId?: string;
+  nodes: WorkbenchWorkflowNode[];
+  maxConcurrency: number;
+  failFast: boolean;
+}
+
+export interface SupervisorEmployeeBinding {
+  employeeId: string;
+  employeeVersion: number;
+}
+
+export interface SupervisorMemberBinding extends SupervisorEmployeeBinding {
+  /** Stable slot exposed to supervisor decisions; it is deliberately separate from Employee identity. */
+  roleId: string;
+  description: string;
+}
+
+export interface SupervisorWorkbenchWorkflowDefinition extends WorkbenchWorkflowBase {
+  architecture: "supervisor";
+  supervisor: SupervisorEmployeeBinding;
+  managementPolicy: {
+    id: string;
+    version: number;
+  };
+  members: SupervisorMemberBinding[];
+}
+
+export type WorkbenchWorkflowDefinition =
+  | GraphWorkbenchWorkflowDefinition
+  | SupervisorWorkbenchWorkflowDefinition;
 
 export interface WorkbenchWorkflowRecord {
   current: WorkbenchWorkflowDefinition;
@@ -143,6 +209,162 @@ export interface InvocationSource {
   publicationId?: string;
 }
 
+export type EntrancePolicyRoute = "auto" | "direct" | "specialist" | "leader";
+
+export type EntrancePolicyRouteResult =
+  | { route: "direct" }
+  | { route: "specialist"; specialistKey: string }
+  | { route: "leader" };
+
+export interface EntrancePolicyEmployeeTarget {
+  kind: "employee";
+  employeeId: string;
+  employeeVersion: number;
+}
+
+export interface EntrancePolicyProjectRoleTarget {
+  kind: "project-role";
+  projectId: string;
+  projectVersion: number;
+  projectBindingVersion: number;
+  roleId: string;
+  employeeId: string;
+  employeeVersion: number;
+}
+
+export interface EntrancePolicyGraphWorkflowTarget {
+  kind: "graph-workflow";
+  workflowId: string;
+  workflowVersion: number;
+}
+
+export interface EntrancePolicySupervisorWorkflowTarget {
+  kind: "supervisor-workflow";
+  workflowId: string;
+  workflowVersion: number;
+}
+
+export type EntrancePolicySpecialistTarget =
+  | EntrancePolicyEmployeeTarget
+  | EntrancePolicyProjectRoleTarget
+  | EntrancePolicyGraphWorkflowTarget;
+
+export type EntrancePolicyResolvedTarget =
+  | { kind: "caller" }
+  | EntrancePolicySpecialistTarget
+  | EntrancePolicySupervisorWorkflowTarget;
+
+export type EntrancePolicyDirectRoute =
+  | { mode: "caller" }
+  | ({ mode: "employee" } & Omit<EntrancePolicyEmployeeTarget, "kind">);
+
+export interface EntrancePolicySourceCondition {
+  kind?: InvocationSourceKind;
+  label?: string;
+  project?: string;
+  projectRole?: string;
+  projectBindingVersion?: number;
+  caller?: string;
+  contextId?: string;
+  taskId?: string;
+  publicationId?: string;
+}
+
+export interface EntrancePolicySignalComparison {
+  eq?: JsonValue;
+  neq?: JsonValue;
+  gte?: number;
+  lte?: number;
+  in?: JsonValue[];
+  exists?: boolean;
+}
+
+export interface EntrancePolicyRuleCondition {
+  tagsAllOf?: string[];
+  tagsAnyOf?: string[];
+  source?: EntrancePolicySourceCondition;
+  /** Dot-delimited paths are resolved only inside EvaluationInput.signals. */
+  signals?: Record<string, EntrancePolicySignalComparison>;
+}
+
+export interface EntrancePolicyRule {
+  id: string;
+  when: EntrancePolicyRuleCondition;
+  result: EntrancePolicyRouteResult;
+}
+
+export interface EntrancePolicyRuleInput {
+  id?: string;
+  when: EntrancePolicyRuleCondition;
+  result: EntrancePolicyRouteResult;
+}
+
+export interface EntrancePolicyDefinition {
+  id: string;
+  version: number;
+  status: RecordStatus;
+  displayName: string;
+  description: string;
+  direct?: EntrancePolicyDirectRoute;
+  specialists: Record<string, EntrancePolicySpecialistTarget>;
+  leader?: EntrancePolicySupervisorWorkflowTarget;
+  rules: EntrancePolicyRule[];
+  default: EntrancePolicyRouteResult;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EntrancePolicyRecord {
+  current: EntrancePolicyDefinition;
+  versions: EntrancePolicyDefinition[];
+}
+
+export interface EntrancePolicyEvaluationInput {
+  route: EntrancePolicyRoute;
+  specialistKey?: string;
+  tags: string[];
+  signals: JsonObject;
+  source: InvocationSource;
+}
+
+export interface EntrancePolicyDecision {
+  policyId: string;
+  policyVersion: number;
+  result: EntrancePolicyRouteResult;
+  decidedBy: "explicit" | "rule" | "default";
+  matchedRuleId?: string;
+  target: EntrancePolicyResolvedTarget;
+  executable: boolean;
+  warnings: string[];
+}
+
+export interface EntrancePolicyExecutionSnapshot {
+  policyId: string;
+  policyVersion: number;
+  result: EntrancePolicyRouteResult;
+  decidedBy: EntrancePolicyDecision["decidedBy"];
+  target: EntrancePolicyResolvedTarget;
+}
+
+export interface EntrancePolicyDispatchInput extends EntrancePolicyEvaluationInput {
+  message?: string;
+  sessionId?: string;
+}
+
+export type EntrancePolicyDispatchResult =
+  | {
+      decision: EntrancePolicyDecision;
+      dispatch: { kind: "return-to-caller"; invocationCreated: false };
+    }
+  | {
+      decision: EntrancePolicyDecision;
+      dispatch: { kind: "employee" | "project-role"; result: EmployeeInvocationResult };
+    }
+  | {
+      decision: EntrancePolicyDecision;
+      dispatch: { kind: "invocation-started"; receipt: InvocationStartResult };
+    };
+
 export type InvocationStatus = "queued" | "running" | "completed" | "blocked" | "failed" | "cancelled";
 export type WorkInstanceStatus =
   | "queued"
@@ -176,6 +398,12 @@ export interface InvocationRecord {
   runId: string;
   sessionId?: string;
   instanceIds: string[];
+  executionSnapshot?: {
+    workflow: { id: string; version: number; architecture: WorkbenchWorkflowDefinition["architecture"] };
+    managementPolicy?: { id: string; version: number };
+    entrance?: EntrancePolicyExecutionSnapshot;
+    employees: Array<{ roleId: string; employeeId: string; employeeVersion: number }>;
+  };
   error?: string;
   createdAt: string;
   startedAt?: string;
@@ -193,6 +421,11 @@ export interface WorkInstanceRecord {
   workflowId: string;
   workflowVersion: number;
   nodeId: string;
+  /** Workflow-local responsibility slot (distinct from Employee identity). */
+  roleId?: string;
+  kind?: "graph" | "supervisor" | "member";
+  round?: number;
+  parentNodeId?: string;
   runId: string;
   sessionId?: string;
   providerId: string;
@@ -320,6 +553,8 @@ export interface WorkbenchState {
   knowledgeProfiles: Record<string, KnowledgeProfileRecord>;
   knowledgeChangeRequests: Record<string, KnowledgeChangeRequest>;
   employees: Record<string, EmployeeRecord>;
+  managementPolicies: Record<string, ManagementPolicyRecord>;
+  entrancePolicies: Record<string, EntrancePolicyRecord>;
   workflows: Record<string, WorkbenchWorkflowRecord>;
   sessions: Record<string, EmployeeSession>;
   publications: Record<string, PublicationDefinition>;
@@ -401,18 +636,98 @@ export interface SkillCreateInput {
 
 export type SkillUpdateInput = Partial<Omit<SkillCreateInput, "id">>;
 
-export interface WorkflowCreateInput {
+export interface ManagementPolicyCreateInput {
+  id: string;
+  displayName?: string;
+  description?: string;
+  allowedRoleIds: string[];
+  instructions: string;
+  limits?: Partial<ManagementPolicyLimits>;
+  failure?: Partial<ManagementPolicyDefinition["failure"]>;
+  completion?: Partial<ManagementPolicyDefinition["completion"]>;
+}
+
+export type ManagementPolicyUpdateInput = Partial<Omit<ManagementPolicyCreateInput, "id">>;
+
+export type EntrancePolicySpecialistTargetInput =
+  | { kind: "employee"; employeeId: string; employeeVersion?: number }
+  | {
+      kind: "project-role";
+      projectId: string;
+      projectVersion?: number;
+      projectBindingVersion?: number;
+      roleId: string;
+    }
+  | { kind: "graph-workflow"; workflowId: string; workflowVersion?: number };
+
+export type EntrancePolicyDirectRouteInput =
+  | { mode: "caller" }
+  | { mode: "employee"; employeeId: string; employeeVersion?: number };
+
+export interface EntrancePolicyLeaderInput {
+  workflowId: string;
+  workflowVersion?: number;
+}
+
+export interface EntrancePolicyCreateInput {
+  id: string;
+  displayName?: string;
+  description?: string;
+  direct?: EntrancePolicyDirectRouteInput;
+  specialists?: Record<string, EntrancePolicySpecialistTargetInput>;
+  leader?: EntrancePolicyLeaderInput;
+  rules?: EntrancePolicyRuleInput[];
+  default: EntrancePolicyRouteResult;
+}
+
+export interface EntrancePolicyUpdateInput {
+  displayName?: string;
+  description?: string;
+  direct?: EntrancePolicyDirectRouteInput | null;
+  specialists?: Record<string, EntrancePolicySpecialistTargetInput>;
+  leader?: EntrancePolicyLeaderInput | null;
+  rules?: EntrancePolicyRuleInput[];
+  default?: EntrancePolicyRouteResult;
+}
+
+interface WorkflowCreateBase {
   id: string;
   description?: string;
+  inputSchema?: JsonObject;
+  presentation?: WorkbenchWorkflowPresentation;
+}
+
+export interface GraphWorkflowCreateInput extends WorkflowCreateBase {
+  architecture?: "graph";
   nodes: Array<Partial<Omit<WorkbenchWorkflowNode, "id" | "employeeId">> & Pick<WorkbenchWorkflowNode, "id" | "employeeId">>;
   maxConcurrency?: number;
   failFast?: boolean;
-  inputSchema?: JsonObject;
   patternId?: string;
-  presentation?: WorkbenchWorkflowDefinition["presentation"];
 }
 
-export type WorkflowUpdateInput = Partial<Omit<WorkflowCreateInput, "id">>;
+export interface SupervisorWorkflowCreateInput extends WorkflowCreateBase {
+  architecture: "supervisor";
+  supervisor: { employeeId: string; employeeVersion?: number };
+  managementPolicy: { id: string; version?: number };
+  members: Array<{
+    roleId: string;
+    description?: string;
+    employeeId: string;
+    employeeVersion?: number;
+  }>;
+}
+
+export type WorkflowCreateInput = GraphWorkflowCreateInput | SupervisorWorkflowCreateInput;
+
+export type GraphWorkflowUpdateInput = Partial<Omit<GraphWorkflowCreateInput, "id" | "architecture">> & {
+  architecture?: "graph";
+};
+
+export type SupervisorWorkflowUpdateInput = Partial<Omit<SupervisorWorkflowCreateInput, "id" | "architecture">> & {
+  architecture?: "supervisor";
+};
+
+export type WorkflowUpdateInput = GraphWorkflowUpdateInput | SupervisorWorkflowUpdateInput;
 
 export interface EmployeeInvocationInput {
   message: string;

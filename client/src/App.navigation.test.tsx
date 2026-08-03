@@ -57,6 +57,7 @@ function bootstrapWith(overrides: Partial<Bootstrap>): Bootstrap {
     knowledgeProfiles: [],
     architectureTemplates: [],
     employees: [],
+    entrancePolicies: [],
     workflows: [],
     sessions: [],
     publications: [],

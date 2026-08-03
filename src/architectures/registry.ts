@@ -1,8 +1,12 @@
 import { graphArchitectureAdapter } from "./graph.js";
+import { supervisorArchitectureAdapter } from "./supervisor.js";
 import type { ArchitectureAdapter, ArchitectureRegistry } from "./types.js";
 
 export function createDefaultArchitectureRegistry(): ArchitectureRegistry {
-  return new Map([[graphArchitectureAdapter.id, graphArchitectureAdapter]]);
+  return new Map([
+    [graphArchitectureAdapter.id, graphArchitectureAdapter],
+    [supervisorArchitectureAdapter.id, supervisorArchitectureAdapter]
+  ]);
 }
 
 export function registerArchitectureAdapter(

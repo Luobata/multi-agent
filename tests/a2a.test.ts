@@ -67,4 +67,59 @@ describe("A2A publication mapping", () => {
     expect(rpc.result.task.artifacts[0]?.name).toBe("Domain block");
     expect(rpc.result.task.artifacts[0]?.metadata.domainBlock).toBe(true);
   });
+
+  it("publishes a Supervisor Workflow final output together with its node evidence", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-a2a-supervisor-"));
+    directories.push(root);
+    const service = await WorkbenchService.open({ dataRoot: root });
+    for (const id of ["a2a-manager", "a2a-worker"]) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Exercises A2A Supervisor output.", responsibilities: ["Work"] }
+      });
+    }
+    await service.createManagementPolicy({
+      id: "a2a-supervision",
+      allowedRoleIds: ["worker"],
+      instructions: "Finish when the available evidence is sufficient."
+    });
+    await service.createWorkflow({
+      id: "a2a-supervisor-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "a2a-manager" },
+      managementPolicy: { id: "a2a-supervision" },
+      members: [{ roleId: "worker", employeeId: "a2a-worker" }]
+    });
+    await service.createPublication({
+      id: "a2a-supervisor-desk",
+      name: "A2A Supervisor Desk",
+      target: { kind: "workflow", id: "a2a-supervisor-team" }
+    });
+    const server = createDaemonApp(service, { staticDir: path.join(root, "missing") }).listen(0, "127.0.0.1");
+    servers.push(server);
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const response = await fetch(`${base}/a2a/a2a-supervisor-desk`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "A2A-Version": "1.0" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "supervisor-request",
+        method: "SendMessage",
+        params: { message: { messageId: "supervisor-message", role: "ROLE_USER", parts: [{ text: "Coordinate this task" }] } }
+      })
+    });
+    const rpc = await response.json() as {
+      result: {
+        task: {
+          status: { state: string };
+          artifacts: Array<{ parts: Array<{ data?: { output?: unknown; outputs?: Record<string, unknown> } }> }>;
+        };
+      };
+    };
+    const data = rpc.result.task.artifacts[0]?.parts.find((part) => part.data)?.data;
+    expect(rpc.result.task.status.state).toBe("TASK_STATE_COMPLETED");
+    expect(data?.output).toMatchObject({ rounds: 1, delegations: 0 });
+    expect(data?.outputs).toHaveProperty("supervisor-r1");
+  });
 });

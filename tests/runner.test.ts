@@ -117,6 +117,54 @@ describe("workflow runtime", () => {
     expect(result.run.status).toBe("failed");
   });
 
+  it("records node preparation failures without abandoning sibling-safe architecture scheduling", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    loaded.manifest.workflows["prepared-review"] = {
+      architecture: "graph",
+      config: {
+        nodes: [
+          { id: "review", role: "product-manager" },
+          { id: "sibling", role: "designer" }
+        ]
+      }
+    };
+    let providerCalls = 0;
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke() {
+        providerCalls += 1;
+        return {
+          stdout: JSON.stringify({ verdict: "Pass", summary: "reviewed", evidence: ["evidence"], risks: [] }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    };
+
+    const result = await runWorkflow(loaded, "prepared-review", {
+      input,
+      providers: new Map([["command", adapter]]),
+      prepareNode: async (node) => {
+        if (node.id === "review") throw new Error("knowledge preparation unavailable");
+        return { node };
+      }
+    });
+
+    expect(providerCalls).toBe(1);
+    expect(result.run.status).toBe("failed");
+    expect(result.run.nodes.review).toMatchObject({
+      status: "failed",
+      attempts: 0,
+      error: "knowledge preparation unavailable"
+    });
+    expect(result.run.nodes.sibling?.status).toBe("passed");
+    const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8");
+    expect(events).toContain('"type":"node.failed"');
+    expect(events).toContain('"phase":"prepare"');
+  });
+
   it("starts newly-ready nodes without waiting for an unrelated node in the same compiled wave", async () => {
     const { config, input } = fixture();
     const loaded = loadManifest(config);

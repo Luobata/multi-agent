@@ -23,6 +23,11 @@ describe("Workbench capability compatibility", () => {
   });
 
   it("accepts bootstrap snapshots that include the knowledge control plane", () => {
-    expect(() => assertKnowledgeControlPlane({ ...bootstrap(), knowledgeBases: [], knowledgeProfiles: [] })).not.toThrow();
+    expect(() => assertKnowledgeControlPlane({ ...bootstrap(), knowledgeBases: [], knowledgeProfiles: [], entrancePolicies: [] })).not.toThrow();
+  });
+
+  it("rejects a stale daemon that does not expose task entrance policies", () => {
+    expect(() => assertKnowledgeControlPlane({ ...bootstrap(), knowledgeBases: [], knowledgeProfiles: [] }))
+      .toThrow(/运行核心版本早于请求分流策略/);
   });
 });

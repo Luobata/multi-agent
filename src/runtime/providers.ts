@@ -65,7 +65,7 @@ class MockProviderAdapter implements ProviderAdapter {
     const latencyMs = Number((invocation.definition as Record<string, unknown>).latencyMs ?? 20);
     if (latencyMs > 0) await new Promise((resolve) => setTimeout(resolve, latencyMs));
     const role = invocation.templateContext.role as
-      | { identity?: { displayName?: string }; id?: string }
+      | { identity?: { displayName?: string }; id?: string; outputSchema?: Record<string, unknown> }
       | undefined;
     const input = invocation.templateContext.input as { message?: unknown } | undefined;
     const needs = invocation.templateContext.needs as Record<string, unknown> | undefined;
@@ -74,6 +74,24 @@ class MockProviderAdapter implements ProviderAdapter {
     const displayName = role?.identity?.displayName ?? role?.id ?? "Local employee";
     const suffix = dependencyCount > 0 ? ` I also received evidence from ${dependencyCount} upstream node(s).` : "";
     const punctuation = /[.!?。！？]$/.test(request) ? "" : ".";
+    const variants = Array.isArray(role?.outputSchema?.oneOf) ? role.outputSchema.oneOf : [];
+    const supportsSupervisorFinish = variants.some((variant) => {
+      if (typeof variant !== "object" || variant === null || Array.isArray(variant)) return false;
+      const properties = (variant as { properties?: Record<string, unknown> }).properties;
+      const action = properties?.action;
+      return typeof action === "object" && action !== null && (action as { const?: unknown }).const === "finish";
+    });
+    if (supportsSupervisorFinish) {
+      return {
+        stdout: JSON.stringify({
+          action: "finish",
+          summary: `${displayName} completed the supervisor decision loop with the local mock provider.`,
+          result: { message: `${displayName} received: ${request}${punctuation}` }
+        }),
+        stderr: "",
+        durationMs: Date.now() - started
+      };
+    }
     return {
       stdout: JSON.stringify({ message: `${displayName} received: ${request}${punctuation}${suffix}` }),
       stderr: "",

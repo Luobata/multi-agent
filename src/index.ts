@@ -24,6 +24,16 @@ export type * from "./knowledge/urlFetcher.js";
 export { htmlFragmentToMarkdown, webpageToKnowledgeDocuments } from "./knowledge/urlImport.js";
 export type * from "./knowledge/types.js";
 export { WorkbenchService, type WorkbenchServiceOptions } from "./workbench/service.js";
+export {
+  entrancePolicyRuleMatches,
+  evaluateEntrancePolicyDefinition,
+  normalizeEntrancePolicyRouteResult,
+  normalizeEntrancePolicyRuleCondition,
+  normalizeEntrancePolicyRules,
+  parseEntrancePolicyDispatchInput,
+  parseEntrancePolicyEvaluationInput,
+  resolveEntrancePolicyTarget
+} from "./workbench/entrancePolicy.js";
 export type * from "./workbench/types.js";
 export { createDaemonApp, startDaemon } from "./daemon/server.js";
 export { buildAgentCard, createA2ARequestHandler } from "./protocols/a2a.js";

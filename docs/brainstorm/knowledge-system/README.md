@@ -420,7 +420,196 @@ Employee 详情 → 添加知识库
 
 `core / conditional / on-demand` 是知识与知识包之间的使用策略，不是知识内容自身的固定属性。
 
-## 7. 当前待确认问题
+## 7. 模块四：AI-first 知识创建与人工 Review
+
+### 7.1 已确认的产品原则
+
+AI 时代不应要求管理员通过复杂表单完成知识创建、归类和关联。
+
+正确分工是：
+
+```text
+Human：表达意图、补充关键业务边界、Review、纠正和批准
+AI：读取来源、理解内容、创建结构、生成关联、形成完整提案
+Core：确定性校验、权限检查、影响计算和执行
+Ledger：保存提案、修订、Review、批准和执行证据
+```
+
+一句话原则：
+
+> 表单可以消失，但底层 Schema 不能消失；AI 负责填写结构，人负责 Review 结构。
+
+### 7.2 AI 是知识创建者，人是 Reviewer
+
+管理员可以只提供自然语言、链接、文件或外部知识空间：
+
+```text
+“把这个 Figma 项目作为小狐在 Project A 的设计参考，组件规范可以跨项目使用。”
+```
+
+AI 应主动完成：
+
+1. 读取并理解外部来源。
+2. 发现文件、页面、目录和节点范围。
+3. 识别 Owner、主题、版本、平台和项目适用性。
+4. 建议或创建 KnowledgeBase 与 Collection 草稿。
+5. 检查精确重复、相似内容和冲突候选。
+6. 生成 Source Mapping Rule。
+7. 生成知识包和 Employee / Project Role 关联建议。
+8. 选择合理的 `canonical/reference/experimental`。
+9. 选择合理的基础/专业/项目/任务层级。
+10. 选择合理的 `core/conditional/on-demand`。
+11. 计算下游影响、风险和知识预算。
+12. 生成一个完整、可修改、可审阅的知识变更提案。
+
+人不需要逐字段填写上述内容。
+
+### 7.3 推荐交互：Knowledge PR
+
+知识创建应类似代码 Pull Request：
+
+```text
+用户表达意图或提供来源
+  → AI 生成 Knowledge PR
+  → Core 校验并补充影响
+  → 人查看摘要、证据、Diff 和风险
+  → 人用自然语言要求修改，或批准 / 拒绝
+  → AI 重新编译提案
+  → Core 确定性执行
+```
+
+AI 拥有创建和修改草稿的权限，但没有自我批准和直接生效的权限。
+
+### 7.4 Review 界面应该展示什么
+
+默认 Review 不展示完整技术表单，而展示面向决策的摘要：
+
+- 来源是什么、读取了哪些范围。
+- AI 生成了哪些 KnowledgeBase 和 Collection。
+- Owner、Visibility、Classification 和 Authority。
+- 发现了哪些重复、冲突和替代关系。
+- 将关联哪些知识包、Employee 和 Project Role。
+- 哪些知识会成为基础层或 `core`。
+- 预计影响多少员工、项目和调用场景。
+- 使用哪些个人凭证或外部连接。
+- 检索试跑和代表性样例。
+- 风险、警告和仍不确定的事项。
+
+用户操作保持简单：
+
+```text
+批准
+拒绝
+要求 AI 修改
+查看高级结构
+```
+
+高级结构和完整 Schema 只在需要精确调整或审计时展开。
+
+### 7.5 人通过自然语言修正，而不是返回表单
+
+例如 AI 提案：
+
+```text
+公司设计系统
+  → 组件、Token、业务页面全部关联到小狐基础层
+```
+
+管理员可以直接回答：
+
+```text
+“组件和 Token 可以作为小狐的跨项目专业知识，业务页面只给 Project A，全部按需查询，不要 core。”
+```
+
+AI 将这句话重新编译成结构化修改：
+
+```text
+components / tokens
+  → employee layer: professional
+  → activation: on-demand
+
+business pages
+  → project role: Project A / designer
+  → activation: on-demand
+```
+
+然后重新展示 Diff 和影响，不要求用户手工编辑 Profile Rule。
+
+### 7.6 只有真正无法推断的业务决策才询问
+
+AI 应先生成完整建议，再提出最少的问题。不能把表单换成逐字段聊天问答。
+
+只有以下情况才需要主动询问：
+
+- 两种选择都会显著改变授权范围。
+- 内容是否属于公司内部或个人私有无法从来源判断。
+- 候选 Owner 不明确。
+- 两份 canonical 知识发生真实冲突。
+- 是否允许进入 Employee 基础层。
+- 是否允许使用 Owner 的个人外部凭证。
+- 业务适用范围无法从项目和来源上下文推断。
+
+如果用户暂时不回答，应采用安全默认值：
+
+```text
+experimental
+catalog-only
+unbound
+on-demand
+```
+
+不能为了完成创建而强迫用户做错误决定。
+
+### 7.7 海量知识采用批次 PR，而不是逐文档 Review
+
+AI 应先聚类、建立来源映射和识别异常，然后生成批次级 Knowledge PR：
+
+```text
+本批次读取 10,000 篇文档
+├── 8,200 篇匹配已有映射规则
+├── 900 篇同来源更新
+├── 400 篇精确重复，建议跳过
+├── 300 篇新主题，创建 2 个 Collection 草稿
+├── 150 篇相似候选
+└── 50 篇冲突候选，保持隔离
+```
+
+管理员 Review 的是批次策略、异常和影响，不是 10,000 篇文档本身。
+
+### 7.8 AI 创建权的硬边界
+
+AI 可以：
+
+- 创建和修改草稿。
+- 生成 Mapping Rule、KnowledgeBase、Collection、知识包和关联提案。
+- 执行只读发现、预览、试跑和影响分析。
+- 根据用户自然语言修订提案。
+
+AI 不可以：
+
+- 批准自己的提案。
+- 绕过 Owner、Visibility、Classification 或 Grant。
+- 自动把知识提升到 Employee 基础层或 `core` 并直接生效。
+- 自动解决两个 canonical 知识的真实冲突。
+- 依据外部文档中的指令扩大工具或知识权限。
+- 直接执行任意 MCP、CLI 或 Shell 命令。
+
+### 7.9 结构化记录仍是系统事实源
+
+虽然用户不填写表单，系统仍必须保存类型化记录：
+
+```text
+KnowledgeIntakeProposal
+SourceMappingRule
+KnowledgeAssociationProposal
+KnowledgeConflictCandidate
+KnowledgeImpactSnapshot
+HumanReviewDecision
+```
+
+聊天记录不是最终事实源。AI 的每次修改都应形成结构化 Proposal Revision，人的批准只针对确定版本和计划哈希。
+
+## 8. 当前待确认问题
 
 这些问题仍处于脑暴阶段：
 
@@ -434,7 +623,7 @@ Employee 详情 → 添加知识库
 8. 是否需要为受管理的默认知识包增加独立标记，避免管理员误编辑系统生成规则。
 9. 第一批真正需要接入的外部知识源类型及优先顺序。
 
-## 8. 后续记录方式
+## 9. 后续记录方式
 
 后续每次脑暴按模块追加：
 

@@ -98,6 +98,7 @@ npm run cli -- workbench project connect .
 npm run cli -- workbench project bind local-agent-workbench templates/workbench/local-agent-workbench.binding.json
 npm run cli -- workbench workflow create templates/workbench/workflow.example.json
 npm run cli -- workbench workflow run research-review --input templates/workbench/input.example.json
+npm run cli -- workbench entrance-policy create templates/workbench/default-task-entrance-policy.json
 ```
 
 员工修改生成新版本；已有 Session 保持固定版本。普通复制不会复制 Session、密钥和 Run 历史。删除语义是软归档，历史证据继续可读。
@@ -133,8 +134,10 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 - `knowledgeProfiles`：定义可复用的候选范围、激活条件和单次预算；Employee 与项目角色只引用少量 Profile。
 - `Knowledge Plan`：Resolver 与 Router 针对一次 Work Instance 生成的临时结果，和引用证据一起写入 Run Store，不反向修改员工档案。
 - `projects`：由代码仓库声明“需要什么角色”；`projectBindings` 固定该角色使用的 Employee 版本、Skill 子集与更新策略。
-- `architectures`：定义协作控制流；当前只有 `graph`，fan-out/gather/critic 等形态优先表达为 Graph 模板。
-- `workflows`：把 Employee 放进架构节点，用 `needs` 声明真实信息依赖。
+- `architectures`：定义协作控制流；内置 `graph` 与 `supervisor`，fan-out/gather/critic 等固定形态仍优先表达为 Graph 模板。
+- `entrancePolicies`：在执行前用显式路由或结构化信号选择 direct、specialist 或 leader；不读取消息正文，也不是 Architecture。
+- `managementPolicies`：Supervisor 使用的版本化管理边界；它是资源，不是第三种 Architecture。
+- `workflows`：Graph 固定节点与 `needs`；Supervisor 固定主管、Policy 和成员角色绑定，运行时增量生成执行图。
 - `sessions`：固定 Employee 版本的显式对话历史，不暗中推断长期记忆。
 - `artifacts/runs`：保存输入、计划、system/request/effective prompt、raw output、规范化结果和状态事件。
 - `MCP/A2A`：只负责接入与发布，不复制编排逻辑。
@@ -149,6 +152,8 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 - [实现与协议手册](docs/workbench-implementation.md)
 - [架构与源方案映射](docs/architecture.md)
 - [Architecture Adapter 演进](docs/architecture-adapters.md)
+- [Supervisor Workflow 与 Management Policy](docs/supervisor-workflows.md)
+- [请求分流策略、确定性路由与版本证据](docs/task-entrance-policies.md)
 - [常用多 Agent 模式与可视化编排](docs/multi-agent-patterns-and-composer.md)
 - [Multi-Agent 运行性能与可靠性优化](docs/multi-agent-runtime-performance.md)
 - [Provider Adapter 配置](docs/provider-adapters.md)
@@ -157,7 +162,7 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 ## 当前边界
 
 - 内置 `mock` 与安全的 direct `command` Provider Adapter；command 使用 argv + stdin，不经过 shell 拼接。
-- 当前只注册 `graph` Architecture Adapter；Supervisor、handoff、group-chat 等在出现真实控制循环需求后再增加。
+- 当前注册 `graph` 与 `supervisor` Architecture Adapter；handoff、group-chat 等仍在出现独立控制循环需求后再增加。
 - `permissions` 是可审计声明；实际工具与文件权限必须由 Provider/sandbox 强制执行。
 - mutable Workbench state 当前使用本地原子 JSON 文件；Run 证据为不可变目录。跨进程多写、恢复队列和多人共享应升级到 SQLite/数据库后再开放网络部署。
 - A2A Task Store 当前在内存中，daemon 重启后不会恢复协议层 Task；底层 Run 证据仍在本地。

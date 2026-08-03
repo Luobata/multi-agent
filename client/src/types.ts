@@ -105,6 +105,18 @@ export interface InvocationRecord {
   runId: string;
   sessionId?: string;
   instanceIds: string[];
+  executionSnapshot?: {
+    workflow: { id: string; version: number; architecture: "graph" | "supervisor" };
+    managementPolicy?: { id: string; version: number };
+    entrance?: {
+      policyId: string;
+      policyVersion: number;
+      result: EntrancePolicyRouteResult;
+      decidedBy: EntrancePolicyDecision["decidedBy"];
+      target: EntrancePolicyResolvedTarget;
+    };
+    employees: Array<{ roleId: string; employeeId: string; employeeVersion: number }>;
+  };
   error?: string;
   createdAt: string;
   startedAt?: string;
@@ -121,6 +133,10 @@ export interface WorkInstanceRecord {
   workflowId: string;
   workflowVersion: number;
   nodeId: string;
+  roleId?: string;
+  kind?: "graph" | "supervisor" | "member";
+  round?: number;
+  parentNodeId?: string;
   runId: string;
   sessionId?: string;
   providerId: string;
@@ -153,21 +169,156 @@ export interface WorkflowNode {
   with: JsonObject;
 }
 
-export interface Workflow {
+export type EntrancePolicyRoute = "auto" | "direct" | "specialist" | "leader";
+
+export type EntrancePolicyRouteResult =
+  | { route: "direct" }
+  | { route: "specialist"; specialistKey: string }
+  | { route: "leader" };
+
+export interface EntrancePolicyEmployeeTarget {
+  kind: "employee";
+  employeeId: string;
+  employeeVersion: number;
+}
+
+export interface EntrancePolicyProjectRoleTarget {
+  kind: "project-role";
+  projectId: string;
+  projectVersion: number;
+  projectBindingVersion: number;
+  roleId: string;
+  employeeId: string;
+  employeeVersion: number;
+}
+
+export interface EntrancePolicyGraphWorkflowTarget {
+  kind: "graph-workflow";
+  workflowId: string;
+  workflowVersion: number;
+}
+
+export interface EntrancePolicySupervisorWorkflowTarget {
+  kind: "supervisor-workflow";
+  workflowId: string;
+  workflowVersion: number;
+}
+
+export type EntrancePolicySpecialistTarget =
+  | EntrancePolicyEmployeeTarget
+  | EntrancePolicyProjectRoleTarget
+  | EntrancePolicyGraphWorkflowTarget;
+
+export type EntrancePolicyResolvedTarget =
+  | { kind: "caller" }
+  | EntrancePolicySpecialistTarget
+  | EntrancePolicySupervisorWorkflowTarget;
+
+export type EntrancePolicyDirectRoute =
+  | { mode: "caller" }
+  | { mode: "employee"; employeeId: string; employeeVersion: number };
+
+export interface EntrancePolicySignalComparison {
+  eq?: JsonValue;
+  neq?: JsonValue;
+  gte?: number;
+  lte?: number;
+  in?: JsonValue[];
+  exists?: boolean;
+}
+
+/** Rule conditions only inspect stable structured metadata; message text is never part of an entrance decision. */
+export interface EntrancePolicyRuleCondition {
+  tagsAllOf?: string[];
+  tagsAnyOf?: string[];
+  source?: Partial<InvocationSource>;
+  signals?: Record<string, EntrancePolicySignalComparison>;
+}
+
+export interface EntrancePolicyRule {
+  id: string;
+  when: EntrancePolicyRuleCondition;
+  result: EntrancePolicyRouteResult;
+}
+
+export interface EntrancePolicy {
   id: string;
   version: number;
   status: "active" | "archived";
-  architecture: "graph";
-  patternId?: string;
+  displayName: string;
   description: string;
-  nodes: WorkflowNode[];
-  maxConcurrency: number;
-  failFast: boolean;
+  direct?: EntrancePolicyDirectRoute;
+  specialists: Record<string, EntrancePolicySpecialistTarget>;
+  leader?: EntrancePolicySupervisorWorkflowTarget;
+  rules: EntrancePolicyRule[];
+  default: EntrancePolicyRouteResult;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EntrancePolicyDecision {
+  policyId: string;
+  policyVersion: number;
+  result: EntrancePolicyRouteResult;
+  decidedBy: "explicit" | "rule" | "default";
+  matchedRuleId?: string;
+  target: EntrancePolicyResolvedTarget;
+  executable: boolean;
+  warnings: string[];
+}
+
+export interface ManagementPolicy {
+  id: string;
+  version: number;
+  status: "active" | "archived";
+  displayName: string;
+  description: string;
+  allowedRoleIds: string[];
+  instructions: string;
+  limits: {
+    maxRounds: number;
+    maxDelegations: number;
+    maxParallelDelegations: number;
+    maxDurationMs: number;
+  };
+  failure: { workerFailure: "observe-and-replan" | "fail-fast" };
+  completion: { requireDelegation: boolean; requireAllDelegationsSuccessful: boolean };
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface WorkflowBase {
+  id: string;
+  version: number;
+  status: "active" | "archived";
+  description: string;
   inputSchema?: JsonObject;
   presentation?: { positions?: Record<string, { x: number; y: number }> };
   createdAt: string;
   updatedAt: string;
 }
+
+export interface GraphWorkflow extends WorkflowBase {
+  architecture: "graph";
+  patternId?: string;
+  nodes: WorkflowNode[];
+  maxConcurrency: number;
+  failFast: boolean;
+}
+
+export interface SupervisorWorkflow extends WorkflowBase {
+  architecture: "supervisor";
+  supervisor: { employeeId: string; employeeVersion: number };
+  managementPolicy: { id: string; version: number };
+  members: Array<{
+    roleId: string;
+    description: string;
+    employeeId: string;
+    employeeVersion: number;
+  }>;
+}
+
+export type Workflow = GraphWorkflow | SupervisorWorkflow;
 
 export interface ArchitectureTemplate {
   id: string;
@@ -191,6 +342,7 @@ export interface InstantiatedArchitectureTemplate {
 export interface RunNode {
   nodeId: string;
   roleId: string;
+  metadata?: JsonObject;
   status: "pending" | "running" | "passed" | "blocked" | "failed" | "skipped";
   attempts: number;
   startedAt?: string;
@@ -208,6 +360,8 @@ export interface Run {
   status: "running" | "passed" | "blocked" | "failed";
   createdAt: string;
   completedAt?: string;
+  output?: JsonValue;
+  error?: string;
   nodes: Record<string, RunNode>;
 }
 
@@ -776,6 +930,8 @@ export interface Bootstrap {
   knowledgeChanges?: KnowledgeChangeRequest[];
   architectureTemplates: ArchitectureTemplate[];
   employees: Employee[];
+  managementPolicies?: ManagementPolicy[];
+  entrancePolicies?: EntrancePolicy[];
   workflows: Workflow[];
   sessions: Session[];
   publications: Publication[];

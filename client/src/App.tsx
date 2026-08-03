@@ -12,7 +12,7 @@ import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
 
 type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications";
-const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], employees: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
+const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
 
 function pageFromHash(): Page {
   const value = window.location.hash.replace("#", "");
@@ -51,6 +51,9 @@ export function mergeActivity(current: ActivitySnapshot, incoming: ActivitySnaps
 export function assertKnowledgeControlPlane(bootstrap: Bootstrap): void {
   if (!Array.isArray(bootstrap.knowledgeBases) || !Array.isArray(bootstrap.knowledgeProfiles)) {
     throw new Error("本地运行核心版本早于知识控制台，请重启 Workbench 后重试；现有知识和员工绑定不会丢失。");
+  }
+  if (!Array.isArray(bootstrap.entrancePolicies)) {
+    throw new Error("本地运行核心版本早于请求分流策略，请重新构建并重启 Workbench 后重试；现有编排、策略和运行证据不会丢失。");
   }
 }
 
