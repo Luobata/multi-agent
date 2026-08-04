@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  automaticDagPositions,
   buildSupervisorFlowPayload,
+  dagIssueTargetsNode,
   dagPayloadFromDrafts,
   defaultDagWorkKind,
   layoutSupervisorDag,
+  renameDagPosition,
+  resolveDagPositions,
+  scaffoldDagRoleIds,
   scaffoldDagDrafts,
   supervisorDagDraftIssues,
   type DagNodeDraft
@@ -56,6 +61,15 @@ describe("supervisor DAG drafts", () => {
     expect(drafts.filter((node) => node.roleId === "tester")).toHaveLength(3);
   });
 
+  it("maps example slots by declared capability instead of member list order", () => {
+    expect(scaffoldDagRoleIds([
+      { roleId: "designer", capabilities: ["design.product"] },
+      { roleId: "quality", capabilities: ["quality.test"] },
+      { roleId: "server", capabilities: ["code.backend", "code.integration"] },
+      { roleId: "web", capabilities: ["code.frontend"] }
+    ])).toEqual(["web", "server", "quality", "server"]);
+  });
+
   it("flags duplicate nodeId, unknown needs, self dependency and unknown member roles deterministically", () => {
     const issues = supervisorDagDraftIssues([
       draft("build", "frontend", [], "task"),
@@ -97,6 +111,14 @@ describe("supervisor DAG drafts", () => {
       draft("cycle-two", "backend", ["cycle-one"], "task")
     ], MEMBERS);
     expect(issues.some((issue) => issue.startsWith("DAG 存在循环依赖"))).toBe(true);
+  });
+
+  it("maps validation messages to exact node ids without substring collisions", () => {
+    const issue = "DAG 节点 frontend-test 依赖了未知节点 missing-node";
+    expect(dagIssueTargetsNode(issue, "frontend-test")).toBe(true);
+    expect(dagIssueTargetsNode(issue, "test")).toBe(false);
+    expect(dagIssueTargetsNode("DAG 存在循环依赖：test, frontend-test", "test")).toBe(true);
+    expect(dagIssueTargetsNode("DAG 存在循环依赖：frontend-test", "test")).toBe(false);
   });
 });
 
@@ -168,5 +190,24 @@ describe("supervisor DAG layout", () => {
       { nodeId: "b", roleId: "backend", needs: ["a"], kind: "task", task: "B", requiredCapabilities: [], workKind: "code" as SupervisorWorkKind, required: true }
     ]);
     expect(layout.cyclic).toBe(true);
+  });
+
+  it("persists valid manual positions, fills missing nodes, prunes stale ids and follows node renames", () => {
+    const drafts = branchFlowDrafts();
+    const automatic = automaticDagPositions(drafts);
+    const resolved = resolveDagPositions(drafts, {
+      "frontend-task": { x: 80, y: 96 },
+      "backend-task": { x: Number.POSITIVE_INFINITY, y: 40 },
+      ghost: { x: 900, y: 900 }
+    });
+
+    expect(resolved["frontend-task"]).toEqual({ x: 80, y: 96 });
+    expect(resolved["backend-task"]).toEqual(automatic["backend-task"]);
+    expect(resolved.ghost).toBeUndefined();
+    expect(Object.keys(resolved)).toHaveLength(drafts.length);
+    expect(renameDagPosition(resolved, "frontend-task", "web-task")).toMatchObject({
+      "web-task": { x: 80, y: 96 }
+    });
+    expect(renameDagPosition(resolved, "frontend-task", "web-task")).not.toHaveProperty("frontend-task");
   });
 });

@@ -60,6 +60,17 @@ export function dagNodeDrafts(definition: SupervisorDagDefinition | undefined): 
   }));
 }
 
+/** Resolve semantic example slots from declared capabilities without depending on product-specific role names. */
+export function scaffoldDagRoleIds(candidates: Array<{ roleId: string; capabilities: readonly string[] }>): string[] {
+  const roleIds = candidates.map((candidate) => candidate.roleId.trim()).filter(Boolean);
+  const capable = (capability: string): string | undefined => candidates.find((candidate) => candidate.capabilities.includes(capability))?.roleId.trim() || undefined;
+  const frontend = capable("code.frontend") ?? roleIds[0] ?? "";
+  const backend = capable("code.backend") ?? roleIds[1] ?? frontend;
+  const tester = capable("quality.test") ?? roleIds[2] ?? backend;
+  const integrator = capable("code.integration") ?? roleIds[3] ?? backend;
+  return [frontend, backend, tester, integrator];
+}
+
 /** Branch → per-branch tests → merge → integration-test scaffold; the same tester role may be reused across test stages. */
 export function scaffoldDagDrafts(memberRoleIds: string[]): DagNodeDraft[] {
   const [frontend = "", backend = frontend, tester = backend, integrator = backend] = memberRoleIds;
@@ -140,6 +151,18 @@ export function supervisorDagDraftIssues(nodes: DagNodeDraft[], memberRoleIds: R
   return [...new Set(issues)];
 }
 
+/** Map a human-readable validation message back to its exact node without substring collisions. */
+export function dagIssueTargetsNode(issue: string, nodeId: string): boolean {
+  if (!nodeId) return issue === "存在未填写 nodeId 的 DAG 节点";
+  if (issue === `DAG 节点 nodeId 重复：${nodeId}`) return true;
+  if (issue.startsWith(`DAG 节点 ${nodeId} `)) return true;
+  if (issue.startsWith(`DAG 节点 ${nodeId} 的`)) return true;
+  if (issue.startsWith(`合并节点 ${nodeId} `)) return true;
+  if (issue.startsWith(`集成测试节点 ${nodeId} `)) return true;
+  if (!issue.startsWith("DAG 存在循环依赖：")) return false;
+  return issue.slice("DAG 存在循环依赖：".length).split(", ").includes(nodeId);
+}
+
 export function dagPayloadFromDrafts(nodes: DagNodeDraft[]): SupervisorDagDefinition {
   return {
     nodes: nodes.map((node): SupervisorDagNode => ({
@@ -177,18 +200,21 @@ export function buildSupervisorFlowPayload(
   };
 }
 
-export interface SupervisorDagLayoutNode {
-  node: SupervisorDagNode;
+/** Minimal shape the layered layout needs; drafts and persisted nodes both satisfy it. */
+export type SupervisorDagLayoutInput = Pick<SupervisorDagNode, "nodeId" | "needs">;
+
+export interface SupervisorDagLayoutNode<T extends SupervisorDagLayoutInput = SupervisorDagNode> {
+  node: T;
   depth: number;
   row: number;
   x: number;
   y: number;
 }
 
-export interface SupervisorDagLayout {
+export interface SupervisorDagLayout<T extends SupervisorDagLayoutInput = SupervisorDagNode> {
   width: number;
   height: number;
-  nodes: SupervisorDagLayoutNode[];
+  nodes: SupervisorDagLayoutNode<T>[];
   edges: Array<{ from: string; to: string }>;
   cyclic: boolean;
 }
@@ -197,7 +223,7 @@ export const DAG_NODE_WIDTH = 216;
 export const DAG_NODE_HEIGHT = 78;
 
 /** Layered left-to-right layout so branch/fan-in/merge/integration-test stages read as distinct columns. */
-export function layoutSupervisorDag(nodes: SupervisorDagNode[]): SupervisorDagLayout {
+export function layoutSupervisorDag<T extends SupervisorDagLayoutInput>(nodes: readonly T[]): SupervisorDagLayout<T> {
   const byId = new Map(nodes.map((node) => [node.nodeId, node]));
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -218,7 +244,7 @@ export function layoutSupervisorDag(nodes: SupervisorDagNode[]): SupervisorDagLa
   };
   nodes.forEach((node) => visit(node.nodeId));
 
-  const layers = new Map<number, SupervisorDagNode[]>();
+  const layers = new Map<number, T[]>();
   nodes.forEach((node) => {
     const depth = cyclic ? 0 : depths.get(node.nodeId) ?? 0;
     layers.set(depth, [...(layers.get(depth) ?? []), node]);
@@ -228,7 +254,7 @@ export function layoutSupervisorDag(nodes: SupervisorDagNode[]): SupervisorDagLa
   const width = Math.max(560, (maxDepth + 1) * 268 + 72);
   const rowHeight = 112;
   const height = Math.max(240, maxRows * rowHeight + 72);
-  const layoutNodes: SupervisorDagLayoutNode[] = [];
+  const layoutNodes: SupervisorDagLayoutNode<T>[] = [];
   [...layers.entries()].sort(([a], [b]) => a - b).forEach(([depth, layer]) => {
     const layerHeight = layer.length * rowHeight;
     const startY = Math.max(36, (height - layerHeight) / 2 + 8);
@@ -242,4 +268,39 @@ export function layoutSupervisorDag(nodes: SupervisorDagNode[]): SupervisorDagLa
   });
   const edges = nodes.flatMap((node) => node.needs.flatMap((need) => byId.has(need) ? [{ from: need, to: node.nodeId }] : []));
   return { width, height, nodes: layoutNodes, edges, cyclic };
+}
+
+/** Manual canvas positions keyed by nodeId; persisted as workflow presentation.positions. */
+export type DagNodePositions = Record<string, { x: number; y: number }>;
+
+/** Deterministic auto-layout positions for every DAG node; the fallback before any manual drag. */
+export function automaticDagPositions(nodes: readonly SupervisorDagLayoutInput[]): DagNodePositions {
+  return Object.fromEntries(layoutSupervisorDag(nodes).nodes.map((item) => [item.node.nodeId, { x: item.x, y: item.y }]));
+}
+
+/**
+ * Resolve one position per current node: saved positions win, nodes without one fall back to the
+ * deterministic layered layout, and stale ids (renamed/removed nodes) are pruned so the save payload
+ * only carries positions for nodes that still exist.
+ */
+export function resolveDagPositions(nodes: readonly SupervisorDagLayoutInput[], positions: DagNodePositions): DagNodePositions {
+  const fallback = automaticDagPositions(nodes);
+  const resolved: DagNodePositions = {};
+  for (const node of nodes) {
+    if (!node.nodeId || resolved[node.nodeId]) continue;
+    const saved = positions[node.nodeId];
+    resolved[node.nodeId] = saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)
+      ? saved
+      : fallback[node.nodeId] ?? { x: 36, y: 36 };
+  }
+  return resolved;
+}
+
+/** Carry a manual position across a nodeId rename so the canvas does not jump back to auto layout. */
+export function renameDagPosition(positions: DagNodePositions, oldId: string, newId: string): DagNodePositions {
+  if (oldId === newId || !oldId || !positions[oldId]) return positions;
+  const next = { ...positions };
+  next[newId] = next[oldId]!;
+  delete next[oldId];
+  return next;
 }

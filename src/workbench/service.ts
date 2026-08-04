@@ -1562,6 +1562,23 @@ function isInstanceTerminal(status: WorkInstanceStatus): boolean {
   return ["completed", "blocked", "failed", "skipped", "cancelled"].includes(status);
 }
 
+function normalizeWorkflowPositions(
+  positions: Record<string, { x: number; y: number }> | undefined,
+  nodeIds: ReadonlySet<string>
+): Record<string, { x: number; y: number }> | undefined {
+  if (positions === undefined) return undefined;
+  return Object.fromEntries(Object.entries(positions).filter(([nodeId, position]) => {
+    if (!nodeIds.has(nodeId)) return false;
+    if (!Number.isFinite(position.x) || !Number.isFinite(position.y)) {
+      throw new Error(`workflow node ${nodeId} position must contain finite x/y coordinates`);
+    }
+    if (Math.abs(position.x) > 100_000 || Math.abs(position.y) > 100_000) {
+      throw new Error(`workflow node ${nodeId} position is outside the supported canvas bounds`);
+    }
+    return true;
+  }));
+}
+
 export interface WorkbenchServiceOptions {
   dataRoot?: string;
   providers?: ProviderRegistry;
@@ -5327,18 +5344,7 @@ export class WorkbenchService {
     });
     const timestamp = now();
     const presentationInput = input.presentation ?? current?.presentation;
-    const positions = presentationInput?.positions === undefined
-      ? undefined
-      : Object.fromEntries(Object.entries(presentationInput.positions).filter(([nodeId, position]) => {
-          if (!nodeIds.has(nodeId)) return false;
-          if (!Number.isFinite(position.x) || !Number.isFinite(position.y)) {
-            throw new Error(`workflow node ${nodeId} position must contain finite x/y coordinates`);
-          }
-          if (Math.abs(position.x) > 100_000 || Math.abs(position.y) > 100_000) {
-            throw new Error(`workflow node ${nodeId} position is outside the supported canvas bounds`);
-          }
-          return true;
-        }));
+    const positions = normalizeWorkflowPositions(presentationInput?.positions, nodeIds);
     const patternId = input.patternId ?? current?.patternId;
     if (patternId) requireId(patternId, "workflow pattern id");
     return {
@@ -5411,6 +5417,13 @@ export class WorkbenchService {
     });
     if (members.length === 0) throw new Error("supervisor workflow members must not be empty");
     const timestamp = now();
+    const flow = normalizeSupervisorFlow(input.flow, current?.flow, new Set(members.map((member) => member.roleId)));
+    const positions = flow.dag
+      ? normalizeWorkflowPositions(
+          (input.presentation ?? current?.presentation)?.positions,
+          new Set(flow.dag.nodes.map((node) => node.nodeId))
+        )
+      : undefined;
     return {
       id,
       version: current ? current.version + 1 : 1,
@@ -5424,8 +5437,9 @@ export class WorkbenchService {
       },
       managementPolicy: { id: policy.id, version: policy.version },
       members,
-      flow: normalizeSupervisorFlow(input.flow, current?.flow, new Set(members.map((member) => member.roleId))),
+      flow,
       inputSchema: input.inputSchema ?? current?.inputSchema,
+      presentation: positions ? { positions } : undefined,
       createdAt: current?.createdAt ?? timestamp,
       updatedAt: timestamp
     };

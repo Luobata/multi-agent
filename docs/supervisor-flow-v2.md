@@ -97,15 +97,16 @@ Provider 调用、Skill、Role 身份、Architecture 控制流、Workflow 实例
 
 ## 7. UI
 
-协作编排页面同时呈现：
+协作编排页面的第 05 节使用与 Graph 编排一致的画布交互，但没有改变 Architecture 或运行时所有权：
 
-- 固定 Plan / Delegation loop / Delivery；
-- DAG 的分支、测试、汇合、合并和集成测试节点；
-- 每个节点引用的 roleId 与 Employee；
-- 同一角色在多个节点上的重复引用；
-- Run 中的实际节点状态、轮次、证据和阻塞原因。
+- 节点可拖拽，方向键移动 8px，Shift + 方向键移动 24px；自动排版只更新 `presentation.positions`；
+- 从上游节点右侧端口连接到下游节点左侧端口会写入下游的 `needs`，属性栏复选框提供完整的键盘编辑路径；
+- 属性栏只编辑当前节点的 nodeId、roleId、kind、task、requiredCapabilities、workKind、changeSet 和 required；
+- 相同 roleId 在多个节点显示相同角色徽标，但每个节点仍会创建独立 WorkInstance；
+- “填入分支-合并示例骨架”生成开发、分支测试、合并、集成测试六节点示例；
+- 未知依赖、循环、提前合并和集成测试缺少 merge 在画布旁实时展示，服务端校验仍是最终权威。
 
-编辑器支持启用 DAG、增删节点和编辑完整节点契约。前端校验用于即时反馈，服务端校验是最终权威。
+保存仍使用原有 `flow.dag`；`presentation.positions` 只保存有限坐标并过滤已删除节点。Graph Canvas 在这里是共享交互语义，不是 Graph Architecture，也不参与调度。运行时唯一调度中心仍是 Supervisor；没有 `flow.dag` 的旧 Workflow 不产生新的画布或调度语义。
 
 ## 8. 验收
 

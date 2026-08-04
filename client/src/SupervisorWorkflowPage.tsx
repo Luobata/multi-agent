@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { api, writeBody } from "./api";
 import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, ReadonlyEvidence, SelectControl, Stamp, UtilityIcon, formatTime, scrollRecordIntoView, useDaemonAvailable } from "./components";
 import { SupervisorDagCanvas } from "./SupervisorDagCanvas";
+import { SupervisorDagEditorCanvas } from "./SupervisorDagEditorCanvas";
 import {
+  automaticDagPositions,
   buildSupervisorFlowPayload,
   dagNodeDrafts,
   dagNodeKindLabels,
@@ -10,11 +12,15 @@ import {
   dagWorkKindLabels,
   defaultDagWorkKind,
   emptyDagNodeDraft,
+  renameDagPosition,
+  resolveDagPositions,
   scaffoldDagDrafts,
+  scaffoldDagRoleIds,
   supervisorDagDraftIssues,
   DAG_NODE_KINDS,
   DAG_WORK_KINDS,
-  type DagNodeDraft
+  type DagNodeDraft,
+  type DagNodePositions
 } from "./supervisorDag";
 import { activeWorkflowPublications, buildWorkflowSessionPrompts } from "./workflowSessionPrompts";
 import type { Bootstrap, Employee, InvocationRecord, JsonObject, ManagementPolicy, SupervisorDagNodeKind, SupervisorGate, SupervisorWorkflow, SupervisorWorkKind, Workflow } from "./types";
@@ -41,6 +47,7 @@ interface SupervisorDraft {
   gates: SupervisorGate[];
   dagEnabled: boolean;
   dagNodes: DagNodeDraft[];
+  positions: DagNodePositions;
   inputSchema: string;
 }
 
@@ -83,6 +90,7 @@ function supervisorDraft(workflow: SupervisorWorkflow | undefined, employees: Em
     gates: workflow?.flow.gates.map((gate) => ({ ...gate })) ?? [],
     dagEnabled: Boolean(workflow?.flow.dag),
     dagNodes: dagNodeDrafts(workflow?.flow.dag),
+    positions: { ...(workflow?.presentation?.positions ?? {}) },
     inputSchema: JSON.stringify(workflow?.inputSchema ?? {}, null, 2)
   };
 }
@@ -141,6 +149,9 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
       description: `${policy.allowedRoleIds.length} 个角色槽 · ${formatTime(policy.updatedAt)}`
     }))
   ];
+  const dagIssues = draft.dagEnabled
+    ? supervisorDagDraftIssues(draft.dagNodes, new Set(draft.members.map((member) => member.roleId.trim()).filter(Boolean)))
+    : [];
   const issues = [
     !draft.supervisorEmployeeId ? "未选择领队 Employee" : undefined,
     !draft.policyId ? "未绑定活动管理策略" : undefined,
@@ -149,8 +160,15 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
     new Set(draft.members.map((member) => member.roleId)).size !== draft.members.length ? "成员角色槽重复" : undefined,
     draft.gates.some((gate) => !gate.id || !gate.requiredCapability || !gate.instructions) ? "门禁 ID、能力或执行说明不完整" : undefined,
     new Set(draft.gates.map((gate) => gate.id)).size !== draft.gates.length ? "门禁 ID 重复" : undefined,
-    ...(draft.dagEnabled ? supervisorDagDraftIssues(draft.dagNodes, new Set(draft.members.map((member) => member.roleId.trim()).filter(Boolean))) : [])
+    ...dagIssues
   ].filter((issue): issue is string => Boolean(issue));
+  const [selectedDagIndex, setSelectedDagIndex] = useState(0);
+  const selectedDagNode = draft.dagNodes[selectedDagIndex] ?? draft.dagNodes[0];
+  const dagRoleDisplay = (roleId: string): string | undefined => {
+    const member = draft.members.find((candidate) => candidate.roleId.trim() === roleId);
+    if (!member) return undefined;
+    return employees.find((employee) => employee.id === member.employeeId)?.identity.displayName ?? member.employeeId;
+  };
   const setMember = (index: number, patch: Partial<MemberDraft>) => setDraft((current) => ({
     ...current,
     members: current.members.map((member, memberIndex) => memberIndex === index ? { ...member, ...patch } : member)
@@ -159,6 +177,31 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
     ...current,
     dagNodes: current.dagNodes.map((node, nodeIndex) => nodeIndex === index ? { ...node, ...patch } : node)
   }));
+  const renameDagNode = (index: number, nodeId: string) => setDraft((current) => {
+    const oldId = current.dagNodes[index]?.nodeId ?? "";
+    const canMovePosition = !current.dagNodes.some((node, nodeIndex) => nodeIndex !== index && node.nodeId === nodeId);
+    return {
+      ...current,
+      positions: canMovePosition ? renameDagPosition(current.positions, oldId, nodeId) : current.positions,
+      dagNodes: current.dagNodes.map((node, nodeIndex) => ({
+        ...node,
+        nodeId: nodeIndex === index ? nodeId : node.nodeId,
+        needs: node.needs.map((need) => need === oldId ? nodeId : need)
+      }))
+    };
+  });
+  const removeDagNode = (index: number) => setDraft((current) => {
+    const removedId = current.dagNodes[index]?.nodeId ?? "";
+    const positions = { ...current.positions };
+    delete positions[removedId];
+    return {
+      ...current,
+      positions,
+      dagNodes: current.dagNodes
+        .filter((_, nodeIndex) => nodeIndex !== index)
+        .map((node) => ({ ...node, needs: node.needs.filter((need) => need !== removedId) }))
+    };
+  });
   const toggleDagNeed = (index: number, need: string) => setDraft((current) => ({
     ...current,
     dagNodes: current.dagNodes.map((node, nodeIndex) => nodeIndex !== index ? node : {
@@ -166,13 +209,43 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
       needs: node.needs.includes(need) ? node.needs.filter((candidate) => candidate !== need) : [...node.needs, need]
     })
   }));
-  const toggleDag = (enabled: boolean) => setDraft((current) => ({
-    ...current,
-    dagEnabled: enabled,
-    dagNodes: enabled && current.dagNodes.length === 0
-      ? scaffoldDagDrafts(current.members.map((member) => member.roleId.trim()).filter(Boolean))
-      : current.dagNodes
-  }));
+  const addDagNode = () => {
+    setDraft((current) => ({
+      ...current,
+      dagNodes: [...current.dagNodes, emptyDagNodeDraft(current.dagNodes.length + 1, current.members[0]?.roleId.trim() ?? "")]
+    }));
+    setSelectedDagIndex(draft.dagNodes.length);
+  };
+  const scaffoldNodesForMembers = (members: MemberDraft[]) => scaffoldDagDrafts(scaffoldDagRoleIds(members.map((member) => ({
+    roleId: member.roleId,
+    capabilities: employees.find((employee) => employee.id === member.employeeId)?.capabilities ?? []
+  }))));
+  const applyDagScaffold = () => {
+    setDraft((current) => {
+      const dagNodes = scaffoldNodesForMembers(current.members);
+      return { ...current, dagNodes, positions: automaticDagPositions(dagNodes) };
+    });
+    setSelectedDagIndex(0);
+  };
+  const connectDagNodes = (sourceIndex: number, targetIndex: number) => {
+    setDraft((current) => {
+      const sourceId = current.dagNodes[sourceIndex]?.nodeId.trim();
+      const target = current.dagNodes[targetIndex];
+      if (!sourceId || !target || sourceIndex === targetIndex || target.needs.includes(sourceId)) return current;
+      return {
+        ...current,
+        dagNodes: current.dagNodes.map((node, nodeIndex) => nodeIndex === targetIndex
+          ? { ...node, needs: [...node.needs, sourceId] }
+          : node)
+      };
+    });
+    setSelectedDagIndex(targetIndex);
+  };
+  const toggleDag = (enabled: boolean) => setDraft((current) => {
+    if (!enabled || current.dagNodes.length > 0) return { ...current, dagEnabled: enabled };
+    const dagNodes = scaffoldNodesForMembers(current.members);
+    return { ...current, dagEnabled: true, dagNodes, positions: automaticDagPositions(dagNodes) };
+  });
   const selectPolicy = (policyId: string) => {
     const policy = policies.find((candidate) => candidate.id === policyId);
     setPolicyVersions(policy ? [policy] : []);
@@ -200,6 +273,7 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
     event.preventDefault();
     setSaving(true);
     try {
+      const dagPayload = draft.dagEnabled ? dagPayloadFromDrafts(draft.dagNodes) : undefined;
       const payload = {
         id: draft.id.trim(),
         architecture: "supervisor",
@@ -211,7 +285,8 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
           description: member.description.trim(),
           employeeId: member.employeeId
         })),
-        flow: buildSupervisorFlowPayload(draft.gates, draft.dagEnabled ? dagPayloadFromDrafts(draft.dagNodes) : undefined),
+        flow: buildSupervisorFlowPayload(draft.gates, dagPayload),
+        ...(dagPayload ? { presentation: { positions: resolveDagPositions(dagPayload.nodes, draft.positions) } } : {}),
         inputSchema: parseObject(draft.inputSchema || "{}", "Input Schema")
       };
       const saved = workflow
@@ -247,14 +322,26 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
           <Field label="执行说明"><textarea required rows={3} value={gate.instructions} onChange={(event) => setDraft({ ...draft, gates: draft.gates.map((candidate, gateIndex) => gateIndex === index ? { ...candidate, instructions: event.target.value } : candidate) })} /></Field>
         </article>)}</div><button type="button" className="button secondary" onClick={() => setDraft({ ...draft, gates: [...draft.gates, { id: `gate-${draft.gates.length + 1}`, requiredCapability: "quality.test", mode: "before-completion", required: true, instructions: "验证本次交付并提供可审计证据。", fallback: "supervisor" }] })}><UtilityIcon name="add" />添加能力门禁</button></section>
         <section className="workflow-contract"><div className="section-kicker"><b>05</b><span>声明式任务 DAG</span></div><div className="flow-editor-intro"><strong>可选：把分支开发 → 分支测试 → 合并 → 集成测试固定为声明式 DAG。</strong><p>启用后领队只能按 nodeId 派工，依赖未通过的环节不可执行；同一角色槽可负责多个环节（如 tester 同时负责 frontend-test、backend-test 与 integration-test）。不启用时保存 payload 不携带 dag，运行行为与旧版一致。</p></div><label className="switch-line dag-enable-switch"><span><b>启用 DAG 编排</b><small>{draft.dagEnabled ? "保存时随 stages/gates 一起提交 dag 定义" : "关闭时仅保留固定阶段与门禁"}</small></span><input type="checkbox" role="switch" checked={draft.dagEnabled} onChange={(event) => toggleDag(event.target.checked)} /></label>
-          {draft.dagEnabled && <><div className="dag-node-editor">{draft.dagNodes.map((node, index) => <article key={`dag-${index}`}>
-            <header><span>NODE {String(index + 1).padStart(2, "0")} · {dagNodeKindLabels[node.kind]}</span><button type="button" className="text-button danger-text" disabled={draft.dagNodes.length === 1} onClick={() => setDraft({ ...draft, dagNodes: draft.dagNodes.filter((_, nodeIndex) => nodeIndex !== index) })}>移除</button></header>
-            <div className="form-grid three"><Field label="环节 ID (nodeId)"><input required pattern="[a-z][a-z0-9-]*" value={node.nodeId} placeholder="frontend-test" onChange={(event) => setDagNode(index, { nodeId: event.target.value })} /></Field><Field label="环节类型"><SelectControl ariaLabel={`节点 ${node.nodeId || index + 1} 的环节类型`} value={node.kind} options={DAG_NODE_KINDS.map((kind) => ({ value: kind, label: dagNodeKindLabels[kind], description: kind }))} onChange={(value) => { const kind = value as SupervisorDagNodeKind; setDagNode(index, { kind, ...(node.workKind === defaultDagWorkKind(node.kind) ? { workKind: defaultDagWorkKind(kind) } : {}) }); }} /></Field><Field label="执行角色槽"><SelectControl ariaLabel={`节点 ${node.nodeId || index + 1} 的执行角色槽`} value={node.roleId} invalid={!draft.members.some((member) => member.roleId.trim() === node.roleId)} options={[{ value: "", label: "选择成员角色槽", disabled: true }, ...draft.members.map((member) => ({ value: member.roleId.trim(), label: member.roleId.trim() || "(未命名角色槽)", description: member.description }))]} onChange={(roleId) => setDagNode(index, { roleId })} /></Field></div>
-            <div className="form-grid three"><Field label="工作性质 (workKind)"><SelectControl ariaLabel={`节点 ${node.nodeId || index + 1} 的工作性质`} value={node.workKind} options={DAG_WORK_KINDS.map((workKind) => ({ value: workKind, label: dagWorkKindLabels[workKind], description: workKind }))} onChange={(value) => setDagNode(index, { workKind: value as SupervisorWorkKind })} /></Field><Field label="需要能力（逗号分隔）"><input value={node.capabilitiesText} placeholder="quality.test" onChange={(event) => setDagNode(index, { capabilitiesText: event.target.value })} /></Field><Field label="变更集 changeSet（可空）"><input value={node.changeSet} placeholder="frontend" onChange={(event) => setDagNode(index, { changeSet: event.target.value })} /></Field></div>
-            <Field label="先行环节 (needs)"><div className="dag-needs-group" role="group" aria-label={`节点 ${node.nodeId || index + 1} 的先行环节`}>{draft.dagNodes.filter((_, candidateIndex) => candidateIndex !== index && draft.dagNodes[candidateIndex]!.nodeId.trim()).map((candidate, candidateIndex) => { const needId = candidate.nodeId.trim(); const checked = node.needs.includes(needId); return <label key={`${candidateIndex}-${needId}`} className={`dag-need-chip ${checked ? "checked" : ""}`}><input type="checkbox" checked={checked} onChange={() => toggleDagNeed(index, needId)} /><span>{needId}</span><small>{dagNodeKindLabels[candidate.kind]}</small></label>; })}{draft.dagNodes.length <= 1 && <small className="dag-needs-empty">添加更多节点后可勾选先行环节；无依赖的环节在首轮即可派发。</small>}</div></Field>
-            <Field label="任务说明 (task)"><textarea required rows={2} value={node.task} onChange={(event) => setDagNode(index, { task: event.target.value })} /></Field>
-            <label className="switch-line"><span><b>必需环节</b><small>未通过时禁止领队 finish</small></span><input type="checkbox" role="switch" checked={node.required} onChange={(event) => setDagNode(index, { required: event.target.checked })} /></label>
-          </article>)}</div><div className="dag-editor-actions"><button type="button" className="button secondary" onClick={() => setDraft({ ...draft, dagNodes: [...draft.dagNodes, emptyDagNodeDraft(draft.dagNodes.length + 1, draft.members[0]?.roleId.trim() ?? "")] })}><UtilityIcon name="add" />添加环节</button><button type="button" className="text-button" onClick={() => setDraft({ ...draft, dagNodes: scaffoldDagDrafts(draft.members.map((member) => member.roleId.trim()).filter(Boolean)) })}>填入分支-合并示例骨架</button></div></>}</section>
+          {draft.dagEnabled && <div className="workflow-builder supervisor-dag-builder">
+            <header className="workflow-builder-toolbar"><div><p className="record-meta">DAG / VISUAL COMPOSER</p><h3>领队编排画布</h3></div><div className="canvas-actions"><button type="button" className="button secondary dag-scaffold-action" onClick={applyDagScaffold}>填入分支-合并示例骨架</button><button type="button" className="button ghost" onClick={addDagNode}><UtilityIcon name="add" />添加环节</button><button type="button" className="button ghost" onClick={() => setDraft((current) => ({ ...current, positions: automaticDagPositions(current.dagNodes) }))}>自动排版</button></div></header>
+            <div className="workflow-builder-grid"><div className="canvas-column"><div className="canvas-status"><span>拖动节点排版；从右侧端口连到下游左侧端口建立 needs，右侧检查器也可精确编辑。</span><Stamp status={dagIssues.length ? "blocked" : "passed"} label={dagIssues.length ? `${dagIssues.length} 项待修正` : "DAG 草稿通过预检"} /></div><SupervisorDagEditorCanvas nodes={draft.dagNodes} positions={draft.positions} selectedIndex={selectedDagIndex} issues={dagIssues} onSelect={setSelectedDagIndex} onPositionsChange={(positions) => setDraft((current) => ({ ...current, positions }))} onConnect={connectDagNodes} roleDisplay={dagRoleDisplay} />{dagIssues.length > 0 && <div className="canvas-issues" role="alert">{dagIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}</div>
+              <aside className="node-inspector">{selectedDagNode ? <><header><div><p className="record-meta">DAG NODE INSPECTOR</p><h4>{selectedDagNode.nodeId || "未命名节点"}</h4></div><button type="button" className="text-button danger-text" disabled={draft.dagNodes.length === 1} onClick={() => { removeDagNode(selectedDagIndex); setSelectedDagIndex(Math.max(0, selectedDagIndex - 1)); }}>移除</button></header>
+                <Field label="环节 ID (nodeId)"><input required pattern="[a-z][a-z0-9-]*" value={selectedDagNode.nodeId} placeholder="frontend-test" onChange={(event) => renameDagNode(selectedDagIndex, event.target.value)} /></Field>
+                <Field label="环节类型"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的环节类型`} value={selectedDagNode.kind} options={DAG_NODE_KINDS.map((kind) => ({ value: kind, label: dagNodeKindLabels[kind], description: kind }))} onChange={(value) => { const kind = value as SupervisorDagNodeKind; setDagNode(selectedDagIndex, { kind, ...(selectedDagNode.workKind === defaultDagWorkKind(selectedDagNode.kind) ? { workKind: defaultDagWorkKind(kind) } : {}) }); }} /></Field>
+                <Field label="执行角色槽"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的执行角色槽`} value={selectedDagNode.roleId} invalid={!draft.members.some((member) => member.roleId.trim() === selectedDagNode.roleId)} errorMessage={!draft.members.some((member) => member.roleId.trim() === selectedDagNode.roleId) ? "请选择第 03 节成员清册中的角色槽。" : undefined} options={[{ value: "", label: "选择成员角色槽", disabled: true }, ...draft.members.map((member) => ({ value: member.roleId.trim(), label: member.roleId.trim() || "(未命名角色槽)", description: member.description }))]} onChange={(roleId) => setDagNode(selectedDagIndex, { roleId })} /></Field>
+                <Field label="工作性质 (workKind)"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的工作性质`} value={selectedDagNode.workKind} options={DAG_WORK_KINDS.map((workKind) => ({ value: workKind, label: dagWorkKindLabels[workKind], description: workKind }))} onChange={(value) => setDagNode(selectedDagIndex, { workKind: value as SupervisorWorkKind })} /></Field>
+                <Field label="需要能力（逗号分隔）"><input value={selectedDagNode.capabilitiesText} placeholder="quality.test" onChange={(event) => setDagNode(selectedDagIndex, { capabilitiesText: event.target.value })} /></Field>
+                <Field label="变更集 changeSet（可空）"><input value={selectedDagNode.changeSet} placeholder="frontend" onChange={(event) => setDagNode(selectedDagIndex, { changeSet: event.target.value })} /></Field>
+                <fieldset className="dependency-checks"><legend>先行环节 (needs)</legend>{draft.dagNodes.map((candidate, candidateIndex) => {
+                  const needId = candidate.nodeId.trim();
+                  if (candidateIndex === selectedDagIndex || !needId) return null;
+                  return <label key={`${candidateIndex}-${needId}`}><input type="checkbox" checked={selectedDagNode.needs.includes(needId)} onChange={(event) => toggleDagNeed(selectedDagIndex, needId)} /><span><b>{needId}</b><small>{dagNodeKindLabels[candidate.kind]}</small></span></label>;
+                })}{draft.dagNodes.length <= 1 && <span className="muted">只有一个节点，无上游依赖。</span>}</fieldset>
+                <Field label="任务说明 (task)"><textarea required rows={3} value={selectedDagNode.task} onChange={(event) => setDagNode(selectedDagIndex, { task: event.target.value })} /></Field>
+                <label className="switch-line"><span><b>必需环节</b><small>未通过时禁止领队 finish</small></span><input type="checkbox" role="switch" checked={selectedDagNode.required} onChange={(event) => setDagNode(selectedDagIndex, { required: event.target.checked })} /></label>
+              </> : <div className="mini-empty">在画布选择一个环节开始编辑。</div>}</aside>
+            </div>
+          </div>}</section>
         <section className="workflow-contract"><div className="section-kicker"><b>06</b><span>输入契约</span></div><Field label="Input JSON Schema"><textarea className="mono" rows={6} value={draft.inputSchema} onChange={(event) => setDraft({ ...draft, inputSchema: event.target.value })} /></Field></section>
         {issues.length > 0 && <div className="canvas-issues" role="alert">{issues.map((issue) => <span key={issue}>{issue}</span>)}</div>}
       </fieldset>

@@ -75,7 +75,11 @@ const flowDag: { nodes: SupervisorDagNodeInput[] } = {
   ]
 };
 
-async function createDagWorkflow(service: WorkbenchService, id = "flow-v2"): Promise<void> {
+async function createDagWorkflow(
+  service: WorkbenchService,
+  id = "flow-v2",
+  positions?: Record<string, { x: number; y: number }>
+): Promise<void> {
   await service.createWorkflow({
     id,
     architecture: "supervisor",
@@ -87,11 +91,55 @@ async function createDagWorkflow(service: WorkbenchService, id = "flow-v2"): Pro
       { roleId: "tester", employeeId: "flow-tester" },
       { roleId: "integrator", employeeId: "flow-integrator" }
     ],
-    flow: { stages: flowStages, gates: [], dag: flowDag }
+    flow: { stages: flowStages, gates: [], dag: flowDag },
+    ...(positions ? { presentation: { positions } } : {})
   });
 }
 
 describe("Supervisor Flow v2 declarative DAG runtime", () => {
+  it("persists finite DAG canvas positions and filters keys outside the declared Supervisor DAG", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await createFlowTeam(service, "mock");
+    await createDagWorkflow(service, "positioned-flow", {
+      "frontend-task": { x: 24, y: 48 },
+      "backend-task": { x: 24, y: 168 },
+      ghost: { x: 999, y: 999 }
+    });
+
+    const created = service.getWorkflow("positioned-flow");
+    expect(created.architecture).toBe("supervisor");
+    expect(created.presentation).toEqual({
+      positions: {
+        "frontend-task": { x: 24, y: 48 },
+        "backend-task": { x: 24, y: 168 }
+      }
+    });
+
+    const updated = await service.updateWorkflow("positioned-flow", {
+      presentation: {
+        positions: {
+          "frontend-task": { x: 96, y: 120 },
+          unknown: { x: 10, y: 20 }
+        }
+      }
+    });
+    expect(updated.presentation).toEqual({ positions: { "frontend-task": { x: 96, y: 120 } } });
+    expect(service.getWorkflow("positioned-flow").presentation).toEqual(updated.presentation);
+
+    await expect(service.updateWorkflow("positioned-flow", {
+      presentation: { positions: { "frontend-task": { x: Number.POSITIVE_INFINITY, y: 0 } } }
+    })).rejects.toThrow("workflow node frontend-task position must contain finite x/y coordinates");
+
+    const withoutDag = await service.updateWorkflow("positioned-flow", {
+      flow: { stages: flowStages, gates: [] },
+      presentation: { positions: { "frontend-task": { x: 16, y: 32 } } }
+    });
+    expect(withoutDag.architecture).toBe("supervisor");
+    if (withoutDag.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
+    expect(withoutDag.flow.dag).toBeUndefined();
+    expect(withoutDag.presentation).toBeUndefined();
+  });
+
   it("runs ready frontend/backend and branch tests in parallel, then merge and integration-test", async () => {
     const buildBarrier = parallelBarrier(2);
     const testBarrier = parallelBarrier(2);
