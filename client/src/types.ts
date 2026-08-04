@@ -136,6 +136,7 @@ export interface Session {
   };
   title: string;
   status: "active" | "closed";
+  context?: JsonObject;
   messages: SessionMessage[];
   createdAt: string;
   updatedAt: string;
@@ -455,6 +456,7 @@ export interface Run {
   output?: JsonValue;
   error?: string;
   nodes: Record<string, RunNode>;
+  effectiveProfiles?: Record<string, EffectiveExecutionProfile>;
 }
 
 export interface Publication {
@@ -476,6 +478,7 @@ export interface ProjectRoleContract {
   description: string;
   requiredSkills: string[];
   optionalSkills: string[];
+  requiredProviderProfiles?: string[];
   knowledgeProfileIds?: string[];
   instructions: string;
   outputSchema?: JsonObject;
@@ -1004,6 +1007,93 @@ export interface KnowledgeChangeRequest {
   appliedAt?: string;
 }
 
+export type ConfigurationOperationRisk = "low" | "medium" | "high";
+export type ConfigurationOperation =
+  | { type: "identity-profile.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { identity: Employee["identity"]; description: string } }
+  | { type: "prompts.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { systemPrompt: string; requestPrompt: string } }
+  | { type: "capabilities.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { capabilities: string[] } }
+  | { type: "skills.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { skills: SkillBinding[]; skillVersions?: Record<string, number> } }
+  | { type: "runtime.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { providerId: string; maxAttempts: number } }
+  | { type: "permissions.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { permissions: Employee["permissions"] } }
+  | { type: "output-contract.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { outputSchema: JsonObject; verdict?: Employee["verdict"] | null } }
+  | { type: "context-policy.set"; rationale: string; risk: ConfigurationOperationRisk; payload: { historyLimit: number } }
+  | { type: "presentation.set"; rationale: string; risk: ConfigurationOperationRisk; payload: Employee["presentation"] };
+
+export type ConfigurationProposalStatus =
+  | "awaiting-review"
+  | "ready-to-apply"
+  | "applying"
+  | "applied"
+  | "needs-reapproval"
+  | "cancelled"
+  | "failed";
+
+export interface ConfigurationReviewItem {
+  id: string;
+  operationIndex: number;
+  operationType: ConfigurationOperation["type"];
+  label: string;
+  rationale: string;
+  risk: ConfigurationOperationRisk;
+  before: JsonValue;
+  after: JsonValue;
+}
+
+export interface ConfigurationReviewDecision {
+  id: string;
+  reviewItemId: string;
+  decision: "accepted" | "rejected";
+  actor: string;
+  at: string;
+  comment?: string;
+  planHash: string;
+}
+
+export interface ConfigurationProposal {
+  id: string;
+  status: ConfigurationProposalStatus;
+  title: string;
+  reason: string;
+  employeeId: string;
+  expectedEmployeeVersion: number;
+  operations: ConfigurationOperation[];
+  reviewItems: ConfigurationReviewItem[];
+  decisions: ConfigurationReviewDecision[];
+  progress: { total: number; reviewed: number; accepted: number; rejected: number; pending: number };
+  reviewRevision: number;
+  reviewHash: string;
+  source: {
+    kind: "ai-generated";
+    invocationId: string;
+    projectId: string;
+    projectVersion: number;
+    projectRoleId: string;
+    projectBindingVersion: number;
+    employeeId: string;
+    employeeVersion: number;
+    requestedBy: string;
+    sessionId: string;
+    runId: string;
+  };
+  planHash: string;
+  validation: { valid: boolean; errors: string[] };
+  result?: { employeeId: string; employeeVersion: number };
+  application?: {
+    actor: string;
+    at: string;
+    reviewRevision: number;
+    reviewHash: string;
+    acceptedReviewItemIds: string[];
+    fromEmployeeVersion: number;
+    toEmployeeVersion: number;
+  };
+  cancellation?: { actor: string; at: string; comment?: string };
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  appliedAt?: string;
+}
+
 export interface KnowledgeBaseDetail {
   knowledgeBase: KnowledgeBase;
   versions: KnowledgeBase[];
@@ -1020,6 +1110,7 @@ export interface Bootstrap {
   knowledgeBases?: KnowledgeBase[];
   knowledgeProfiles?: KnowledgeProfile[];
   knowledgeChanges?: KnowledgeChangeRequest[];
+  configurationProposals?: ConfigurationProposal[];
   architectureTemplates: ArchitectureTemplate[];
   employees: Employee[];
   employeeTemplates?: EmployeeTemplate[];
@@ -1031,6 +1122,62 @@ export interface Bootstrap {
   projects: Project[];
   projectBindings: ProjectBinding[];
   activity: ActivitySnapshot;
+}
+
+export type EffectiveConfigurationSourceKind =
+  | "employee"
+  | "project-contract"
+  | "project-binding"
+  | "skill"
+  | "knowledge-profile"
+  | "knowledge-base"
+  | "provider"
+  | "workflow"
+  | "task";
+
+export interface EffectiveConfigurationReference {
+  refId: string;
+  kind: EffectiveConfigurationSourceKind;
+  id: string;
+  version?: number;
+  revision?: number;
+  label: string;
+  route?: {
+    page: "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs";
+    entityId: string;
+  };
+  snapshot: JsonValue;
+}
+
+export interface EffectiveConfigurationContribution {
+  referenceId: string;
+  scope: "employee" | "project" | "run";
+  action: "base" | "append" | "select" | "override" | "narrow" | "resolve";
+  path?: string;
+}
+
+export interface EffectiveConfigurationField {
+  key: string;
+  label: string;
+  mergeRule: string;
+  value: JsonValue;
+  contributions: EffectiveConfigurationContribution[];
+}
+
+export interface EffectiveExecutionProfile {
+  schemaVersion: 1;
+  compiledAt: string;
+  runId: string;
+  nodeId: string;
+  employee: { id: string; version: number; displayName: string };
+  assignment?: {
+    projectId: string;
+    projectVersion: number;
+    projectBindingVersion: number;
+    roleId: string;
+  };
+  fields: EffectiveConfigurationField[];
+  references: EffectiveConfigurationReference[];
 }
 
 export interface ContextView {
@@ -1048,4 +1195,5 @@ export interface ContextView {
     runMetadata?: JsonObject;
   };
   effectivePrompt?: { system: string; request: string; combined: string; runId: string; runDir: string };
+  effectiveProfile?: EffectiveExecutionProfile;
 }

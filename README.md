@@ -10,9 +10,10 @@
 - 在每份员工档案中核对 Provider 模型、adapter 与脱敏后的启动指令；
 - 独立维护带 Collection、Source、Revision 和发布指针的知识库，并用可复用 Knowledge Profile 给员工和项目角色按需分配；
 - 在知识后台通过项目内部 Codex 员工进行受限对话；LLM 只经 Knowledge Control MCP 读取、试跑和生成待人工审批的变更单；
+- 在 Employee 档案中通过项目内配置管家对话起草严格语义 Proposal，再由人逐项审阅并显式生成新版本；高级表单保留为精确查看与微调入口；
 - 从 CLI、HTTP、MCP 或本地 UI 直接调用任意 Employee；
 - 用一份短小的项目声明接入代码仓库，在项目角色槽位上选择 Employee 与 Skill 子集，而不复制完整 Prompt；
-- 查看版本固定的 Session、七层上下文、Knowledge Plan 和完整有效 Prompt；
+- 查看版本固定的 Session、上下文、Knowledge Plan、完整有效 Prompt，以及按字段编译的有效执行配置与来源快照；
 - 从四种常用多 Agent 模板生成 Graph 草稿，在画布拖动节点、改派员工与编辑依赖，并保存不可变 Run 证据；
 - 将一个 Employee 或 Workflow 发布成 A2A v1 Agent；
 - 在 `127.0.0.1` 上运行由 `claude-kimi` 设计的「档案室 / Dossier Office」客户端。
@@ -148,6 +149,8 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 - [知识库设计与交付入口](docs/knowledge-base/README.md)
 - [实时调用与员工出勤模型](docs/live-invocations.md)
 - [项目接入、员工任用与调用](docs/project-integration.md)
+- [对话式 Employee 配置](docs/employee-configuration-conversation.md)
+- [有效执行配置与来源追踪](docs/effective-execution-profile.md)
 - [档案室 UI 规范](docs/workbench-ui.md)
 - [实现与协议手册](docs/workbench-implementation.md)
 - [架构与源方案映射](docs/architecture.md)

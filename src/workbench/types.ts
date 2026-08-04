@@ -16,6 +16,7 @@ import type {
   KnowledgeProfileGrantInput,
   KnowledgeProfileRecord
 } from "../knowledge/types.js";
+import type { ConfigurationProposal } from "../configuration/types.js";
 
 export type RecordStatus = "active" | "archived";
 
@@ -50,6 +51,10 @@ export interface EmployeeContextPolicy {
 export type EmployeeScope =
   | { kind: "global" }
   | { kind: "project"; projectId: string; projectVersion: number };
+
+export type EmployeeScopeInput =
+  | { kind: "global" }
+  | { kind: "project"; projectId: string; projectVersion?: number };
 
 export interface EmployeeTemplateSource {
   id: string;
@@ -257,6 +262,7 @@ export interface EmployeeSession {
   };
   title: string;
   status: "active" | "closed";
+  context?: JsonObject;
   messages: EmployeeSessionMessage[];
   createdAt: string;
   updatedAt: string;
@@ -462,6 +468,7 @@ export interface InvocationRecord {
   status: InvocationStatus;
   phase: string;
   requestSummary: string;
+  requestContext?: JsonObject;
   runId: string;
   sessionId?: string;
   instanceIds: string[];
@@ -559,6 +566,7 @@ export interface ProjectRoleContract {
   description: string;
   requiredSkills: string[];
   optionalSkills: string[];
+  requiredProviderProfiles: string[];
   knowledgeProfileIds: string[];
   instructions: string;
   outputSchema?: JsonObject;
@@ -619,6 +627,7 @@ export interface WorkbenchState {
   knowledgeBases: Record<string, KnowledgeBaseRecord>;
   knowledgeProfiles: Record<string, KnowledgeProfileRecord>;
   knowledgeChangeRequests: Record<string, KnowledgeChangeRequest>;
+  configurationProposals: Record<string, ConfigurationProposal>;
   employees: Record<string, EmployeeRecord>;
   employeeTemplates: Record<string, EmployeeTemplateRecord>;
   managementPolicies: Record<string, ManagementPolicyRecord>;
@@ -679,7 +688,7 @@ export interface EmployeeCreateInput {
   systemPrompt?: string;
   requestPrompt?: string;
   capabilities?: string[];
-  scope?: EmployeeScope;
+  scope?: EmployeeScopeInput;
   skills?: RoleSkillBinding[];
   skillVersions?: Record<string, number>;
   knowledgeProfileIds?: string[];
@@ -818,6 +827,7 @@ export type WorkflowUpdateInput = GraphWorkflowUpdateInput | SupervisorWorkflowU
 export interface EmployeeInvocationInput {
   message: string;
   sessionId?: string;
+  context?: JsonObject;
 }
 
 export interface EmployeeInvocationResult {
@@ -827,6 +837,83 @@ export interface EmployeeInvocationResult {
   status: string;
   output?: JsonValue;
   message: string;
+}
+
+export type EffectiveConfigurationSourceKind =
+  | "employee"
+  | "project-contract"
+  | "project-binding"
+  | "skill"
+  | "knowledge-profile"
+  | "knowledge-base"
+  | "provider"
+  | "workflow"
+  | "task";
+
+export type EffectiveConfigurationPage =
+  | "employees"
+  | "projects"
+  | "skills"
+  | "knowledge"
+  | "workflows"
+  | "runs";
+
+/** One immutable, expandable source captured when a node is prepared. */
+export interface EffectiveConfigurationReference {
+  refId: string;
+  kind: EffectiveConfigurationSourceKind;
+  id: string;
+  version?: number;
+  revision?: number;
+  label: string;
+  route?: { page: EffectiveConfigurationPage; entityId: string };
+  snapshot: JsonValue;
+}
+
+export interface EffectiveConfigurationContribution {
+  referenceId: string;
+  scope: "employee" | "project" | "run";
+  action: "base" | "append" | "select" | "override" | "narrow" | "resolve";
+  path?: string;
+}
+
+export interface EffectiveConfigurationField {
+  key:
+    | "identity"
+    | "instructions"
+    | "capabilities"
+    | "skills"
+    | "knowledge"
+    | "runtime"
+    | "permissions"
+    | "output-contract"
+    | "context-policy"
+    | "task"
+    | "workflow";
+  label: string;
+  mergeRule: string;
+  value: JsonValue;
+  contributions: EffectiveConfigurationContribution[];
+}
+
+/**
+ * The executable, source-traceable configuration for one runtime node.
+ * This is a compiled Run artifact; Employee/Project/Skill records remain the sources of truth.
+ */
+export interface EffectiveExecutionProfile {
+  schemaVersion: 1;
+  compiledAt: string;
+  runId: string;
+  nodeId: string;
+  employee: { id: string; version: number; displayName: string };
+  assignment?: {
+    projectId: string;
+    projectVersion: number;
+    projectBindingVersion: number;
+    roleId: string;
+  };
+  fields: EffectiveConfigurationField[];
+  references: EffectiveConfigurationReference[];
 }
 
 export interface EmployeeContextView {
@@ -853,6 +940,7 @@ export interface EmployeeContextView {
     runId: string;
     runDir: string;
   };
+  effectiveProfile?: EffectiveExecutionProfile;
 }
 
 export const DEFAULT_EMPLOYEE_OUTPUT_SCHEMA: JsonObject = {

@@ -7,6 +7,8 @@ export { compilePlan, formatPlanMermaid, formatPlanText } from "./core/plan.js";
 export { renderRoleSystemPrompt, resolveRoleProfile } from "./core/roles.js";
 export { renderTemplate } from "./core/template.js";
 export type * from "./core/types.js";
+export { configurationPlanHash, configurationReviewProgress, latestConfigurationDecisions } from "./configuration/proposal.js";
+export type * from "./configuration/types.js";
 export { createDefaultProviderRegistry, registerProviderAdapter } from "./runtime/providers.js";
 export type * from "./runtime/providers.js";
 export { runWorkflow } from "./runtime/runner.js";

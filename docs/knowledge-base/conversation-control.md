@@ -69,11 +69,13 @@ URL 入口同样是有限能力：只接收目标 KnowledgeBase、Collection 和
 首次安装或重新建立本地数据时：
 
 ```bash
+npm run cli -- workbench project connect .
 npm run cli -- workbench skill-create templates/workbench/knowledge-control-conversation.skill.json
 npm run cli -- workbench employee create templates/workbench/knowledge-steward.employee.json
-npm run cli -- workbench project connect .
 npm run cli -- workbench project bind local-agent-workbench templates/workbench/local-agent-workbench.binding.json
 ```
+
+项目声明升级后，已有内部员工可执行 `npm run cli -- workbench employee repin-project local-agent-workbench-knowledge-steward` 生成固定当前项目版本的新 Employee 版本，再重新绑定。
 
 本机需要完成 Codex 登录，并使用支持 permission profiles 的 Codex CLI（`0.138.0+`；当前验收环境为 `0.142.0`）。Provider `codex-knowledge-control` 是无密钥的默认本地 Provider 定义，不会把认证信息写入 Workbench state。
 

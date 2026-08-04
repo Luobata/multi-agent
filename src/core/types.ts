@@ -9,6 +9,8 @@ export interface ProviderDefinition {
   adapter: string;
   /** Human-readable runtime model metadata. Invocation remains owned by the adapter definition. */
   model?: string;
+  /** System-certified execution profiles used by project assignment compatibility checks. */
+  runtimeProfiles?: string[];
   outputProtocol?: OutputProtocol;
   [key: string]: unknown;
 }

@@ -65,6 +65,7 @@ roles:
     displayName: 项目知识管理员
     description: 通过受限 Knowledge Control MCP 查询知识状态、生成变更提案，并把最终审批留给人。
     requiredSkills: [knowledge-control-conversation]
+    requiredProviderProfiles: [knowledge-proposal-only]
     knowledgeProfiles: []
     policyRef: docs/project-roles/knowledge-steward.md
     permissions:
@@ -83,3 +84,17 @@ roles:
         - knowledge_change_list
         - knowledge_change_get
         - knowledge_change_propose
+  configuration-steward:
+    displayName: 员工配置管家
+    description: 通过受限 Configuration Control MCP 读取单个 Employee 并生成待人工逐项审阅的严格配置 Proposal。
+    requiredSkills: [configuration-control-conversation]
+    requiredProviderProfiles: [configuration-proposal-only]
+    knowledgeProfiles: []
+    policyRef: docs/project-roles/configuration-steward.md
+    permissions:
+      write: none
+      tools:
+        - configuration_control_snapshot
+        - configuration_proposal_list
+        - configuration_proposal_get
+        - configuration_proposal_create

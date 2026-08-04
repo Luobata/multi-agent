@@ -28,6 +28,7 @@ roles:
     displayName: 测试验收
     description: 验证真实行为和自动化覆盖。
     requiredSkills: [browser-e2e-validation]
+    requiredProviderProfiles: []
     knowledgeProfiles: [workbench-quality-knowledge]
     policyRef: docs/agents/tester.md
     permissions:
@@ -35,6 +36,8 @@ roles:
 ```
 
 `policyRef` 和可选的 `outputSchemaRef` 必须位于项目根目录内。Workbench 读取并版本化其内容；YAML 不保存 Employee ID、Provider 命令、完整 Skill 指令或密钥。
+
+控制面角色可声明 `requiredProviderProfiles`，Binding 保存前会校验 Employee 所用 Provider 是否具备由系统管理的执行配置。例如员工配置管家要求 `configuration-proposal-only`，普通 command/full Provider 不能冒充该受限运行时。
 
 ## 接入与任用
 
@@ -104,13 +107,18 @@ MCP 对话使用：
 | `fullstack-developer` | `yaoxi-programmer` |
 | `test-engineer` | `xiaomixiang-tester` |
 | `knowledge-steward` | `local-agent-workbench-knowledge-steward`（项目内部） |
+| `configuration-steward` | `local-agent-workbench-configuration-steward`（项目内部） |
 
 ```bash
 npm run cli -- workbench employee create templates/workbench/mihuhu-frontend-engineer.employee.json
 npm run cli -- workbench project connect .
+npm run cli -- workbench skill-create templates/workbench/configuration-control-conversation.skill.json
+npm run cli -- workbench employee create templates/workbench/configuration-steward.employee.json
 npm run cli -- workbench project bind local-agent-workbench templates/workbench/local-agent-workbench.binding.json
 npm run cli -- workbench project invoke local-agent-workbench frontend-developer "完成当前前端开发任务"
 ```
+
+项目内部 Employee 固定项目版本。项目声明升级后，用 `workbench employee repin-project <employee-id>` 显式生成 Employee 新版本，再保存新 Binding；旧 Session 与旧 Binding 仍固定原版本。
 
 每个角色的项目权限会与 Employee 权限共同收窄；产品、设计和测试保持只读，三个开发角色可以按各自边界写入项目。直接调用 Employee 不会自动获得项目策略；项目工作应使用 `invoke_project_role`。
 

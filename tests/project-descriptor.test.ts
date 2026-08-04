@@ -90,7 +90,8 @@ describe("project descriptor", () => {
       ["backend-developer", "huotuizhu-product-manager"],
       ["fullstack-developer", "yaoxi-programmer"],
       ["test-engineer", "xiaomixiang-tester"],
-      ["knowledge-steward", "local-agent-workbench-knowledge-steward"]
+      ["knowledge-steward", "local-agent-workbench-knowledge-steward"],
+      ["configuration-steward", "local-agent-workbench-configuration-steward"]
     ];
 
     expect(project).toMatchObject({
@@ -120,6 +121,7 @@ describe("project descriptor", () => {
     const knowledgeSteward = project.roles.find((role) => role.id === "knowledge-steward");
     expect(knowledgeSteward).toMatchObject({
       requiredSkills: ["knowledge-control-conversation"],
+      requiredProviderProfiles: ["knowledge-proposal-only"],
       knowledgeProfileIds: [],
       permissions: {
         write: "none",
@@ -127,6 +129,27 @@ describe("project descriptor", () => {
       }
     });
     expect(knowledgeSteward?.permissions?.tools).not.toContain("knowledge_change_approve");
+
+    const configurationSteward = project.roles.find((role) => role.id === "configuration-steward");
+    expect(configurationSteward).toMatchObject({
+      requiredSkills: ["configuration-control-conversation"],
+      requiredProviderProfiles: ["configuration-proposal-only"],
+      knowledgeProfileIds: [],
+      permissions: {
+        write: "none",
+        tools: [
+          "configuration_control_snapshot",
+          "configuration_proposal_list",
+          "configuration_proposal_get",
+          "configuration_proposal_create"
+        ]
+      }
+    });
+    expect(configurationSteward?.permissions?.tools).not.toEqual(expect.arrayContaining([
+      "configuration_proposal_review",
+      "configuration_proposal_apply",
+      "update_employee"
+    ]));
 
     const binding = JSON.parse(
       fs.readFileSync(path.join(root, "templates/workbench/local-agent-workbench.binding.json"), "utf8")

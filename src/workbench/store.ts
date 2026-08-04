@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
+import { configurationReviewHash, configurationReviewProgress } from "../configuration/proposal.js";
 import type { ProviderDefinition } from "../core/types.js";
 import type { KnowledgeProfileGrant } from "../knowledge/types.js";
+import { isSystemManagedProviderId, systemProviderRuntimeProfiles } from "../runtime/systemProviders.js";
 import type { EmployeeDefinition, WorkbenchSkillDefinition, WorkbenchState } from "./types.js";
 import { defaultSupervisorFlow } from "./supervisorFlow.js";
 
@@ -23,6 +25,12 @@ const KNOWLEDGE_CONTROL_TOOLS = [
   "knowledge_change_list",
   "knowledge_change_get",
   "knowledge_change_propose"
+];
+const CONFIGURATION_CONTROL_TOOLS = [
+  "configuration_control_snapshot",
+  "configuration_proposal_list",
+  "configuration_proposal_get",
+  "configuration_proposal_create"
 ];
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const SYSTEM_SKILL_TIMESTAMP = "1970-01-01T00:00:00.000Z";
@@ -104,6 +112,7 @@ function resolveCodexCommand(): string {
 function codexKnowledgeControlProvider(): ProviderDefinition {
   return {
     adapter: "codex",
+    runtimeProfiles: [...systemProviderRuntimeProfiles("codex-knowledge-control")!],
     command: resolveCodexCommand(),
     filesystemIsolation: "workspace-read-only",
     workingDirectory: "{{run.materializedRoot}}",
@@ -122,6 +131,34 @@ function codexKnowledgeControlProvider(): ProviderDefinition {
   };
 }
 
+function codexConfigurationControlProvider(): ProviderDefinition {
+  return {
+    adapter: "codex",
+    runtimeProfiles: [...systemProviderRuntimeProfiles("codex-configuration-control")!],
+    command: resolveCodexCommand(),
+    filesystemIsolation: "workspace-read-only",
+    workingDirectory: "{{run.materializedRoot}}",
+    approvalPolicy: "never",
+    timeoutMs: 600_000,
+    outputProtocol: "json",
+    mcpServers: {
+      configuration_control: {
+        command: process.execPath,
+        args: [
+          path.join(packageRoot, "dist", "mcp", "main.js"),
+          "--profile",
+          "configuration-control",
+          "--source-run-id",
+          "{{run.id}}"
+        ],
+        cwd: "{{run.projectRoot}}",
+        enabledTools: CONFIGURATION_CONTROL_TOOLS,
+        defaultToolsApprovalMode: "approve"
+      }
+    }
+  };
+}
+
 function initialState(): WorkbenchState {
   return {
     schemaVersion: 1,
@@ -131,13 +168,15 @@ function initialState(): WorkbenchState {
         model: "deterministic-mock",
         outputProtocol: "json"
       },
-      "codex-knowledge-control": codexKnowledgeControlProvider()
+      "codex-knowledge-control": codexKnowledgeControlProvider(),
+      "codex-configuration-control": codexConfigurationControlProvider()
     },
     skills: { "team-orchestration": teamOrchestrationSkill() },
     skillHistory: { "team-orchestration": [teamOrchestrationSkill()] },
     knowledgeBases: {},
     knowledgeProfiles: {},
     knowledgeChangeRequests: {},
+    configurationProposals: {},
     employees: {},
     employeeTemplates: {},
     managementPolicies: {},
@@ -168,6 +207,11 @@ function normalizedStoredGrants(
 }
 
 function normalizeState(state: WorkbenchState): WorkbenchState {
+  // Runtime profiles are certifications, not user-authored metadata. Persisted
+  // custom Providers from older versions must not be able to self-assert one.
+  for (const [id, definition] of Object.entries(state.providers)) {
+    if (!isSystemManagedProviderId(id)) delete definition.runtimeProfiles;
+  }
   if (state.providers.mock?.adapter === "mock" && state.providers.mock.model === undefined) {
     state.providers.mock.model = "deterministic-mock";
   }
@@ -176,12 +220,55 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     ...codexKnowledgeControlProvider(),
     ...(typeof currentKnowledgeControl?.model === "string" ? { model: currentKnowledgeControl.model } : {})
   };
+  const currentConfigurationControl = state.providers["codex-configuration-control"];
+  state.providers["codex-configuration-control"] = {
+    ...codexConfigurationControlProvider(),
+    ...(typeof currentConfigurationControl?.model === "string" ? { model: currentConfigurationControl.model } : {})
+  };
   state.skillHistory ??= Object.fromEntries(
     Object.entries(state.skills).map(([id, skill]) => [id, [skill]])
   );
   state.knowledgeBases ??= {};
   state.knowledgeProfiles ??= {};
   state.knowledgeChangeRequests ??= {};
+  state.configurationProposals ??= {};
+  for (const proposal of Object.values(state.configurationProposals)) {
+    proposal.progress = configurationReviewProgress(
+      proposal.reviewItems.map((item) => item.id),
+      proposal.decisions
+    );
+    if (!Number.isInteger(proposal.reviewRevision) || proposal.reviewRevision < 0) {
+      proposal.reviewRevision = proposal.decisions.length;
+    }
+    proposal.reviewHash = configurationReviewHash(proposal);
+    const source = proposal.source as Partial<typeof proposal.source>;
+    const verifiedSource = source.kind === "ai-generated"
+      && typeof source.invocationId === "string"
+      && typeof source.projectId === "string"
+      && Number.isInteger(source.projectVersion)
+      && typeof source.projectRoleId === "string"
+      && Number.isInteger(source.projectBindingVersion)
+      && typeof source.employeeId === "string"
+      && Number.isInteger(source.employeeVersion)
+      && typeof source.requestedBy === "string"
+      && typeof source.sessionId === "string"
+      && typeof source.runId === "string";
+    const reviewItemIds = new Set(proposal.reviewItems.map((item) => item.id));
+    const validLedger = reviewItemIds.size === proposal.reviewItems.length
+      && proposal.decisions.every((decision) => reviewItemIds.has(decision.reviewItemId) && decision.planHash === proposal.planHash);
+    if (!verifiedSource || !validLedger) {
+      const integrityError = !verifiedSource
+        ? "legacy configuration proposal has no verifiable source Run"
+        : "configuration proposal review ledger is invalid";
+      if (["awaiting-review", "ready-to-apply", "applying", "needs-reapproval"].includes(proposal.status)) {
+        proposal.status = "needs-reapproval";
+        proposal.error = `${integrityError}; create a fresh proposal`;
+      } else {
+        proposal.error = `${integrityError}; historical outcome was preserved but its audit evidence is incomplete`;
+      }
+      proposal.validation = { valid: false, errors: [proposal.error] };
+    }
+  }
   state.managementPolicies ??= {};
   state.entrancePolicies ??= {};
   state.invocations ??= {};
@@ -269,9 +356,15 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   }
   for (const record of Object.values(state.projects)) {
     for (const project of record.versions) {
-      for (const role of project.roles) role.knowledgeProfileIds ??= [];
+      for (const role of project.roles) {
+        role.knowledgeProfileIds ??= [];
+        role.requiredProviderProfiles ??= [];
+      }
     }
-    for (const role of record.current.roles) role.knowledgeProfileIds ??= [];
+    for (const role of record.current.roles) {
+      role.knowledgeProfileIds ??= [];
+      role.requiredProviderProfiles ??= [];
+    }
   }
   for (const record of Object.values(state.projectBindings)) {
     for (const binding of record.versions) {

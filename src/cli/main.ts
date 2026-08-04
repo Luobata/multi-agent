@@ -210,6 +210,15 @@ employee
   });
 
 employee
+  .command("repin-project")
+  .description("Create a new Employee version pinned to its project's current or requested version")
+  .argument("<id>", "project-scoped Employee id")
+  .option("--project-version <version>", "specific existing project version", (value: string) => Number(value))
+  .action(async (id: string, options: { projectVersion?: number }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).repinEmployeeProject(id, options.projectVersion), null, 2)}\n`);
+  });
+
+employee
   .command("invoke")
   .argument("<id>", "Employee id")
   .argument("<message>", "request text")

@@ -32,7 +32,7 @@ function invocationHeaders(metadata: { project?: string; contextId?: string; cal
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0));
 }
 
-export type WorkbenchMcpProfile = "full" | "knowledge-control";
+export type WorkbenchMcpProfile = "full" | "knowledge-control" | "configuration-control";
 
 const resourceId = z.string().regex(/^[a-z][a-z0-9-]*$/, "use a lowercase kebab-case resource id");
 const catalogValue = z.string().min(1);
@@ -215,11 +215,161 @@ const knowledgeChangeOperationSchema = z.discriminatedUnion("type", [
   }).strict()
 ]);
 
+const configurationRisk = z.enum(["low", "medium", "high"]);
+const configurationIdentitySchema = z.object({
+  displayName: z.string().min(1),
+  background: z.string().min(1),
+  responsibilities: z.array(z.string().min(1)).min(1),
+  goals: z.array(z.string().min(1)).optional(),
+  constraints: z.array(z.string().min(1)).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
+}).strict();
+const configurationSkillBindingSchema = z.union([
+  resourceId,
+  z.object({
+    id: resourceId,
+    config: z.record(z.string(), z.unknown()).optional(),
+    enabled: z.boolean().optional()
+  }).strict()
+]);
+const configurationVerdictSchema = z.object({
+  path: z.string().min(1),
+  pass: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])),
+  block: z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+}).strict();
+const configurationOperationSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("identity-profile.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({ identity: configurationIdentitySchema, description: z.string().min(1) }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("prompts.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({ systemPrompt: z.string().min(1), requestPrompt: z.string().min(1) }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("capabilities.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({ capabilities: z.array(z.string().min(1)) }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("skills.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({
+      skills: z.array(configurationSkillBindingSchema),
+      skillVersions: z.record(resourceId, z.number().int().positive()).optional()
+    }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("runtime.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({ providerId: resourceId, maxAttempts: z.number().int().min(1).max(10) }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("permissions.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({
+      permissions: z.object({
+        write: z.enum(["none", "artifacts-only", "project"]),
+        tools: z.array(z.string().min(1)).optional()
+      }).strict()
+    }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("output-contract.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({
+      outputSchema: z.record(z.string(), z.unknown()),
+      verdict: configurationVerdictSchema.nullable().optional()
+    }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("context-policy.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({ historyLimit: z.number().int().min(0).max(100) }).strict()
+  }).strict(),
+  z.object({
+    type: z.literal("presentation.set"),
+    rationale: z.string().min(1),
+    risk: configurationRisk,
+    payload: z.object({
+      accent: z.string().min(1).optional(),
+      initials: z.string().min(1).optional(),
+      avatarUrl: z.string().min(1).optional()
+    }).strict()
+  }).strict()
+]);
+
 export function createWorkbenchMcpServer(
   daemonUrl = "http://127.0.0.1:4318",
-  options: { profile?: WorkbenchMcpProfile } = {}
+  options: { profile?: WorkbenchMcpProfile; sourceRunId?: string } = {}
 ): McpServer {
   const server = new McpServer({ name: "local-agent-workbench", version: "0.1.0" });
+
+  if (options.profile === "configuration-control") {
+    const sourceRunId = () => {
+      const value = options.sourceRunId?.trim();
+      if (!value) throw new Error("configuration-control MCP requires a source Run id");
+      return value;
+    };
+    server.registerTool("configuration_control_snapshot", {
+      title: "Inspect one Employee configuration target",
+      description: "Read one existing Employee, available Providers and Skills, and its frozen configuration proposals. Knowledge grants are intentionally excluded. This tool never mutates state.",
+      inputSchema: {}
+    }, async () => content(await request(
+      daemonUrl,
+      `/api/configuration-control/snapshot?sourceRunId=${encodeURIComponent(sourceRunId())}`
+    )));
+
+    server.registerTool("configuration_proposal_list", {
+      title: "List Employee configuration proposals",
+      description: "List frozen proposals and human review progress for one Employee. This tool cannot review or apply them.",
+      inputSchema: {}
+    }, async () => content(await request(
+      daemonUrl,
+      `/api/configuration-control/proposals?sourceRunId=${encodeURIComponent(sourceRunId())}`
+    )));
+
+    server.registerTool("configuration_proposal_get", {
+      title: "Inspect one Employee configuration proposal",
+      description: "Read semantic before/after review items, expected Employee version, risk, plan hash, and review progress.",
+      inputSchema: { proposalId: z.string().min(1) }
+    }, async ({ proposalId }) => content(await request(
+      daemonUrl,
+      `/api/configuration-control/proposals/${encodeURIComponent(proposalId)}?sourceRunId=${encodeURIComponent(sourceRunId())}`
+    )));
+
+    server.registerTool("configuration_proposal_create", {
+      title: "Create a governed Employee configuration proposal",
+      description: "Create one frozen, strictly typed proposal for a single existing Employee. This never reviews, applies, patches, or changes the Employee. Read the current target first.",
+      inputSchema: {
+        title: z.string().min(1),
+        reason: z.string().min(1),
+        operations: z.array(configurationOperationSchema).min(1).max(9)
+      }
+    }, async (input) => content(await request(
+      daemonUrl,
+      "/api/configuration-proposals",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...input,
+          sourceRunId: sourceRunId()
+        })
+      }
+    )));
+
+    return server;
+  }
 
   if (options.profile === "knowledge-control") {
     server.registerTool("knowledge_control_snapshot", {

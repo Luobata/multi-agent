@@ -19,6 +19,22 @@ import type {
   RolePermissionDefinition,
   RoleSkillBinding
 } from "../core/types.js";
+import {
+  configurationPlanHash,
+  configurationReviewHash,
+  configurationReviewProgress,
+  latestConfigurationDecisions
+} from "../configuration/proposal.js";
+import type {
+  ConfigurationOperation,
+  ConfigurationOperationRisk,
+  ConfigurationOperationType,
+  ConfigurationProposal,
+  ConfigurationProposalApplyInput,
+  ConfigurationProposalCreateInput,
+  ConfigurationReviewDecisionInput,
+  ConfigurationReviewItem
+} from "../configuration/types.js";
 import { KnowledgeRuntime } from "../knowledge/runtime.js";
 import { assessKnowledgeRevision } from "../knowledge/assessment.js";
 import { knowledgeChangePlanHash, knowledgeChangeRisk } from "../knowledge/change.js";
@@ -68,6 +84,7 @@ import type {
   KnowledgeWikiView
 } from "../knowledge/types.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
+import { isSystemManagedProviderId } from "../runtime/systemProviders.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
 import {
   materializeWorkflow,
@@ -78,6 +95,7 @@ import {
 import { loadProjectDescriptor } from "./projectDescriptor.js";
 import { WorkbenchStore } from "./store.js";
 import { normalizeSupervisorFlow } from "./supervisorFlow.js";
+import { compileEffectiveExecutionProfile } from "./effectiveProfile.js";
 import {
   evaluateEntrancePolicyDefinition,
   normalizeEntrancePolicyRouteResult,
@@ -93,8 +111,10 @@ import {
   type EmployeeContextView,
   type EmployeeCreateInput,
   type EmployeeDefinition,
+  type EffectiveExecutionProfile,
   type EmployeeFromTemplateCreateInput,
   type EmployeeScope,
+  type EmployeeScopeInput,
   type EmployeeTemplateCreateInput,
   type EmployeeTemplateDefaults,
   type EmployeeTemplateDefinition,
@@ -132,6 +152,7 @@ import {
   type ProjectCreateInput,
   type ProjectDefinition,
   type ProjectRecord,
+  type ProjectRoleContract,
   type ProjectRoleBinding,
   type ProjectRoleBindingInput,
   type GraphWorkbenchWorkflowDefinition,
@@ -315,7 +336,7 @@ function legacyMetadataProjectId(identity: RoleIdentityDefinition): string | und
 
 function normalizeEmployeeScope(
   state: WorkbenchState,
-  scope: EmployeeScope | undefined,
+  scope: EmployeeScopeInput | undefined,
   identity: RoleIdentityDefinition,
   label: string
 ): EmployeeScope {
@@ -325,7 +346,11 @@ function normalizeEmployeeScope(
     : { kind: "global" as const });
   if (normalized.kind === "global") return normalized;
   const projectId = requireId(normalized.projectId, `${label} project id`);
-  const projectVersionValue = validRevision(normalized.projectVersion, undefined, `${label} project version`);
+  const projectVersionValue = validRevision(
+    normalized.projectVersion,
+    legacyProjectId ? 1 : state.projects[projectId]?.current.version,
+    `${label} project version`
+  );
   if (!legacyProjectId) {
     const project = state.projects[projectId];
     if (!project) throw new Error(`project not found: ${projectId}`);
@@ -483,6 +508,95 @@ function buildEmployeeDefinition(
     createdAt: timestamp,
     updatedAt: timestamp
   };
+}
+
+function buildUpdatedEmployeeDefinition(
+  state: WorkbenchState,
+  id: string,
+  input: EmployeeUpdateInput,
+  updatedAt: string,
+  allowProjectRepin = false
+): EmployeeDefinition {
+  const record = state.employees[id];
+  if (!record) throw new Error(`employee not found: ${id}`);
+  const current = record.current;
+  const providerId = input.providerId ?? current.providerId;
+  if (!state.providers[providerId]) throw new Error(`unknown provider ${providerId}`);
+  const skills = input.skills ?? current.skills;
+  const skillVersions = input.skills === undefined && input.skillVersions === undefined
+    ? current.skillVersions
+    : pinSkillVersions(state, skills, input.skillVersions);
+  validateSkillBindings(state, skills, skillVersions);
+  const knowledgeProfileIds = input.knowledgeProfileIds === undefined
+    ? current.knowledgeProfileIds
+    : validateKnowledgeProfileIds(state, input.knowledgeProfileIds, `employee ${id} knowledge profile`);
+  const outputSchema = input.outputSchema ?? current.outputSchema;
+  validateSchema(outputSchema, `employee ${id} outputSchema`);
+  const verdict = input.verdict === undefined ? current.verdict : input.verdict ?? undefined;
+  validateVerdict(verdict, `employee ${id}`);
+  const identity = input.identity ?? current.identity;
+  const legacyScopedProjectId = legacyMetadataProjectId(current.identity);
+  if (legacyMetadataProjectId(identity) !== legacyScopedProjectId) {
+    throw new Error(legacyScopedProjectId
+      ? `employee ${id} internal project scope ${legacyScopedProjectId} is immutable`
+      : `employee ${id} internal project identity scope is immutable`);
+  }
+  const scopedRoleId = internalProjectRoleId(current);
+  if (internalProjectRoleId({ ...current, identity }) !== scopedRoleId) {
+    throw new Error(scopedRoleId
+      ? `employee ${id} internal project role scope ${scopedRoleId} is immutable`
+      : `employee ${id} internal project role scope is immutable`);
+  }
+  const knowledgeGrants = normalizeKnowledgeGrants(
+    knowledgeProfileIds,
+    input.knowledgeGrants,
+    updatedAt,
+    current.knowledgeGrants
+  );
+  const scope = input.scope === undefined
+    ? current.scope
+    : normalizeEmployeeScope(state, input.scope, identity, `employee ${id} scope`);
+  const repinsSameProject = current.scope.kind === "project"
+    && scope.kind === "project"
+    && current.scope.projectId === scope.projectId;
+  if (!sameEmployeeScope(current.scope, scope) && !(allowProjectRepin && repinsSameProject)) {
+    throw new Error(`employee ${id} scope is immutable outside its current project`);
+  }
+  const updated: EmployeeDefinition = {
+    ...current,
+    identity: {
+      ...identity,
+      displayName: requireText(identity.displayName, "employee displayName"),
+      background: requireText(identity.background, "employee background"),
+      responsibilities: identity.responsibilities.map((value) => requireText(value, "employee responsibility")),
+      goals: identity.goals?.map((value) => requireText(value, "employee goal")),
+      constraints: identity.constraints?.map((value) => requireText(value, "employee constraint"))
+    },
+    description: input.description === undefined ? current.description : requireText(input.description, "employee description"),
+    systemPrompt: input.systemPrompt === undefined ? current.systemPrompt : requireText(input.systemPrompt, "employee systemPrompt"),
+    requestPrompt: input.requestPrompt === undefined ? current.requestPrompt : requireText(input.requestPrompt, "employee requestPrompt"),
+    capabilities: input.capabilities === undefined
+      ? current.capabilities
+      : normalizeCapabilities(input.capabilities, `employee ${id} capability`),
+    scope,
+    skills,
+    skillVersions,
+    knowledgeProfileIds,
+    knowledgeGrants,
+    providerId,
+    outputSchema,
+    maxAttempts: input.maxAttempts === undefined ? current.maxAttempts : Math.max(1, Math.min(10, input.maxAttempts)),
+    permissions: input.permissions ?? current.permissions,
+    verdict,
+    contextPolicy: {
+      historyLimit: Math.max(0, Math.min(100, input.contextPolicy?.historyLimit ?? current.contextPolicy.historyLimit))
+    },
+    presentation: input.presentation ?? current.presentation,
+    version: current.version + 1,
+    updatedAt
+  };
+  if (updated.identity.responsibilities.length === 0) throw new Error("employee responsibilities must not be empty");
+  return updated;
 }
 
 function normalizeEmployeeTemplateDefaults(
@@ -719,6 +833,523 @@ function internalProjectVersion(employee: EmployeeDefinition): number | undefine
 function internalProjectRoleId(employee: EmployeeDefinition): string | undefined {
   const value = employee.identity.metadata?.internalProjectRoleId;
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function assertProjectRoleProviderCompatibility(
+  state: WorkbenchState,
+  role: Pick<ProjectRoleContract, "id" | "requiredProviderProfiles">,
+  employee: EmployeeDefinition
+): void {
+  const provider = state.providers[employee.providerId];
+  if (!provider) throw new Error(`employee ${employee.id} uses unknown provider ${employee.providerId}`);
+  const missingProviderProfiles = role.requiredProviderProfiles
+    .filter((profile) => !provider.runtimeProfiles?.includes(profile));
+  if (missingProviderProfiles.length > 0) {
+    throw new Error(`employee ${employee.id} Provider ${employee.providerId} lacks required runtime profiles: ${missingProviderProfiles.join(", ")}`);
+  }
+}
+
+const CONFIGURATION_OPERATION_LABELS: Record<ConfigurationOperationType, string> = {
+  "identity-profile.set": "身份与档案摘要",
+  "prompts.set": "提示词",
+  "capabilities.set": "结构化能力",
+  "skills.set": "Skill 绑定",
+  "runtime.set": "运行时",
+  "permissions.set": "权限",
+  "output-contract.set": "输出契约",
+  "context-policy.set": "上下文策略",
+  "presentation.set": "外观"
+};
+
+const CONFIGURATION_RISK_RANK: Record<ConfigurationOperationRisk, number> = {
+  low: 0,
+  medium: 1,
+  high: 2
+};
+
+const CONFIGURATION_MINIMUM_RISK: Record<ConfigurationOperationType, ConfigurationOperationRisk> = {
+  "identity-profile.set": "medium",
+  "prompts.set": "medium",
+  "capabilities.set": "medium",
+  "skills.set": "high",
+  "runtime.set": "high",
+  "permissions.set": "high",
+  "output-contract.set": "high",
+  "context-policy.set": "medium",
+  "presentation.set": "low"
+};
+
+function configurationOperationRisk(
+  type: ConfigurationOperationType,
+  proposedRisk: ConfigurationOperationRisk
+): ConfigurationOperationRisk {
+  const minimumRisk = CONFIGURATION_MINIMUM_RISK[type];
+  return CONFIGURATION_RISK_RANK[proposedRisk] >= CONFIGURATION_RISK_RANK[minimumRisk]
+    ? proposedRisk
+    : minimumRisk;
+}
+
+function strictConfigurationObject(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function onlyConfigurationKeys(value: Record<string, unknown>, keys: string[], label: string): void {
+  const allowed = new Set(keys);
+  const unexpected = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unexpected.length > 0) throw new Error(`${label} contains unsupported fields: ${unexpected.join(", ")}`);
+}
+
+function configurationStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`${label} must be an array of strings`);
+  }
+  return value.map((item) => requireText(item, label));
+}
+
+function normalizeConfigurationOperation(value: unknown, index: number): ConfigurationOperation {
+  const label = `configuration operation ${index + 1}`;
+  const operation = strictConfigurationObject(value, label);
+  onlyConfigurationKeys(operation, ["type", "rationale", "risk", "payload"], label);
+  const type = operation.type;
+  if (typeof type !== "string" || !(type in CONFIGURATION_OPERATION_LABELS)) {
+    throw new Error(`${label} has unsupported type ${String(type)}`);
+  }
+  const operationType = type as ConfigurationOperationType;
+  const rationale = requireText(String(operation.rationale ?? ""), `${label} rationale`);
+  if (operation.risk !== "low" && operation.risk !== "medium" && operation.risk !== "high") {
+    throw new Error(`${label} risk must be low, medium, or high`);
+  }
+  const risk = configurationOperationRisk(operationType, operation.risk);
+  const payload = strictConfigurationObject(operation.payload, `${label} payload`);
+  switch (operationType) {
+    case "identity-profile.set": {
+      onlyConfigurationKeys(payload, ["identity", "description"], `${label} payload`);
+      const identity = strictConfigurationObject(payload.identity, `${label} identity`);
+      onlyConfigurationKeys(identity, ["displayName", "background", "responsibilities", "goals", "constraints", "metadata"], `${label} identity`);
+      const metadata = identity.metadata === undefined
+        ? undefined
+        : strictConfigurationObject(identity.metadata, `${label} identity metadata`) as JsonObject;
+      return {
+        type: operationType,
+        rationale,
+        risk,
+        payload: {
+          identity: {
+            displayName: requireText(String(identity.displayName ?? ""), `${label} displayName`),
+            background: requireText(String(identity.background ?? ""), `${label} background`),
+            responsibilities: configurationStringArray(identity.responsibilities, `${label} responsibilities`),
+            goals: identity.goals === undefined ? undefined : configurationStringArray(identity.goals, `${label} goals`),
+            constraints: identity.constraints === undefined ? undefined : configurationStringArray(identity.constraints, `${label} constraints`),
+            metadata
+          },
+          description: requireText(String(payload.description ?? ""), `${label} description`)
+        }
+      };
+    }
+    case "prompts.set":
+      onlyConfigurationKeys(payload, ["systemPrompt", "requestPrompt"], `${label} payload`);
+      return {
+        type: operationType,
+        rationale,
+        risk,
+        payload: {
+          systemPrompt: requireText(String(payload.systemPrompt ?? ""), `${label} systemPrompt`),
+          requestPrompt: requireText(String(payload.requestPrompt ?? ""), `${label} requestPrompt`)
+        }
+      };
+    case "capabilities.set":
+      onlyConfigurationKeys(payload, ["capabilities"], `${label} payload`);
+      return { type: operationType, rationale, risk, payload: { capabilities: configurationStringArray(payload.capabilities, `${label} capabilities`) } };
+    case "skills.set": {
+      onlyConfigurationKeys(payload, ["skills", "skillVersions"], `${label} payload`);
+      if (!Array.isArray(payload.skills)) throw new Error(`${label} skills must be an array`);
+      const skills = payload.skills.map((binding, bindingIndex): RoleSkillBinding => {
+        if (typeof binding === "string") return requireId(binding, `${label} skill id`);
+        const entry = strictConfigurationObject(binding, `${label} skill ${bindingIndex + 1}`);
+        onlyConfigurationKeys(entry, ["id", "config", "enabled"], `${label} skill ${bindingIndex + 1}`);
+        const config = entry.config === undefined
+          ? {}
+          : strictConfigurationObject(entry.config, `${label} skill ${bindingIndex + 1} config`) as JsonObject;
+        if (entry.enabled !== undefined && typeof entry.enabled !== "boolean") {
+          throw new Error(`${label} skill ${bindingIndex + 1} enabled must be boolean`);
+        }
+        return { id: requireId(String(entry.id ?? ""), `${label} skill id`), config, enabled: entry.enabled as boolean | undefined };
+      });
+      let skillVersions: Record<string, number> | undefined;
+      if (payload.skillVersions !== undefined) {
+        const versions = strictConfigurationObject(payload.skillVersions, `${label} skillVersions`);
+        skillVersions = Object.fromEntries(Object.entries(versions).map(([id, version]) => {
+          requireId(id, `${label} skill version id`);
+          if (!Number.isInteger(version) || Number(version) < 1) {
+            throw new Error(`${label} skill version ${id} must be a positive integer`);
+          }
+          return [id, Number(version)];
+        }));
+      }
+      return { type: operationType, rationale, risk, payload: { skills, skillVersions } };
+    }
+    case "runtime.set": {
+      onlyConfigurationKeys(payload, ["providerId", "maxAttempts"], `${label} payload`);
+      const maxAttempts = Number(payload.maxAttempts);
+      if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+        throw new Error(`${label} maxAttempts must be an integer from 1 to 10`);
+      }
+      return { type: operationType, rationale, risk, payload: { providerId: requireId(String(payload.providerId ?? ""), `${label} providerId`), maxAttempts } };
+    }
+    case "permissions.set": {
+      onlyConfigurationKeys(payload, ["permissions"], `${label} payload`);
+      const permissions = strictConfigurationObject(payload.permissions, `${label} permissions`);
+      onlyConfigurationKeys(permissions, ["write", "tools"], `${label} permissions`);
+      if (permissions.write !== "none" && permissions.write !== "artifacts-only" && permissions.write !== "project") {
+        throw new Error(`${label} permissions.write is invalid`);
+      }
+      return {
+        type: operationType,
+        rationale,
+        risk,
+        payload: {
+          permissions: {
+            write: permissions.write,
+            tools: permissions.tools === undefined ? undefined : configurationStringArray(permissions.tools, `${label} permission tools`)
+          }
+        }
+      };
+    }
+    case "output-contract.set": {
+      onlyConfigurationKeys(payload, ["outputSchema", "verdict"], `${label} payload`);
+      const outputSchema = strictConfigurationObject(payload.outputSchema, `${label} outputSchema`) as JsonObject;
+      let verdict: EmployeeDefinition["verdict"] | null | undefined;
+      if (payload.verdict === null) verdict = null;
+      else if (payload.verdict !== undefined) {
+        const rawVerdict = strictConfigurationObject(payload.verdict, `${label} verdict`);
+        onlyConfigurationKeys(rawVerdict, ["path", "pass", "block"], `${label} verdict`);
+        if (!Array.isArray(rawVerdict.pass) || !Array.isArray(rawVerdict.block)) throw new Error(`${label} verdict pass/block must be arrays`);
+        const primitives = (items: unknown[], itemLabel: string) => items.map((item) => {
+          if (item !== null && !["string", "number", "boolean"].includes(typeof item)) throw new Error(`${itemLabel} must contain JSON primitives`);
+          return item as string | number | boolean | null;
+        });
+        verdict = {
+          path: requireText(String(rawVerdict.path ?? ""), `${label} verdict path`),
+          pass: primitives(rawVerdict.pass, `${label} verdict pass`),
+          block: primitives(rawVerdict.block, `${label} verdict block`)
+        };
+      }
+      return { type: operationType, rationale, risk, payload: { outputSchema, verdict } };
+    }
+    case "context-policy.set": {
+      onlyConfigurationKeys(payload, ["historyLimit"], `${label} payload`);
+      const historyLimit = Number(payload.historyLimit);
+      if (!Number.isInteger(historyLimit) || historyLimit < 0 || historyLimit > 100) {
+        throw new Error(`${label} historyLimit must be an integer from 0 to 100`);
+      }
+      return { type: operationType, rationale, risk, payload: { historyLimit } };
+    }
+    case "presentation.set": {
+      onlyConfigurationKeys(payload, ["accent", "initials", "avatarUrl"], `${label} payload`);
+      const optionalText = (value: unknown, field: string) => value === undefined ? undefined : requireText(String(value), `${label} ${field}`);
+      return {
+        type: operationType,
+        rationale,
+        risk,
+        payload: {
+          accent: optionalText(payload.accent, "accent"),
+          initials: optionalText(payload.initials, "initials"),
+          avatarUrl: optionalText(payload.avatarUrl, "avatarUrl")
+        }
+      };
+    }
+  }
+}
+
+function configurationUpdateInput(operations: ConfigurationOperation[]): EmployeeUpdateInput {
+  const input: EmployeeUpdateInput = {};
+  for (const operation of operations) {
+    switch (operation.type) {
+      case "identity-profile.set":
+        input.identity = operation.payload.identity;
+        input.description = operation.payload.description;
+        break;
+      case "prompts.set":
+        input.systemPrompt = operation.payload.systemPrompt;
+        input.requestPrompt = operation.payload.requestPrompt;
+        break;
+      case "capabilities.set": input.capabilities = operation.payload.capabilities; break;
+      case "skills.set":
+        input.skills = operation.payload.skills;
+        input.skillVersions = operation.payload.skillVersions;
+        break;
+      case "runtime.set":
+        input.providerId = operation.payload.providerId;
+        input.maxAttempts = operation.payload.maxAttempts;
+        break;
+      case "permissions.set": input.permissions = operation.payload.permissions; break;
+      case "output-contract.set":
+        input.outputSchema = operation.payload.outputSchema;
+        if ("verdict" in operation.payload) input.verdict = operation.payload.verdict;
+        break;
+      case "context-policy.set": input.contextPolicy = { historyLimit: operation.payload.historyLimit }; break;
+      case "presentation.set": input.presentation = operation.payload; break;
+    }
+  }
+  return input;
+}
+
+function employeeConfigurationGroup(employee: EmployeeDefinition, type: ConfigurationOperationType): JsonValue {
+  switch (type) {
+    case "identity-profile.set": return jsonValue({ identity: employee.identity, description: employee.description });
+    case "prompts.set": return jsonValue({ systemPrompt: employee.systemPrompt, requestPrompt: employee.requestPrompt });
+    case "capabilities.set": return jsonValue({ capabilities: employee.capabilities });
+    case "skills.set": return jsonValue({ skills: employee.skills, skillVersions: employee.skillVersions });
+    case "runtime.set": return jsonValue({ providerId: employee.providerId, maxAttempts: employee.maxAttempts });
+    case "permissions.set": return jsonValue({ permissions: employee.permissions });
+    case "output-contract.set": return jsonValue({ outputSchema: employee.outputSchema, verdict: employee.verdict });
+    case "context-policy.set": return jsonValue(employee.contextPolicy);
+    case "presentation.set": return jsonValue(employee.presentation);
+  }
+}
+
+interface ConfigurationProposalPlan {
+  operations: ConfigurationOperation[];
+  reviewItems: ConfigurationReviewItem[];
+  candidate: EmployeeDefinition;
+  planHash: string;
+}
+
+function planConfigurationProposal(
+  state: WorkbenchState,
+  employeeIdInput: string,
+  expectedVersion: number,
+  operationInputs: ConfigurationOperation[]
+): ConfigurationProposalPlan {
+  const employeeId = requireId(employeeIdInput, "configuration proposal employeeId");
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+    throw new Error("configuration proposal expectedEmployeeVersion must be a positive integer");
+  }
+  const record = state.employees[employeeId];
+  if (!record) throw new Error(`employee not found: ${employeeId}`);
+  const current = record.current;
+  if (current.version !== expectedVersion) {
+    throw new Error(`employee ${employeeId} is v${current.version}, expected v${expectedVersion}`);
+  }
+  if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
+  if (!Array.isArray(operationInputs) || operationInputs.length === 0 || operationInputs.length > 9) {
+    throw new Error("configuration proposal must contain from 1 to 9 semantic operations");
+  }
+  const operations = operationInputs.map(normalizeConfigurationOperation).map((operation): ConfigurationOperation => {
+    if (operation.type !== "skills.set") return operation;
+    const boundIds = operation.payload.skills.map((binding) => normalizeBinding(binding).id);
+    const unexpectedVersionIds = Object.keys(operation.payload.skillVersions ?? {})
+      .filter((id) => !boundIds.includes(id));
+    if (unexpectedVersionIds.length > 0) {
+      throw new Error(`configuration proposal skillVersions reference unbound Skills: ${unexpectedVersionIds.join(", ")}`);
+    }
+    const skillVersions = Object.fromEntries(boundIds.flatMap((id) => {
+      const requestedVersion = operation.payload.skillVersions?.[id];
+      const retainedVersion = current.skillVersions[id];
+      const version = requestedVersion ?? retainedVersion;
+      return version === undefined ? [] : [[id, version]];
+    }));
+    return { ...operation, payload: { ...operation.payload, skillVersions } };
+  });
+  const repeated = operations.find((operation, index) => operations.findIndex((candidate) => candidate.type === operation.type) !== index);
+  if (repeated) throw new Error(`configuration proposal repeats semantic group ${repeated.type}`);
+  const candidate = buildUpdatedEmployeeDefinition(state, employeeId, configurationUpdateInput(operations), current.updatedAt);
+  const reviewItems = operations.map((operation, operationIndex): ConfigurationReviewItem => ({
+    id: `review-${String(operationIndex + 1).padStart(2, "0")}-${operation.type.replace(".set", "")}`,
+    operationIndex,
+    operationType: operation.type,
+    label: CONFIGURATION_OPERATION_LABELS[operation.type],
+    rationale: operation.rationale,
+    risk: operation.risk,
+    before: employeeConfigurationGroup(current, operation.type),
+    after: employeeConfigurationGroup(candidate, operation.type)
+  }));
+  const unchanged = reviewItems.find((item) => configurationPlanHash(item.before) === configurationPlanHash(item.after));
+  if (unchanged) {
+    throw new Error(`configuration proposal operation ${unchanged.operationType} does not change the current Employee`);
+  }
+  const planHash = configurationPlanHash(jsonValue({
+    employeeId,
+    expectedEmployeeVersion: expectedVersion,
+    operations,
+    reviewItems,
+    dependencies: {
+      provider: state.providers[candidate.providerId],
+      skillVersions: candidate.skillVersions
+    }
+  }));
+  return { operations, reviewItems, candidate, planHash };
+}
+
+interface ConfigurationControlAccess {
+  invocation: InvocationRecord;
+  session: EmployeeSession;
+  targetEmployeeId: string;
+  expectedEmployeeVersion: number;
+  project: ProjectDefinition;
+  binding: ProjectBindingDefinition;
+  projectRoleId: string;
+  steward: EmployeeDefinition;
+}
+
+function configurationControlAccess(
+  state: WorkbenchState,
+  sourceRunIdInput: string,
+  requiredTool: string
+): ConfigurationControlAccess {
+  const sourceRunId = requireText(sourceRunIdInput, "configuration control sourceRunId");
+  const invocation = Object.values(state.invocations).find((candidate) => candidate.runId === sourceRunId);
+  if (!invocation) throw new Error(`configuration control run not found: ${sourceRunId}`);
+  if (invocation.status !== "running") {
+    throw new Error(`configuration control run ${sourceRunId} is ${invocation.status}, expected running`);
+  }
+  if (!invocation.sessionId) throw new Error(`configuration control run ${sourceRunId} has no Session`);
+  const session = state.sessions[invocation.sessionId];
+  if (!session?.assignment) throw new Error(`configuration control run ${sourceRunId} has no project assignment`);
+  const projectId = requireId(invocation.source.project ?? "", "configuration control source project");
+  const projectRoleId = requireId(invocation.source.projectRole ?? "", "configuration control source project role");
+  if (session.assignment.projectId !== projectId || session.assignment.roleId !== projectRoleId) {
+    throw new Error(`configuration control run ${sourceRunId} Session assignment does not match its source`);
+  }
+  if (invocation.source.projectBindingVersion !== session.assignment.projectBindingVersion) {
+    throw new Error(`configuration control run ${sourceRunId} binding version does not match its Session`);
+  }
+  const projectRecord = state.projects[projectId];
+  if (!projectRecord) throw new Error(`configuration control project not found: ${projectId}`);
+  const project = projectVersion(projectRecord, session.assignment.projectVersion);
+  const role = project.roles.find((candidate) => candidate.id === projectRoleId);
+  if (!role) throw new Error(`configuration control project role not found: ${projectId}/${projectRoleId}`);
+  const bindingRecord = state.projectBindings[projectId];
+  const binding = bindingRecord?.versions.find((candidate) => candidate.version === session.assignment?.projectBindingVersion);
+  if (!binding || binding.projectVersion !== project.version) {
+    throw new Error(`configuration control binding v${session.assignment.projectBindingVersion} is unavailable for project v${project.version}`);
+  }
+  const roleBinding = binding.roles.find((candidate) => candidate.roleId === projectRoleId);
+  if (!roleBinding || roleBinding.employeeId !== session.employeeId || roleBinding.employeeVersion !== session.employeeVersion) {
+    throw new Error(`configuration control Session is not pinned to ${projectId}/${projectRoleId}`);
+  }
+  const stewardRecord = state.employees[session.employeeId];
+  if (!stewardRecord) throw new Error(`configuration control steward not found: ${session.employeeId}`);
+  const steward = employeeVersion(stewardRecord, session.employeeVersion);
+  if (invocation.target.id !== steward.id || invocation.target.version !== steward.version) {
+    throw new Error(`configuration control run ${sourceRunId} target does not match its bound Employee`);
+  }
+  const stewardProvider = state.providers[steward.providerId];
+  if (!stewardProvider?.runtimeProfiles?.includes("configuration-proposal-only")) {
+    throw new Error(`configuration control steward Provider ${steward.providerId} is not proposal-only`);
+  }
+  if (!role.permissions?.tools?.includes(requiredTool) || !steward.permissions.tools?.includes(requiredTool)) {
+    throw new Error(`configuration control run ${sourceRunId} is not allowed to use ${requiredTool}`);
+  }
+  const context = strictConfigurationObject(invocation.requestContext, "configuration control invocation context");
+  onlyConfigurationKeys(context, ["kind", "employeeId", "expectedEmployeeVersion"], "configuration control invocation context");
+  if (context.kind !== "employee-configuration") {
+    throw new Error("configuration control invocation context kind must be employee-configuration");
+  }
+  if (!session.context || !jsonEqual(session.context, context)) {
+    throw new Error(`configuration control run ${sourceRunId} context does not match its Session`);
+  }
+  const targetEmployeeId = requireId(String(context.employeeId ?? ""), "configuration control target Employee");
+  const expectedEmployeeVersion = Number(context.expectedEmployeeVersion);
+  if (!Number.isInteger(expectedEmployeeVersion) || expectedEmployeeVersion < 1) {
+    throw new Error("configuration control expected Employee version must be a positive integer");
+  }
+  const target = state.employees[targetEmployeeId]?.current;
+  if (!target) throw new Error(`employee not found: ${targetEmployeeId}`);
+  if (target.status !== "active") throw new Error(`employee ${targetEmployeeId} is archived`);
+  if (target.version !== expectedEmployeeVersion) {
+    throw new Error(`employee ${targetEmployeeId} is v${target.version}, expected v${expectedEmployeeVersion}`);
+  }
+  return {
+    invocation,
+    session,
+    targetEmployeeId,
+    expectedEmployeeVersion,
+    project,
+    binding,
+    projectRoleId,
+    steward
+  };
+}
+
+type ConfigurationProposalAttestation =
+  | { kind: "attested" }
+  | { kind: "pending"; error: string }
+  | { kind: "invalid"; error: string };
+
+const CONFIGURATION_ATTESTATION_GRACE_MS = 30_000;
+
+function configurationProposalAttestation(
+  state: WorkbenchState,
+  proposal: ConfigurationProposal
+): ConfigurationProposalAttestation {
+  const invocation = state.invocations[proposal.source.invocationId];
+  if (!invocation || invocation.runId !== proposal.source.runId) {
+    return { kind: "invalid", error: `configuration proposal ${proposal.id} source invocation is unavailable` };
+  }
+  if (invocation.sessionId !== proposal.source.sessionId) {
+    return { kind: "invalid", error: `configuration proposal ${proposal.id} source Session does not match its invocation` };
+  }
+  if (["failed", "blocked", "cancelled"].includes(invocation.status)) {
+    return { kind: "invalid", error: `configuration proposal ${proposal.id} source run is ${invocation.status}; create a fresh proposal` };
+  }
+  if (invocation.status !== "completed") {
+    return { kind: "pending", error: `configuration proposal ${proposal.id} source run is ${invocation.status}, expected completed` };
+  }
+  const session = state.sessions[proposal.source.sessionId];
+  if (!session) {
+    return { kind: "invalid", error: `configuration proposal ${proposal.id} source Session is unavailable` };
+  }
+  const attestation = session?.messages.find((message) => {
+    if (message.role !== "employee" || message.runId !== proposal.source.runId) return false;
+    if (typeof message.output !== "object" || message.output === null || Array.isArray(message.output)) return false;
+    const proposalIds = (message.output as JsonObject).proposalIds;
+    return Array.isArray(proposalIds) && proposalIds.includes(proposal.id);
+  });
+  if (!attestation) {
+    // Invocation completion is persisted before its Employee message is appended
+    // to the Session. Keep that narrow interval retryable, but fail closed after
+    // a crash leaves no writer capable of completing the attestation.
+    const completedAt = invocation.completedAt ? Date.parse(invocation.completedAt) : Number.NaN;
+    if (!Number.isFinite(completedAt) || Math.abs(Date.now() - completedAt) > CONFIGURATION_ATTESTATION_GRACE_MS) {
+      return {
+        kind: "invalid",
+        error: `configuration proposal ${proposal.id} source Run completed without attestation; create a fresh proposal`
+      };
+    }
+    return { kind: "pending", error: `configuration proposal ${proposal.id} is waiting for source Run attestation` };
+  }
+  return { kind: "attested" };
+}
+
+function assertConfigurationReviewSnapshot(
+  proposal: ConfigurationProposal,
+  expectedReviewRevision: number,
+  expectedReviewHashInput: string
+): void {
+  if (!Number.isInteger(expectedReviewRevision) || expectedReviewRevision < 0) {
+    throw new Error("configuration proposal expectedReviewRevision must be a non-negative integer");
+  }
+  const expectedReviewHash = requireText(expectedReviewHashInput, "configuration proposal expectedReviewHash");
+  if (!/^[a-f0-9]{64}$/.test(expectedReviewHash)) {
+    throw new Error("configuration proposal expectedReviewHash must be a sha256 hex digest");
+  }
+  const currentReviewHash = configurationReviewHash(proposal);
+  if (proposal.reviewRevision !== expectedReviewRevision
+    || proposal.reviewHash !== expectedReviewHash
+    || currentReviewHash !== proposal.reviewHash) {
+    throw new Error(`configuration proposal ${proposal.id} review changed; reload and confirm the final selections`);
+  }
+}
+
+function markConfigurationSourceInvalid(proposal: ConfigurationProposal, error: string): void {
+  proposal.status = "needs-reapproval";
+  proposal.error = error;
+  proposal.validation = { valid: false, errors: [error] };
+  proposal.updatedAt = now();
 }
 
 function stringArray(value: JsonValue | undefined, label: string): string[] {
@@ -1111,6 +1742,11 @@ export class WorkbenchService {
       status: "queued",
       phase: "queued",
       requestSummary: summarizeInput(options.input),
+      requestContext: typeof options.input.context === "object"
+        && options.input.context !== null
+        && !Array.isArray(options.input.context)
+        ? options.input.context as JsonObject
+        : undefined,
       runId,
       sessionId: options.sessionId,
       instanceIds: instances.map((instance) => instance.id),
@@ -1371,11 +2007,22 @@ export class WorkbenchService {
             : typeof input.message === "string"
               ? input.message
               : JSON.stringify(input);
-          const knowledge = await this.knowledge.prepare(this.snapshot(), employee, {
+          const preparationState = this.snapshot();
+          const taskTags = [...new Set([...inputTaskTags, ...nodeTaskTags])];
+          const knowledge = await this.knowledge.prepare(preparationState, employee, {
             request,
             projectId: invocation.source.project,
             projectRoleId: invocation.source.projectRole,
-            taskTags: [...new Set([...inputTaskTags, ...nodeTaskTags])]
+            taskTags
+          });
+          const effectiveProfile = compileEffectiveExecutionProfile({
+            state: preparationState,
+            invocation,
+            employee,
+            nodeId: node.id,
+            request,
+            taskTags,
+            knowledge
           });
           return {
             node: {
@@ -1383,7 +2030,8 @@ export class WorkbenchService {
               with: { ...node.with, __knowledgeEvidence: knowledge.promptSection }
             },
             artifacts: {
-              [`knowledge/${node.id}.json`]: JSON.parse(JSON.stringify(knowledge)) as JsonValue
+              [`knowledge/${node.id}.json`]: JSON.parse(JSON.stringify(knowledge)) as JsonValue,
+              [`effective-profile/${node.id}.json`]: JSON.parse(JSON.stringify(effectiveProfile)) as JsonValue
             }
           };
         },
@@ -1421,6 +2069,12 @@ export class WorkbenchService {
 
   async putProvider(id: string, definition: WorkbenchState["providers"][string]): Promise<void> {
     requireId(id, "provider id");
+    if (isSystemManagedProviderId(id)) {
+      throw new Error(`provider ${id} has system-managed runtime profiles and cannot be replaced`);
+    }
+    if (definition.runtimeProfiles !== undefined) {
+      throw new Error("provider runtimeProfiles are reserved for system-managed Provider definitions");
+    }
     const adapter = this.providers.get(definition.adapter);
     if (!adapter) throw new Error(`provider adapter not registered: ${definition.adapter}`);
     const issues = adapter.validate({ providerId: id, definition, projectRoot: this.store.dataRoot });
@@ -2413,6 +3067,332 @@ export class WorkbenchService {
     });
   }
 
+  listConfigurationProposals(employeeId?: string): ConfigurationProposal[] {
+    return Object.values(this.snapshot().configurationProposals)
+      .filter((proposal) => !employeeId || proposal.employeeId === employeeId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  getConfigurationProposal(id: string): ConfigurationProposal {
+    const proposal = this.snapshot().configurationProposals[id];
+    if (!proposal) throw new Error(`configuration proposal not found: ${id}`);
+    return proposal;
+  }
+
+  getConfigurationControlSnapshot(sourceRunId: string): {
+    employee: Omit<EmployeeDefinition, "knowledgeProfileIds" | "knowledgeGrants">;
+    providers: Array<{ id: string; adapter: string; model?: string; runtimeProfiles?: string[] }>;
+    skills: Array<Pick<WorkbenchSkillDefinition, "id" | "version" | "status" | "displayName" | "description" | "tools" | "configSchema">>;
+    proposals: ConfigurationProposal[];
+  } {
+    const state = this.snapshot();
+    const access = configurationControlAccess(state, sourceRunId, "configuration_control_snapshot");
+    const target = state.employees[access.targetEmployeeId]!.current;
+    const { knowledgeProfileIds: _profileIds, knowledgeGrants: _grants, ...employee } = target;
+    return {
+      employee,
+      providers: Object.entries(state.providers).map(([id, definition]) => ({
+        id,
+        adapter: definition.adapter,
+        ...(typeof definition.model === "string" ? { model: definition.model } : {}),
+        ...(definition.runtimeProfiles?.length ? { runtimeProfiles: definition.runtimeProfiles } : {})
+      })),
+      skills: Object.values(state.skills).map((skill) => ({
+        id: skill.id,
+        version: skill.version,
+        status: skill.status,
+        displayName: skill.displayName,
+        description: skill.description,
+        tools: skill.tools,
+        ...(skill.configSchema ? { configSchema: skill.configSchema } : {})
+      })),
+      proposals: Object.values(state.configurationProposals)
+        .filter((proposal) => proposal.employeeId === access.targetEmployeeId)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    };
+  }
+
+  listConfigurationProposalsForControl(sourceRunId: string): ConfigurationProposal[] {
+    const state = this.snapshot();
+    const access = configurationControlAccess(state, sourceRunId, "configuration_proposal_list");
+    return Object.values(state.configurationProposals)
+      .filter((proposal) => proposal.employeeId === access.targetEmployeeId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  getConfigurationProposalForControl(sourceRunId: string, id: string): ConfigurationProposal {
+    const state = this.snapshot();
+    const access = configurationControlAccess(state, sourceRunId, "configuration_proposal_get");
+    const proposal = state.configurationProposals[id];
+    if (!proposal || proposal.employeeId !== access.targetEmployeeId) {
+      throw new Error(`configuration proposal not found for the active target: ${id}`);
+    }
+    return proposal;
+  }
+
+  async createConfigurationProposal(input: ConfigurationProposalCreateInput): Promise<ConfigurationProposal> {
+    return this.store.mutate((state) => {
+      const access = configurationControlAccess(state, input.sourceRunId, "configuration_proposal_create");
+      const plan = planConfigurationProposal(
+        state,
+        access.targetEmployeeId,
+        access.expectedEmployeeVersion,
+        input.operations
+      );
+      const timestamp = now();
+      const proposal: ConfigurationProposal = {
+        id: `cp-${timestamp.replaceAll(/[:.]/g, "-").toLowerCase()}-${randomUUID().slice(0, 8)}`,
+        status: "awaiting-review",
+        title: requireText(input.title, "configuration proposal title"),
+        reason: requireText(input.reason, "configuration proposal reason"),
+        employeeId: access.targetEmployeeId,
+        expectedEmployeeVersion: access.expectedEmployeeVersion,
+        operations: plan.operations,
+        reviewItems: plan.reviewItems,
+        decisions: [],
+        progress: configurationReviewProgress(plan.reviewItems.map((item) => item.id), []),
+        reviewRevision: 0,
+        reviewHash: configurationReviewHash({
+          planHash: plan.planHash,
+          reviewItems: plan.reviewItems,
+          decisions: []
+        }),
+        source: {
+          kind: "ai-generated",
+          invocationId: access.invocation.id,
+          projectId: access.project.id,
+          projectVersion: access.project.version,
+          projectRoleId: access.projectRoleId,
+          projectBindingVersion: access.binding.version,
+          employeeId: access.steward.id,
+          employeeVersion: access.steward.version,
+          requestedBy: access.steward.id,
+          sessionId: access.session.id,
+          runId: access.invocation.runId
+        },
+        planHash: plan.planHash,
+        validation: { valid: true, errors: [] },
+        createdAt: timestamp,
+        updatedAt: timestamp
+      };
+      state.configurationProposals[proposal.id] = proposal;
+      return proposal;
+    });
+  }
+
+  async decideConfigurationReviewItem(
+    proposalId: string,
+    reviewItemId: string,
+    input: ConfigurationReviewDecisionInput
+  ): Promise<ConfigurationProposal> {
+    const outcome = await this.store.mutate((state) => {
+      const proposal = state.configurationProposals[proposalId];
+      if (!proposal) throw new Error(`configuration proposal not found: ${proposalId}`);
+      if (proposal.status !== "awaiting-review" && proposal.status !== "ready-to-apply") {
+        throw new Error(`configuration proposal ${proposalId} cannot be reviewed from ${proposal.status}`);
+      }
+      const reviewItem = proposal.reviewItems.find((item) => item.id === reviewItemId);
+      if (!reviewItem) throw new Error(`configuration review item not found: ${reviewItemId}`);
+      if (input.decision !== "accepted" && input.decision !== "rejected") {
+        throw new Error("configuration review decision must be accepted or rejected");
+      }
+      assertConfigurationReviewSnapshot(
+        proposal,
+        input.expectedReviewRevision,
+        input.expectedReviewHash
+      );
+      const attestation = configurationProposalAttestation(state, proposal);
+      if (attestation.kind === "invalid") {
+        markConfigurationSourceInvalid(proposal, attestation.error);
+        return { proposal, stale: false, sourceInvalid: true };
+      }
+      if (attestation.kind === "pending") throw new Error(attestation.error);
+      let fullPlan: ConfigurationProposalPlan;
+      try {
+        fullPlan = planConfigurationProposal(
+          state,
+          proposal.employeeId,
+          proposal.expectedEmployeeVersion,
+          proposal.operations
+        );
+      } catch (error) {
+        proposal.status = "needs-reapproval";
+        proposal.error = errorMessage(error);
+        proposal.validation = { valid: false, errors: [proposal.error] };
+        proposal.updatedAt = now();
+        return { proposal, stale: true, sourceInvalid: false };
+      }
+      if (fullPlan.planHash !== proposal.planHash) {
+        proposal.status = "needs-reapproval";
+        proposal.error = "configuration dependencies or semantic preview changed; create a fresh proposal";
+        proposal.validation = { valid: false, errors: [proposal.error] };
+        proposal.updatedAt = now();
+        return { proposal, stale: true, sourceInvalid: false };
+      }
+      const timestamp = now();
+      proposal.decisions.push({
+        id: `decision-${randomUUID()}`,
+        reviewItemId,
+        decision: input.decision,
+        actor: requireText(input.actor?.trim() || "local-owner", "configuration reviewer"),
+        at: timestamp,
+        comment: input.comment?.trim() || undefined,
+        planHash: proposal.planHash
+      });
+      proposal.reviewRevision += 1;
+      proposal.reviewHash = configurationReviewHash(proposal);
+      proposal.progress = configurationReviewProgress(
+        proposal.reviewItems.map((item) => item.id),
+        proposal.decisions
+      );
+      proposal.status = "awaiting-review";
+      proposal.error = undefined;
+      proposal.validation = { valid: true, errors: [] };
+      if (proposal.progress.pending === 0) {
+        if (proposal.progress.accepted === 0) {
+          proposal.validation = { valid: false, errors: ["至少接受一项配置变更后才能应用。"] };
+        } else {
+          const latest = latestConfigurationDecisions(proposal);
+          const acceptedOperations = proposal.reviewItems
+            .filter((item) => latest.get(item.id)?.decision === "accepted")
+            .map((item) => proposal.operations[item.operationIndex]!);
+          try {
+            planConfigurationProposal(
+              state,
+              proposal.employeeId,
+              proposal.expectedEmployeeVersion,
+              acceptedOperations
+            );
+            proposal.status = "ready-to-apply";
+          } catch (error) {
+            proposal.validation = { valid: false, errors: [errorMessage(error)] };
+          }
+        }
+      }
+      proposal.updatedAt = timestamp;
+      return { proposal, stale: false, sourceInvalid: false };
+    });
+    if (outcome.sourceInvalid) throw new Error(outcome.proposal.error);
+    if (outcome.stale) throw new Error(`configuration proposal ${proposalId} needs reapproval`);
+    return outcome.proposal;
+  }
+
+  async applyConfigurationProposal(
+    id: string,
+    input: ConfigurationProposalApplyInput,
+    actor = "local-owner"
+  ): Promise<ConfigurationProposal> {
+    const outcome = await this.store.mutate((state) => {
+      const proposal = state.configurationProposals[id];
+      if (!proposal) throw new Error(`configuration proposal not found: ${id}`);
+      assertConfigurationReviewSnapshot(proposal, input.expectedReviewRevision, input.expectedReviewHash);
+      if (proposal.status !== "ready-to-apply") {
+        throw new Error(`configuration proposal ${id} is ${proposal.status}`);
+      }
+      const attestation = configurationProposalAttestation(state, proposal);
+      if (attestation.kind === "invalid") {
+        markConfigurationSourceInvalid(proposal, attestation.error);
+        return { proposal, stale: false, sourceInvalid: true };
+      }
+      if (attestation.kind === "pending") throw new Error(attestation.error);
+      let fullPlan: ConfigurationProposalPlan;
+      try {
+        fullPlan = planConfigurationProposal(
+          state,
+          proposal.employeeId,
+          proposal.expectedEmployeeVersion,
+          proposal.operations
+        );
+      } catch (error) {
+        proposal.status = "needs-reapproval";
+        proposal.error = errorMessage(error);
+        proposal.validation = { valid: false, errors: [proposal.error] };
+        proposal.updatedAt = now();
+        return { proposal, stale: true, sourceInvalid: false };
+      }
+      if (fullPlan.planHash !== proposal.planHash) {
+        proposal.status = "needs-reapproval";
+        proposal.error = "configuration dependencies or semantic preview changed; create a fresh proposal";
+        proposal.validation = { valid: false, errors: [proposal.error] };
+        proposal.updatedAt = now();
+        return { proposal, stale: true, sourceInvalid: false };
+      }
+      proposal.progress = configurationReviewProgress(
+        proposal.reviewItems.map((item) => item.id),
+        proposal.decisions
+      );
+      if (proposal.progress.pending > 0 || proposal.progress.accepted === 0) {
+        throw new Error(`configuration proposal ${id} is not fully reviewed`);
+      }
+      const latest = latestConfigurationDecisions(proposal);
+      const acceptedOperations = proposal.reviewItems
+        .filter((item) => latest.get(item.id)?.decision === "accepted")
+        .map((item) => proposal.operations[item.operationIndex]!);
+      let acceptedPlan: ConfigurationProposalPlan;
+      try {
+        acceptedPlan = planConfigurationProposal(
+          state,
+          proposal.employeeId,
+          proposal.expectedEmployeeVersion,
+          acceptedOperations
+        );
+      } catch (error) {
+        proposal.status = "needs-reapproval";
+        proposal.error = errorMessage(error);
+        proposal.validation = { valid: false, errors: [proposal.error] };
+        proposal.updatedAt = now();
+        return { proposal, stale: true, sourceInvalid: false };
+      }
+      const timestamp = now();
+      const record = state.employees[proposal.employeeId]!;
+      const appliedEmployee = { ...acceptedPlan.candidate, updatedAt: timestamp };
+      proposal.status = "applying";
+      record.current = appliedEmployee;
+      record.versions.push(appliedEmployee);
+      proposal.status = "applied";
+      proposal.result = { employeeId: appliedEmployee.id, employeeVersion: appliedEmployee.version };
+      proposal.application = {
+        actor: requireText(actor, "configuration proposal application actor"),
+        at: timestamp,
+        reviewRevision: proposal.reviewRevision,
+        reviewHash: proposal.reviewHash,
+        acceptedReviewItemIds: proposal.reviewItems
+          .filter((item) => latest.get(item.id)?.decision === "accepted")
+          .map((item) => item.id),
+        fromEmployeeVersion: proposal.expectedEmployeeVersion,
+        toEmployeeVersion: appliedEmployee.version
+      };
+      proposal.validation = { valid: true, errors: [] };
+      proposal.error = undefined;
+      proposal.appliedAt = timestamp;
+      proposal.updatedAt = timestamp;
+      return { proposal, stale: false, sourceInvalid: false };
+    });
+    if (outcome.sourceInvalid) throw new Error(outcome.proposal.error);
+    if (outcome.stale) throw new Error(`configuration proposal ${id} changed after review and needs reapproval`);
+    return outcome.proposal;
+  }
+
+  async cancelConfigurationProposal(id: string, actor = "local-owner", comment?: string): Promise<ConfigurationProposal> {
+    return this.store.mutate((state) => {
+      const proposal = state.configurationProposals[id];
+      if (!proposal) throw new Error(`configuration proposal not found: ${id}`);
+      if (proposal.status !== "awaiting-review" && proposal.status !== "ready-to-apply" && proposal.status !== "needs-reapproval") {
+        throw new Error(`configuration proposal ${id} cannot be cancelled from ${proposal.status}`);
+      }
+      const timestamp = now();
+      proposal.status = "cancelled";
+      proposal.cancellation = {
+        actor: requireText(actor, "configuration cancellation actor"),
+        at: timestamp,
+        comment: comment?.trim() || undefined
+      };
+      proposal.error = undefined;
+      proposal.updatedAt = timestamp;
+      return proposal;
+    });
+  }
+
   private normalizeKnowledgeBase(
     input: KnowledgeBaseCreateInput,
     current?: KnowledgeBaseDefinition
@@ -2950,6 +3930,8 @@ export class WorkbenchService {
       seen.add(roleId);
       const requiredSkills = [...new Set(role.requiredSkills ?? [])].map((skillId) => requireId(skillId, `project role ${roleId} required skill`));
       const optionalSkills = [...new Set(role.optionalSkills ?? [])].map((skillId) => requireId(skillId, `project role ${roleId} optional skill`));
+      const requiredProviderProfiles = [...new Set(role.requiredProviderProfiles ?? [])]
+        .map((profile) => requireId(profile, `project role ${roleId} required Provider profile`));
       const knowledgeProfileIds = uniqueIds(role.knowledgeProfileIds ?? [], `project role ${roleId} knowledge profile`);
       const overlap = requiredSkills.filter((skillId) => optionalSkills.includes(skillId));
       if (overlap.length > 0) throw new Error(`project role ${roleId} repeats skills as required and optional: ${overlap.join(", ")}`);
@@ -2960,6 +3942,7 @@ export class WorkbenchService {
         description: requireText(role.description ?? `Project role ${roleId}.`, `project role ${roleId} description`),
         requiredSkills,
         optionalSkills,
+        requiredProviderProfiles,
         knowledgeProfileIds,
         instructions: requireText(role.instructions ?? `Follow the ${roleId} project role contract.`, `project role ${roleId} instructions`),
         outputSchema: role.outputSchema,
@@ -3051,6 +4034,7 @@ export class WorkbenchService {
     if (!record) throw new Error(`employee not found: ${input.employeeId}`);
     if (record.current.status !== "active") throw new Error(`employee ${input.employeeId} is archived`);
     const employee = employeeVersion(record, input.employeeVersion);
+    assertProjectRoleProviderCompatibility(state, role, employee);
     const scopedProjectId = internalProjectId(employee);
     if (scopedProjectId && scopedProjectId !== project.id) {
       throw new Error(`employee ${employee.id} is internal to project ${scopedProjectId}`);
@@ -3294,75 +4278,26 @@ export class WorkbenchService {
     return this.store.mutate((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);
-      const current = record.current;
-      const providerId = input.providerId ?? current.providerId;
-      if (!state.providers[providerId]) throw new Error(`unknown provider ${providerId}`);
-      const skills = input.skills ?? current.skills;
-      const skillVersions = input.skills === undefined && input.skillVersions === undefined
-        ? current.skillVersions
-        : pinSkillVersions(state, skills, input.skillVersions);
-      validateSkillBindings(state, skills, skillVersions);
-      const knowledgeProfileIds = input.knowledgeProfileIds === undefined
-        ? current.knowledgeProfileIds
-        : validateKnowledgeProfileIds(state, input.knowledgeProfileIds, `employee ${id} knowledge profile`);
-      const outputSchema = input.outputSchema ?? current.outputSchema;
-      validateSchema(outputSchema, `employee ${id} outputSchema`);
-      const verdict = input.verdict === undefined ? current.verdict : input.verdict ?? undefined;
-      validateVerdict(verdict, `employee ${id}`);
-      const identity = input.identity ?? current.identity;
-      const legacyScopedProjectId = legacyMetadataProjectId(current.identity);
-      if (legacyScopedProjectId && legacyMetadataProjectId(identity) !== legacyScopedProjectId) {
-        throw new Error(`employee ${id} internal project scope ${legacyScopedProjectId} is immutable`);
-      }
-      const scopedRoleId = internalProjectRoleId(current);
-      if (scopedRoleId && internalProjectRoleId({ ...current, identity }) !== scopedRoleId) {
-        throw new Error(`employee ${id} internal project role scope ${scopedRoleId} is immutable`);
-      }
       const updatedAt = now();
-      const knowledgeGrants = normalizeKnowledgeGrants(
-        knowledgeProfileIds,
-        input.knowledgeGrants,
-        updatedAt,
-        current.knowledgeGrants
-      );
-      const scope = input.scope === undefined
-        ? current.scope
-        : normalizeEmployeeScope(state, input.scope, identity, `employee ${id} scope`);
-      if (!sameEmployeeScope(current.scope, scope)) throw new Error(`employee ${id} scope is immutable`);
-      const updated: EmployeeDefinition = {
-        ...current,
-        identity: {
-          ...identity,
-          displayName: requireText(identity.displayName, "employee displayName"),
-          background: requireText(identity.background, "employee background"),
-          responsibilities: identity.responsibilities.map((value) => requireText(value, "employee responsibility")),
-          goals: identity.goals?.map((value) => requireText(value, "employee goal")),
-          constraints: identity.constraints?.map((value) => requireText(value, "employee constraint"))
-        },
-        description: input.description === undefined ? current.description : requireText(input.description, "employee description"),
-        systemPrompt: input.systemPrompt === undefined ? current.systemPrompt : requireText(input.systemPrompt, "employee systemPrompt"),
-        requestPrompt: input.requestPrompt === undefined ? current.requestPrompt : requireText(input.requestPrompt, "employee requestPrompt"),
-        capabilities: input.capabilities === undefined
-          ? current.capabilities
-          : normalizeCapabilities(input.capabilities, `employee ${id} capability`),
-        scope,
-        skills,
-        skillVersions,
-        knowledgeProfileIds,
-        knowledgeGrants,
-        providerId,
-        outputSchema,
-        maxAttempts: input.maxAttempts === undefined ? current.maxAttempts : Math.max(1, Math.min(10, input.maxAttempts)),
-        permissions: input.permissions ?? current.permissions,
-        verdict,
-        contextPolicy: {
-          historyLimit: Math.max(0, Math.min(100, input.contextPolicy?.historyLimit ?? current.contextPolicy.historyLimit))
-        },
-        presentation: input.presentation ?? current.presentation,
-        version: current.version + 1,
-        updatedAt
-      };
-      if (updated.identity.responsibilities.length === 0) throw new Error("employee responsibilities must not be empty");
+      const updated = buildUpdatedEmployeeDefinition(state, id, input, updatedAt);
+      record.current = updated;
+      record.versions.push(updated);
+      return updated;
+    });
+  }
+
+  async repinEmployeeProject(id: string, requestedProjectVersion?: number): Promise<EmployeeDefinition> {
+    const employee = this.getEmployee(id);
+    if (employee.scope.kind !== "project") throw new Error(`employee ${id} is not project-scoped`);
+    const project = this.getProject(employee.scope.projectId, requestedProjectVersion);
+    if (project.status !== "active") throw new Error(`project ${project.id} is archived`);
+    if (employee.scope.projectVersion === project.version) return employee;
+    return this.store.mutate((state) => {
+      const record = state.employees[id];
+      if (!record) throw new Error(`employee not found: ${id}`);
+      const updated = buildUpdatedEmployeeDefinition(state, id, {
+        scope: { kind: "project", projectId: project.id, projectVersion: project.version }
+      }, now(), true);
       record.current = updated;
       record.versions.push(updated);
       return updated;
@@ -3465,6 +4400,7 @@ export class WorkbenchService {
     const roleBinding = binding.roles.find((candidate) => candidate.roleId === roleId);
     if (!roleBinding) throw new Error(`project role is not assigned: ${project.id}/${roleId}`);
     const base = this.getEmployee(roleBinding.employeeId, roleBinding.employeeVersion);
+    assertProjectRoleProviderCompatibility(this.snapshot(), role, base);
     const assignmentHeader = [
       "## Project assignment",
       `Project: ${project.name} (${project.id})`,
@@ -3522,7 +4458,13 @@ export class WorkbenchService {
     entrance?: EntrancePolicyExecutionSnapshot;
   }): Promise<EmployeeInvocationResult> {
     const { employee, input, source } = options;
+    if (input.context !== undefined && (typeof input.context !== "object" || input.context === null || Array.isArray(input.context))) {
+      throw new Error("invocation context must be a JSON object");
+    }
     let session = options.session;
+    if (session && !jsonEqual(session.context, input.context)) {
+      throw new Error(`session ${session.id} belongs to another structured invocation context`);
+    }
     if (!session) {
       const timestamp = now();
       session = {
@@ -3532,6 +4474,7 @@ export class WorkbenchService {
         assignment: options.assignment,
         title: input.message.trim().slice(0, 72),
         status: "active",
+        context: input.context,
         messages: [],
         createdAt: timestamp,
         updatedAt: timestamp
@@ -3548,7 +4491,10 @@ export class WorkbenchService {
       source,
       workflow,
       employees,
-      input: { message: input.message.trim() },
+      input: {
+        message: input.message.trim(),
+        ...(input.context ? { context: input.context } : {})
+      },
       sessionId: session.id,
       entrance: options.entrance
     });
@@ -3563,7 +4509,8 @@ export class WorkbenchService {
         .join("\n\n");
       const result = await this.runTrackedWorkflow(invocation, workflow, employees, {
         message: input.message.trim(),
-        sessionHistory: history
+        sessionHistory: history,
+        ...(input.context ? { context: input.context } : {})
       }, options.providerCwd);
       const node = result.run.nodes.respond;
       const responseMessage = invocationMessage(node?.output);
@@ -3814,6 +4761,13 @@ export class WorkbenchService {
           view.layers.knowledge = { plan: knowledge.plan, evidence: knowledge.evidence };
         } catch {
           // Older runs and employees without prepared knowledge have no knowledge artifact.
+        }
+        try {
+          view.effectiveProfile = JSON.parse(
+            await fs.readFile(path.join(latest.runDir, "effective-profile", "respond.json"), "utf8")
+          ) as EffectiveExecutionProfile;
+        } catch {
+          // Runs created before effective configuration compilation have no profile artifact.
         }
       } catch {
         // A failed attempt can legitimately have incomplete prompt artifacts.
@@ -4788,9 +5742,25 @@ export class WorkbenchService {
   async getRun(id: string): Promise<unknown> {
     if (!/^run-[A-Za-z0-9-]+$/.test(id)) throw new Error("run id is invalid");
     try {
-      return JSON.parse(
+      const run = JSON.parse(
         await fs.readFile(path.join(this.store.dataRoot, "artifacts", "runs", id, "run.json"), "utf8")
-      ) as unknown;
+      ) as Record<string, unknown>;
+      const profileDir = path.join(this.store.dataRoot, "artifacts", "runs", id, "effective-profile");
+      const effectiveProfiles: Record<string, EffectiveExecutionProfile> = {};
+      try {
+        const entries = await fs.readdir(profileDir, { withFileTypes: true });
+        await Promise.all(entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+          .map(async (entry) => {
+            const nodeId = entry.name.slice(0, -".json".length);
+            effectiveProfiles[nodeId] = JSON.parse(
+              await fs.readFile(path.join(profileDir, entry.name), "utf8")
+            ) as EffectiveExecutionProfile;
+          }));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      return Object.keys(effectiveProfiles).length > 0 ? { ...run, effectiveProfiles } : run;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`run not found: ${id}`);
       throw error;

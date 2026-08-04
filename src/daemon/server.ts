@@ -35,6 +35,13 @@ function routeParam(request: Request, name: string): string {
   return Array.isArray(value) ? value[0] ?? "" : value ?? "";
 }
 
+function queryText(request: Request, name: string): string {
+  const value = request.query[name];
+  const text = Array.isArray(value) ? value[0] : value;
+  if (typeof text !== "string" || !text.trim()) throw new Error(`${name} query parameter is required`);
+  return text.trim();
+}
+
 function jsonObject(value: unknown, label = "input"): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`${label} must be a JSON object`);
@@ -101,6 +108,8 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
         knowledgeImpactAnalysis: true,
         knowledgeConversation: "codex-mcp-v1",
         knowledgeChangeApproval: true,
+        configurationProposal: "review-items-v1",
+        configurationConversation: "codex-mcp-v1",
         asyncWorkflowInvocations: "v1",
         supervisorWorkflows: "v1",
         managementPolicies: "versioned-v1",
@@ -119,6 +128,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       knowledgeBases: service.listKnowledgeBases(true),
       knowledgeProfiles: service.listKnowledgeProfiles(true),
       knowledgeChanges: service.listKnowledgeChangeRequests(),
+      configurationProposals: service.listConfigurationProposals(),
       architectureTemplates: service.listArchitectureTemplates(),
       employees: service.listEmployees(true),
       employeeTemplates: service.listEmployeeTemplates(true),
@@ -293,6 +303,72 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   }));
   app.post("/api/knowledge-changes/:id/cancel", asyncRoute(async (request, response) => {
     send(response, await service.cancelKnowledgeChangeRequest(
+      routeParam(request, "id"),
+      "local-owner",
+      typeof request.body?.comment === "string" ? request.body.comment : undefined
+    ));
+  }));
+
+  app.get("/api/configuration-proposals", (request, response) => {
+    send(response, service.listConfigurationProposals(
+      typeof request.query.employeeId === "string" ? request.query.employeeId : undefined
+    ));
+  });
+  app.get("/api/configuration-control/snapshot", (request, response, next) => {
+    try {
+      send(response, service.getConfigurationControlSnapshot(queryText(request, "sourceRunId")));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.get("/api/configuration-control/proposals", (request, response, next) => {
+    try {
+      send(response, service.listConfigurationProposalsForControl(queryText(request, "sourceRunId")));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.get("/api/configuration-control/proposals/:id", (request, response, next) => {
+    try {
+      send(response, service.getConfigurationProposalForControl(
+        queryText(request, "sourceRunId"),
+        routeParam(request, "id")
+      ));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.post("/api/configuration-proposals", asyncRoute(async (request, response) => {
+    send(response, await service.createConfigurationProposal(request.body), 201);
+  }));
+  app.get("/api/configuration-proposals/:id", (request, response, next) => {
+    try {
+      send(response, service.getConfigurationProposal(routeParam(request, "id")));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.post("/api/configuration-proposals/:id/review-items/:reviewItemId/decisions", asyncRoute(async (request, response) => {
+    send(response, await service.decideConfigurationReviewItem(
+      routeParam(request, "id"),
+      routeParam(request, "reviewItemId"),
+      {
+        decision: request.body?.decision,
+        expectedReviewRevision: request.body?.expectedReviewRevision,
+        expectedReviewHash: request.body?.expectedReviewHash,
+        actor: "local-owner",
+        comment: typeof request.body?.comment === "string" ? request.body.comment : undefined
+      }
+    ));
+  }));
+  app.post("/api/configuration-proposals/:id/apply", asyncRoute(async (request, response) => {
+    send(response, await service.applyConfigurationProposal(routeParam(request, "id"), {
+      expectedReviewRevision: request.body?.expectedReviewRevision,
+      expectedReviewHash: request.body?.expectedReviewHash
+    }, "local-owner"));
+  }));
+  app.post("/api/configuration-proposals/:id/cancel", asyncRoute(async (request, response) => {
+    send(response, await service.cancelConfigurationProposal(
       routeParam(request, "id"),
       "local-owner",
       typeof request.body?.comment === "string" ? request.body.comment : undefined

@@ -907,4 +907,203 @@ describe("workbench daemon", () => {
       await mcpServer.close();
     }
   });
+
+  it("exposes a proposal-only Configuration Control MCP profile while review and apply remain human-owned", async () => {
+    const { base, service } = await fixture();
+    const controlTools = [
+      "configuration_control_snapshot",
+      "configuration_proposal_list",
+      "configuration_proposal_get",
+      "configuration_proposal_create"
+    ];
+    await service.createProject({
+      id: "configuration-project",
+      rootPath: service.store.dataRoot,
+      descriptorPath: path.join(service.store.dataRoot, "configuration.project.yaml"),
+      roles: [{
+        id: "configuration-steward",
+        displayName: "Configuration Steward",
+        description: "Draft Employee configuration proposals.",
+        instructions: "Use restricted tools.",
+        permissions: { write: "none", tools: controlTools }
+      }]
+    });
+    const steward = await service.createEmployee({
+      id: "configuration-steward",
+      identity: {
+        displayName: "Configuration Steward",
+        background: "Project-internal control agent.",
+        responsibilities: ["Draft proposals"],
+        metadata: { internalProjectId: "configuration-project", internalProjectRoleId: "configuration-steward" }
+      },
+      scope: { kind: "project", projectId: "configuration-project", projectVersion: 1 },
+      providerId: "codex-configuration-control",
+      permissions: { write: "none", tools: controlTools }
+    });
+    await service.saveProjectBinding("configuration-project", {
+      roles: [{ roleId: "configuration-steward", employeeId: steward.id }]
+    });
+    const sourceRunId = "run-configuration-mcp";
+    const sourceSessionId = "session-configuration-mcp";
+    const timestamp = "2026-08-04T00:00:00.000Z";
+    await service.store.mutate((state) => {
+      state.sessions[sourceSessionId] = {
+        id: sourceSessionId,
+        employeeId: steward.id,
+        employeeVersion: steward.version,
+        assignment: {
+          projectId: "configuration-project",
+          projectVersion: 1,
+          projectBindingVersion: 1,
+          roleId: "configuration-steward"
+        },
+        title: "Configure desk-agent",
+        status: "active",
+        context: { kind: "employee-configuration", employeeId: "desk-agent", expectedEmployeeVersion: 1 },
+        messages: [],
+        createdAt: timestamp,
+        updatedAt: timestamp
+      };
+      state.invocations["inv-configuration-mcp"] = {
+        id: "inv-configuration-mcp",
+        target: { kind: "employee", id: steward.id, version: steward.version },
+        source: {
+          kind: "workbench",
+          project: "configuration-project",
+          projectRole: "configuration-steward",
+          projectBindingVersion: 1
+        },
+        status: "running",
+        phase: "provider",
+        requestSummary: "Configure desk-agent",
+        requestContext: { kind: "employee-configuration", employeeId: "desk-agent", expectedEmployeeVersion: 1 },
+        runId: sourceRunId,
+        sessionId: sourceSessionId,
+        instanceIds: [],
+        createdAt: timestamp,
+        startedAt: timestamp,
+        updatedAt: timestamp,
+        transitions: [{ at: timestamp, status: "running", phase: "provider" }]
+      };
+    });
+    const mcpServer = createWorkbenchMcpServer(base, { profile: "configuration-control", sourceRunId });
+    const client = new Client({ name: "configuration-steward-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await mcpServer.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      const names = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(names).toEqual([
+        "configuration_control_snapshot",
+        "configuration_proposal_list",
+        "configuration_proposal_get",
+        "configuration_proposal_create"
+      ]);
+      expect(names).not.toEqual(expect.arrayContaining([
+        "configuration_proposal_review",
+        "configuration_proposal_apply",
+        "update_employee",
+        "invoke_employee"
+      ]));
+
+      const snapshot = await client.callTool({
+        name: "configuration_control_snapshot",
+        arguments: {}
+      });
+      const snapshotText = (snapshot.content as Array<{ type: string; text?: string }>)[0]?.text ?? "";
+      expect(snapshotText).toContain('"id": "desk-agent"');
+      expect(snapshotText).not.toContain("knowledgeProfileIds");
+      expect(snapshotText).not.toContain('"command"');
+      expect(snapshotText).not.toContain('"args"');
+      expect(snapshotText).not.toContain('"env"');
+      expect(snapshotText).not.toContain('"instructions"');
+
+      const invalid = await client.callTool({
+        name: "configuration_proposal_create",
+        arguments: {
+          title: "Invalid arbitrary patch",
+          reason: "The MCP schema must reject paths.",
+          operations: [{
+            type: "prompts.set",
+            rationale: "Invalid path field.",
+            risk: "medium",
+            path: "/systemPrompt",
+            payload: { systemPrompt: "New system.", requestPrompt: "New request." }
+          }]
+        }
+      });
+      expect(invalid.isError).toBe(true);
+      expect(service.listConfigurationProposals()).toHaveLength(0);
+
+      const proposed = await client.callTool({
+        name: "configuration_proposal_create",
+        arguments: {
+          title: "Clarify Desk prompts",
+          reason: "Preserve evidence in each response.",
+          operations: [{
+            type: "prompts.set",
+            rationale: "Make evidence requirements explicit.",
+            risk: "medium",
+            payload: { systemPrompt: "Preserve evidence.", requestPrompt: "Return the scoped result." }
+          }]
+        }
+      });
+      const text = (proposed.content as Array<{ type: string; text?: string }>)[0]?.text ?? "{}";
+      const proposal = JSON.parse(text) as {
+        id: string;
+        status: string;
+        reviewItems: Array<{ id: string }>;
+        reviewRevision: number;
+        reviewHash: string;
+      };
+      expect(proposal.status).toBe("awaiting-review");
+      expect(service.getEmployee("desk-agent")).toMatchObject({ version: 1 });
+      expect(service.getEmployee("desk-agent").systemPrompt).not.toBe("Preserve evidence.");
+
+      await service.store.mutate((state) => {
+        const invocation = state.invocations["inv-configuration-mcp"]!;
+        invocation.status = "completed";
+        invocation.phase = "done";
+        invocation.completedAt = timestamp;
+        invocation.updatedAt = timestamp;
+        invocation.transitions.push({ at: timestamp, status: "completed", phase: "done" });
+        state.sessions[sourceSessionId]!.messages.push({
+          id: "configuration-proposal-attestation",
+          role: "employee",
+          content: `Created ${proposal.id}`,
+          at: timestamp,
+          runId: sourceRunId,
+          output: { message: "Proposal created.", proposalIds: [proposal.id] }
+        });
+      });
+
+      const reviewed = await fetch(`${base}/api/configuration-proposals/${proposal.id}/review-items/${proposal.reviewItems[0]!.id}/decisions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          decision: "accepted",
+          expectedReviewRevision: proposal.reviewRevision,
+          expectedReviewHash: proposal.reviewHash
+        })
+      });
+      expect(reviewed.status).toBe(200);
+      const reviewedEnvelope = await reviewed.json() as { data: { reviewRevision: number; reviewHash: string } };
+      const reviewedProposal = reviewedEnvelope.data;
+      expect(service.getEmployee("desk-agent").version).toBe(1);
+
+      const applied = await fetch(`${base}/api/configuration-proposals/${proposal.id}/apply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedReviewRevision: reviewedProposal.reviewRevision,
+          expectedReviewHash: reviewedProposal.reviewHash
+        })
+      });
+      expect(applied.status).toBe(200);
+      expect(service.getEmployee("desk-agent")).toMatchObject({ version: 2, systemPrompt: "Preserve evidence." });
+    } finally {
+      await client.close();
+      await mcpServer.close();
+    }
+  });
 });

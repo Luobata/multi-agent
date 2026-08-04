@@ -54,9 +54,9 @@ npm run cli -- workbench employee knowledge mihuhu-frontend-engineer workbench-e
 项目内 AI 管理入口还需要登记专用 Skill 与内部员工，然后重新连接和绑定当前项目：
 
 ```bash
+npm run cli -- workbench project connect .
 npm run cli -- workbench skill-create templates/workbench/knowledge-control-conversation.skill.json
 npm run cli -- workbench employee create templates/workbench/knowledge-steward.employee.json
-npm run cli -- workbench project connect .
 npm run cli -- workbench project bind local-agent-workbench templates/workbench/local-agent-workbench.binding.json
 ```
 

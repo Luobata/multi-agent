@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { EmployeePage } from "./EmployeePage";
+import { DaemonGate } from "./components";
 import type { Bootstrap, Employee, Skill, WorkInstanceRecord, WorkInstanceStatus } from "./types";
 
 const timestamp = "2026-07-31T00:00:00.000Z";
@@ -132,6 +133,8 @@ describe("Employee Skill actions", () => {
     expect(html).toContain("产品知识");
     expect(html).toContain("知识试跑");
     expect(html).toContain("调整授权");
+    expect(html).toContain("AI 对话起草");
+    expect(html).toContain("高级表单");
   });
 
   it("offers the employee knowledge perspective entry from the dossier", () => {
@@ -139,6 +142,16 @@ describe("Employee Skill actions", () => {
 
     expect(html).toContain("知识视角");
     expect(html).toContain("查看知识视角");
+  });
+
+  it("keeps the AI proposal history entry reachable while daemon writes are offline", () => {
+    const html = renderToStaticMarkup(<DaemonGate status="offline"><EmployeePage data={bootstrap} refresh={vi.fn()} notify={vi.fn()} /></DaemonGate>);
+    document.body.innerHTML = html;
+
+    const draftButton = [...document.querySelectorAll("button")].find((button) => button.textContent === "AI 对话起草");
+    const advancedFormButton = [...document.querySelectorAll("button")].find((button) => button.textContent === "高级表单");
+    expect(draftButton?.disabled).toBe(false);
+    expect(advancedFormButton?.disabled).toBe(true);
   });
 });
 
@@ -155,7 +168,7 @@ describe("Employee access grouping", () => {
     expect(html).toContain("knowledge-steward");
     expect(html).not.toContain('id="direct-desk"');
     expect(html).not.toContain("<h3>直接交办</h3>");
-    expect(html).toContain("修订档案");
+    expect(html).toContain("高级表单");
     expect(html).toContain("管理绑定");
     expect(html).toContain("调整授权");
   });

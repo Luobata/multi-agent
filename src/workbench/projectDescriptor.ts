@@ -123,6 +123,7 @@ export async function loadProjectDescriptor(input: ProjectConnectInput): Promise
         description: textValue(role.description, `project descriptor.roles.${id}.description`, `Project role ${id}.`),
         requiredSkills: stringList(role.requiredSkills, `project descriptor.roles.${id}.requiredSkills`),
         optionalSkills: stringList(role.optionalSkills, `project descriptor.roles.${id}.optionalSkills`),
+        requiredProviderProfiles: stringList(role.requiredProviderProfiles, `project descriptor.roles.${id}.requiredProviderProfiles`),
         knowledgeProfileIds: stringList(role.knowledgeProfiles, `project descriptor.roles.${id}.knowledgeProfiles`),
         instructions,
         outputSchema,

@@ -37,13 +37,17 @@ class MockProviderAdapter implements ProviderAdapter {
   readonly id = "mock";
 
   validate(context: ProviderValidationContext): string[] {
-    const allowed = new Set(["adapter", "model", "outputProtocol", "latencyMs"]);
+    const allowed = new Set(["adapter", "model", "runtimeProfiles", "outputProtocol", "latencyMs"]);
     const definition = context.definition as Record<string, unknown>;
     const issues = Object.keys(definition)
       .filter((key) => !allowed.has(key))
       .map((key) => `provider ${context.providerId} mock adapter does not support property ${key}`);
     if (definition.model !== undefined && (typeof definition.model !== "string" || !definition.model.trim())) {
       issues.push(`provider ${context.providerId} model must be a non-empty string`);
+    }
+    if (definition.runtimeProfiles !== undefined && (!Array.isArray(definition.runtimeProfiles)
+      || definition.runtimeProfiles.some((profile) => typeof profile !== "string" || !profile.trim()))) {
+      issues.push(`provider ${context.providerId} runtimeProfiles must be an array of non-empty strings`);
     }
     if (
       definition.latencyMs !== undefined &&
@@ -126,7 +130,7 @@ function validateCommandProvider(context: ProviderValidationContext): string[] {
   const prefix = `provider ${context.providerId}`;
   const definition = context.definition as unknown as Record<string, unknown>;
   const issues: string[] = [];
-  const allowed = new Set(["adapter", "model", "command", "args", "env", "inputTemplate", "timeoutMs", "outputProtocol"]);
+  const allowed = new Set(["adapter", "model", "runtimeProfiles", "command", "args", "env", "inputTemplate", "timeoutMs", "outputProtocol"]);
   for (const key of Object.keys(definition)) {
     if (!allowed.has(key)) issues.push(`${prefix} command adapter does not support property ${key}`);
   }
@@ -135,6 +139,10 @@ function validateCommandProvider(context: ProviderValidationContext): string[] {
   }
   if (definition.model !== undefined && (typeof definition.model !== "string" || !definition.model.trim())) {
     issues.push(`${prefix} model must be a non-empty string`);
+  }
+  if (definition.runtimeProfiles !== undefined && (!Array.isArray(definition.runtimeProfiles)
+    || definition.runtimeProfiles.some((profile) => typeof profile !== "string" || !profile.trim()))) {
+    issues.push(`${prefix} runtimeProfiles must be an array of non-empty strings`);
   }
   if (definition.args !== undefined && (!Array.isArray(definition.args) || definition.args.some((value) => typeof value !== "string"))) {
     issues.push(`${prefix} args must be an array of strings`);
@@ -291,6 +299,7 @@ function validateCodexProvider(context: ProviderValidationContext): string[] {
   const allowed = new Set([
     "adapter",
     "model",
+    "runtimeProfiles",
     "outputProtocol",
     "command",
     "sandbox",
@@ -308,6 +317,10 @@ function validateCodexProvider(context: ProviderValidationContext): string[] {
   }
   if (definition.model !== undefined && (typeof definition.model !== "string" || !definition.model.trim())) {
     issues.push(`${prefix} model must be a non-empty string`);
+  }
+  if (definition.runtimeProfiles !== undefined && (!Array.isArray(definition.runtimeProfiles)
+    || definition.runtimeProfiles.some((profile) => typeof profile !== "string" || !profile.trim()))) {
+    issues.push(`${prefix} runtimeProfiles must be an array of non-empty strings`);
   }
   if (definition.outputProtocol !== undefined && definition.outputProtocol !== "json") {
     issues.push(`${prefix} outputProtocol must be json`);

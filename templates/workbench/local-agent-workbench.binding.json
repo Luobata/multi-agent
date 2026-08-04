@@ -51,6 +51,13 @@
       "skills": ["knowledge-control-conversation"],
       "knowledgeProfileIds": [],
       "updatePolicy": "locked"
+    },
+    {
+      "roleId": "configuration-steward",
+      "employeeId": "local-agent-workbench-configuration-steward",
+      "skills": ["configuration-control-conversation"],
+      "knowledgeProfileIds": [],
+      "updatePolicy": "locked"
     }
   ]
 }
