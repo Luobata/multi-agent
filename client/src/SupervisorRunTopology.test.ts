@@ -45,4 +45,34 @@ describe("Supervisor runtime topology", () => {
     expect(markup).toContain(`<title>independent-release-reviewer · ${longId} · failed</title>`);
     expect(markup).toContain("…");
   });
+
+  it("shows DAG flowNodeId/kind so one tester role reads as distinct frontend/backend/integration stages", () => {
+    const dagNode = (nodeId: string, kind: string, status: RunNode["status"] = "passed"): RunNode => ({
+      nodeId,
+      roleId: "tester",
+      metadata: { kind: "member", round: 2, flowNodeId: nodeId, flowNodeKind: kind, flowNodeExecution: 1 },
+      status,
+      attempts: 1
+    });
+    const layout = layoutSupervisorRun([
+      node("supervisor-r2", "supervisor", "supervisor", 2),
+      dagNode("frontend-test", "test"),
+      dagNode("backend-test", "test"),
+      node("supervisor-r4", "supervisor", "supervisor", 4),
+      dagNode("integration-test", "integration-test", "running")
+    ]);
+    expect(layout.nodes.filter((item) => item.roleId === "tester").map((item) => [item.id, item.flowNodeId, item.flowNodeKind])).toEqual([
+      ["frontend-test", "frontend-test", "test"],
+      ["backend-test", "backend-test", "test"],
+      ["integration-test", "integration-test", "integration-test"]
+    ]);
+    const markup = renderToStaticMarkup(createElement(SupervisorRunTopology, { nodes: [
+      dagNode("frontend-test", "test"),
+      dagNode("integration-test", "integration-test", "running")
+    ] }));
+    expect(markup).toContain("环节 frontend-test [test]");
+    expect(markup).toContain("环节 integration-test [integration-test]");
+    expect(markup).toContain("<title>tester · 环节 integration-test [integration-test] · integration-test · running</title>");
+    expect(markup).toContain("▶ running");
+  });
 });

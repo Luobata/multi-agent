@@ -7,6 +7,13 @@ import type {
   ArchitectureExecutionResult,
   ArchitectureValidationContext
 } from "./types.js";
+import {
+  normalizeSupervisorDagConfig,
+  supervisorDagIssues,
+  supervisorDagSnapshot,
+  type SupervisorDagConfig,
+  type SupervisorDagNodeTracker
+} from "./supervisorDag.js";
 
 type SupervisorWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
 
@@ -49,6 +56,7 @@ interface SupervisorFlowConfig {
   version: number;
   stages: SupervisorFlowStageConfig[];
   gates: SupervisorGateConfig[];
+  dag?: SupervisorDagConfig;
 }
 
 interface SupervisorTeamMemberConfig {
@@ -70,8 +78,9 @@ interface SupervisorWorkflowConfig {
 }
 
 interface SupervisorAssignment {
+  nodeId?: string;
   roleId: string;
-  task: string;
+  task?: string;
   requiredCapabilities?: string[];
   workKind?: SupervisorWorkKind;
   changeSet?: string;
@@ -257,6 +266,43 @@ const supervisorConfigSchema = {
               fallback: { enum: ["supervisor", "block"] }
             }
           }
+        },
+        dag: {
+          type: "object",
+          additionalProperties: false,
+          required: ["nodes"],
+          properties: {
+            nodes: {
+              type: "array",
+              minItems: 1,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["nodeId", "needs", "kind", "task"],
+                anyOf: [{ required: ["roleId"] }, { required: ["roleRef"] }],
+                properties: {
+                  nodeId: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
+                  roleId: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
+                  roleRef: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
+                  needs: {
+                    type: "array",
+                    uniqueItems: true,
+                    items: { type: "string", pattern: "^[a-z][a-z0-9-]*$" }
+                  },
+                  kind: { enum: ["task", "test", "merge", "integration", "integration-test", "other"] },
+                  task: { type: "string", minLength: 1 },
+                  requiredCapabilities: {
+                    type: "array",
+                    uniqueItems: true,
+                    items: { type: "string", minLength: 1 }
+                  },
+                  workKind: { enum: ["discussion", "code", "test", "audit", "integration", "other"] },
+                  changeSet: { type: "string", minLength: 1 },
+                  required: { type: "boolean" }
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -265,11 +311,12 @@ const supervisorConfigSchema = {
 
 function config(value: JsonObject): SupervisorWorkflowConfig {
   const raw = value as unknown as Omit<SupervisorWorkflowConfig, "flow"> & { flow?: SupervisorFlowConfig };
+  const flow = raw.flow ?? defaultFlow();
   return {
     ...raw,
     supervisor: { ...raw.supervisor, capabilities: raw.supervisor.capabilities ?? [] },
     members: raw.members.map((member) => ({ ...member, capabilities: member.capabilities ?? [] })),
-    flow: raw.flow ?? defaultFlow()
+    flow: { ...flow, dag: normalizeSupervisorDagConfig(flow.dag) }
   };
 }
 
@@ -352,6 +399,7 @@ function validateSupervisor(context: ArchitectureValidationContext): string[] {
     issues.push(`workflow ${context.workflowId} maxParallelDelegations cannot exceed maxDelegations`);
   }
   issues.push(...flowIssues(context.workflowId, value.flow));
+  issues.push(...supervisorDagIssues(context.workflowId, value.flow.dag, roleIds));
   return issues;
 }
 
@@ -379,7 +427,8 @@ function supervisorWith(
   value: SupervisorWorkflowConfig,
   round: number,
   history: JsonValue[],
-  gates: JsonValue[] = []
+  gates: JsonValue[] = [],
+  dagTrackers?: Map<string, SupervisorDagNodeTracker>
 ): JsonObject {
   return {
     __supervisorRound: round,
@@ -388,6 +437,7 @@ function supervisorWith(
     __supervisorTeam: value.members.map(({ roleId, description, capabilities }) => ({ roleId, description, capabilities })),
     __supervisorCapabilities: value.supervisor.capabilities,
     __supervisorGates: gates,
+    ...(dagTrackers ? { __supervisorDag: supervisorDagSnapshot(dagTrackers) } : {}),
     __gateExecution: null,
     __supervisorHistory: history
   };
@@ -398,14 +448,15 @@ function supervisorNode(
   round: number,
   needs: string[],
   history: JsonValue[],
-  gates: JsonValue[] = []
+  gates: JsonValue[] = [],
+  dagTrackers?: Map<string, SupervisorDagNodeTracker>
 ): ExecutionPlanNode {
   return {
     id: `supervisor-r${round}`,
     role: value.supervisor.role,
     provider: "",
     needs,
-    with: supervisorWith(value, round, history, gates),
+    with: supervisorWith(value, round, history, gates, dagTrackers),
     metadata: { kind: "supervisor", roleId: "supervisor", round }
   };
 }
@@ -440,6 +491,9 @@ function formatSupervisorText(plan: ExecutionPlan): string {
     plan.description ? `Purpose: ${plan.description}` : undefined,
     `Flow v${value.flow.version}: ${value.flow.stages.map((stage) => `${stage.title} [${stage.kind}]`).join(" -> ")}`,
     `Gates: ${gates}`,
+    value.flow.dag
+      ? `DAG: ${value.flow.dag.nodes.map((node) => `${node.nodeId} [${node.kind}, ${node.roleId}]`).join(", ")}`
+      : undefined,
     `Management policy: ${value.policy.id} v${value.policy.version}`,
     `Supervisor role: ${value.supervisor.role} (capabilities: ${value.supervisor.capabilities.join(", ") || "none"})`,
     `Members: ${value.members.map((member) => `${member.roleId} (${member.role}; capabilities: ${member.capabilities.join(", ") || "none"})`).join(", ")}`,
@@ -472,6 +526,14 @@ function formatSupervisorMermaid(plan: ExecutionPlan): string {
     lines.push(`  ${memberId}["${mermaidLabel(member.roleId)}<br/>${mermaidLabel(member.role)}"]`);
     lines.push(`  stage_${mermaidId(loop.id)} -. runtime delegation .-> ${memberId}`);
   }
+  if (value.flow.dag) {
+    for (const node of value.flow.dag.nodes) {
+      const dagId = `dag_${mermaidId(node.nodeId)}`;
+      lines.push(`  ${dagId}["${mermaidLabel(node.nodeId)}<br/>${mermaidLabel(node.kind)} · ${mermaidLabel(node.roleId)}"]`);
+      if (node.needs.length === 0) lines.push(`  stage_${mermaidId(loop.id)} -. ready .-> ${dagId}`);
+      for (const need of node.needs) lines.push(`  dag_${mermaidId(need)} --> ${dagId}`);
+    }
+  }
   return lines.join("\n");
 }
 
@@ -498,14 +560,16 @@ function output(
   round: number,
   delegations: number,
   trackers: Map<string, GateTracker>,
-  result?: { summary: string; result: JsonValue }
+  result?: { summary: string; result: JsonValue },
+  dagTrackers?: Map<string, SupervisorDagNodeTracker>
 ): JsonObject {
   return {
     ...(reason ? { reason } : {}),
     ...(result ?? {}),
     rounds: round,
     delegations,
-    gates: gateSnapshot(trackers, true)
+    gates: gateSnapshot(trackers, true),
+    ...(dagTrackers ? { dag: supervisorDagSnapshot(dagTrackers) } : {})
   };
 }
 
@@ -513,9 +577,10 @@ function blocked(
   reason: string,
   round: number,
   delegations: number,
-  trackers: Map<string, GateTracker>
+  trackers: Map<string, GateTracker>,
+  dagTrackers?: Map<string, SupervisorDagNodeTracker>
 ): ArchitectureExecutionResult {
-  return { status: "blocked", output: output(reason, round, delegations, trackers) };
+  return { status: "blocked", output: output(reason, round, delegations, trackers, undefined, dagTrackers) };
 }
 
 function gateMatchesAssignment(gate: SupervisorGateConfig, assignment: SupervisorAssignment): boolean {
@@ -786,6 +851,13 @@ function requiredGateIssues(trackers: Map<string, GateTracker>): GateTracker[] {
 async function executeSupervisor(context: ArchitectureExecutionContext): Promise<ArchitectureExecutionResult> {
   const value = planConfig(context.plan);
   const members = new Map(value.members.map((member) => [member.roleId, member]));
+  const dagTrackers = value.flow.dag
+    ? new Map(value.flow.dag.nodes.map((node): [string, SupervisorDagNodeTracker] => [node.nodeId, {
+        node,
+        status: "pending",
+        executions: []
+      }]))
+    : undefined;
   const trackers = new Map<string, GateTracker>(value.flow.gates.map((gate): [string, GateTracker] => [gate.id, {
     gate,
     status: "pending",
@@ -807,28 +879,32 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
 
   while (true) {
     if (durationExceeded()) {
-      return blocked("management policy duration limit reached before convergence", round - 1, delegationCount, trackers);
+      return blocked("management policy duration limit reached before convergence", round - 1, delegationCount, trackers, dagTrackers);
     }
     const node = round === 1
       ? context.plan.nodes[0]!
-      : supervisorNode(value, round, latestNodeIds, history, gateSnapshot(trackers));
+      : supervisorNode(value, round, latestNodeIds, history, gateSnapshot(trackers), dagTrackers);
+    if (round === 1) node.with = supervisorWith(value, round, history, gateSnapshot(trackers), dagTrackers);
     const supervisorRole = context.loaded.manifest.roles[node.role];
     if (!supervisorRole) throw new Error(`supervisor runtime role not found: ${node.role}`);
     node.provider = supervisorRole.provider;
     await context.scheduleNode(node);
     const supervisorResult = await context.executeNode(node, { dependencyFailure: "observe", deadlineAt });
     if (durationExceeded()) {
-      return blocked("management policy duration limit reached before convergence", round, delegationCount, trackers);
+      return blocked("management policy duration limit reached before convergence", round, delegationCount, trackers, dagTrackers);
     }
     if (supervisorResult.status === "failed" || supervisorResult.status === "skipped") {
       return {
         status: "failed",
-        output: output(supervisorResult.error ?? "supervisor decision failed", round, delegationCount, trackers)
+        output: output(supervisorResult.error ?? "supervisor decision failed", round, delegationCount, trackers, undefined, dagTrackers)
       };
     }
     const next = decision(supervisorResult.output);
     if (!next) {
-      return { status: "failed", output: output("supervisor returned an invalid decision", round, delegationCount, trackers) };
+      return {
+        status: "failed",
+        output: output("supervisor returned an invalid decision", round, delegationCount, trackers, undefined, dagTrackers)
+      };
     }
 
     if (next.action === "satisfy-gate") {
@@ -838,7 +914,14 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       if (!tracker || executor?.roleId !== "supervisor" || pending.length === 0) {
         return {
           status: "failed",
-          output: output(`supervisor cannot satisfy inactive or member-owned gate ${next.gateId}`, round, delegationCount, trackers)
+          output: output(
+            `supervisor cannot satisfy inactive or member-owned gate ${next.gateId}`,
+            round,
+            delegationCount,
+            trackers,
+            undefined,
+            dagTrackers
+          )
         };
       }
       for (const activation of pending) {
@@ -857,7 +940,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       trackerStatus(tracker);
       history.push({ round, supervisorNodeId: node.id, decision: next as unknown as JsonValue });
       if (round >= value.policy.limits.maxRounds) {
-        return blocked("management policy round limit reached before convergence", round, delegationCount, trackers);
+        return blocked("management policy round limit reached before convergence", round, delegationCount, trackers, dagTrackers);
       }
       latestNodeIds = [node.id];
       round += 1;
@@ -866,24 +949,54 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
 
     if (next.action === "finish") {
       if (value.policy.completion.requireDelegation && delegationCount === 0) {
-        return blocked("management policy requires at least one delegation before completion", round, delegationCount, trackers);
+        return blocked(
+          "management policy requires at least one delegation before completion",
+          round,
+          delegationCount,
+          trackers,
+          dagTrackers
+        );
       }
-      if (
-        value.policy.completion.requireAllDelegationsSuccessful
-        && workerResults.some((result) => result.status !== "passed")
-      ) {
-        return blocked("management policy requires every delegation to complete successfully", round, delegationCount, trackers);
+      const requiredDagNodes = dagTrackers
+        ? [...dagTrackers.values()].filter((tracker) => tracker.node.required && tracker.status !== "passed")
+        : [];
+      if (requiredDagNodes.length > 0) {
+        return blocked(
+          `supervisor cannot finish before required DAG nodes pass: ${requiredDagNodes.map((tracker) => `${tracker.node.nodeId} (${tracker.status})`).join(", ")}`,
+          round,
+          delegationCount,
+          trackers,
+          dagTrackers
+        );
+      }
+      const unsuccessfulDelegation = dagTrackers
+        ? [...dagTrackers.values()].some((tracker) => tracker.executions.length > 0 && tracker.status !== "passed")
+        : workerResults.some((result) => result.status !== "passed");
+      if (value.policy.completion.requireAllDelegationsSuccessful && unsuccessfulDelegation) {
+        return blocked(
+          "management policy requires every delegation to complete successfully",
+          round,
+          delegationCount,
+          trackers,
+          dagTrackers
+        );
       }
       const gateNodeIds = await runCompletionGates(
         context, value, trackers, delegationLedger, round, node.id, deadlineAt, gateSequence
       );
       if (durationExceeded()) {
-        return blocked("management policy duration limit reached before convergence", round, delegationCount, trackers);
+        return blocked("management policy duration limit reached before convergence", round, delegationCount, trackers, dagTrackers);
       }
       const unmet = requiredGateIssues(trackers);
       if (unmet.length > 0) {
         if (unmet.some((tracker) => tracker.noExecutor)) {
-          return blocked(unmet.map((tracker) => tracker.reason).filter(Boolean).join("; "), round, delegationCount, trackers);
+          return blocked(
+            unmet.map((tracker) => tracker.reason).filter(Boolean).join("; "),
+            round,
+            delegationCount,
+            trackers,
+            dagTrackers
+          );
         }
         if (round >= value.policy.limits.maxRounds) {
           for (const tracker of unmet) tracker.status = "blocked";
@@ -891,7 +1004,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             `required workflow Gates remain unsatisfied: ${unmet.map((tracker) => tracker.gate.id).join(", ")}`,
             round,
             delegationCount,
-            trackers
+            trackers,
+            dagTrackers
           );
         }
         history.push({
@@ -907,55 +1021,140 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       }
       return {
         status: "passed",
-        output: output(undefined, round, delegationCount, trackers, { summary: next.summary, result: next.result })
+        output: output(
+          undefined,
+          round,
+          delegationCount,
+          trackers,
+          { summary: next.summary, result: next.result },
+          dagTrackers
+        )
       };
     }
 
     if (round >= value.policy.limits.maxRounds) {
-      return blocked("management policy round limit reached before convergence", round, delegationCount, trackers);
+      return blocked("management policy round limit reached before convergence", round, delegationCount, trackers, dagTrackers);
     }
     if (next.assignments.length === 0) {
-      return { status: "failed", output: output("delegate decision contains no assignments", round, delegationCount, trackers) };
+      return {
+        status: "failed",
+        output: output("delegate decision contains no assignments", round, delegationCount, trackers, undefined, dagTrackers)
+      };
     }
     if (next.assignments.length > value.policy.limits.maxParallelDelegations) {
-      return blocked("management policy parallel delegation limit exceeded", round, delegationCount, trackers);
+      return blocked("management policy parallel delegation limit exceeded", round, delegationCount, trackers, dagTrackers);
     }
     if (delegationCount + next.assignments.length > value.policy.limits.maxDelegations) {
-      return blocked("management policy delegation limit reached before convergence", round, delegationCount, trackers);
+      return blocked("management policy delegation limit reached before convergence", round, delegationCount, trackers, dagTrackers);
     }
 
+    const dagViolation = async (reason: string): Promise<ArchitectureExecutionResult> => {
+      await context.emit("supervisor.dag.blocked", node.id, {
+        reason,
+        dag: supervisorDagSnapshot(dagTrackers)
+      });
+      await context.persist();
+      return blocked(reason, round, delegationCount, trackers, dagTrackers);
+    };
     const scheduled: Array<{ assignment: SupervisorAssignment; worker: ExecutionPlanNode }> = [];
+    const scheduledDagNodes = new Set<string>();
     for (let index = 0; index < next.assignments.length; index += 1) {
       const assignment = next.assignments[index]!;
+      const dagTracker = dagTrackers && typeof assignment.nodeId === "string"
+        ? dagTrackers.get(assignment.nodeId)
+        : undefined;
+      if (dagTrackers) {
+        if (typeof assignment.nodeId !== "string" || !assignment.nodeId.trim()) {
+          return dagViolation("supervisor DAG delegation must specify nodeId");
+        }
+        if (!dagTracker) {
+          return dagViolation(`supervisor delegated outside the declared DAG: ${assignment.nodeId}`);
+        }
+        if (scheduledDagNodes.has(assignment.nodeId)) {
+          return dagViolation(`supervisor delegated DAG node ${assignment.nodeId} more than once in the same round`);
+        }
+        scheduledDagNodes.add(assignment.nodeId);
+        if (dagTracker.status === "passed") {
+          return dagViolation(`supervisor cannot delegate DAG node ${assignment.nodeId} because it already passed`);
+        }
+        if (assignment.roleId !== dagTracker.node.roleId) {
+          return dagViolation(
+            `supervisor delegated DAG node ${assignment.nodeId} to role ${assignment.roleId}; expected ${dagTracker.node.roleId}`
+          );
+        }
+        const unmetNeeds = dagTracker.node.needs.filter((need) => dagTrackers.get(need)?.status !== "passed");
+        if (unmetNeeds.length > 0) {
+          return dagViolation(
+            `supervisor delegated DAG node ${assignment.nodeId} before dependencies passed: ${unmetNeeds.map((need) => `${need} (${dagTrackers.get(need)?.status ?? "unknown"})`).join(", ")}`
+          );
+        }
+      }
       const member = members.get(assignment.roleId);
       if (!member) {
-        return blocked(`supervisor delegated to unbound role ${assignment.roleId}`, round, delegationCount, trackers);
+        const reason = `supervisor delegated to unbound role ${assignment.roleId}`;
+        return dagTrackers ? dagViolation(reason) : blocked(reason, round, delegationCount, trackers);
       }
-      const requiredCapabilities = assignment.requiredCapabilities ?? [];
+      if (dagTracker && assignment.workKind !== undefined && assignment.workKind !== dagTracker.node.workKind) {
+        return dagViolation(
+          `supervisor delegated DAG node ${assignment.nodeId} with workKind ${assignment.workKind}; expected ${dagTracker.node.workKind}`
+        );
+      }
+      if (dagTracker && assignment.changeSet !== undefined && assignment.changeSet !== dagTracker.node.changeSet) {
+        return dagViolation(
+          `supervisor delegated DAG node ${assignment.nodeId} with changeSet ${assignment.changeSet}; expected ${dagTracker.node.changeSet ?? "none"}`
+        );
+      }
+      const requiredCapabilities = [...new Set([
+        ...(dagTracker?.node.requiredCapabilities ?? []),
+        ...(assignment.requiredCapabilities ?? [])
+      ])];
       const missing = requiredCapabilities.filter((capability) => !member.capabilities.includes(capability));
       if (missing.length > 0) {
         return blocked(
           `supervisor member ${assignment.roleId} lacks required capabilities: ${missing.join(", ")}`,
           round,
           delegationCount,
-          trackers
+          trackers,
+          dagTrackers
         );
       }
       const role = context.loaded.manifest.roles[member.role];
       if (!role) throw new Error(`supervisor member runtime role not found: ${member.role}`);
+      const delegatedTask = assignment.task?.trim() || dagTracker?.node.task;
+      if (!delegatedTask) {
+        return dagTrackers
+          ? dagViolation(`supervisor DAG node ${assignment.nodeId} has no delegated task`)
+          : { status: "failed", output: output("delegate assignment task is missing", round, delegationCount, trackers) };
+      }
+      const workKind = dagTracker?.node.workKind ?? assignment.workKind ?? "other";
+      const changeSet = dagTracker?.node.changeSet ?? assignment.changeSet;
+      const effectiveAssignment: SupervisorAssignment = {
+        ...assignment,
+        task: delegatedTask,
+        requiredCapabilities,
+        workKind,
+        ...(changeSet ? { changeSet } : {})
+      };
+      const executionNumber = dagTracker ? dagTracker.executions.length + 1 : 1;
+      const workerId = dagTracker
+        ? executionNumber === 1 ? dagTracker.node.nodeId : `${dagTracker.node.nodeId}-retry-${executionNumber}`
+        : `${member.roleId}-r${round}-${index + 1}`;
+      const dependencyNodeIds = dagTracker
+        ? dagTracker.node.needs.map((need) => dagTrackers!.get(need)!.passedExecutionNodeId!)
+        : [];
       scheduled.push({
-        assignment,
+        assignment: effectiveAssignment,
         worker: {
-          id: `${member.roleId}-r${round}-${index + 1}`,
+          id: workerId,
           role: member.role,
           provider: role.provider,
-          needs: [node.id],
+          needs: [node.id, ...dependencyNodeIds],
           with: {
             __delegatedRoleId: member.roleId,
-            __delegatedTask: assignment.task,
+            __delegatedTask: delegatedTask,
             __requiredCapabilities: requiredCapabilities,
-            __workKind: assignment.workKind ?? "other",
-            __changeSet: assignment.changeSet ?? "",
+            __workKind: workKind,
+            __changeSet: changeSet ?? "",
             __gateExecution: null,
             __delegatedContext: assignment.context ?? {},
             __supervisorSummary: next.summary ?? ""
@@ -965,9 +1164,15 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             roleId: member.roleId,
             round,
             parentNodeId: node.id,
-            workKind: assignment.workKind ?? "other",
-            changeSet: assignment.changeSet ?? "",
-            requiredCapabilities
+            workKind,
+            changeSet: changeSet ?? "",
+            requiredCapabilities,
+            ...(dagTracker ? {
+              flowNodeId: dagTracker.node.nodeId,
+              flowNodeKind: dagTracker.node.kind,
+              flowNodeRequired: dagTracker.node.required,
+              flowNodeExecution: executionNumber
+            } : {})
           }
         }
       });
@@ -978,6 +1183,22 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       worker,
       result: await context.executeNode(worker, { deadlineAt })
     })));
+    if (dagTrackers) {
+      for (const record of completed) {
+        const tracker = record.assignment.nodeId ? dagTrackers.get(record.assignment.nodeId) : undefined;
+        if (!tracker) continue;
+        tracker.status = record.result.status;
+        tracker.executions.push({
+          nodeId: record.worker.id,
+          status: record.result.status,
+          output: record.result.output ?? null,
+          error: record.result.error ?? null
+        });
+        if (record.result.status === "passed") tracker.passedExecutionNodeId = record.worker.id;
+      }
+      await context.emit("supervisor.dag.updated", node.id, { dag: supervisorDagSnapshot(dagTrackers) });
+      await context.persist();
+    }
     delegationCount += completed.length;
     delegationLedger.push(...completed);
     workerResults.push(...completed.map(({ result }) => ({ status: result.status })));
@@ -987,8 +1208,9 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       decision: next as unknown as JsonValue,
       delegations: completed.map(({ assignment, worker, result }) => ({
         nodeId: worker.id,
+        flowNodeId: assignment.nodeId ?? null,
         roleId: assignment.roleId,
-        task: assignment.task,
+        task: assignment.task ?? null,
         requiredCapabilities: assignment.requiredCapabilities ?? [],
         workKind: assignment.workKind ?? "other",
         changeSet: assignment.changeSet ?? null,
@@ -1006,12 +1228,13 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         missingGateExecutors.map((tracker) => tracker.reason).filter(Boolean).join("; "),
         round,
         delegationCount,
-        trackers
+        trackers,
+        dagTrackers
       );
     }
     latestNodeIds = gateNodeIds.length > 0 ? gateNodeIds : completed.map(({ worker }) => worker.id);
     if (durationExceeded()) {
-      return blocked("management policy duration limit reached before convergence", round, delegationCount, trackers);
+      return blocked("management policy duration limit reached before convergence", round, delegationCount, trackers, dagTrackers);
     }
     if (
       value.policy.failure.workerFailure === "fail-fast"
@@ -1019,7 +1242,14 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     ) {
       return {
         status: "failed",
-        output: output("a delegated worker failed under fail-fast policy", round, delegationCount, trackers)
+        output: output(
+          "a delegated worker failed under fail-fast policy",
+          round,
+          delegationCount,
+          trackers,
+          undefined,
+          dagTrackers
+        )
       };
     }
     round += 1;

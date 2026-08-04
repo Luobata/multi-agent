@@ -390,10 +390,31 @@ export interface SupervisorGate {
   fallback: SupervisorGateFallback;
 }
 
+export type SupervisorDagNodeKind = "task" | "test" | "merge" | "integration" | "integration-test" | "other";
+
+export interface SupervisorDagNode {
+  /** Stable logical identity used by supervisor delegate decisions and Run evidence. */
+  nodeId: string;
+  /** Workflow-local member slot. Multiple nodes may intentionally reference the same role. */
+  roleId: string;
+  needs: string[];
+  kind: SupervisorDagNodeKind;
+  task: string;
+  requiredCapabilities: string[];
+  workKind: SupervisorWorkKind;
+  changeSet?: string;
+  required: boolean;
+}
+
+export interface SupervisorDagDefinition {
+  nodes: SupervisorDagNode[];
+}
+
 export interface SupervisorFlowDefinition {
   version: number;
   stages: SupervisorFlowStage[];
   gates: SupervisorGate[];
+  dag?: SupervisorDagDefinition;
 }
 
 export interface SupervisorWorkflow extends WorkflowBase {

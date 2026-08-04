@@ -157,6 +157,7 @@ v1 只监听回环地址且没有认证，不应直接暴露到局域网或公�
 - [Architecture Adapter 演进](docs/architecture-adapters.md)
 - [Supervisor Workflow 与 Management Policy](docs/supervisor-workflows.md)
 - [协作编排开发设计：固定流程、动态分工与项目员工](docs/lead-orchestration-development.md)
+- [Supervisor Flow v2：领队约束式 DAG 编排](docs/supervisor-flow-v2.md)
 - [请求分流策略、确定性路由与版本证据](docs/task-entrance-policies.md)
 - [常用多 Agent 模式与可视化编排](docs/multi-agent-patterns-and-composer.md)
 - [Multi-Agent 运行性能与可靠性优化](docs/multi-agent-runtime-performance.md)

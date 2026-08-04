@@ -208,13 +208,53 @@ export interface SupervisorGate {
   fallback: "supervisor" | "block";
 }
 
+export type SupervisorDagNodeKind = "task" | "test" | "merge" | "integration" | "integration-test" | "other";
+export type SupervisorDagWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
+
+export interface SupervisorDagNode {
+  /** Stable logical identity used by supervisor delegate decisions and Run evidence. */
+  nodeId: string;
+  /** Workflow-local member slot. Multiple nodes may intentionally reference the same role. */
+  roleId: string;
+  needs: string[];
+  kind: SupervisorDagNodeKind;
+  task: string;
+  requiredCapabilities: string[];
+  workKind: SupervisorDagWorkKind;
+  changeSet?: string;
+  required: boolean;
+}
+
+export interface SupervisorDagDefinition {
+  nodes: SupervisorDagNode[];
+}
+
+export interface SupervisorDagNodeInput extends Omit<SupervisorDagNode, "roleId" | "required" | "requiredCapabilities" | "workKind"> {
+  /** Canonical member slot reference. */
+  roleId?: string;
+  /** Accepted authoring alias; persisted definitions are normalized to roleId. */
+  roleRef?: string;
+  requiredCapabilities?: string[];
+  workKind?: SupervisorDagWorkKind;
+  required?: boolean;
+}
+
+export interface SupervisorDagInput {
+  nodes: SupervisorDagNodeInput[];
+}
+
 export interface SupervisorFlowDefinition {
   version: number;
   stages: SupervisorFlowStage[];
   gates: SupervisorGate[];
+  dag?: SupervisorDagDefinition;
 }
 
-export type SupervisorFlowInput = Omit<SupervisorFlowDefinition, "version">;
+export interface SupervisorFlowInput {
+  stages: SupervisorFlowStage[];
+  gates: SupervisorGate[];
+  dag?: SupervisorDagInput;
+}
 
 export interface SupervisorWorkbenchWorkflowDefinition extends WorkbenchWorkflowBase {
   architecture: "supervisor";

@@ -5424,7 +5424,7 @@ export class WorkbenchService {
       },
       managementPolicy: { id: policy.id, version: policy.version },
       members,
-      flow: normalizeSupervisorFlow(input.flow, current?.flow),
+      flow: normalizeSupervisorFlow(input.flow, current?.flow, new Set(members.map((member) => member.roleId))),
       inputSchema: input.inputSchema ?? current?.inputSchema,
       createdAt: current?.createdAt ?? timestamp,
       updatedAt: timestamp

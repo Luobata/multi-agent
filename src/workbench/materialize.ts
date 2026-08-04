@@ -23,8 +23,10 @@ export function supervisorMemberRuntimeRoleId(roleId: string): string {
 export function supervisorDecisionSchema(
   roleIds: string[],
   gateIds: string[],
-  maxParallelDelegations: number
+  maxParallelDelegations: number,
+  dagNodeIds?: string[]
 ): JsonObject {
+  const dagMode = dagNodeIds !== undefined;
   return {
     oneOf: [
       {
@@ -41,9 +43,10 @@ export function supervisorDecisionSchema(
             items: {
               type: "object",
               additionalProperties: false,
-              required: ["roleId", "task"],
+              required: dagMode ? ["nodeId", "roleId"] : ["roleId", "task"],
               properties: {
-                roleId: { type: "string", enum: roleIds },
+                ...(dagMode ? { nodeId: { type: "string", minLength: 1 } } : {}),
+                roleId: dagMode ? { type: "string", minLength: 1 } : { type: "string", enum: roleIds },
                 task: { type: "string", minLength: 1 },
                 requiredCapabilities: {
                   type: "array",
@@ -134,7 +137,10 @@ function requestTemplateFor(
     return `${employee.requestPrompt.trim()}\n\n## Knowledge evidence\n\n{{node.with.__knowledgeEvidence}}\n\n## Current input\n\n{{input}}\n\n## Dependency evidence\n\n{{needs}}\n`;
   }
   if (runtimeRoleId === SUPERVISOR_RUNTIME_ROLE_ID) {
-    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself.\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\nManagement policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nAvailable member role slots and explicit capabilities:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, and Gate ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn exactly one JSON decision matching the supplied output schema. Use action \"delegate\" with one or more assignments, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
+    if (!workflow.flow.dag) {
+      return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself.\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\nManagement policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nAvailable member role slots and explicit capabilities:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, and Gate ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn exactly one JSON decision matching the supplied output schema. Use action \"delegate\" with one or more assignments, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
+    }
+    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself.\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\nDeclarative DAG and current logical-node state, when configured:\n{{node.with.__supervisorDag}}\n\nManagement policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nAvailable member role slots and explicit capabilities:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, and Gate ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn exactly one JSON decision matching the supplied output schema. In DAG mode every delegate assignment must name its declared nodeId and matching roleId; delegate only ready nodes whose dependencies passed. Use action \"delegate\" with one or more assignments, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
   }
   return `${employee.requestPrompt.trim()}\n\n## Delegation from the workflow supervisor\n\nYour workflow-local role slot:\n{{node.with.__delegatedRoleId}}\n\nDelegated task:\n{{node.with.__delegatedTask}}\n\nRequired capabilities:\n{{node.with.__requiredCapabilities}}\n\nWork kind and change set:\n{{node.with.__workKind}} / {{node.with.__changeSet}}\n\nGate execution request, when present:\n{{node.with.__gateExecution}}\n\nDelegated context:\n{{node.with.__delegatedContext}}\n\nSupervisor summary:\n{{node.with.__supervisorSummary}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn the requested specialist result using your normal output contract.\n`;
 }
@@ -210,7 +216,8 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
         ? supervisorDecisionSchema(
             supervisorWorkflow!.members.map((member) => member.roleId),
             supervisorWorkflow!.flow.gates.map((gate) => gate.id),
-            supervisorPolicy!.limits.maxParallelDelegations
+            supervisorPolicy!.limits.maxParallelDelegations,
+            supervisorWorkflow!.flow.dag?.nodes.map((node) => node.nodeId)
           )
         : employee.outputSchema
     );
@@ -303,7 +310,15 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
         flow: {
           version: supervisorWorkflow!.flow.version,
           stages: supervisorWorkflow!.flow.stages.map((stage) => ({ ...stage })),
-          gates: supervisorWorkflow!.flow.gates.map((gate) => ({ ...gate }))
+          gates: supervisorWorkflow!.flow.gates.map((gate) => ({ ...gate })),
+          ...(supervisorWorkflow!.flow.dag ? {
+            dag: {
+              nodes: supervisorWorkflow!.flow.dag.nodes.map((node) => ({
+                ...node,
+                needs: [...node.needs]
+              }))
+            }
+          } : {})
         }
       };
   const manifest: MultiAgentManifest = {

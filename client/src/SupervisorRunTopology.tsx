@@ -23,6 +23,9 @@ export interface SupervisorRunLayoutNode {
   roleId: string;
   kind: "supervisor" | "member";
   round: number;
+  flowNodeId?: string;
+  flowNodeKind?: string;
+  flowNodeExecution?: number;
   x: number;
   y: number;
   status: RunNode["status"];
@@ -44,6 +47,23 @@ function metadataRound(node: RunNode): number {
   if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
   const match = /-r(\d+)/.exec(node.nodeId);
   return match?.[1] ? Number(match[1]) : 1;
+}
+
+interface DagFlowMetadata {
+  flowNodeId?: string;
+  flowNodeKind?: string;
+  flowNodeExecution?: number;
+}
+
+/** DAG runs tag member nodes with the declared logical node; one role slot may own several distinct DAG nodes. */
+function dagFlowMetadata(node: RunNode): DagFlowMetadata {
+  const metadata = node.metadata;
+  if (!metadata || metadata.kind !== "member") return {};
+  return {
+    ...(typeof metadata.flowNodeId === "string" ? { flowNodeId: metadata.flowNodeId } : {}),
+    ...(typeof metadata.flowNodeKind === "string" ? { flowNodeKind: metadata.flowNodeKind } : {}),
+    ...(typeof metadata.flowNodeExecution === "number" ? { flowNodeExecution: metadata.flowNodeExecution } : {})
+  };
 }
 
 export function layoutSupervisorRun(nodes: RunNode[]): SupervisorRunLayout {
@@ -68,6 +88,7 @@ export function layoutSupervisorRun(nodes: RunNode[]): SupervisorRunLayout {
       roleId: member.node.roleId,
       kind: "member",
       round,
+      ...dagFlowMetadata(member.node),
       x: 40 + (round - 1) * ROUND_GAP,
       y: 136 + index * 86,
       status: member.node.status
@@ -103,12 +124,20 @@ export function SupervisorRunTopology({ nodes }: { nodes: RunNode[] }) {
       const bend = startX === endX ? startX + 24 : (startX + endX) / 2;
       return <path key={`${edge.from}-${edge.to}`} className="supervisor-run-edge" d={`M${startX} ${startY} H${bend} V${endY} H${endX}`} markerEnd="url(#supervisor-run-arrow)" />;
     })}
-    {layout.nodes.map((node) => <g key={node.id} className={`supervisor-run-node supervisor-run-node--${node.kind} status-${node.status}`} transform={`translate(${node.x} ${node.y})`}>
-      <title>{`${node.kind === "supervisor" ? `领队 Round ${node.round}` : node.roleId} · ${node.id} · ${node.status}`}</title>
-      <rect width={NODE_WIDTH} height="60" />
-      <text x="12" y="21">{compactLabel(node.kind === "supervisor" ? `领队 · Round ${node.round}` : node.roleId, 18)}</text>
-      <text x={NODE_WIDTH - 12} y="21" textAnchor="end" className="supervisor-run-node-status">{statusLabels[node.status]}</text>
-      <text x="12" y="43" className="supervisor-run-node-id">{compactLabel(node.id)}</text>
-    </g>)}
+    {layout.nodes.map((node) => {
+      const primaryLabel = node.kind === "supervisor" ? `领队 · Round ${node.round}` : node.flowNodeId ?? node.roleId;
+      const secondaryLabel = node.kind === "supervisor"
+        ? node.id
+        : node.flowNodeId
+          ? `${node.roleId} · ${node.flowNodeKind ?? "dag"}${node.flowNodeExecution && node.flowNodeExecution > 1 ? ` · 第 ${node.flowNodeExecution} 次执行` : ""}`
+          : node.id;
+      return <g key={node.id} className={`supervisor-run-node supervisor-run-node--${node.kind} status-${node.status}`} transform={`translate(${node.x} ${node.y})`}>
+        <title>{`${node.kind === "supervisor" ? `领队 Round ${node.round}` : node.roleId}${node.flowNodeId ? ` · 环节 ${node.flowNodeId} [${node.flowNodeKind ?? "dag"}]` : ""} · ${node.id} · ${node.status}`}</title>
+        <rect width={NODE_WIDTH} height="60" />
+        <text x="12" y="21">{compactLabel(primaryLabel, 18)}</text>
+        <text x={NODE_WIDTH - 12} y="21" textAnchor="end" className="supervisor-run-node-status">{statusLabels[node.status]}</text>
+        <text x="12" y="43" className="supervisor-run-node-id">{compactLabel(secondaryLabel)}</text>
+      </g>;
+    })}
   </svg></div>;
 }
