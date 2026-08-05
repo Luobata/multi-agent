@@ -27,61 +27,52 @@ export function supervisorDecisionSchema(
   dagNodeIds?: string[]
 ): JsonObject {
   const dagMode = dagNodeIds !== undefined;
+  const actions = ["delegate", ...(gateIds.length > 0 ? ["satisfy-gate"] : []), "finish"];
+  // A single root object with an `action` discriminator. Structured-output APIs reject a
+  // root-level `oneOf`/`anyOf` with 400 before processing, so the union is flattened here and
+  // per-action required fields are enforced downstream in supervisor.ts `decision()`.
   return {
-    oneOf: [
-      {
-        type: "object",
-        additionalProperties: false,
-        required: ["action", "assignments"],
-        properties: {
-          action: { const: "delegate" },
-          summary: { type: "string" },
-          assignments: {
-            type: "array",
-            minItems: 1,
-            maxItems: maxParallelDelegations,
-            items: {
-              type: "object",
-              additionalProperties: false,
-              required: dagMode ? ["nodeId", "roleId"] : ["roleId", "task"],
-              properties: {
-                ...(dagMode ? { nodeId: { type: "string", minLength: 1 } } : {}),
-                roleId: dagMode ? { type: "string", minLength: 1 } : { type: "string", enum: roleIds },
-                task: { type: "string", minLength: 1 },
-                requiredCapabilities: {
-                  type: "array",
-                  uniqueItems: true,
-                  items: { type: "string", minLength: 1 }
-                },
-                workKind: { enum: ["discussion", "code", "test", "audit", "integration", "other"] },
-                changeSet: { type: "string", minLength: 1 },
-                context: { type: "object" }
-              }
-            }
+    type: "object",
+    additionalProperties: false,
+    required: ["action"],
+    properties: {
+      action: { enum: actions },
+      summary: { type: "string" },
+      assignments: {
+        type: "array",
+        minItems: 1,
+        maxItems: maxParallelDelegations,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: dagMode ? ["nodeId", "roleId"] : ["roleId", "task"],
+          properties: {
+            ...(dagMode ? { nodeId: { type: "string", minLength: 1 } } : {}),
+            roleId: dagMode ? { type: "string", minLength: 1 } : { type: "string", enum: roleIds },
+            task: { type: "string", minLength: 1 },
+            requiredCapabilities: {
+              type: "array",
+              uniqueItems: true,
+              items: { type: "string", minLength: 1 }
+            },
+            workKind: { enum: ["discussion", "code", "test", "audit", "integration", "other"] },
+            changeSet: { type: "string", minLength: 1 },
+            context: { type: "object" }
           }
         }
       },
-      ...(gateIds.length > 0 ? [{
-        type: "object",
-        additionalProperties: false,
-        required: ["action", "gateId", "summary", "evidence"],
-        properties: {
-          action: { const: "satisfy-gate" },
-          gateId: { type: "string", enum: gateIds },
-          summary: { type: "string", minLength: 1 },
-          evidence: {}
-        }
-      }] : []),
-      {
-        type: "object",
-        additionalProperties: false,
-        required: ["action", "summary", "result"],
-        properties: {
-          action: { const: "finish" },
-          summary: { type: "string", minLength: 1 },
-          result: {}
-        }
-      }
+      ...(gateIds.length > 0 ? { gateId: { type: "string", enum: gateIds } } : {}),
+      evidence: {},
+      result: {}
+    },
+    // Per-action required fields, enforced schema-side so a malformed decision fails validation
+    // (and triggers the runtime repair attempt) instead of silently passing the flat object.
+    allOf: [
+      { if: { properties: { action: { const: "delegate" } } }, then: { required: ["assignments"] } },
+      ...(gateIds.length > 0
+        ? [{ if: { properties: { action: { const: "satisfy-gate" } } }, then: { required: ["gateId", "summary", "evidence"] } }]
+        : []),
+      { if: { properties: { action: { const: "finish" } } }, then: { required: ["summary", "result"] } }
     ]
   };
 }

@@ -182,6 +182,32 @@ function monitorProviderProcess(
   };
 }
 
+/**
+ * Extract the supervisor decision actions a role's output schema permits.
+ * Understands the flattened `{ properties: { action: { enum | const } } }` shape and the
+ * legacy root-level `oneOf` variant shape, so the mock provider works with either.
+ */
+function supervisorSchemaActions(schema: Record<string, unknown> | undefined): Set<string> {
+  const actions = new Set<string>();
+  if (!schema || typeof schema !== "object") return actions;
+  const collectFromAction = (action: unknown): void => {
+    if (typeof action !== "object" || action === null) return;
+    const asRecord = action as { const?: unknown; enum?: unknown };
+    if (typeof asRecord.const === "string") actions.add(asRecord.const);
+    if (Array.isArray(asRecord.enum)) for (const value of asRecord.enum) if (typeof value === "string") actions.add(value);
+  };
+  const properties = (schema as { properties?: Record<string, unknown> }).properties;
+  if (properties && typeof properties === "object") collectFromAction(properties.action);
+  const variants = (schema as { oneOf?: unknown }).oneOf;
+  if (Array.isArray(variants)) {
+    for (const variant of variants) {
+      if (typeof variant !== "object" || variant === null) continue;
+      collectFromAction((variant as { properties?: Record<string, unknown> }).properties?.action);
+    }
+  }
+  return actions;
+}
+
 class MockProviderAdapter implements ProviderAdapter {
   readonly id = "mock";
 
@@ -227,23 +253,15 @@ class MockProviderAdapter implements ProviderAdapter {
     const displayName = role?.identity?.displayName ?? role?.id ?? "Local employee";
     const suffix = dependencyCount > 0 ? ` I also received evidence from ${dependencyCount} upstream node(s).` : "";
     const punctuation = /[.!?。！？]$/.test(request) ? "" : ".";
-    const variants = Array.isArray(role?.outputSchema?.oneOf) ? role.outputSchema.oneOf : [];
     const node = invocation.templateContext.node as { with?: { __gateExecution?: unknown } } | undefined;
     const gateExecution = typeof node?.with?.__gateExecution === "object" && node.with.__gateExecution !== null
       ? node.with.__gateExecution as { gateId?: unknown }
       : undefined;
-    const supportsSupervisorGate = variants.some((variant) => {
-      if (typeof variant !== "object" || variant === null || Array.isArray(variant)) return false;
-      const properties = (variant as { properties?: Record<string, unknown> }).properties;
-      const action = properties?.action;
-      return typeof action === "object" && action !== null && (action as { const?: unknown }).const === "satisfy-gate";
-    });
-    const supportsSupervisorFinish = variants.some((variant) => {
-      if (typeof variant !== "object" || variant === null || Array.isArray(variant)) return false;
-      const properties = (variant as { properties?: Record<string, unknown> }).properties;
-      const action = properties?.action;
-      return typeof action === "object" && action !== null && (action as { const?: unknown }).const === "finish";
-    });
+    // Discover which supervisor actions the role's output schema allows. Supports both the
+    // flattened `{ properties: { action: { enum } } }` schema and legacy root-level `oneOf` variants.
+    const supervisorActions = supervisorSchemaActions(role?.outputSchema);
+    const supportsSupervisorGate = supervisorActions.has("satisfy-gate");
+    const supportsSupervisorFinish = supervisorActions.has("finish");
     if (gateExecution && supportsSupervisorGate && typeof gateExecution.gateId === "string") {
       return {
         stdout: JSON.stringify({
