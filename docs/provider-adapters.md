@@ -48,7 +48,12 @@ providers:
       - --allowedTools
       - "{{role.toolsCsv}}"
       - --disallowedTools=Write,Edit
+    # 软时限：超过后标记为长任务，只要仍有输出就继续执行
     timeoutMs: 600000
+    # 连续无 stdout/stderr 的空闲时限；未填时等于 timeoutMs
+    idleTimeoutMs: 600000
+    # 即使持续输出也不能越过的安全上限；未填时至少为 1 小时
+    hardTimeoutMs: 3600000
     outputProtocol: claude-json
 ```
 
@@ -67,7 +72,9 @@ Workbench 默认登记 `codex-knowledge-control`。它使用 `codex exec --ephem
 - 环境、凭据、alias 或容器启动需要专门解析；
 - 需要取消、心跳、租约或恢复。
 
-Adapter 应继续返回 stdout、stderr 和持续时间；规范化、Schema 校验、verdict 与证据存储仍由通用 runtime 处理。
+Adapter 应继续返回 stdout、stderr 和持续时间；规范化、Schema 校验、verdict 与证据存储仍由通用 runtime 处理。Command 与 Codex Adapter 会把 stdout/stderr 活动记录为进度：`timeoutMs` 是长任务软时限，不再直接杀死进程；只有连续无输出达到 `idleTimeoutMs`，或总耗时达到 `hardTimeoutMs`，才会终止调用。这样可以区分仍在执行的大任务、疑似卡死和无限输出循环。
+
+Supervisor Management Policy 的 `maxDurationMs` 仍是整个编排的显式硬上限，会早于单个 Provider 的硬上限时优先生效。它与 Provider 的软时限、空闲时限不是同一概念；长任务团队应把该值配置为可接受的端到端最长交付窗口。
 
 ## 注册自定义 adapter
 

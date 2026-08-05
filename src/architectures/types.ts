@@ -38,6 +38,8 @@ export interface ExecuteNodeOptions {
   dependencyFailure?: "skip" | "observe";
   /** Absolute runtime deadline used by bounded dynamic control loops. */
   deadlineAt?: number;
+  /** Dynamic controllers may repair malformed structured decisions without restarting the whole Run. */
+  retryValidation?: boolean;
 }
 
 export interface ArchitectureExecutionContext {

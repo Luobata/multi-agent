@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Ajv, type ErrorObject } from "ajv";
 import { createDefaultArchitectureRegistry } from "../architectures/registry.js";
-import type { ArchitectureRegistry } from "../architectures/types.js";
+import type { ArchitectureRegistry, ExecuteNodeOptions } from "../architectures/types.js";
 import { ProviderExecutionError } from "../core/errors.js";
 import { compilePlan } from "../core/plan.js";
 import { renderRoleSystemPrompt, resolveRoleProfile } from "../core/roles.js";
@@ -17,7 +17,7 @@ import type {
   WorkflowRunRecord
 } from "../core/types.js";
 import { RunStore, type RunEvent } from "./artifacts.js";
-import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers.js";
+import { createDefaultProviderRegistry, type ProviderProgress, type ProviderRegistry } from "./providers.js";
 import { parseProviderOutput, readJsonSchema, statusFromVerdict, validateStructuredOutput } from "./output.js";
 
 export interface RunWorkflowOptions {
@@ -179,7 +179,7 @@ async function executeNode(
   emit: (type: string, nodeId?: string, detail?: JsonValue) => Promise<void>,
   providerCwd: string,
   signal?: AbortSignal,
-  options: { dependencyFailure?: "skip" | "observe"; deadlineAt?: number } = {}
+  options: ExecuteNodeOptions = {}
 ): Promise<NodeRunResult> {
   const role = loaded.manifest.roles[node.role];
   if (!role) throw new Error(`role not found: ${node.role}`);
@@ -257,7 +257,15 @@ async function executeNode(
           cwd: providerCwd,
           prompt: bundle.prompt,
           templateContext: bundle.context,
-          signal: callSignal.signal
+          signal: callSignal.signal,
+          onProgress: async (progress: ProviderProgress) => {
+            const eventType = progress.kind === "long-running"
+              ? "node.long-running"
+              : progress.kind === "output"
+                ? "node.progress"
+                : "node.provider-timeout";
+            await emit(eventType, node.id, progress);
+          }
         });
         if (callSignal.signal?.aborted) {
           throw new ProviderExecutionError(
@@ -290,8 +298,17 @@ async function executeNode(
         await store.writeText(attemptDir, "stdout.txt", error.stdout);
         await store.writeText(attemptDir, "stderr.txt", error.stderr);
       }
-      const retryable = error instanceof ProviderExecutionError && error.retryable;
+      const validationFailure = !(error instanceof ProviderExecutionError);
+      const retryable = error instanceof ProviderExecutionError
+        ? error.retryable
+        : Boolean(options.retryValidation);
       const willRetry = attempt < maxAttempts && retryable;
+      if (willRetry && validationFailure) {
+        node.with = {
+          ...node.with,
+          __previousAttemptError: error instanceof Error ? error.message : String(error)
+        };
+      }
       await store.writeAttemptJson(attemptDir, "error.json", {
         attempt,
         error: error instanceof Error ? error.message : String(error),
@@ -399,7 +416,7 @@ export async function runWorkflow(
   };
   const executePreparedNode = async (
     node: ExecutionPlanNode,
-    executionOptions?: { dependencyFailure?: "skip" | "observe"; deadlineAt?: number }
+    executionOptions?: ExecuteNodeOptions
   ): Promise<NodeRunResult> => {
     let prepared: { node: ExecutionPlanNode; artifacts?: Record<string, JsonValue> };
     try {

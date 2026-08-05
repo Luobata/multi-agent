@@ -93,6 +93,10 @@ import {
   supervisorMemberRuntimeRoleId
 } from "./materialize.js";
 import { loadProjectDescriptor } from "./projectDescriptor.js";
+import {
+  observePassiveProjectAccess,
+  passiveProjectAccessLinkedProjectId
+} from "./passiveProjectAccess.js";
 import { WorkbenchStore } from "./store.js";
 import { normalizeSupervisorFlow } from "./supervisorFlow.js";
 import { compileEffectiveExecutionProfile } from "./effectiveProfile.js";
@@ -144,6 +148,7 @@ import {
   type InvocationStartResult,
   type InvocationSource,
   type InvocationStatus,
+  type PassiveProjectAccessRecord,
   type PublicationDefinition,
   type ProjectBindingDefinition,
   type ProjectBindingInput,
@@ -1945,6 +1950,24 @@ export class WorkbenchService {
     if (event.nodeId) {
       if (event.type === "node.started" || event.type === "node.attempt.started") {
         await this.transitionInstance(invocationId, event.nodeId, "running", "provider");
+      } else if (event.type === "node.progress") {
+        const detail = event.detail as { longRunning?: boolean } | undefined;
+        await this.transitionInstance(
+          invocationId,
+          event.nodeId,
+          "running",
+          detail?.longRunning ? "long-running" : "making-progress"
+        );
+      } else if (event.type === "node.long-running") {
+        await this.transitionInstance(invocationId, event.nodeId, "running", "long-running");
+      } else if (event.type === "node.provider-timeout") {
+        const detail = event.detail as { kind?: string } | undefined;
+        await this.transitionInstance(
+          invocationId,
+          event.nodeId,
+          "running",
+          detail?.kind === "idle-timeout" ? "idle-timeout" : "hard-timeout"
+        );
       } else if (event.type === "node.attempt.failed") {
         const detail = event.detail as { error?: string } | undefined;
         await this.transitionInstance(invocationId, event.nodeId, "running", "retrying", detail?.error);
@@ -2058,6 +2081,21 @@ export class WorkbenchService {
       await this.failInvocationActivity(invocation.id, error);
       throw error;
     }
+  }
+
+  private async validatedProviderCwd(providerCwd?: string): Promise<string | undefined> {
+    const requested = providerCwd?.trim();
+    if (!requested) return undefined;
+    if (!path.isAbsolute(requested)) throw new Error("workflow execution root must be an absolute path");
+    let resolved: string;
+    try {
+      resolved = await fs.realpath(requested);
+      const stats = await fs.stat(resolved);
+      if (!stats.isDirectory()) throw new Error("not a directory");
+    } catch (error) {
+      throw new Error(`workflow execution root is unavailable: ${requested} (${errorMessage(error)})`);
+    }
+    return resolved;
   }
 
   private async inSessionQueue<T>(
@@ -3905,6 +3943,34 @@ export class WorkbenchService {
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
+  listPassiveProjectAccesses(): PassiveProjectAccessRecord[] {
+    const state = this.snapshot();
+    const projects = Object.values(state.projects).map((record) => record.current);
+    return Object.values(state.passiveProjectAccesses)
+      .map((access) => ({
+        ...access,
+        linkedProjectId: passiveProjectAccessLinkedProjectId(access, projects)
+      }))
+      .sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt));
+  }
+
+  async recordPassiveProjectAccess(input: {
+    rootPath?: string;
+    projectKey?: string;
+  }): Promise<PassiveProjectAccessRecord> {
+    const requestedRoot = input.rootPath?.trim();
+    if (requestedRoot && !path.isAbsolute(requestedRoot)) throw new Error("MCP client root must be an absolute path");
+    const rootPath = requestedRoot ? path.normalize(requestedRoot) : undefined;
+    const projectKey = input.projectKey?.trim() || undefined;
+    if (!rootPath && !projectKey) throw new Error("MCP project access requires a root path or project key");
+    const timestamp = now();
+    const stored = await this.store.mutate((state) => {
+      return observePassiveProjectAccess(state, { rootPath, projectKey, seenAt: timestamp });
+    });
+    const projects = Object.values(this.snapshot().projects).map((record) => record.current);
+    return { ...stored, linkedProjectId: passiveProjectAccessLinkedProjectId(stored, projects) };
+  }
+
   getProject(id: string, version?: number): ProjectDefinition {
     const record = this.snapshot().projects[id];
     if (!record) throw new Error(`project not found: ${id}`);
@@ -4564,7 +4630,8 @@ export class WorkbenchService {
   async invokeEmployee(
     employeeId: string,
     input: EmployeeInvocationInput,
-    source: InvocationSource = { kind: "workbench" }
+    source: InvocationSource = { kind: "workbench" },
+    options: { providerCwd?: string } = {}
   ): Promise<EmployeeInvocationResult> {
     requireText(input.message, "message");
     const current = this.getEmployee(employeeId);
@@ -4575,7 +4642,8 @@ export class WorkbenchService {
     if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
     if (session?.assignment) throw new Error(`session ${session.id} belongs to project ${session.assignment.projectId}/${session.assignment.roleId}`);
     const employee = session ? this.getEmployee(employeeId, session.employeeVersion) : current;
-    return this.invokeResolvedEmployee({ employee, input: { ...input, message: input.message.trim() }, source, session });
+    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
+    return this.invokeResolvedEmployee({ employee, input: { ...input, message: input.message.trim() }, source, session, providerCwd });
   }
 
   private async invokePinnedEmployee(
@@ -4583,7 +4651,8 @@ export class WorkbenchService {
     employeeVersionValue: number,
     input: EmployeeInvocationInput,
     source: InvocationSource,
-    entrance: EntrancePolicyExecutionSnapshot
+    entrance: EntrancePolicyExecutionSnapshot,
+    providerCwd?: string
   ): Promise<EmployeeInvocationResult> {
     requireText(input.message, "message");
     const current = this.getEmployee(employeeId);
@@ -4602,7 +4671,8 @@ export class WorkbenchService {
       input: { ...input, message: input.message.trim() },
       source,
       session,
-      entrance
+      entrance,
+      providerCwd: await this.validatedProviderCwd(providerCwd)
     });
   }
 
@@ -5111,7 +5181,8 @@ export class WorkbenchService {
 
   async dispatchEntrancePolicy(
     id: string,
-    input: EntrancePolicyDispatchInput
+    input: EntrancePolicyDispatchInput,
+    options: { providerCwd?: string } = {}
   ): Promise<EntrancePolicyDispatchResult> {
     const parsed = parseEntrancePolicyDispatchInput(input);
     const { message: dispatchMessage, sessionId, ...evaluationInput } = parsed;
@@ -5130,7 +5201,8 @@ export class WorkbenchService {
         decision.target.employeeVersion,
         { message, sessionId },
         parsed.source,
-        entrance
+        entrance,
+        options.providerCwd
       );
       return { decision, dispatch: { kind: "employee", result } };
     }
@@ -5147,7 +5219,7 @@ export class WorkbenchService {
       decision.target.workflowId,
       { message },
       parsed.source,
-      { workflowVersion: decision.target.workflowVersion, entrance }
+      { workflowVersion: decision.target.workflowVersion, entrance, providerCwd: options.providerCwd }
     );
     return { decision, dispatch: { kind: "invocation-started", receipt } };
   }
@@ -5557,10 +5629,12 @@ export class WorkbenchService {
   async runWorkbenchWorkflow(
     id: string,
     input: JsonObject = {},
-    source: InvocationSource = { kind: "workbench" }
+    source: InvocationSource = { kind: "workbench" },
+    options: { providerCwd?: string } = {}
   ): Promise<RunWorkflowResult> {
+    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
     const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source);
-    return this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input);
+    return this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
   }
 
   private async prepareWorkbenchWorkflowInvocation(
@@ -5609,10 +5683,11 @@ export class WorkbenchService {
     id: string,
     input: JsonObject = {},
     source: InvocationSource = { kind: "workbench" },
-    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot } = {}
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
   ): Promise<InvocationStartResult> {
+    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
     const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, options);
-    const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input);
+    const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
     const settled = execution.then(() => undefined, () => undefined);
     this.backgroundInvocations.set(prepared.invocation.id, settled);
     void settled.finally(() => {
@@ -5714,7 +5789,8 @@ export class WorkbenchService {
   async invokePublication(
     id: string,
     input: JsonObject,
-    source: InvocationSource = { kind: "http" }
+    source: InvocationSource = { kind: "http" },
+    options: { providerCwd?: string } = {}
   ): Promise<RunWorkflowResult | EmployeeInvocationResult> {
     const publication = this.getPublication(id);
     if (publication.status !== "active") throw new Error(`publication ${id} is archived`);
@@ -5724,9 +5800,9 @@ export class WorkbenchService {
       return this.invokeEmployee(publication.target.id, {
         message,
         sessionId: this.sessionForExternalContext(publication.target.id, publicationSource)
-      }, publicationSource);
+      }, publicationSource, options);
     }
-    return this.runWorkbenchWorkflow(publication.target.id, input, publicationSource);
+    return this.runWorkbenchWorkflow(publication.target.id, input, publicationSource, options);
   }
 
   async listRuns(limit = 50): Promise<unknown[]> {

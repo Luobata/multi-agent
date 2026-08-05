@@ -61,6 +61,10 @@ describe("Entrance Policy MCP adapter", () => {
         "http://127.0.0.1:4318/api/entrance-policies/desk-entrance/evaluate",
         "http://127.0.0.1:4318/api/entrance-policies/desk-entrance/dispatch"
       ]);
+      expect(requests.every((request) => {
+        const headers = request.init?.headers as Record<string, string> | undefined;
+        return headers?.["x-multi-agent-mcp-root"] === `utf8:${encodeURIComponent(process.cwd())}`;
+      })).toBe(true);
       const evaluated = JSON.parse(String(requests[2]?.init?.body)) as Record<string, unknown>;
       expect(evaluated).toEqual({
         route: "specialist",

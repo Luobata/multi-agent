@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { decodeUtf8HeaderValue } from "../src/core/httpHeaders.js";
+import { decodeUtf8HeaderValue, encodeUtf8HeaderValue } from "../src/core/httpHeaders.js";
 
 describe("UTF-8 HTTP metadata", () => {
+  it("round-trips explicitly encoded metadata", () => {
+    expect(decodeUtf8HeaderValue(encodeUtf8HeaderValue("/tmp/外部项目"))).toBe("/tmp/外部项目");
+  });
+
   it("decodes explicitly encoded metadata", () => {
     expect(decodeUtf8HeaderValue(`utf8:${encodeURIComponent("小狐整体档案设计")}`)).toBe("小狐整体档案设计");
   });

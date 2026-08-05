@@ -135,6 +135,80 @@ describe("provider adapters", () => {
     expect(failure).toMatchObject({ kind: "rate-limit", retryable: true });
   });
 
+  it("keeps an active Provider alive after the soft timeout", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const progress: Array<{ kind: string; longRunning: boolean }> = [];
+    const response = await adapter.invoke({
+      providerId: "active-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: [
+          "-e",
+          "let ticks=0; const timer=setInterval(() => { process.stderr.write('tick'); ticks += 1; if (ticks === 4) { clearInterval(timer); process.stdout.write('{}'); } }, 40)"
+        ],
+        timeoutMs: 50,
+        idleTimeoutMs: 500,
+        hardTimeoutMs: 2_000
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {},
+      onProgress: (event) => { progress.push({ kind: event.kind, longRunning: event.longRunning }); }
+    });
+
+    expect(response.stdout).toBe("{}");
+    expect(response.durationMs).toBeGreaterThan(50);
+    expect(progress.some((event) => event.kind === "long-running")).toBe(true);
+    expect(progress.some((event) => event.kind === "output")).toBe(true);
+  });
+
+  it("terminates a Provider only after its output becomes idle", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const progress: string[] = [];
+    const failure = await adapter.invoke({
+      providerId: "idle-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", "setInterval(() => undefined, 1000)"],
+        timeoutMs: 50,
+        idleTimeoutMs: 100,
+        hardTimeoutMs: 500
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {},
+      onProgress: (event) => { progress.push(event.kind); }
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "idle-timeout", retryable: false });
+    expect(progress).toContain("long-running");
+    expect(progress).toContain("idle-timeout");
+  });
+
+  it("retains an absolute hard timeout for a noisy infinite Provider", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const failure = await adapter.invoke({
+      providerId: "noisy-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", "setInterval(() => process.stderr.write('tick'), 10)"],
+        timeoutMs: 50,
+        idleTimeoutMs: 250,
+        hardTimeoutMs: 300
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {}
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "hard-timeout", retryable: false });
+  });
+
   it("accepts non-empty model metadata and rejects empty declarations", () => {
     const registry = createDefaultProviderRegistry();
     const command = registry.get("command")!;
@@ -158,6 +232,20 @@ describe("provider adapters", () => {
       definition: { adapter: "codex", sandbox: "danger-full-access" },
       projectRoot: process.cwd()
     })).toContain("provider unsafe-codex sandbox must be read-only or workspace-write");
+    expect(command.validate({
+      providerId: "invalid-timeouts",
+      definition: {
+        adapter: "command",
+        command: "agent",
+        timeoutMs: 200,
+        idleTimeoutMs: 300,
+        hardTimeoutMs: 100
+      },
+      projectRoot: process.cwd()
+    })).toEqual(expect.arrayContaining([
+      "provider invalid-timeouts timeoutMs must not exceed hardTimeoutMs",
+      "provider invalid-timeouts idleTimeoutMs must not exceed hardTimeoutMs"
+    ]));
   });
 
   it("places Codex global safety and MCP options before the exec subcommand", () => {

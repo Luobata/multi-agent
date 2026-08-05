@@ -18,6 +18,7 @@ import {
 import type {
   Bootstrap,
   Employee,
+  PassiveProjectAccess,
   Project,
   ProjectBinding,
   ProjectBindingUpdatePolicy,
@@ -109,6 +110,13 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
     return () => window.clearInterval(timer);
   }, []);
   const activeProjects = data.projects.filter((project) => project.status === "active");
+  const passiveProjectAccesses = data.passiveProjectAccesses ?? [];
+  const unlinkedPassiveAccesses = passiveProjectAccesses.filter((access) => !access.linkedProjectId);
+  const passiveAccessByProjectId = new Map(
+    passiveProjectAccesses
+      .filter((access): access is PassiveProjectAccess & { linkedProjectId: string } => Boolean(access.linkedProjectId))
+      .map((access) => [access.linkedProjectId, access])
+  );
   const assignableEmployees = data.employees.filter((employee) => employee.status === "active");
   const [selectedId, setSelectedId] = useState(activeProjects[0]?.id ?? data.projects[0]?.id ?? "");
   const selected = data.projects.find((project) => project.id === selectedId) ?? data.projects[0];
@@ -253,20 +261,27 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
       <div className="record-scroll project-list">
         {data.projects.map((project) => {
           const projectBinding = data.projectBindings.find((candidate) => candidate.projectId === project.id);
+          const passiveAccess = passiveAccessByProjectId.get(project.id);
           return <button type="button" key={project.id} className={`project-card ${selected?.id === project.id ? "selected" : ""}`} onClick={() => setSelectedId(project.id)}>
             <span className="project-card-mark" aria-hidden="true">项</span>
-            <div><strong>{project.name}</strong><code>{project.id} · v{project.version}</code><small>{projectBinding?.roles.length ?? 0}/{project.roles.length} 个角色已分派 · {project.connector.kind}</small></div>
+            <div><strong>{project.name}</strong><code>{project.id} · v{project.version}</code><small>{projectBinding?.roles.length ?? 0}/{project.roles.length} 个角色已分派 · {project.connector.kind}</small>{passiveAccess && <small>MCP 最近触发 {formatTime(passiveAccess.lastSeenAt)} · {passiveAccess.requestCount} 次请求</small>}</div>
             <Stamp status={project.status} />
           </button>;
         })}
-        {data.projects.length === 0 && <div className="mini-empty">尚未接入项目。项目只需一份很短的声明文件，不需要复制员工 Prompt。</div>}
+        {data.projects.length === 0 && <div className="mini-empty">尚未正式接入项目。项目只需一份很短的声明文件，不需要复制员工 Prompt。</div>}
+        {unlinkedPassiveAccesses.length > 0 && <div className="passive-project-heading"><strong>MCP 被动接入</strong><small>工具请求触发后自动留档；尚未建立角色任用关系。</small></div>}
+        {unlinkedPassiveAccesses.map((access) => <article className="project-card passive-project-card" key={access.id}>
+          <span className="project-card-mark passive-project-mark" aria-hidden="true">MCP</span>
+          <div><strong>{access.displayName}</strong><code>{access.rootPath ?? "未记录工作目录（历史调用）"}</code>{access.projectKeys.length > 0 && <small>项目标识 {access.projectKeys.join(" · ")}</small>}<small>首次 {formatTime(access.firstSeenAt)} · 最近 {formatTime(access.lastSeenAt)}</small><small>{access.requestCount} 次 Workbench 请求</small></div>
+          <Stamp status="active" label="被动" />
+        </article>)}
       </div>
-      <footer className="list-footer"><span>{activeProjects.length} 个在用项目</span><span>DESCRIPTOR → BINDING</span></footer>
+      <footer className="list-footer"><span>{activeProjects.length} 个正式接入 · {unlinkedPassiveAccesses.length} 个被动记录</span><span>DESCRIPTOR → BINDING</span></footer>
     </aside>
 
     <main className="detail-pane">
       {!selected ? <EmptyState title="把第一个项目接入员工小镇" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setConnectOpen(true)}>读取项目声明</button>}>
-        在项目根目录放一份 <code>multi-agent.project.yaml</code>，只描述项目和角色需求。员工身份、Skill 和完整 Prompt 继续由 Workbench 管理。
+        {unlinkedPassiveAccesses.length > 0 && <>Workbench 已记录上方 MCP 被动接入；它只证明工具曾被触发，不会自动获得项目角色或权限。</>} 在项目根目录放一份 <code>multi-agent.project.yaml</code>，即可把被动记录升级为正式项目接入。
       </EmptyState> : <div className="dossier project-dossier">
         <header className="dossier-cover">
           <div className="file-index"><span>PROJECT CONNECTION RECORD</span><code>No. {selected.id.toUpperCase()}</code></div>

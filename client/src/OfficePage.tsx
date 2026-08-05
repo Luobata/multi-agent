@@ -29,6 +29,24 @@ const statusLabels: Record<WorkInstanceStatus | InvocationStatus | "idle", strin
   cancelled: "已取消"
 };
 
+const phaseLabels: Record<string, string> = {
+  provider: "Provider 执行中",
+  "making-progress": "持续产生进展",
+  "long-running": "长任务持续执行",
+  "idle-timeout": "长时间无进展",
+  "hard-timeout": "达到安全上限",
+  retrying: "正在重试",
+  done: "已结束",
+  error: "执行失败",
+  queued: "等待调度",
+  waiting: "等待依赖",
+  "waiting-session": "等待会话"
+};
+
+function phaseLabel(phase: string): string {
+  return phaseLabels[phase] ?? phase;
+}
+
 function sourceName(instance: WorkInstanceRecord | InvocationRecord): string {
   const { source } = instance;
   if (source.project) return source.project;
@@ -88,7 +106,7 @@ function WorkInstanceCard({ instance, invocation, clock }: {
       <button type="button" className="instance-evidence-action" onClick={() => { window.location.hash = "runs"; }}>查看运行证据 →</button>
     </div>}
     <footer>
-      <span>{instance.phase}</span>
+      <span>{phaseLabel(instance.phase)}</span>
       <button type="button" onClick={() => { window.location.hash = "runs"; }}>查看运行证据 →</button>
     </footer>
   </article>;

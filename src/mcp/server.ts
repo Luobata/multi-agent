@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { encodeUtf8HeaderValue } from "../core/httpHeaders.js";
 
 interface ApiEnvelope<T> {
   data?: T;
@@ -9,7 +10,11 @@ interface ApiEnvelope<T> {
 async function request<T>(daemonUrl: string, pathname: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${daemonUrl.replace(/\/$/, "")}${pathname}`, {
     ...init,
-    headers: init?.body ? { "content-type": "application/json", ...init.headers } : init?.headers
+    headers: {
+      "x-multi-agent-mcp-root": encodeUtf8HeaderValue(process.cwd()),
+      ...(init?.body ? { "content-type": "application/json" } : {}),
+      ...init?.headers
+    }
   });
   const envelope = await response.json() as ApiEnvelope<T>;
   if (!response.ok || envelope.error) {

@@ -117,6 +117,61 @@ describe("workflow runtime", () => {
     expect(result.run.status).toBe("failed");
   });
 
+  it("persists Provider progress and long-running events", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    loaded.manifest.workflows["progress-review"] = {
+      architecture: "graph",
+      config: { nodes: [{ id: "review", role: "product-manager" }] }
+    };
+    const observed: string[] = [];
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke(invocation) {
+        const common = {
+          at: new Date().toISOString(),
+          stream: "stderr" as const,
+          chunkBytes: 4,
+          totalBytes: 4,
+          elapsedMs: 10,
+          idleMs: 0,
+          softTimeoutMs: 20,
+          idleTimeoutMs: 50,
+          hardTimeoutMs: 100,
+          longRunning: false
+        };
+        await invocation.onProgress?.({ ...common, kind: "output" });
+        await invocation.onProgress?.({
+          ...common,
+          kind: "long-running",
+          stream: null,
+          chunkBytes: 0,
+          elapsedMs: 20,
+          idleMs: 10,
+          longRunning: true
+        });
+        return {
+          stdout: JSON.stringify({ verdict: "Pass", summary: "reviewed", evidence: ["evidence"], risks: [] }),
+          stderr: "tick",
+          durationMs: 30
+        };
+      }
+    };
+
+    const result = await runWorkflow(loaded, "progress-review", {
+      input,
+      providers: new Map([["command", adapter]]),
+      onEvent: (event) => { observed.push(event.type); }
+    });
+
+    expect(result.run.status).toBe("passed");
+    expect(observed).toEqual(expect.arrayContaining(["node.progress", "node.long-running"]));
+    const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8");
+    expect(events).toContain('"type":"node.progress"');
+    expect(events).toContain('"type":"node.long-running"');
+  });
+
   it("records node preparation failures without abandoning sibling-safe architecture scheduling", async () => {
     const { config, input } = fixture();
     const loaded = loadManifest(config);

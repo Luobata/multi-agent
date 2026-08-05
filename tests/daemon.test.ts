@@ -132,6 +132,20 @@ describe("workbench daemon", () => {
     expect(createWorkflow.status).toBe(201);
     const workflow = await createWorkflow.json() as { data: { architecture: string; managementPolicy: { version: number } } };
     expect(workflow.data).toMatchObject({ architecture: "supervisor", managementPolicy: { version: 1 } });
+    const missingMcpRoot = path.join(os.tmpdir(), `missing-mcp-project-${Date.now()}`);
+    const rejectedExecutionRoot = await fetch(`${base}/api/workflows/desk-supervisor/run`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-multi-agent-source": "mcp",
+        "x-multi-agent-mcp-root": missingMcpRoot
+      },
+      body: JSON.stringify({ message: "Do not start outside the caller project" })
+    });
+    expect(rejectedExecutionRoot.status).toBe(400);
+    expect(await rejectedExecutionRoot.json()).toMatchObject({
+      error: { message: expect.stringContaining("workflow execution root is unavailable") }
+    });
     await service.updateManagementPolicy("desk-supervision", { instructions: "A newer policy version." });
     expect(service.getWorkflow("desk-supervisor")).toMatchObject({ managementPolicy: { version: 1 } });
 
@@ -835,6 +849,31 @@ describe("workbench daemon", () => {
           source: { kind: "mcp", caller: "mcp-root" },
           executionSnapshot: { entrance: { policyId: "mcp-entrance", target: { employeeVersion: 1 } } }
         });
+      const passiveAccesses = await fetch(`${base}/api/project-accesses`).then((response) => response.json()) as {
+        data: Array<{
+          rootPath?: string;
+          projectKeys: string[];
+          displayName: string;
+          transport: string;
+          requestCount: number;
+          firstSeenAt: string;
+          lastSeenAt: string;
+          linkedProjectId?: string;
+        }>;
+      };
+      expect(passiveAccesses.data).toContainEqual(expect.objectContaining({
+        rootPath: process.cwd(),
+        projectKeys: ["desk-project", "mcp-project"],
+        displayName: path.basename(process.cwd()),
+        transport: "mcp",
+        requestCount: expect.any(Number),
+        linkedProjectId: "desk-project"
+      }));
+      expect(passiveAccesses.data).toHaveLength(1);
+      const recorded = passiveAccesses.data.find((access) => access.rootPath === process.cwd());
+      expect(recorded?.requestCount).toBeGreaterThanOrEqual(1);
+      expect(recorded?.firstSeenAt).toBeTruthy();
+      expect(recorded?.lastSeenAt).toBeTruthy();
     } finally {
       await client.close();
       await mcpServer.close();

@@ -150,6 +150,64 @@ describe("Project connection page", () => {
     expect(html).toContain("invoke_project_role");
   });
 
+  it("shows MCP-triggered passive access separately and links matching roots to formal projects", () => {
+    const data: Bootstrap = {
+      ...bootstrap,
+      passiveProjectAccesses: [{
+        id: "mcp-external",
+        rootPath: "/tmp/external-project",
+        projectKeys: [],
+        displayName: "external-project",
+        transport: "mcp",
+        requestCount: 3,
+        firstSeenAt: timestamp,
+        lastSeenAt: timestamp
+      }, {
+        id: "mcp-cart-review",
+        rootPath: "/tmp/cart-review",
+        projectKeys: ["cart-review"],
+        displayName: "cart-review",
+        transport: "mcp",
+        requestCount: 5,
+        firstSeenAt: timestamp,
+        lastSeenAt: timestamp,
+        linkedProjectId: "cart-review"
+      }]
+    };
+
+    const html = renderToStaticMarkup(<ProjectPage data={data} refresh={vi.fn()} notify={vi.fn()} />);
+
+    expect(html).toContain("MCP 被动接入");
+    expect(html).toContain("external-project");
+    expect(html).toContain("/tmp/external-project");
+    expect(html).toContain("3 次 Workbench 请求");
+    expect(html).toContain("MCP 最近触发");
+    expect(html).toContain("5 次请求");
+    expect(html.match(/passive-project-card/g)).toHaveLength(1);
+  });
+
+  it("shows a migrated MCP project key when historical evidence has no root path", () => {
+    const data: Bootstrap = {
+      ...bootstrap,
+      passiveProjectAccesses: [{
+        id: "mcp-vibe-docing",
+        projectKeys: ["vibe-docing"],
+        displayName: "vibe-docing",
+        transport: "mcp",
+        requestCount: 2,
+        firstSeenAt: timestamp,
+        lastSeenAt: timestamp
+      }]
+    };
+
+    const html = renderToStaticMarkup(<ProjectPage data={data} refresh={vi.fn()} notify={vi.fn()} />);
+
+    expect(html).toContain("vibe-docing");
+    expect(html).toContain("未记录工作目录（历史调用）");
+    expect(html).toContain("项目标识 vibe-docing");
+    expect(html).toContain("2 次 Workbench 请求");
+  });
+
   it("shows the bound employee runtime status on the role card", () => {
     const data: Bootstrap = { ...bootstrap, activity: { invocations: [], instances: [workInstance("i-1", "running")] } };
     const { container, root } = mount(data);

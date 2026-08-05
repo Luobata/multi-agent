@@ -18,6 +18,115 @@ afterEach(() => {
 });
 
 describe("Local Agent Workbench", () => {
+  it("persists and merges MCP project keys with their observed root", async () => {
+    const dataRoot = temporaryRoot();
+    const externalRoot = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot });
+
+    await service.recordPassiveProjectAccess({ rootPath: externalRoot });
+    await service.recordPassiveProjectAccess({ projectKey: "source-alias" });
+    expect(service.listPassiveProjectAccesses()).toHaveLength(2);
+
+    await service.recordPassiveProjectAccess({ rootPath: externalRoot, projectKey: "source-alias" });
+    expect(service.listPassiveProjectAccesses()).toEqual([
+      expect.objectContaining({
+        rootPath: externalRoot,
+        projectKeys: ["source-alias"],
+        transport: "mcp",
+        requestCount: 3,
+        linkedProjectId: undefined
+      })
+    ]);
+
+    await service.createProject({
+      id: "observed-project",
+      name: "Observed Project",
+      rootPath: externalRoot,
+      descriptorPath: path.join(externalRoot, "multi-agent.project.yaml"),
+      roles: [{ id: "reviewer" }]
+    });
+    expect(service.listPassiveProjectAccesses()[0]).toMatchObject({
+      rootPath: externalRoot,
+      projectKeys: ["source-alias"],
+      requestCount: 3,
+      linkedProjectId: "observed-project"
+    });
+
+    const reopened = await WorkbenchService.open({ dataRoot });
+    expect(reopened.listPassiveProjectAccesses()[0]).toMatchObject({
+      rootPath: externalRoot,
+      projectKeys: ["source-alias"],
+      requestCount: 3,
+      linkedProjectId: "observed-project"
+    });
+  });
+
+  it("persists an idempotent key-only migration from historical MCP Invocations", async () => {
+    const dataRoot = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot });
+    await service.createEmployee({
+      id: "legacy-mcp-worker",
+      identity: { displayName: "Legacy MCP Worker", background: "Tests migration.", responsibilities: ["Respond"] }
+    });
+    await service.invokeEmployee(
+      "legacy-mcp-worker",
+      { message: "First historical request" },
+      { kind: "mcp", project: "vibe-docing", caller: "yaochenghao" }
+    );
+    await service.invokeEmployee(
+      "legacy-mcp-worker",
+      { message: "Second historical request" },
+      { kind: "mcp", project: "vibe-docing", caller: "yaochenghao" }
+    );
+    await service.invokeEmployee(
+      "legacy-mcp-worker",
+      { message: "Non-MCP metadata must not migrate" },
+      { kind: "http", project: "ignored-http-project" }
+    );
+
+    const statePath = path.join(dataRoot, "state.json");
+    const legacy = JSON.parse(fs.readFileSync(statePath, "utf8")) as { passiveProjectAccesses?: unknown };
+    delete legacy.passiveProjectAccesses;
+    fs.writeFileSync(statePath, `${JSON.stringify(legacy, null, 2)}\n`, "utf8");
+
+    const migrated = await WorkbenchService.open({ dataRoot });
+    expect(migrated.listPassiveProjectAccesses()).toEqual([
+      expect.objectContaining({
+        rootPath: undefined,
+        projectKeys: ["vibe-docing"],
+        displayName: "vibe-docing",
+        requestCount: 2,
+        linkedProjectId: undefined
+      })
+    ]);
+    const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      passiveProjectAccesses?: Record<string, { projectKeys?: string[]; requestCount?: number }>;
+    };
+    expect(Object.values(persisted.passiveProjectAccesses ?? {})).toEqual([
+      expect.objectContaining({ projectKeys: ["vibe-docing"], requestCount: 2 })
+    ]);
+
+    const reopened = await WorkbenchService.open({ dataRoot });
+    expect(reopened.listPassiveProjectAccesses()[0]).toMatchObject({
+      projectKeys: ["vibe-docing"],
+      requestCount: 2
+    });
+
+    const connectedRoot = temporaryRoot();
+    await reopened.createProject({
+      id: "vibe-docing",
+      name: "Vibe Docing",
+      rootPath: connectedRoot,
+      descriptorPath: path.join(connectedRoot, "multi-agent.project.yaml"),
+      roles: [{ id: "programmer" }]
+    });
+    expect(reopened.listPassiveProjectAccesses()[0]).toMatchObject({
+      rootPath: undefined,
+      projectKeys: ["vibe-docing"],
+      linkedProjectId: "vibe-docing"
+    });
+  });
+
   it("repairs persisted invocation metadata written with the legacy header encoding", async () => {
     const root = temporaryRoot();
     const service = await WorkbenchService.open({ dataRoot: root });
@@ -514,6 +623,181 @@ describe("Local Agent Workbench", () => {
     await service.archiveWorkflow(workflow.id);
     await expect(service.archiveManagementPolicy(policy.id)).resolves.toMatchObject({ status: "archived", version: 3 });
     await expect(service.restoreManagementPolicy(policy.id)).resolves.toMatchObject({ status: "active", version: 4 });
+  });
+
+  it("runs an MCP-triggered Supervisor Workflow in the caller project root", async () => {
+    const callerRoot = temporaryRoot();
+    const providerCwds: string[] = [];
+    const providers: ProviderRegistry = new Map([["cwd-supervisor", {
+      id: "cwd-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        providerCwds.push(invocation.cwd);
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Caller root confirmed.", result: { cwd: invocation.cwd } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("cwd-provider", { adapter: "cwd-supervisor", outputProtocol: "json" });
+    for (const id of ["cwd-manager", "cwd-worker"]) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Checks execution roots.", responsibilities: ["Work"] },
+        providerId: "cwd-provider"
+      });
+    }
+    await service.createManagementPolicy({
+      id: "cwd-policy",
+      description: "Allow a Supervisor to inspect the caller project root.",
+      allowedRoleIds: ["worker"],
+      instructions: "Inspect the caller project and finish with evidence.",
+      completion: { requireDelegation: false }
+    });
+    await service.createWorkflow({
+      id: "cwd-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "cwd-manager" },
+      managementPolicy: { id: "cwd-policy" },
+      members: [{ roleId: "worker", employeeId: "cwd-worker" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow(
+      "cwd-team",
+      { message: "Inspect this project" },
+      { kind: "mcp", project: "external-project" },
+      { providerCwd: callerRoot }
+    );
+    expect(result.run.status).toBe("passed");
+    const resolvedCallerRoot = fs.realpathSync(callerRoot);
+    expect(providerCwds).toEqual([resolvedCallerRoot]);
+    expect(result.run.output).toMatchObject({ result: { cwd: resolvedCallerRoot } });
+  });
+
+  it("repairs a malformed Supervisor decision inside the node attempt budget", async () => {
+    let supervisorAttempts = 0;
+    const prompts: string[] = [];
+    const providers: ProviderRegistry = new Map([["repairing-supervisor", {
+      id: "repairing-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role !== "supervisor") return { stdout: JSON.stringify({ message: "done" }), stderr: "", durationMs: 1 };
+        supervisorAttempts += 1;
+        prompts.push(invocation.prompt);
+        return supervisorAttempts === 1
+          ? { stdout: JSON.stringify({ action: "finish" }), stderr: "", durationMs: 1 }
+          : {
+              stdout: JSON.stringify({ action: "finish", summary: "Repaired decision.", result: { repaired: true } }),
+              stderr: "",
+              durationMs: 1
+            };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("repairing-provider", { adapter: "repairing-supervisor", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "repair-manager",
+      identity: { displayName: "Repair Manager", background: "Repairs output.", responsibilities: ["Manage"] },
+      providerId: "repairing-provider",
+      maxAttempts: 2
+    });
+    await service.createEmployee({
+      id: "repair-worker",
+      identity: { displayName: "Repair Worker", background: "Provides a member slot.", responsibilities: ["Work"] },
+      providerId: "repairing-provider"
+    });
+    await service.createManagementPolicy({
+      id: "repair-policy",
+      description: "Allow malformed Supervisor decisions to be repaired locally.",
+      allowedRoleIds: ["worker"],
+      instructions: "Return one schema-valid decision.",
+      completion: { requireDelegation: false }
+    });
+    await service.createWorkflow({
+      id: "repair-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "repair-manager" },
+      managementPolicy: { id: "repair-policy" },
+      members: [{ roleId: "worker", employeeId: "repair-worker" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("repair-team", { message: "Return a valid decision" });
+    expect(result.run.status).toBe("passed");
+    expect(result.run.nodes["supervisor-r1"]).toMatchObject({ status: "passed", attempts: 2 });
+    expect(prompts[1]).toContain("Previous structured-decision validation error");
+    expect(prompts[1]).toContain("output schema validation failed");
+  });
+
+  it("does not execute an unchanged blocked delegation repeatedly", async () => {
+    const providers: ProviderRegistry = new Map([["blocked-dedup-supervisor", {
+      id: "blocked-dedup-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role !== "supervisor") {
+          return { stdout: JSON.stringify({ message: "No runnable test target.", verdict: "Block" }), stderr: "", durationMs: 1 };
+        }
+        if (round <= 2) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              assignments: [{ roleId: "tester", task: "Run the unchanged test target.", workKind: "test" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Disclose the unavailable test target.", result: { risk: "test unavailable" } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("blocked-dedup-provider", { adapter: "blocked-dedup-supervisor", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "dedup-manager",
+      identity: { displayName: "Dedup Manager", background: "Stops repeated blockers.", responsibilities: ["Manage"] },
+      providerId: "blocked-dedup-provider"
+    });
+    await service.createEmployee({
+      id: "dedup-tester",
+      identity: { displayName: "Dedup Tester", background: "Reports blockers.", responsibilities: ["Test"] },
+      providerId: "blocked-dedup-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message", "verdict"],
+        properties: { message: { type: "string" }, verdict: { enum: ["Pass", "Block"] } }
+      },
+      verdict: { path: "verdict", pass: ["Pass"], block: ["Block"] }
+    });
+    await service.createManagementPolicy({
+      id: "dedup-policy",
+      description: "Prevent unchanged blocked test assignments from looping.",
+      allowedRoleIds: ["tester"],
+      instructions: "Do not repeat an unchanged blocked test assignment.",
+      limits: { maxRounds: 4, maxDelegations: 4, maxParallelDelegations: 1, maxDurationMs: 60_000 }
+    });
+    await service.createWorkflow({
+      id: "dedup-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "dedup-manager" },
+      managementPolicy: { id: "dedup-policy" },
+      members: [{ roleId: "tester", employeeId: "dedup-tester" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("dedup-team", { message: "Avoid an endless blocker" });
+    expect(result.run.status).toBe("passed");
+    expect(Object.keys(result.run.nodes).filter((id) => id.startsWith("tester-r"))).toEqual(["tester-r1-1"]);
+    expect(result.run.output).toMatchObject({ rounds: 3, delegations: 1 });
+    expect(fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8"))
+      .toContain("supervisor.delegation.rejected");
   });
 
   it("marks Supervisor policy exhaustion as blocked instead of a technical failure", async () => {

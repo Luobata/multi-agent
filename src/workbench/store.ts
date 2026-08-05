@@ -10,6 +10,7 @@ import type { KnowledgeProfileGrant } from "../knowledge/types.js";
 import { isSystemManagedProviderId, systemProviderRuntimeProfiles } from "../runtime/systemProviders.js";
 import type { EmployeeDefinition, WorkbenchSkillDefinition, WorkbenchState } from "./types.js";
 import { defaultSupervisorFlow } from "./supervisorFlow.js";
+import { normalizePassiveProjectAccesses } from "./passiveProjectAccess.js";
 
 const KNOWLEDGE_CONTROL_TOOLS = [
   "knowledge_control_snapshot",
@@ -186,6 +187,7 @@ function initialState(): WorkbenchState {
     publications: {},
     projects: {},
     projectBindings: {},
+    passiveProjectAccesses: {},
     invocations: {},
     workInstances: {}
   };
@@ -275,6 +277,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   state.workInstances ??= {};
   state.projects ??= {};
   state.projectBindings ??= {};
+  state.passiveProjectAccesses ??= {};
   state.employeeTemplates ??= {};
   for (const activity of [...Object.values(state.invocations), ...Object.values(state.workInstances)]) {
     const source = activity.source;
@@ -283,6 +286,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     if (source.caller) source.caller = decodeUtf8HeaderValue(source.caller);
     if (source.contextId) source.contextId = decodeUtf8HeaderValue(source.contextId);
   }
+  normalizePassiveProjectAccesses(state);
   for (const skill of Object.values(state.skills)) {
     skill.status ??= "active";
     skill.owner ??= "user";
@@ -432,8 +436,25 @@ export class WorkbenchStore {
     const statePath = path.join(resolvedRoot, "state.json");
     let state: WorkbenchState;
     try {
-      state = normalizeState(JSON.parse(await fs.readFile(statePath, "utf8")) as WorkbenchState);
+      const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as WorkbenchState;
+      const passiveBefore = JSON.stringify(persisted.passiveProjectAccesses ?? {});
+      state = normalizeState(persisted);
       if (state.schemaVersion !== 1) throw new Error(`unsupported workbench schema version ${String(state.schemaVersion)}`);
+      if (passiveBefore !== JSON.stringify(state.passiveProjectAccesses)) {
+        const release = await acquireFileLock(path.join(resolvedRoot, "state.lock"));
+        try {
+          const latestPersisted = JSON.parse(await fs.readFile(statePath, "utf8")) as WorkbenchState;
+          const latestPassiveBefore = JSON.stringify(latestPersisted.passiveProjectAccesses ?? {});
+          const latest = normalizeState(structuredClone(latestPersisted));
+          if (latestPassiveBefore !== JSON.stringify(latest.passiveProjectAccesses)) {
+            latestPersisted.passiveProjectAccesses = latest.passiveProjectAccesses;
+            await writeJsonAtomic(statePath, latestPersisted);
+          }
+          state = latest;
+        } finally {
+          await release();
+        }
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       state = initialState();

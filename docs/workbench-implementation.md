@@ -101,9 +101,13 @@ Provider Adapter 由可信 TypeScript 代码注册；Provider 实例由 state/AP
   "env": { "MODEL_API_TOKEN": "$ENV:MODEL_API_TOKEN" },
   "inputTemplate": "{{prompt}}",
   "timeoutMs": 600000,
+  "idleTimeoutMs": 600000,
+  "hardTimeoutMs": 3600000,
   "outputProtocol": "claude-json"
 }
 ```
+
+`timeoutMs` 是软时限：越过后 Work Instance 显示为长任务，但有 stdout/stderr 进展时继续执行。`idleTimeoutMs` 才表示持续无输出多久后按疑似卡死终止；`hardTimeoutMs` 是防止无限循环的绝对安全上限。省略后两项时，空闲时限沿用 `timeoutMs`，硬上限取软时限的四倍且至少一小时。
 
 Employee identity 是结构化字段，不是一段不可拆 prompt：
 

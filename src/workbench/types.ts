@@ -608,6 +608,22 @@ export interface ProjectConnectorDefinition {
   config: JsonObject;
 }
 
+/** Durable evidence that an MCP client running inside a local project contacted the workbench. */
+export interface PassiveProjectAccessRecord {
+  id: string;
+  /** Missing on records recovered from legacy Invocation metadata. */
+  rootPath?: string;
+  /** MCP source.project values observed for this project directory. */
+  projectKeys: string[];
+  displayName: string;
+  transport: "mcp";
+  requestCount: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  /** Resolved dynamically when the observed root or project key matches a connected Project. */
+  linkedProjectId?: string;
+}
+
 /** A role slot is a project-owned contract. It describes the work required, not the Employee identity. */
 export interface ProjectRoleContract {
   id: string;
@@ -686,6 +702,7 @@ export interface WorkbenchState {
   publications: Record<string, PublicationDefinition>;
   projects: Record<string, ProjectRecord>;
   projectBindings: Record<string, ProjectBindingRecord>;
+  passiveProjectAccesses: Record<string, PassiveProjectAccessRecord>;
   invocations: Record<string, InvocationRecord>;
   workInstances: Record<string, WorkInstanceRecord>;
 }

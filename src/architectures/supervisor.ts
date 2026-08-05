@@ -111,6 +111,42 @@ interface DelegationRecord {
   result: NodeRunResult;
 }
 
+function normalizedAssignmentFingerprint(assignment: SupervisorAssignment): string {
+  const task = assignment.task?.trim().replace(/\s+/g, " ").toLocaleLowerCase() ?? "";
+  return JSON.stringify([
+    assignment.roleId,
+    assignment.workKind ?? "other",
+    assignment.changeSet ?? "",
+    task,
+    assignment.context ?? {}
+  ]);
+}
+
+function repeatedBlockedAssignment(
+  assignment: SupervisorAssignment,
+  ledger: DelegationRecord[]
+): DelegationRecord | undefined {
+  const fingerprint = normalizedAssignmentFingerprint(assignment);
+  const prior = [...ledger].reverse().find((record) => (
+    record.result.status === "blocked"
+    && normalizedAssignmentFingerprint(record.assignment) === fingerprint
+  ));
+  if (!prior) return undefined;
+  const priorRound = typeof prior.worker.metadata?.round === "number" ? prior.worker.metadata.round : 0;
+  const prerequisiteProgress = ledger.some((record) => {
+    const recordRound = typeof record.worker.metadata?.round === "number" ? record.worker.metadata.round : 0;
+    return record !== prior
+      && record.result.status === "passed"
+      && recordRound >= priorRound
+      && (
+        !assignment.changeSet
+        || !record.assignment.changeSet
+        || record.assignment.changeSet === assignment.changeSet
+      );
+  });
+  return prerequisiteProgress ? undefined : prior;
+}
+
 type GateRunStatus = "pending" | "passed" | "blocked" | "skipped";
 
 interface GateActivation {
@@ -439,7 +475,8 @@ function supervisorWith(
     __supervisorGates: gates,
     ...(dagTrackers ? { __supervisorDag: supervisorDagSnapshot(dagTrackers) } : {}),
     __gateExecution: null,
-    __supervisorHistory: history
+    __supervisorHistory: history,
+    __previousAttemptError: ""
   };
 }
 
@@ -889,7 +926,11 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     if (!supervisorRole) throw new Error(`supervisor runtime role not found: ${node.role}`);
     node.provider = supervisorRole.provider;
     await context.scheduleNode(node);
-    const supervisorResult = await context.executeNode(node, { dependencyFailure: "observe", deadlineAt });
+    const supervisorResult = await context.executeNode(node, {
+      dependencyFailure: "observe",
+      deadlineAt,
+      retryValidation: true
+    });
     if (durationExceeded()) {
       return blocked("management policy duration limit reached before convergence", round, delegationCount, trackers, dagTrackers);
     }
@@ -1046,6 +1087,23 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     }
     if (delegationCount + next.assignments.length > value.policy.limits.maxDelegations) {
       return blocked("management policy delegation limit reached before convergence", round, delegationCount, trackers, dagTrackers);
+    }
+
+    if (!dagTrackers) {
+      const repeated = next.assignments.find((assignment) => repeatedBlockedAssignment(assignment, delegationLedger));
+      if (repeated) {
+        const reason = `blocked assignment was repeated without new prerequisite evidence: ${repeated.roleId}`;
+        history.push({
+          round,
+          supervisorNodeId: node.id,
+          decision: next as unknown as JsonValue,
+          decisionRejected: reason
+        });
+        await context.emit("supervisor.delegation.rejected", node.id, { reason });
+        latestNodeIds = [node.id];
+        round += 1;
+        continue;
+      }
     }
 
     const dagViolation = async (reason: string): Promise<ArchitectureExecutionResult> => {

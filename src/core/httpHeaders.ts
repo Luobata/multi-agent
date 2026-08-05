@@ -1,5 +1,9 @@
 const utf8HeaderPrefix = "utf8:";
 
+export function encodeUtf8HeaderValue(value: string): string {
+  return `${utf8HeaderPrefix}${encodeURIComponent(value)}`;
+}
+
 export function decodeUtf8HeaderValue(value: string): string {
   if (value.startsWith(utf8HeaderPrefix)) {
     try {

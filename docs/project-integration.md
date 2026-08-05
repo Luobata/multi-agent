@@ -11,6 +11,16 @@
 
 管理台是控制面；daemon 和 Run Store 是事实来源。
 
+### MCP 被动接入记录
+
+当其他本地项目以 stdio MCP 配置 Workbench 时，MCP 子进程会继承该项目的工作目录。只要任一 MCP tool 实际向 daemon 发出请求，Workbench 就会把工作目录以及请求携带的 `source.project` 项目标识合并写入独立的 `PassiveProjectAccessRecord` 台账，保存首次触发时间、最近触发时间和请求次数，并在“项目接入”页的“MCP 被动接入”区域展示。
+
+Workbench 启动时也会从持久化的历史 MCP Invocation 安全回填 `source.project`；旧 Invocation 没有 cwd，因此这类记录允许不含 `rootPath`，管理台会明确标成历史调用。回填是幂等的，不会因重复启动累加请求次数。后续同时观察到相同项目标识和 cwd 时，两份证据会合并。
+
+被动记录只证明某个本地目录或项目标识通过 MCP 接触过 Workbench，不会自动创建 `Project Descriptor`、`ProjectBinding`，也不会授予项目角色、Skill 或写权限。正式项目接入后，控制面会按相同根目录或相同项目标识动态关联被动记录；历史触发证据仍然保留。仅配置但从未触发 MCP tool 时不会产生记录。
+
+当该 MCP 客户端实际调用 Employee、Workflow、Entrance Policy 或 Publication 时，daemon 会先校验这个绝对路径真实存在且为目录，再把它作为 Provider 的工作目录传入；materialized manifest 与 Run Store 仍留在 Workbench 数据目录。目录上下文不等于授权，最终可用工具、写入范围和沙箱能力仍由 Employee 与 Provider 配置控制。无效目录会在创建长时间 Run 前直接失败，避免员工落到生成目录或只读快照中反复阻塞。
+
 ## 最小项目声明
 
 项目根目录中的 `multi-agent.project.yaml` 可以保持很短：

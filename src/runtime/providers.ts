@@ -2,7 +2,28 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { ProviderExecutionError } from "../core/errors.js";
 import { renderTemplate } from "../core/template.js";
-import type { CodexProviderDefinition, CommandProviderDefinition, ProviderDefinition } from "../core/types.js";
+import type { CodexProviderDefinition, CommandProviderDefinition, JsonValue, ProviderDefinition } from "../core/types.js";
+
+const DEFAULT_PROVIDER_SOFT_TIMEOUT_MS = 600_000;
+const MINIMUM_DEFAULT_HARD_TIMEOUT_MS = 3_600_000;
+const PROGRESS_EVENT_INTERVAL_MS = 5_000;
+
+type ProviderTimeoutDefinition = Pick<CommandProviderDefinition, "timeoutMs" | "idleTimeoutMs" | "hardTimeoutMs">;
+
+export type ProviderProgress = {
+  [key: string]: JsonValue;
+  kind: "output" | "long-running" | "idle-timeout" | "hard-timeout";
+  at: string;
+  stream: "stdout" | "stderr" | null;
+  chunkBytes: number;
+  totalBytes: number;
+  elapsedMs: number;
+  idleMs: number;
+  softTimeoutMs: number;
+  idleTimeoutMs: number;
+  hardTimeoutMs: number;
+  longRunning: boolean;
+};
 
 export interface ProviderValidationContext {
   providerId: string;
@@ -17,6 +38,7 @@ export interface ProviderInvocation {
   prompt: string;
   templateContext: Record<string, unknown>;
   signal?: AbortSignal;
+  onProgress?: (progress: ProviderProgress) => void | Promise<void>;
 }
 
 export interface ProviderResponse {
@@ -32,6 +54,133 @@ export interface ProviderAdapter {
 }
 
 export type ProviderRegistry = Map<string, ProviderAdapter>;
+
+function validateTimeoutPolicy(prefix: string, definition: Record<string, unknown>): string[] {
+  const issues: string[] = [];
+  for (const key of ["timeoutMs", "idleTimeoutMs", "hardTimeoutMs"] as const) {
+    if (definition[key] !== undefined && (!Number.isInteger(definition[key]) || (definition[key] as number) < 1)) {
+      issues.push(`${prefix} ${key} must be a positive integer`);
+    }
+  }
+  const soft = definition.timeoutMs;
+  const idle = definition.idleTimeoutMs;
+  const hard = definition.hardTimeoutMs;
+  if (typeof soft === "number" && typeof hard === "number" && soft > hard) {
+    issues.push(`${prefix} timeoutMs must not exceed hardTimeoutMs`);
+  }
+  if (typeof idle === "number" && typeof hard === "number" && idle > hard) {
+    issues.push(`${prefix} idleTimeoutMs must not exceed hardTimeoutMs`);
+  }
+  return issues;
+}
+
+function providerTimeoutPolicy(definition: ProviderTimeoutDefinition): {
+  softTimeoutMs: number;
+  idleTimeoutMs: number;
+  hardTimeoutMs: number;
+} {
+  const softTimeoutMs = definition.timeoutMs ?? DEFAULT_PROVIDER_SOFT_TIMEOUT_MS;
+  return {
+    softTimeoutMs,
+    idleTimeoutMs: definition.idleTimeoutMs ?? softTimeoutMs,
+    hardTimeoutMs: definition.hardTimeoutMs ?? Math.max(softTimeoutMs * 4, MINIMUM_DEFAULT_HARD_TIMEOUT_MS)
+  };
+}
+
+function monitorProviderProcess(
+  invocation: ProviderInvocation,
+  definition: ProviderTimeoutDefinition,
+  started: number,
+  terminate: () => void
+): {
+  noteOutput: (stream: "stdout" | "stderr", chunk: string) => void;
+  stop: () => void;
+  flush: () => Promise<void>;
+  timeoutKind: () => "idle-timeout" | "hard-timeout" | undefined;
+  policy: ReturnType<typeof providerTimeoutPolicy>;
+} {
+  const policy = providerTimeoutPolicy(definition);
+  let timeoutKind: "idle-timeout" | "hard-timeout" | undefined;
+  let longRunning = false;
+  let lastOutputAt = started;
+  let lastProgressEventAt = 0;
+  let totalBytes = 0;
+  let progressQueue = Promise.resolve();
+  let idleTimer: ReturnType<typeof setTimeout>;
+
+  const publish = (
+    kind: ProviderProgress["kind"],
+    stream: ProviderProgress["stream"] = null,
+    chunkBytes = 0
+  ) => {
+    if (!invocation.onProgress) return;
+    const timestamp = Date.now();
+    const progress: ProviderProgress = {
+      kind,
+      at: new Date(timestamp).toISOString(),
+      stream,
+      chunkBytes,
+      totalBytes,
+      elapsedMs: timestamp - started,
+      idleMs: timestamp - lastOutputAt,
+      softTimeoutMs: policy.softTimeoutMs,
+      idleTimeoutMs: policy.idleTimeoutMs,
+      hardTimeoutMs: policy.hardTimeoutMs,
+      longRunning
+    };
+    progressQueue = progressQueue
+      .then(async () => { await invocation.onProgress?.(progress); })
+      .catch(() => undefined);
+  };
+
+  const expireIdle = () => {
+    if (timeoutKind) return;
+    timeoutKind = "idle-timeout";
+    publish("idle-timeout");
+    terminate();
+  };
+  const resetIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(expireIdle, policy.idleTimeoutMs);
+    idleTimer.unref();
+  };
+  resetIdleTimer();
+
+  const softTimer = setTimeout(() => {
+    longRunning = true;
+    publish("long-running");
+  }, policy.softTimeoutMs);
+  softTimer.unref();
+  const hardTimer = setTimeout(() => {
+    if (timeoutKind) return;
+    timeoutKind = "hard-timeout";
+    publish("hard-timeout");
+    terminate();
+  }, policy.hardTimeoutMs);
+  hardTimer.unref();
+
+  return {
+    noteOutput(stream, chunk) {
+      const timestamp = Date.now();
+      const chunkBytes = Buffer.byteLength(chunk);
+      lastOutputAt = timestamp;
+      totalBytes += chunkBytes;
+      resetIdleTimer();
+      if (lastProgressEventAt === 0 || timestamp - lastProgressEventAt >= PROGRESS_EVENT_INTERVAL_MS) {
+        lastProgressEventAt = timestamp;
+        publish("output", stream, chunkBytes);
+      }
+    },
+    stop() {
+      clearTimeout(softTimer);
+      clearTimeout(idleTimer);
+      clearTimeout(hardTimer);
+    },
+    flush: () => progressQueue,
+    timeoutKind: () => timeoutKind,
+    policy
+  };
+}
 
 class MockProviderAdapter implements ProviderAdapter {
   readonly id = "mock";
@@ -130,7 +279,19 @@ function validateCommandProvider(context: ProviderValidationContext): string[] {
   const prefix = `provider ${context.providerId}`;
   const definition = context.definition as unknown as Record<string, unknown>;
   const issues: string[] = [];
-  const allowed = new Set(["adapter", "model", "runtimeProfiles", "command", "args", "env", "inputTemplate", "timeoutMs", "outputProtocol"]);
+  const allowed = new Set([
+    "adapter",
+    "model",
+    "runtimeProfiles",
+    "command",
+    "args",
+    "env",
+    "inputTemplate",
+    "timeoutMs",
+    "idleTimeoutMs",
+    "hardTimeoutMs",
+    "outputProtocol"
+  ]);
   for (const key of Object.keys(definition)) {
     if (!allowed.has(key)) issues.push(`${prefix} command adapter does not support property ${key}`);
   }
@@ -157,9 +318,7 @@ function validateCommandProvider(context: ProviderValidationContext): string[] {
   if (definition.inputTemplate !== undefined && (typeof definition.inputTemplate !== "string" || !definition.inputTemplate)) {
     issues.push(`${prefix} inputTemplate must be a non-empty string`);
   }
-  if (definition.timeoutMs !== undefined && (!Number.isInteger(definition.timeoutMs) || (definition.timeoutMs as number) < 1)) {
-    issues.push(`${prefix} timeoutMs must be a positive integer`);
-  }
+  issues.push(...validateTimeoutPolicy(prefix, definition));
   if (
     definition.outputProtocol !== undefined &&
     !["json", "claude-json", "raw"].includes(String(definition.outputProtocol))
@@ -199,7 +358,6 @@ class CommandProviderAdapter implements ProviderAdapter {
       })
     );
     const input = renderTemplate(definition.inputTemplate ?? "{{prompt}}", context);
-    const timeoutMs = definition.timeoutMs ?? 600_000;
     const started = Date.now();
 
     return new Promise((resolve, reject) => {
@@ -211,7 +369,6 @@ class CommandProviderAdapter implements ProviderAdapter {
       let stdout = "";
       let stderr = "";
       let settled = false;
-      let timedOut = false;
 
       const failureOptions = (status: number | null) => {
         const detail = `${stdout}\n${stderr}`.toLowerCase();
@@ -227,28 +384,26 @@ class CommandProviderAdapter implements ProviderAdapter {
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        monitor.stop();
         invocation.signal?.removeEventListener("abort", abort);
-        callback();
+        void monitor.flush().then(callback);
       };
       const abort = () => {
         child.kill("SIGTERM");
         setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
       };
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        abort();
-      }, timeoutMs);
-      timeout.unref();
+      const monitor = monitorProviderProcess(invocation, definition, started, abort);
       invocation.signal?.addEventListener("abort", abort, { once: true });
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
         stdout += chunk;
+        monitor.noteOutput("stdout", chunk);
       });
       child.stderr.on("data", (chunk: string) => {
         stderr += chunk;
+        monitor.noteOutput("stderr", chunk);
       });
       child.once("error", (error) => {
         finish(() => reject(new ProviderExecutionError(error.message, stdout, stderr, {
@@ -267,9 +422,12 @@ class CommandProviderAdapter implements ProviderAdapter {
             }));
             return;
           }
-          if (timedOut) {
-            reject(new ProviderExecutionError(`provider ${invocation.providerId} timed out after ${timeoutMs}ms`, stdout, stderr, {
-              kind: "timeout",
+          const timeoutKind = monitor.timeoutKind();
+          if (timeoutKind) {
+            const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs;
+            const reason = timeoutKind === "idle-timeout" ? "was idle" : "reached its hard timeout";
+            reject(new ProviderExecutionError(`provider ${invocation.providerId} ${reason} after ${timeoutMs}ms`, stdout, stderr, {
+              kind: timeoutKind,
               retryable: false,
               durationMs: Date.now() - started
             }));
@@ -307,6 +465,8 @@ function validateCodexProvider(context: ProviderValidationContext): string[] {
     "workingDirectory",
     "approvalPolicy",
     "timeoutMs",
+    "idleTimeoutMs",
+    "hardTimeoutMs",
     "mcpServers"
   ]);
   for (const key of Object.keys(definition)) {
@@ -340,9 +500,7 @@ function validateCodexProvider(context: ProviderValidationContext): string[] {
   if (definition.approvalPolicy !== undefined && definition.approvalPolicy !== "never") {
     issues.push(`${prefix} approvalPolicy must be never for non-interactive execution`);
   }
-  if (definition.timeoutMs !== undefined && (!Number.isInteger(definition.timeoutMs) || (definition.timeoutMs as number) < 1)) {
-    issues.push(`${prefix} timeoutMs must be a positive integer`);
-  }
+  issues.push(...validateTimeoutPolicy(prefix, definition));
   if (definition.mcpServers !== undefined) {
     if (typeof definition.mcpServers !== "object" || definition.mcpServers === null || Array.isArray(definition.mcpServers)) {
       issues.push(`${prefix} mcpServers must be an object`);
@@ -452,7 +610,6 @@ class CodexProviderAdapter implements ProviderAdapter {
     const workingDirectory = definition.workingDirectory
       ? path.resolve(invocation.cwd, renderTemplate(definition.workingDirectory, context))
       : invocation.cwd;
-    const timeoutMs = definition.timeoutMs ?? 600_000;
     const started = Date.now();
 
     return new Promise((resolve, reject) => {
@@ -464,28 +621,29 @@ class CodexProviderAdapter implements ProviderAdapter {
       let stdout = "";
       let stderr = "";
       let settled = false;
-      let timedOut = false;
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeout);
+        monitor.stop();
         invocation.signal?.removeEventListener("abort", abort);
-        callback();
+        void monitor.flush().then(callback);
       };
       const abort = () => {
         child.kill("SIGTERM");
         setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
       };
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        abort();
-      }, timeoutMs);
-      timeout.unref();
+      const monitor = monitorProviderProcess(invocation, definition, started, abort);
       invocation.signal?.addEventListener("abort", abort, { once: true });
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-      child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+        monitor.noteOutput("stdout", chunk);
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+        monitor.noteOutput("stderr", chunk);
+      });
       child.once("error", (error) => finish(() => reject(new ProviderExecutionError(
         `provider ${invocation.providerId} could not start ${definition.command?.trim() || "codex"}; set MULTI_AGENT_CODEX_COMMAND when Codex is outside the daemon PATH (${error.message})`,
         stdout,
@@ -499,9 +657,12 @@ class CodexProviderAdapter implements ProviderAdapter {
             retryable: false,
             durationMs: Date.now() - started
           }));
-        } else if (timedOut) {
-          reject(new ProviderExecutionError(`provider ${invocation.providerId} timed out after ${timeoutMs}ms`, stdout, stderr, {
-            kind: "timeout",
+        } else if (monitor.timeoutKind()) {
+          const timeoutKind = monitor.timeoutKind()!;
+          const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs;
+          const reason = timeoutKind === "idle-timeout" ? "was idle" : "reached its hard timeout";
+          reject(new ProviderExecutionError(`provider ${invocation.providerId} ${reason} after ${timeoutMs}ms`, stdout, stderr, {
+            kind: timeoutKind,
             retryable: false,
             durationMs: Date.now() - started
           }));

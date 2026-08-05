@@ -12,7 +12,16 @@ export class TemplateRenderError extends Error {
   }
 }
 
-export type ProviderFailureKind = "aborted" | "budget" | "rate-limit" | "start" | "timeout" | "exit" | "unknown";
+export type ProviderFailureKind =
+  | "aborted"
+  | "budget"
+  | "rate-limit"
+  | "start"
+  | "timeout"
+  | "idle-timeout"
+  | "hard-timeout"
+  | "exit"
+  | "unknown";
 
 export interface ProviderExecutionErrorOptions {
   kind?: ProviderFailureKind;

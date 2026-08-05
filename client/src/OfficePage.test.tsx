@@ -199,6 +199,22 @@ describe("Office floor live announcements", () => {
     expect(window.location.hash).toBe("#runs");
   });
 
+  it("explains progress-aware long-running phases in the instance drawer", () => {
+    const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
+    const longRunning = { ...instance("i-1", mihuhu.id, "running"), phase: "long-running" };
+    act(() => root.render(<OfficePage
+      data={bootstrapWith({
+        employees: [mihuhu],
+        activity: { invocations: [], instances: [longRunning] }
+      })}
+      streamStatus="live"
+    />));
+
+    const seat = container.querySelector<HTMLButtonElement>(".office-employee");
+    act(() => seat?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(container.querySelector(".employee-activity-drawer")?.textContent).toContain("长任务持续执行");
+  });
+
   it("announces deduped status migrations keyed by instance id and status", () => {
     const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
     const running = bootstrapWith({

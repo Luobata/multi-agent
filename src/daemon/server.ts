@@ -57,12 +57,12 @@ function providerDefinition(value: unknown): ProviderDefinition {
   return definition as ProviderDefinition;
 }
 
-function headerText(request: Request, name: string): string | undefined {
+function headerText(request: Request, name: string, maxLength = 240): string | undefined {
   const value = request.headers[name];
   const text = Array.isArray(value) ? value[0] : value;
   if (typeof text !== "string") return undefined;
   const decoded = decodeUtf8HeaderValue(text).trim();
-  return decoded ? decoded.slice(0, 240) : undefined;
+  return decoded ? decoded.slice(0, maxLength) : undefined;
 }
 
 function invocationSource(request: Request, fallback: InvocationSourceKind): InvocationSource {
@@ -79,6 +79,10 @@ function invocationSource(request: Request, fallback: InvocationSourceKind): Inv
   };
 }
 
+function mcpExecutionRoot(request: Request, source: InvocationSource): string | undefined {
+  return source.kind === "mcp" ? headerText(request, "x-multi-agent-mcp-root", 4096) : undefined;
+}
+
 export interface DaemonAppOptions {
   baseUrl?: string;
   staticDir?: string;
@@ -91,6 +95,17 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
 
   app.disable("x-powered-by");
   app.use("/api", express.json({ limit: "2mb" }));
+  app.use("/api", (request, _response, next) => {
+    const mcpRoot = headerText(request, "x-multi-agent-mcp-root", 4096);
+    if (!mcpRoot) {
+      next();
+      return;
+    }
+    void service.recordPassiveProjectAccess({
+      rootPath: mcpRoot,
+      projectKey: headerText(request, "x-multi-agent-project")
+    }).then(() => next(), next);
+  });
 
   app.get("/api/health", (_request, response) => {
     send(response, {
@@ -116,7 +131,8 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
         entrancePolicies: "versioned-routing-v1",
         employeeTemplates: "versioned-static-v1",
         employeeScopes: "version-pinned-v1",
-        systemSkills: "read-only-v1"
+        systemSkills: "read-only-v1",
+        passiveProjectAccesses: "mcp-project-root-merge-v1"
       }
     });
   });
@@ -139,6 +155,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       publications: service.listPublications(true),
       projects: service.listProjects(true),
       projectBindings: service.listProjectBindings(),
+      passiveProjectAccesses: service.listPassiveProjectAccesses(),
       activity: service.getActivitySnapshot()
     });
   });
@@ -391,6 +408,9 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.get("/api/projects", (request, response) => {
     send(response, service.listProjects(booleanQuery(request.query.includeArchived)));
   });
+  app.get("/api/project-accesses", (_request, response) => {
+    send(response, service.listPassiveProjectAccesses());
+  });
   app.post("/api/projects/connect", asyncRoute(async (request, response) => {
     send(response, await service.connectProject(request.body), 201);
   }));
@@ -496,7 +516,13 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     );
   }));
   app.post("/api/employees/:id/invoke", asyncRoute(async (request, response) => {
-    send(response, await service.invokeEmployee(routeParam(request, "id"), request.body, invocationSource(request, "http")));
+    const source = invocationSource(request, "http");
+    send(response, await service.invokeEmployee(
+      routeParam(request, "id"),
+      request.body,
+      source,
+      { providerCwd: mcpExecutionRoot(request, source) }
+    ));
   }));
 
   app.get("/api/sessions", (request, response) => {
@@ -534,17 +560,21 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, await service.planWorkflow(routeParam(request, "id")));
   }));
   app.post("/api/workflows/:id/run", asyncRoute(async (request, response) => {
+    const source = invocationSource(request, "http");
     send(response, await service.runWorkbenchWorkflow(
       routeParam(request, "id"),
       jsonObject(request.body ?? {}, "workflow input"),
-      invocationSource(request, "http")
+      source,
+      { providerCwd: mcpExecutionRoot(request, source) }
     ));
   }));
   app.post("/api/workflows/:id/start", asyncRoute(async (request, response) => {
+    const source = invocationSource(request, "http");
     const started = await service.startWorkbenchWorkflow(
       routeParam(request, "id"),
       jsonObject(request.body ?? {}, "workflow input"),
-      invocationSource(request, "http")
+      source,
+      { providerCwd: mcpExecutionRoot(request, source) }
     );
     send(response, {
       ...started,
@@ -620,7 +650,10 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       ...body,
       source: body.source ?? invocationSource(request, "http")
     } as unknown as EntrancePolicyDispatchInput;
-    const result = await service.dispatchEntrancePolicy(routeParam(request, "id"), input);
+    const source = input.source as InvocationSource;
+    const result = await service.dispatchEntrancePolicy(routeParam(request, "id"), input, {
+      providerCwd: mcpExecutionRoot(request, source)
+    });
     if (result.dispatch.kind !== "invocation-started") {
       send(response, result);
       return;
@@ -668,10 +701,12 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     }
   });
   app.post("/api/publications/:id/invoke", asyncRoute(async (request, response) => {
+    const source = invocationSource(request, "http");
     send(response, await service.invokePublication(
       routeParam(request, "id"),
       jsonObject(request.body ?? {}, "publication input"),
-      invocationSource(request, "http")
+      source,
+      { providerCwd: mcpExecutionRoot(request, source) }
     ));
   }));
 

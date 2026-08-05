@@ -21,7 +21,12 @@ export interface CommandProviderDefinition extends ProviderDefinition {
   args?: string[];
   env?: Record<string, string>;
   inputTemplate?: string;
+  /** Soft limit: crossing it marks the call as long-running but does not terminate active work. */
   timeoutMs?: number;
+  /** Terminates a call only after this long without stdout or stderr activity. */
+  idleTimeoutMs?: number;
+  /** Absolute safety limit even when the Provider keeps producing output. */
+  hardTimeoutMs?: number;
 }
 
 export interface CodexMcpServerDefinition {
@@ -39,7 +44,12 @@ export interface CodexProviderDefinition extends ProviderDefinition {
   filesystemIsolation?: "workspace-read-only";
   workingDirectory?: string;
   approvalPolicy?: "never";
+  /** Soft limit: crossing it marks the call as long-running but does not terminate active work. */
   timeoutMs?: number;
+  /** Terminates a call only after this long without stdout or stderr activity. */
+  idleTimeoutMs?: number;
+  /** Absolute safety limit even when the Provider keeps producing output. */
+  hardTimeoutMs?: number;
   mcpServers?: Record<string, CodexMcpServerDefinition>;
 }
 

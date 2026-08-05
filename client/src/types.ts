@@ -530,6 +530,18 @@ export interface Project {
   updatedAt: string;
 }
 
+export interface PassiveProjectAccess {
+  id: string;
+  rootPath?: string;
+  projectKeys: string[];
+  displayName: string;
+  transport: "mcp";
+  requestCount: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  linkedProjectId?: string;
+}
+
 export interface ProjectRoleBinding {
   roleId: string;
   employeeId: string;
@@ -1151,6 +1163,7 @@ export interface Bootstrap {
   publications: Publication[];
   projects: Project[];
   projectBindings: ProjectBinding[];
+  passiveProjectAccesses?: PassiveProjectAccess[];
   activity: ActivitySnapshot;
 }
 
