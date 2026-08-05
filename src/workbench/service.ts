@@ -99,6 +99,7 @@ import {
 } from "./passiveProjectAccess.js";
 import { WorkbenchStore } from "./store.js";
 import { normalizeSupervisorFlow } from "./supervisorFlow.js";
+import { computeInvocationProgress, type InvocationProgress } from "./invocationProgress.js";
 import { compileEffectiveExecutionProfile } from "./effectiveProfile.js";
 import {
   evaluateEntrancePolicyDefinition,
@@ -1713,6 +1714,11 @@ export class WorkbenchService {
   async waitForInvocation(id: string): Promise<InvocationDetail> {
     await this.backgroundInvocations.get(id);
     return this.getInvocationDetail(id);
+  }
+
+  /** Aggregated caller-facing progress (overall status, per-step tally, leader narrative) for one invocation. */
+  async getInvocationProgress(id: string): Promise<InvocationProgress> {
+    return computeInvocationProgress(await this.getInvocationDetail(id));
   }
 
   private async createInvocationActivity(options: {

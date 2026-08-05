@@ -191,6 +191,19 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
         .filter((roleId) => roleId && !pinnedPolicy.allowedRoleIds.includes(roleId))
         .map((roleId) => `成员角色槽 ${roleId} 未被管理策略 ${pinnedPolicy.id} v${pinnedPolicy.version} 允许（允许的角色槽：${pinnedPolicy.allowedRoleIds.join("、")}）。`)
     : [];
+  // 角色槽只能取自管理策略声明的有限集合，用选择框而非自由输入，从源头杜绝非法角色。
+  const allowedRoleIds = pinnedPolicy?.allowedRoleIds ?? [];
+  const usedRoleIds = new Set(draft.members.map((member) => member.roleId.trim()).filter(Boolean));
+  const nextAvailableRoleId = allowedRoleIds.find((roleId) => !usedRoleIds.has(roleId)) ?? "";
+  const roleSlotOptions = (member: MemberDraft) => {
+    const own = member.roleId.trim();
+    const options = allowedRoleIds
+      .filter((roleId) => roleId === own || !usedRoleIds.has(roleId))
+      .map((roleId) => ({ value: roleId, label: roleId, description: roleId === own ? "当前角色槽" : "策略允许的角色槽" }));
+    // 兜底：历史团队里遗留的、当前策略版本已不允许的角色槽仍需可见，便于用户改选。
+    if (own && !allowedRoleIds.includes(own)) options.unshift({ value: own, label: `${own} · 不符合当前策略`, description: "请改选下方策略允许的角色槽" });
+    return options.length ? options : [{ value: "", label: allowedRoleIds.length ? "选择角色槽" : "策略未声明角色槽", disabled: true } as { value: string; label: string; disabled?: boolean }];
+  };
   const dagIssues = draft.dagEnabled
     ? supervisorDagDraftIssues(draft.dagNodes, new Set(draft.members.map((member) => member.roleId.trim()).filter(Boolean)))
     : [];
@@ -364,11 +377,11 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
           <Field label="固定版本"><SelectControl ariaLabel="选择管理策略固定版本" value={String(draft.policyVersion)} options={policyVersionOptions} onChange={selectPolicyVersion} /></Field>
         </div>{workflow && selectedPolicy && workflow.managementPolicy.id === selectedPolicy.id && workflow.managementPolicy.version !== selectedPolicy.version && <div className="policy-upgrade-note"><span>当前团队固定 v{workflow.managementPolicy.version}；策略库最新为 v{selectedPolicy.version}。升级会按新版本角色槽重建成员清册。</span><button type="button" className="text-button" onClick={() => selectPolicyVersion(String(selectedPolicy.version))}>显式升级</button></div>}</section>
         <section className="workflow-contract"><div className="section-kicker"><b>03</b><span>成员角色绑定</span></div>{rosterNotice && <div className="policy-roster-notice" role="status">{rosterNotice}</div>}<div className="supervisor-member-editor">{draft.members.map((member, index) => <article key={member.key}>
-          <Field label="角色槽 ID"><input required pattern="[a-z][a-z0-9-]*" aria-invalid={Boolean(pinnedPolicy && member.roleId.trim() && !pinnedPolicy.allowedRoleIds.includes(member.roleId.trim()))} value={member.roleId} onChange={(event) => setMember(index, { roleId: event.target.value })} /></Field>
+          <Field label="角色槽 ID" hint="仅可从管理策略声明的角色槽中选择。"><SelectControl ariaLabel={`选择成员 ${index + 1} 的角色槽`} value={member.roleId.trim()} invalid={Boolean(pinnedPolicy && member.roleId.trim() && !pinnedPolicy.allowedRoleIds.includes(member.roleId.trim()))} errorMessage={pinnedPolicy && member.roleId.trim() && !pinnedPolicy.allowedRoleIds.includes(member.roleId.trim()) ? "该角色槽不符合当前管理策略，请改选。" : undefined} options={roleSlotOptions(member)} onChange={(roleId) => setMember(index, { roleId })} /></Field>
           <Field label="职责"><input required value={member.description} onChange={(event) => setMember(index, { description: event.target.value })} /></Field>
           <Field label="Employee"><SelectControl ariaLabel={`为 ${member.roleId || "成员"} 选择 Employee`} value={member.employeeId} invalid={!member.employeeId} options={[{ value: "", label: "选择员工", disabled: true }, ...employees.map((employee) => ({ value: employee.id, label: employee.identity.displayName, description: `v${employee.version}` }))]} onChange={(employeeId) => setMember(index, { employeeId })} /></Field>
           <button type="button" className="text-button danger-text" disabled={draft.members.length === 1} onClick={() => setDraft({ ...draft, members: draft.members.filter((_, memberIndex) => memberIndex !== index) })}>移除</button>
-        </article>)}</div>{policyRoleIssues.length > 0 && <div className="member-policy-errors" role="alert"><strong>角色槽不符合当前管理策略</strong>{policyRoleIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}<button type="button" className="button secondary" onClick={() => setDraft({ ...draft, members: [...draft.members, newMemberDraft(`member-${draft.members.length + 1}`, "执行领队派发的专业任务。", employees[0]?.id ?? "")] })}><UtilityIcon name="add" />添加角色槽</button></section>
+        </article>)}</div>{policyRoleIssues.length > 0 && <div className="member-policy-errors" role="alert"><strong>角色槽不符合当前管理策略</strong>{policyRoleIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}<button type="button" className="button secondary" disabled={pinnedPolicy ? !nextAvailableRoleId : false} title={pinnedPolicy && !nextAvailableRoleId ? "策略声明的角色槽已全部添加" : undefined} onClick={() => setDraft({ ...draft, members: [...draft.members, newMemberDraft(pinnedPolicy ? nextAvailableRoleId : `member-${draft.members.length + 1}`, "执行领队派发的专业任务。", employees[0]?.id ?? "")] })}><UtilityIcon name="add" />添加角色槽</button></section>
         <section className="workflow-contract"><div className="section-kicker"><b>04</b><span>固定流程与交付门禁</span></div><div className="flow-editor-intro"><strong>领队只在动态分工区自由拆解；这些 Gate 是流程的硬边界。</strong><p>按能力选择执行者，不绑定测试员、审计员等固定角色名。没有合格成员时，只有具备同等能力的领队才能兜底。</p></div><div className="gate-editor-list">{draft.gates.map((gate, index) => <article key={`${gate.id}-${index}`}>
           <header><span>GATE {String(index + 1).padStart(2, "0")}</span><button type="button" className="text-button danger-text" onClick={() => setDraft({ ...draft, gates: draft.gates.filter((_, gateIndex) => gateIndex !== index) })}>移除</button></header>
           <div className="form-grid two"><Field label="Gate ID"><input required pattern="[a-z][a-z0-9-]*" value={gate.id} onChange={(event) => setDraft({ ...draft, gates: draft.gates.map((candidate, gateIndex) => gateIndex === index ? { ...candidate, id: event.target.value } : candidate) })} /></Field><Field label="需要能力"><input required value={gate.requiredCapability} placeholder="quality.test" onChange={(event) => setDraft({ ...draft, gates: draft.gates.map((candidate, gateIndex) => gateIndex === index ? { ...candidate, requiredCapability: event.target.value } : candidate) })} /></Field></div>
@@ -404,12 +417,14 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
         <section className="workflow-contract"><div className="section-kicker"><b>06</b><span>输入契约</span></div><Field label="Input JSON Schema"><textarea className="mono" rows={6} value={draft.inputSchema} onChange={(event) => setDraft({ ...draft, inputSchema: event.target.value })} /></Field></section>
         {generalIssues.length > 0 && <div className="canvas-issues" role="alert">{generalIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}
       </fieldset>
-      {submitError && <div className="editor-submit-error" role="alert" tabIndex={-1} ref={submitErrorRef}>
-        <strong>保存失败</strong>
-        <p>{summarizeSubmitError(submitError)}</p>
-        <details><summary>查看技术详情</summary><code>{submitError}</code></details>
-      </div>}
-      <div className="editor-savebar"><span className={`editor-save-note${primaryIssue ? " is-error" : ""}`} role={primaryIssue ? "status" : undefined}>{primaryIssue ?? "Flow 固定阶段与门禁；领队只在动态分工区拆解、派发和重排。所有 Employee 与资源均固定版本。"}</span><button type="button" className="button secondary" onClick={onClose}>放弃修改</button><button className="button primary" disabled={saving || !daemonAvailable || issues.length > 0}>{saving ? "校验中…" : workflow ? `校验并另存为 v${workflow.version + 1}` : "校验并建立"}</button></div>
+      <div className="editor-footer-stack">
+        {submitError && <div className="editor-submit-error" role="alert" tabIndex={-1} ref={submitErrorRef}>
+          <strong>保存失败</strong>
+          <p>{summarizeSubmitError(submitError)}</p>
+          <details><summary>查看技术详情</summary><code>{submitError}</code></details>
+        </div>}
+        <div className="editor-savebar"><span className={`editor-save-note${primaryIssue ? " is-error" : ""}`} role={primaryIssue ? "status" : undefined}>{primaryIssue ?? "Flow 固定阶段与门禁；领队只在动态分工区拆解、派发和重排。所有 Employee 与资源均固定版本。"}</span><button type="button" className="button secondary" onClick={onClose}>放弃修改</button><button className="button primary" disabled={saving || !daemonAvailable || issues.length > 0}>{saving ? "校验中…" : workflow ? `校验并另存为 v${workflow.version + 1}` : "校验并建立"}</button></div>
+      </div>
     </form>
   </Modal>;
 }

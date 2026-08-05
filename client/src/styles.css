@@ -1120,6 +1120,10 @@ input[type="color"] { padding: var(--space-1); }
 .field-label { font-size: var(--text-xs); font-weight: 600; }
 .field-hint { min-height: 1lh; color: var(--ink-3); font-size: var(--text-xs); line-height: 1.4; }
 .editor-savebar { position: sticky; z-index: 5; bottom: 0; display: flex; align-items: center; justify-content: flex-end; gap: var(--space-3); padding: var(--space-4) var(--space-5); border-top: 3px double var(--line-strong); background: var(--paper-raised); }
+/* When an inline submit error precedes the save bar, both share one sticky footer so the error is never hidden behind the bar. */
+.editor-footer-stack { position: sticky; z-index: 6; bottom: 0; display: grid; background: var(--paper-raised); }
+.editor-footer-stack .editor-submit-error { position: static; margin: var(--space-4) var(--space-5) 0; }
+.editor-footer-stack .editor-savebar { position: static; z-index: auto; }
 .editor-save-note.is-error { color: var(--stamp-red-ink); font-weight: 700; line-height: 1.45; overflow-wrap: anywhere; }
 .editor-submit-error { margin: var(--space-4) var(--space-5) 0; padding: var(--space-3) var(--space-4); border: 2px solid var(--stamp-red-ink); border-radius: var(--radius-1); background: var(--danger-bg); color: var(--stamp-red-ink); box-shadow: var(--shadow-paper-small); overflow-wrap: anywhere; }
 .editor-submit-error:focus { outline: 2px solid var(--stamp-red-ink); outline-offset: 2px; }
@@ -2475,6 +2479,7 @@ input[type="checkbox"] { border-radius: 2px; accent-color: var(--seal-green); bo
 }
 .icon-button:hover { border-color: var(--ink); background: var(--season-rose-soft); }
 .editor-savebar { background: var(--sky-pale); }
+.editor-footer-stack { background: var(--sky-pale); }
 .field-label { color: var(--ink); font-weight: 800; }
 .field-hint { color: var(--ink-3); }
 .compact-form { border-top: 2px dashed var(--line-strong); }

@@ -139,11 +139,25 @@ describe("SupervisorWorkflowPage editor", () => {
     await flush(); // 等待管理策略版本清册加载，固定版本的角色槽校验才可用
   };
   const memberArticles = () => Array.from(dialog().querySelectorAll<HTMLElement>(".supervisor-member-editor article"));
-  const roleInput = (index: number): HTMLInputElement => {
+  const descriptionInput = (index: number): HTMLInputElement => {
+    // 角色槽已改为选择框，成员条目里唯一的 <input> 是职责字段。
     const input = memberArticles()[index]?.querySelector<HTMLInputElement>("input");
-    if (!input) throw new Error(`成员 ${index + 1} 的角色槽输入框未找到`);
+    if (!input) throw new Error(`成员 ${index + 1} 的职责输入框未找到`);
     return input;
   };
+  const roleTrigger = (index: number): HTMLButtonElement => {
+    const trigger = memberArticles()[index]?.querySelector<HTMLButtonElement>(`[aria-label="选择成员 ${index + 1} 的角色槽"]`);
+    if (!trigger) throw new Error(`成员 ${index + 1} 的角色槽选择器未找到`);
+    return trigger;
+  };
+  const roleOptionLabels = (index: number): string[] => {
+    click(roleTrigger(index));
+    const listId = roleTrigger(index).getAttribute("aria-controls");
+    const listbox = listId ? document.getElementById(listId) : null;
+    return Array.from(listbox?.querySelectorAll<HTMLElement>(".select-option strong") ?? []).map((element) => element.textContent ?? "");
+  };
+  const addRoleButton = (): HTMLButtonElement | undefined => Array.from(dialog().querySelectorAll<HTMLButtonElement>("button"))
+    .find((button) => button.textContent?.includes("添加角色槽"));
   const saveButton = (): HTMLButtonElement => {
     const button = dialog().querySelector<HTMLButtonElement>(".editor-savebar .button.primary");
     if (!button) throw new Error("保存按钮未找到");
@@ -206,39 +220,29 @@ describe("SupervisorWorkflowPage editor", () => {
     vi.unstubAllGlobals();
   });
 
-  it("keeps focus in the member role input while typing multiple characters", async () => {
+  it("keeps focus in the member description input while typing multiple characters", async () => {
     await openEditor();
-    const input = roleInput(0);
+    const input = descriptionInput(0);
     act(() => input.focus());
     expect(document.activeElement).toBe(input);
     for (const char of ["x", "y", "z"]) {
       typeInto(input, input.value + char);
       expect(document.activeElement).toBe(input);
     }
-    expect(input.value).toBe("researcherxyz");
     // 同一个 DOM 节点贯穿多次编辑，说明列表 key 不随可编辑字段变化。
-    expect(roleInput(0)).toBe(input);
+    expect(descriptionInput(0)).toBe(input);
   });
 
-  it("blocks a disallowed member role locally without issuing any write request", async () => {
+  it("constrains the member role slot to policy-allowed, not-yet-used roles", async () => {
     await openEditor();
-    typeInto(roleInput(0), "member-3");
-    await flush();
-
-    const alerts = Array.from(dialog().querySelectorAll("[role='alert']"));
-    const inline = alerts.find((element) => element.textContent?.includes("member-3"));
-    expect(inline?.classList.contains("member-policy-errors")).toBe(true);
-    expect(inline?.textContent).toContain("未被管理策略 review-policy v2 允许");
-    expect(inline?.textContent).toContain("researcher、reviewer");
-    expect(dialog().querySelector(".editor-save-note")?.textContent).toContain("member-3");
-    expect(dialog().querySelector(".editor-save-note")?.classList.contains("is-error")).toBe(true);
-    expect(saveButton().disabled).toBe(true);
-
-    // 即使绕过禁用按钮触发表单提交，也不会发出任何写请求。
-    submitForm();
-    await flush();
-    expect(writeCalls()).toHaveLength(0);
-    expect(notify).not.toHaveBeenCalled();
+    // 第一个成员当前是 researcher；可选项应含自身，且不含已被第二个成员占用的 reviewer。
+    const first = roleOptionLabels(0);
+    expect(first).toContain("researcher");
+    expect(first).not.toContain("reviewer");
+    // 自由文本已不存在——成员条目内唯一的 input 是职责字段而非角色槽。
+    expect(memberArticles()[0]?.querySelectorAll("input")).toHaveLength(1);
+    // 两个成员用尽了策略声明的两个角色槽，添加按钮禁用。
+    expect(addRoleButton()?.disabled).toBe(true);
   });
 
   it("surfaces server policy rejection inside the modal above the save bar", async () => {
@@ -270,7 +274,7 @@ describe("SupervisorWorkflowPage editor", () => {
 
   it("saves normally when every member role is allowed by the pinned policy", async () => {
     await openEditor();
-    typeInto(memberArticles()[0]?.querySelectorAll<HTMLInputElement>("input")[1] as HTMLInputElement, "收集并核对证据");
+    typeInto(descriptionInput(0), "收集并核对证据");
     submitForm();
     await flush();
 

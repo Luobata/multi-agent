@@ -167,6 +167,9 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.get("/api/invocations/:id", asyncRoute(async (request, response) => {
     send(response, await service.getInvocationDetail(routeParam(request, "id")));
   }));
+  app.get("/api/invocations/:id/progress", asyncRoute(async (request, response) => {
+    send(response, await service.getInvocationProgress(routeParam(request, "id")));
+  }));
   app.get("/api/activity/stream", (request, response) => {
     response.status(200);
     response.set({
@@ -579,6 +582,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, {
       ...started,
       statusUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}`,
+      progressUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}/progress`,
       streamUrl: "/api/activity/stream"
     }, 202);
   }));
@@ -664,6 +668,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       dispatch: {
         ...result.dispatch,
         statusUrl: `/api/invocations/${encodeURIComponent(invocationId)}`,
+        progressUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress`,
         streamUrl: "/api/activity/stream"
       }
     }, 202);

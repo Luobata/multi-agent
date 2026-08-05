@@ -722,7 +722,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("start_workflow", {
     title: "Start multi-agent workflow",
-    description: "Start a registered Graph or Supervisor workflow asynchronously and return an invocation id immediately. Use get_invocation to inspect status and final Run evidence.",
+    description: "Start a registered Graph or Supervisor workflow asynchronously and return an invocation id immediately. Use get_workflow_progress for an aggregated status and the leader's per-round narrative, or get_invocation for the raw work instances and final Run evidence.",
     inputSchema: {
       workflowId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
@@ -743,6 +743,15 @@ export function createWorkbenchMcpServer(
   }, async ({ invocationId }) => content(await request(
     daemonUrl,
     `/api/invocations/${encodeURIComponent(invocationId)}`
+  )));
+
+  server.registerTool("get_workflow_progress", {
+    title: "Get workflow progress",
+    description: "Read an aggregated progress report for one asynchronous invocation: overall status and phase, current supervisor round, a per-status tally and ordered list of work steps, plus the leader's (supervisor's) per-round narrative of what it delegated and why. Poll this to watch a running Supervisor team make progress.",
+    inputSchema: { invocationId: z.string().min(1) }
+  }, async ({ invocationId }) => content(await request(
+    daemonUrl,
+    `/api/invocations/${encodeURIComponent(invocationId)}/progress`
   )));
 
   server.registerTool("list_publications", {
