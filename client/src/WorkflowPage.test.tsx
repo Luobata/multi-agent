@@ -392,6 +392,14 @@ describe("WorkflowPage async run order", () => {
     expect(container.textContent).toContain("升级会按新版本角色槽重建成员清册");
     expect(container.textContent).toContain("固定流程与交付门禁");
     expect(container.textContent).toContain("添加能力门禁");
+    expect(container.querySelector("select")).toBeNull();
+    const dagSwitch = container.querySelector<HTMLInputElement>('[role="switch"][aria-label="启用 DAG 编排"]');
+    expect(dagSwitch?.checked).toBe(false);
+    expect(container.querySelector(".dag-enable-switch .switch-state-label")?.textContent).toBe("未启用");
+    if (!dagSwitch) throw new Error("DAG switch not found");
+    click(dagSwitch);
+    expect(dagSwitch.checked).toBe(true);
+    expect(container.querySelector(".dag-enable-switch .switch-state-label")?.textContent).toBe("已启用");
     const closeModal = container.querySelector<HTMLButtonElement>('[aria-label="关闭弹窗"]');
     if (closeModal) click(closeModal);
 

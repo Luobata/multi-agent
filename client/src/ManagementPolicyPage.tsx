@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { api, writeBody } from "./api";
-import { DossierSection, EmptyState, Field, Modal, Stamp, UtilityIcon, formatTime, useDaemonAvailable } from "./components";
+import { DossierSection, EmptyState, Field, Modal, SelectControl, Stamp, UtilityIcon, formatTime, useDaemonAvailable } from "./components";
 import type { Bootstrap, ManagementPolicy, SupervisorWorkflow } from "./types";
 
 interface PageProps {
@@ -102,7 +102,7 @@ function PolicyEditor({ policy, onClose, onSaved, notify }: {
           <Field label="最多派单"><input type="number" min={1} max={256} value={draft.maxDelegations} onChange={(event) => setDraft({ ...draft, maxDelegations: Number(event.target.value) })} /></Field>
           <Field label="单轮并行"><input type="number" min={1} max={32} value={draft.maxParallelDelegations} onChange={(event) => setDraft({ ...draft, maxParallelDelegations: Number(event.target.value) })} /></Field>
           <Field label="最长秒数"><input type="number" min={1} max={86400} value={draft.maxDurationSeconds} onChange={(event) => setDraft({ ...draft, maxDurationSeconds: Number(event.target.value) })} /></Field>
-          <Field label="成员技术失败"><select value={draft.workerFailure} onChange={(event) => setDraft({ ...draft, workerFailure: event.target.value as PolicyDraft["workerFailure"] })}><option value="observe-and-replan">交给领队观察并重规划</option><option value="fail-fast">立即技术失败</option></select></Field>
+          <Field label="成员技术失败"><SelectControl ariaLabel="选择成员技术失败处理方式" value={draft.workerFailure} options={[{ value: "observe-and-replan", label: "交给领队观察并重规划", description: "保留失败证据，由领队决定是否重派或调整计划" }, { value: "fail-fast", label: "立即技术失败", description: "成员失败后不再继续创建新的工作" }]} onChange={(workerFailure) => setDraft({ ...draft, workerFailure: workerFailure as PolicyDraft["workerFailure"] })} /></Field>
         </div><label className="check-line"><input type="checkbox" checked={draft.requireDelegation} onChange={(event) => setDraft({ ...draft, requireDelegation: event.target.checked })} />结束前至少派单一次</label><label className="check-line"><input type="checkbox" checked={draft.requireAllDelegationsSuccessful} onChange={(event) => setDraft({ ...draft, requireAllDelegationsSuccessful: event.target.checked })} />所有派单必须技术成功才能结束</label></section>
       </fieldset>
       <div className="editor-savebar"><span className="editor-save-note">修改会创建新版本；已有领队团队继续固定旧版本。</span><button type="button" className="button secondary" onClick={onClose}>放弃修改</button><button className="button primary" disabled={!daemonAvailable || saving}>{saving ? "保存中…" : policy ? `另存为 v${policy.version + 1}` : "登记策略"}</button></div>

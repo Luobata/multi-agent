@@ -1,10 +1,10 @@
 /** @vitest-environment jsdom */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { COMPLETED_STATE_LINGER_MS, RuntimeStatusChip, SelectControl, employeeRuntimeStatus } from "./components";
+import { COMPLETED_STATE_LINGER_MS, RuntimeStatusChip, SelectControl, SwitchControl, employeeRuntimeStatus } from "./components";
 import type { WorkInstanceRecord } from "./types";
 
 const options = [
@@ -12,6 +12,14 @@ const options = [
   { value: "locked", label: "锁定版本", description: "保留当前固定版本" },
   { value: "latest", label: "始终最新", description: "采用员工最新版本" }
 ];
+
+function productionTsxFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) return productionTsxFiles(path);
+    return entry.name.endsWith(".tsx") && !entry.name.endsWith(".test.tsx") ? [path] : [];
+  });
+}
 
 describe("SelectControl", () => {
   let container: HTMLElement;
@@ -51,6 +59,15 @@ describe("SelectControl", () => {
     act(() => locked?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(onChange).toHaveBeenCalledWith("locked");
     expect(document.body.querySelector("[role='listbox']")).toBeNull();
+  });
+
+  it("is the only dropdown primitive used by production client views", () => {
+    const sourceRoot = resolve(process.cwd(), "client/src");
+    const nativeSelectFiles = productionTsxFiles(sourceRoot)
+      .filter((path) => /<select\b/.test(readFileSync(path, "utf8")))
+      .map((path) => path.slice(sourceRoot.length + 1));
+
+    expect(nativeSelectFiles).toEqual([]);
   });
 
   it("supports arrow navigation, selection, and Escape without trapping focus", () => {
@@ -138,6 +155,24 @@ describe("SelectControl", () => {
     expect(document.body.querySelector("[role='option'][data-active='true']")?.textContent).toContain("C");
     act(() => trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true })));
     expect(trigger.getAttribute("aria-expanded")).toBe("false");
+  });
+});
+
+describe("SwitchControl", () => {
+  it("shows an explicit on/off word in addition to the switch position", () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    act(() => root.render(<SwitchControl checked={false} ariaLabel="测试开关" onChange={vi.fn()} />));
+    expect(container.querySelector(".switch-control-state")?.textContent).toBe("关");
+    expect(container.querySelector('[role="switch"]')?.getAttribute("aria-label")).toBe("测试开关");
+
+    act(() => root.render(<SwitchControl checked ariaLabel="测试开关" onChange={vi.fn()} />));
+    expect(container.querySelector(".switch-control-state")?.textContent).toBe("开");
+
+    act(() => root.unmount());
+    container.remove();
   });
 });
 

@@ -99,8 +99,11 @@ describe("workflow session prompts", () => {
         contextId: "当前会话 ID（可选）"
       }
     });
-    expect(result.humanPrompt).toContain("Publication ID `review-agent`");
-    expect(result.humanPrompt).toContain("运行状态和 runId");
+    expect(result.invocationPrompt).toContain("Publication ID `review-agent`");
+    expect(result.invocationPrompt).toContain("运行状态和 runId");
+    expect(result.agentsMarkdown).toContain("## 协作编排");
+    expect(result.agentsMarkdown).toContain("仅讨论需求、方案或设计时，不要自动启动协作编排");
+    expect(result.agentsMarkdown).toContain("`invoke_publication` 调用 Publication `review-agent`");
   });
 
   it("falls back to run_workflow without exposing internal nodes or prompts", () => {
@@ -112,8 +115,9 @@ describe("workflow session prompts", () => {
       tool: "run_workflow",
       arguments: { workflowId: "review-team" }
     });
-    expect(`${result.humanPrompt}\n${result.mcpJson}`).not.toContain("internal-review");
-    expect(`${result.humanPrompt}\n${result.mcpJson}`).not.toContain("private-reviewer");
-    expect(`${result.humanPrompt}\n${result.mcpJson}`).not.toContain("systemPrompt");
+    expect(result.agentsMarkdown).toContain("`run_workflow` 调用 Workflow `review-team`");
+    expect(`${result.agentsMarkdown}\n${result.invocationPrompt}\n${result.mcpJson}`).not.toContain("internal-review");
+    expect(`${result.agentsMarkdown}\n${result.invocationPrompt}\n${result.mcpJson}`).not.toContain("private-reviewer");
+    expect(`${result.agentsMarkdown}\n${result.invocationPrompt}\n${result.mcpJson}`).not.toContain("systemPrompt");
   });
 });

@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { ArchitectureTemplatePicker } from "./ArchitectureTemplatePicker";
 import { api, writeBody } from "./api";
-import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, ReadonlyEvidence, SelectControl, Stamp, UtilityIcon, formatTime, scrollRecordIntoView, useDaemonAvailable } from "./components";
+import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, SelectControl, Stamp, UtilityIcon, formatTime, scrollRecordIntoView, useDaemonAvailable } from "./components";
 import { layoutTopology } from "./topology";
 import { automaticCanvasPositions, WorkflowCanvas, type CanvasPositions } from "./WorkflowCanvas";
 import { ManagementPolicyPage } from "./ManagementPolicyPage";
 import { EntrancePolicyPage } from "./EntrancePolicyPage";
 import { SupervisorWorkflowPage } from "./SupervisorWorkflowPage";
+import { WorkflowSessionGuide } from "./WorkflowSessionGuide";
 import { activeWorkflowPublications, buildWorkflowSessionPrompts } from "./workflowSessionPrompts";
 import type { Bootstrap, Employee, GraphWorkflow, InstantiatedArchitectureTemplate, InvocationRecord, JsonObject, Workflow, WorkflowNode } from "./types";
 
@@ -241,10 +242,7 @@ function GraphWorkflowPage({ data, refresh, notify }: PageProps) {
             ? <label className="workflow-publication-select"><span>选择调用包</span><SelectControl ariaLabel="选择 Workflow 调用包" value={selectedPublication?.id ?? ""} options={workflowPublications.map((publication) => ({ value: publication.id, label: publication.name, description: `${publication.id} · v${publication.version}` }))} onChange={setPublicationId} /></label>
             : !selectedPublication && <a className="text-button workflow-publication-link" href="#publications">前往调用包建立稳定入口</a>}
         </div>
-        <div className="workflow-session-examples">
-          <ReadonlyEvidence label="给 Codex 会话的提示词 · 推荐" value={sessionPrompts.humanPrompt} />
-          <ReadonlyEvidence label={`MCP 参数示例 · ${sessionPrompts.tool}`} value={sessionPrompts.mcpJson} mono />
-        </div>
+        <WorkflowSessionGuide prompts={sessionPrompts} />
       </DossierSection>}
       <section id="run-workflow" className="run-order"><header><div><p className="record-meta">{selected.id} · v{selected.version}</p><h3>签发运行工单</h3></div><Stamp status={running ? "running" : "pending"} label={running ? "提交回执" : "待签发"} /></header><Field label="Workflow 输入 (JSON)"><textarea className="mono" rows={8} disabled={!daemonAvailable} value={runInput} onChange={(event) => setRunInput(event.target.value)} /></Field><div className="run-actions"><span>签发后立即返回受理回执，不等待运行完成；输入、计划、节点 Prompt 与状态事件保存在运行卷宗，也可到员工大厅实时观察。</span><button className="button primary" disabled={!daemonAvailable || running || selected.status === "archived"} onClick={() => void run()}>{running ? "提交回执…" : "签发并运行"}</button></div></section>
     </div>}</main>

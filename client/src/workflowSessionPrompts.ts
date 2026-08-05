@@ -7,7 +7,8 @@ export interface WorkflowSessionPrompts {
   tool: "invoke_publication" | "run_workflow";
   targetId: string;
   input: JsonObject;
-  humanPrompt: string;
+  agentsMarkdown: string;
+  invocationPrompt: string;
   mcpJson: string;
 }
 
@@ -132,13 +133,26 @@ export function buildWorkflowSessionPrompts(
   const routeDescription = activePublication
     ? `通过调用包「${activePublication.name}」调用 Publication ID \`${activePublication.id}\``
     : `当前没有活动调用包，使用 \`run_workflow\` 直接调试 Workflow ID \`${workflow.id}\``;
+  const agentsRouteRule = activePublication
+    ? `默认通过 \`invoke_publication\` 调用 Publication \`${activePublication.id}\`（${activePublication.name}），不要自行拆解其内部 Workflow、节点或 Prompt。`
+    : `默认通过 \`run_workflow\` 调用 Workflow \`${workflow.id}\`。`;
 
   return {
     mode,
     tool,
     targetId,
     input,
-    humanPrompt: [
+    agentsMarkdown: [
+      "## 协作编排",
+      "",
+      "- 当用户明确要求“推进开发、交付、拆解并分工”，或任务确实需要多个项目角色协作时，使用 `local_agent_workbench` MCP。",
+      "- 仅讨论需求、方案或设计时，不要自动启动协作编排。",
+      `- ${agentsRouteRule}`,
+      "- `project` 使用当前项目名称。新任务不传 `contextId`；只有继续同一次协作编排时，才复用稳定的 `contextId`。",
+      "- 调用完成后汇总运行状态和 `runId`；结果为 `blocked` 或 `failed` 时，明确说明阻塞或故障原因。",
+      "- 如果 MCP 或目标入口不可用，应报告配置问题，不要在本地伪造协作结果。"
+    ].join("\n"),
+    invocationPrompt: [
       `请使用 \`local_agent_workbench\` MCP 服务执行协作编排「${workflow.id}」。`,
       "",
       `- 调用方式：${routeDescription}`,

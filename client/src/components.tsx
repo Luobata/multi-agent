@@ -268,6 +268,18 @@ export function SelectControl({
   </div>;
 }
 
+export function SwitchControl({ checked, onChange, ariaLabel, disabled = false }: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  ariaLabel: string;
+  disabled?: boolean;
+}) {
+  return <span className={`switch-control ${checked ? "is-on" : "is-off"}`}>
+    <input type="checkbox" role="switch" aria-label={ariaLabel} checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+    <span className="switch-control-state" aria-hidden="true">{checked ? "开" : "关"}</span>
+  </span>;
+}
+
 function StampMark({ status }: { status: StampStatus }) {
   if (status === "active") return <><path d="M8 13V8M8 9C8 6 5 4 3 4c0 3 2 5 5 5ZM8 8c0-3 2-5 5-5 0 3-2 5-5 5Z" /><path d="M5 13h6" /></>;
   if (status === "archived") return <><path d="M3 5h10v8H3zM3 7h10" /><path d="M7 7v3h2V7" /></>;
