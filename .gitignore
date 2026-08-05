@@ -7,3 +7,10 @@ coverage/
 *.tgz
 *.log
 .DS_Store
+
+# Test / E2E run artifacts
+midscene_run/
+.worktrees/
+playwright-report/
+test-results/
+.vitest/

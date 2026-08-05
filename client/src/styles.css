@@ -1120,6 +1120,17 @@ input[type="color"] { padding: var(--space-1); }
 .field-label { font-size: var(--text-xs); font-weight: 600; }
 .field-hint { min-height: 1lh; color: var(--ink-3); font-size: var(--text-xs); line-height: 1.4; }
 .editor-savebar { position: sticky; z-index: 5; bottom: 0; display: flex; align-items: center; justify-content: flex-end; gap: var(--space-3); padding: var(--space-4) var(--space-5); border-top: 3px double var(--line-strong); background: var(--paper-raised); }
+.editor-save-note.is-error { color: var(--stamp-red-ink); font-weight: 700; line-height: 1.45; overflow-wrap: anywhere; }
+.editor-submit-error { margin: var(--space-4) var(--space-5) 0; padding: var(--space-3) var(--space-4); border: 2px solid var(--stamp-red-ink); border-radius: var(--radius-1); background: var(--danger-bg); color: var(--stamp-red-ink); box-shadow: var(--shadow-paper-small); overflow-wrap: anywhere; }
+.editor-submit-error:focus { outline: 2px solid var(--stamp-red-ink); outline-offset: 2px; }
+.editor-submit-error strong { display: block; font-size: var(--text-sm); }
+.editor-submit-error p { margin: var(--space-1) 0 0; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.6; white-space: pre-wrap; }
+.editor-submit-error details { margin-top: var(--space-2); }
+.editor-submit-error summary { cursor: pointer; font-size: var(--text-xs); font-weight: 700; }
+.editor-submit-error code { display: block; margin-top: var(--space-2); padding: var(--space-2); border: 1px dashed var(--stamp-red-ink); background: var(--paper); font-family: var(--font-machine); font-size: var(--text-xs); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.member-policy-errors { display: grid; gap: var(--space-1); margin: var(--space-3) 0; padding: var(--space-3) var(--space-4); border: 2px solid var(--stamp-red-ink); background: var(--danger-bg); color: var(--stamp-red-ink); overflow-wrap: anywhere; }
+.member-policy-errors strong { font-size: var(--text-sm); }
+.member-policy-errors span { font-size: var(--text-xs); line-height: 1.5; }
 .version-warning { display: flex; align-items: center; gap: var(--space-3); margin: 0 var(--space-5) var(--space-5); padding: var(--space-3) var(--space-4); border: 1px solid var(--seal-amber); background: var(--seal-amber-bg); color: var(--seal-amber); font-size: var(--text-xs); }
 .skill-selector { display: grid; gap: var(--space-3); }
 .skill-option { padding: var(--space-3); border: 1px solid var(--line); background: var(--paper); }

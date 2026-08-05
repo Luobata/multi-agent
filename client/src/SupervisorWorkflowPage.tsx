@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, writeBody } from "./api";
 import { DossierSection, EmployeeAvatar, EmptyState, Field, Modal, SelectControl, Stamp, SwitchControl, UtilityIcon, formatTime, scrollRecordIntoView, useDaemonAvailable } from "./components";
 import { SupervisorDagCanvas } from "./SupervisorDagCanvas";
@@ -34,9 +34,33 @@ interface PageProps {
 }
 
 interface MemberDraft {
+  /** 稳定的列表 identity，不随 roleId 等可编辑字段变化，保证输入时不重挂载、不失焦。 */
+  key: string;
   roleId: string;
   description: string;
   employeeId: string;
+}
+
+let memberDraftKeyCounter = 0;
+function nextMemberDraftKey(): string {
+  memberDraftKeyCounter += 1;
+  return `member-draft-${memberDraftKeyCounter}`;
+}
+
+function newMemberDraft(roleId: string, description: string, employeeId: string): MemberDraft {
+  return { key: nextMemberDraftKey(), roleId, description, employeeId };
+}
+
+/** 把服务端英文校验错误翻译为可读的中文摘要；原始信息仍完整保留在详情里。 */
+function summarizeSubmitError(message: string): string {
+  const notAllowed = /supervisor member role (\S+) is not allowed by management policy (\S+) v(\d+)/.exec(message);
+  if (notAllowed) return `成员角色槽 ${notAllowed[1]} 未被管理策略 ${notAllowed[2]} v${notAllowed[3]} 允许，请改用策略声明的角色槽。`;
+  const duplicate = /duplicate supervisor member role (\S+)/.exec(message);
+  if (duplicate) return `成员角色槽 ${duplicate[1]} 重复，请为每个角色槽使用唯一 ID。`;
+  if (/management policy \S+ is archived/.test(message)) return "所选管理策略已归档，请改用活动策略后再保存。";
+  if (/management policy .*not found/.test(message)) return "管理策略或其固定版本不存在，请重新选择策略与版本。";
+  if (/[一-鿿]/.test(message)) return message;
+  return "保存未通过服务端校验，请根据下方原始信息修正后重试。";
 }
 
 interface SupervisorDraft {
@@ -67,21 +91,17 @@ function parseObject(value: string, label: string): JsonObject {
 }
 
 function memberDrafts(policy: ManagementPolicy | undefined, employees: Employee[], existing: MemberDraft[] = []): MemberDraft[] {
-  if (!policy) return existing.length ? existing : [{ roleId: "worker", description: "执行领队派发的专业任务。", employeeId: employees[0]?.id ?? "" }];
-  return policy.allowedRoleIds.map((roleId) => existing.find((member) => member.roleId === roleId) ?? {
+  if (!policy) return existing.length ? existing : [newMemberDraft("worker", "执行领队派发的专业任务。", employees[0]?.id ?? "")];
+  return policy.allowedRoleIds.map((roleId) => existing.find((member) => member.roleId === roleId) ?? newMemberDraft(
     roleId,
-    description: `负责 ${roleId} 角色槽的专业任务。`,
-    employeeId: employees[0]?.id ?? ""
-  });
+    `负责 ${roleId} 角色槽的专业任务。`,
+    employees[0]?.id ?? ""
+  ));
 }
 
 function supervisorDraft(workflow: SupervisorWorkflow | undefined, employees: Employee[], policies: ManagementPolicy[]): SupervisorDraft {
   const firstPolicy = policies.find((policy) => policy.status === "active");
-  const existing = workflow?.members.map((member) => ({
-    roleId: member.roleId,
-    description: member.description,
-    employeeId: member.employeeId
-  })) ?? [];
+  const existing = workflow?.members.map((member) => newMemberDraft(member.roleId, member.description, member.employeeId)) ?? [];
   return {
     id: workflow?.id ?? "",
     description: workflow?.description ?? "",
@@ -132,6 +152,17 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
   const [saving, setSaving] = useState(false);
   const [policyVersions, setPolicyVersions] = useState<ManagementPolicy[]>([]);
   const [rosterNotice, setRosterNotice] = useState("");
+  const [submitError, setSubmitError] = useState("");
+  const submitErrorRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!submitError) return;
+    // Modal 首次打开也会在 animation frame 内聚焦首个字段；把错误聚焦排在其后，避免快速提交时被抢回。
+    const frame = window.requestAnimationFrame(() => submitErrorRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [submitError]);
+  useEffect(() => {
+    setSubmitError("");
+  }, [draft]);
   const selectedPolicy = policies.find((policy) => policy.id === draft.policyId);
   useEffect(() => {
     let current = true;
@@ -151,10 +182,19 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
       description: `${policy.allowedRoleIds.length} 个角色槽 · ${formatTime(policy.updatedAt)}`
     }))
   ];
+  // 客户端可确定的固定版本策略（来自版本清册或当前策略），用于在提交前拦截未被允许的成员角色槽。
+  const pinnedPolicy = policyVersions.find((policy) => policy.version === draft.policyVersion)
+    ?? (selectedPolicy && selectedPolicy.version === draft.policyVersion ? selectedPolicy : undefined);
+  const policyRoleIssues = pinnedPolicy
+    ? draft.members
+        .map((member) => member.roleId.trim())
+        .filter((roleId) => roleId && !pinnedPolicy.allowedRoleIds.includes(roleId))
+        .map((roleId) => `成员角色槽 ${roleId} 未被管理策略 ${pinnedPolicy.id} v${pinnedPolicy.version} 允许（允许的角色槽：${pinnedPolicy.allowedRoleIds.join("、")}）。`)
+    : [];
   const dagIssues = draft.dagEnabled
     ? supervisorDagDraftIssues(draft.dagNodes, new Set(draft.members.map((member) => member.roleId.trim()).filter(Boolean)))
     : [];
-  const issues = [
+  const generalIssues = [
     !draft.supervisorEmployeeId ? "未选择领队 Employee" : undefined,
     !draft.policyId ? "未绑定活动管理策略" : undefined,
     draft.members.length === 0 ? "成员角色清册为空" : undefined,
@@ -164,6 +204,8 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
     new Set(draft.gates.map((gate) => gate.id)).size !== draft.gates.length ? "门禁 ID 重复" : undefined,
     ...dagIssues
   ].filter((issue): issue is string => Boolean(issue));
+  const issues = [...generalIssues, ...policyRoleIssues];
+  const primaryIssue = policyRoleIssues[0] ?? generalIssues[0];
   const [selectedDagIndex, setSelectedDagIndex] = useState(0);
   const selectedDagNode = draft.dagNodes[selectedDagIndex] ?? draft.dagNodes[0];
   const dagRoleVisual = (roleId: string): { displayName: string; presentation?: Employee["presentation"] } | undefined => {
@@ -277,6 +319,9 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    // 客户端预检（含策略允许角色槽）未通过时直接阻止提交，不发请求；服务端校验仍然保留。
+    if (issues.length > 0) return;
+    setSubmitError("");
     setSaving(true);
     try {
       const dagPayload = draft.dagEnabled ? dagPayloadFromDrafts(draft.dagNodes) : undefined;
@@ -300,7 +345,10 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
         : await api<SupervisorWorkflow>("/api/workflows", writeBody(payload));
       notify(workflow ? `领队团队已另存为 v${saved.version}` : `领队团队 ${saved.id} 已建立`);
       onSaved(saved);
-    } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSubmitError(message);
+    }
     finally { setSaving(false); }
   };
   return <Modal title={workflow ? `修订 ${workflow.id}` : "建立领队团队"} eyebrow="TEAM LEAD → POLICY → TEAM" onClose={onClose} wide>
@@ -315,12 +363,12 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
           <Field label="管理策略"><SelectControl ariaLabel="选择管理策略" value={draft.policyId} invalid={!draft.policyId} options={[{ value: "", label: policies.length ? "选择策略" : "暂无活动策略", disabled: true }, ...policies.map((policy) => ({ value: policy.id, label: policy.displayName, description: `${policy.id} · 当前 v${policy.version}` }))]} onChange={selectPolicy} /></Field>
           <Field label="固定版本"><SelectControl ariaLabel="选择管理策略固定版本" value={String(draft.policyVersion)} options={policyVersionOptions} onChange={selectPolicyVersion} /></Field>
         </div>{workflow && selectedPolicy && workflow.managementPolicy.id === selectedPolicy.id && workflow.managementPolicy.version !== selectedPolicy.version && <div className="policy-upgrade-note"><span>当前团队固定 v{workflow.managementPolicy.version}；策略库最新为 v{selectedPolicy.version}。升级会按新版本角色槽重建成员清册。</span><button type="button" className="text-button" onClick={() => selectPolicyVersion(String(selectedPolicy.version))}>显式升级</button></div>}</section>
-        <section className="workflow-contract"><div className="section-kicker"><b>03</b><span>成员角色绑定</span></div>{rosterNotice && <div className="policy-roster-notice" role="status">{rosterNotice}</div>}<div className="supervisor-member-editor">{draft.members.map((member, index) => <article key={`${member.roleId}-${index}`}>
-          <Field label="角色槽 ID"><input required pattern="[a-z][a-z0-9-]*" value={member.roleId} onChange={(event) => setMember(index, { roleId: event.target.value })} /></Field>
+        <section className="workflow-contract"><div className="section-kicker"><b>03</b><span>成员角色绑定</span></div>{rosterNotice && <div className="policy-roster-notice" role="status">{rosterNotice}</div>}<div className="supervisor-member-editor">{draft.members.map((member, index) => <article key={member.key}>
+          <Field label="角色槽 ID"><input required pattern="[a-z][a-z0-9-]*" aria-invalid={Boolean(pinnedPolicy && member.roleId.trim() && !pinnedPolicy.allowedRoleIds.includes(member.roleId.trim()))} value={member.roleId} onChange={(event) => setMember(index, { roleId: event.target.value })} /></Field>
           <Field label="职责"><input required value={member.description} onChange={(event) => setMember(index, { description: event.target.value })} /></Field>
           <Field label="Employee"><SelectControl ariaLabel={`为 ${member.roleId || "成员"} 选择 Employee`} value={member.employeeId} invalid={!member.employeeId} options={[{ value: "", label: "选择员工", disabled: true }, ...employees.map((employee) => ({ value: employee.id, label: employee.identity.displayName, description: `v${employee.version}` }))]} onChange={(employeeId) => setMember(index, { employeeId })} /></Field>
           <button type="button" className="text-button danger-text" disabled={draft.members.length === 1} onClick={() => setDraft({ ...draft, members: draft.members.filter((_, memberIndex) => memberIndex !== index) })}>移除</button>
-        </article>)}</div><button type="button" className="button secondary" onClick={() => setDraft({ ...draft, members: [...draft.members, { roleId: `member-${draft.members.length + 1}`, description: "执行领队派发的专业任务。", employeeId: employees[0]?.id ?? "" }] })}><UtilityIcon name="add" />添加角色槽</button></section>
+        </article>)}</div>{policyRoleIssues.length > 0 && <div className="member-policy-errors" role="alert"><strong>角色槽不符合当前管理策略</strong>{policyRoleIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}<button type="button" className="button secondary" onClick={() => setDraft({ ...draft, members: [...draft.members, newMemberDraft(`member-${draft.members.length + 1}`, "执行领队派发的专业任务。", employees[0]?.id ?? "")] })}><UtilityIcon name="add" />添加角色槽</button></section>
         <section className="workflow-contract"><div className="section-kicker"><b>04</b><span>固定流程与交付门禁</span></div><div className="flow-editor-intro"><strong>领队只在动态分工区自由拆解；这些 Gate 是流程的硬边界。</strong><p>按能力选择执行者，不绑定测试员、审计员等固定角色名。没有合格成员时，只有具备同等能力的领队才能兜底。</p></div><div className="gate-editor-list">{draft.gates.map((gate, index) => <article key={`${gate.id}-${index}`}>
           <header><span>GATE {String(index + 1).padStart(2, "0")}</span><button type="button" className="text-button danger-text" onClick={() => setDraft({ ...draft, gates: draft.gates.filter((_, gateIndex) => gateIndex !== index) })}>移除</button></header>
           <div className="form-grid two"><Field label="Gate ID"><input required pattern="[a-z][a-z0-9-]*" value={gate.id} onChange={(event) => setDraft({ ...draft, gates: draft.gates.map((candidate, gateIndex) => gateIndex === index ? { ...candidate, id: event.target.value } : candidate) })} /></Field><Field label="需要能力"><input required value={gate.requiredCapability} placeholder="quality.test" onChange={(event) => setDraft({ ...draft, gates: draft.gates.map((candidate, gateIndex) => gateIndex === index ? { ...candidate, requiredCapability: event.target.value } : candidate) })} /></Field></div>
@@ -354,9 +402,14 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
             </div>
           </div>}</section>
         <section className="workflow-contract"><div className="section-kicker"><b>06</b><span>输入契约</span></div><Field label="Input JSON Schema"><textarea className="mono" rows={6} value={draft.inputSchema} onChange={(event) => setDraft({ ...draft, inputSchema: event.target.value })} /></Field></section>
-        {issues.length > 0 && <div className="canvas-issues" role="alert">{issues.map((issue) => <span key={issue}>{issue}</span>)}</div>}
+        {generalIssues.length > 0 && <div className="canvas-issues" role="alert">{generalIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}
       </fieldset>
-      <div className="editor-savebar"><span className="editor-save-note">Flow 固定阶段与门禁；领队只在动态分工区拆解、派发和重排。所有 Employee 与资源均固定版本。</span><button type="button" className="button secondary" onClick={onClose}>放弃修改</button><button className="button primary" disabled={saving || !daemonAvailable || issues.length > 0}>{saving ? "校验中…" : workflow ? `校验并另存为 v${workflow.version + 1}` : "校验并建立"}</button></div>
+      {submitError && <div className="editor-submit-error" role="alert" tabIndex={-1} ref={submitErrorRef}>
+        <strong>保存失败</strong>
+        <p>{summarizeSubmitError(submitError)}</p>
+        <details><summary>查看技术详情</summary><code>{submitError}</code></details>
+      </div>}
+      <div className="editor-savebar"><span className={`editor-save-note${primaryIssue ? " is-error" : ""}`} role={primaryIssue ? "status" : undefined}>{primaryIssue ?? "Flow 固定阶段与门禁；领队只在动态分工区拆解、派发和重排。所有 Employee 与资源均固定版本。"}</span><button type="button" className="button secondary" onClick={onClose}>放弃修改</button><button className="button primary" disabled={saving || !daemonAvailable || issues.length > 0}>{saving ? "校验中…" : workflow ? `校验并另存为 v${workflow.version + 1}` : "校验并建立"}</button></div>
     </form>
   </Modal>;
 }
