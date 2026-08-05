@@ -208,7 +208,16 @@ export interface SupervisorGate {
   fallback: "supervisor" | "block";
 }
 
-export type SupervisorDagNodeKind = "task" | "test" | "merge" | "integration" | "integration-test" | "other";
+export type SupervisorDagNodeKind =
+  | "task"
+  | "review"
+  | "test"
+  | "approval"
+  | "merge"
+  | "integration"
+  | "integration-test"
+  | "delivery"
+  | "other";
 export type SupervisorDagWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
 
 export interface SupervisorDagNode {

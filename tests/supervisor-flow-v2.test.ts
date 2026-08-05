@@ -97,6 +97,38 @@ async function createDagWorkflow(
 }
 
 describe("Supervisor Flow v2 declarative DAG runtime", () => {
+  it("accepts generic review, approval and delivery process kinds without adding runtime schedulers", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await createFlowTeam(service, "mock");
+    await service.createWorkflow({
+      id: "generic-process-kinds",
+      architecture: "supervisor",
+      supervisor: { employeeId: "flow-lead" },
+      managementPolicy: { id: "flow-policy" },
+      members: [{ roleId: "frontend", employeeId: "flow-frontend" }],
+      flow: {
+        stages: flowStages,
+        gates: [],
+        dag: { nodes: [
+          { nodeId: "produce", roleId: "frontend", needs: [], kind: "task", task: "Produce the result." },
+          { nodeId: "review", roleId: "frontend", needs: ["produce"], kind: "review", task: "Review the result." },
+          { nodeId: "approve", roleId: "frontend", needs: ["review"], kind: "approval", task: "Approve the result." },
+          { nodeId: "deliver", roleId: "frontend", needs: ["approve"], kind: "delivery", task: "Deliver the result." }
+        ] }
+      }
+    });
+
+    const workflow = service.getWorkflow("generic-process-kinds");
+    expect(workflow.architecture).toBe("supervisor");
+    if (workflow.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
+    expect(workflow.flow.dag?.nodes.map((node) => [node.kind, node.workKind])).toEqual([
+      ["task", "other"],
+      ["review", "audit"],
+      ["approval", "audit"],
+      ["delivery", "other"]
+    ]);
+  });
+
   it("persists finite DAG canvas positions and filters keys outside the declared Supervisor DAG", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     await createFlowTeam(service, "mock");

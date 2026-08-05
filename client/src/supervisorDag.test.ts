@@ -45,6 +45,12 @@ function branchFlowDrafts(): DagNodeDraft[] {
 }
 
 describe("supervisor DAG drafts", () => {
+  it("maps the generic process kinds to suitable default work modes", () => {
+    expect(defaultDagWorkKind("review")).toBe("audit");
+    expect(defaultDagWorkKind("approval")).toBe("audit");
+    expect(defaultDagWorkKind("delivery")).toBe("other");
+  });
+
   it("accepts the branch → tests → merge → integration-test flow with one tester role reused across three nodes", () => {
     const issues = supervisorDagDraftIssues(branchFlowDrafts(), MEMBERS);
     expect(issues).toEqual([]);

@@ -1,6 +1,15 @@
 import type { JsonValue, NodeRunStatus } from "../core/types.js";
 
-export type SupervisorDagNodeKind = "task" | "test" | "merge" | "integration" | "integration-test" | "other";
+export type SupervisorDagNodeKind =
+  | "task"
+  | "review"
+  | "test"
+  | "approval"
+  | "merge"
+  | "integration"
+  | "integration-test"
+  | "delivery"
+  | "other";
 export type SupervisorDagWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
 
 export interface SupervisorDagNodeConfig {
@@ -121,6 +130,7 @@ export function supervisorDagSnapshot(trackers: Map<string, SupervisorDagNodeTra
 
 export function supervisorDagWorkKind(kind: SupervisorDagNodeKind): SupervisorDagWorkKind {
   if (kind === "test" || kind === "integration-test") return "test";
+  if (kind === "review" || kind === "approval") return "audit";
   if (kind === "merge" || kind === "integration") return "integration";
   return "other";
 }

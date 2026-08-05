@@ -59,7 +59,7 @@ Provider 调用、Skill、Role 身份、Architecture 控制流、Workflow 实例
 - `nodeId`：Workflow 内稳定且唯一的逻辑节点 ID。
 - `roleId`：成员角色槽；作者输入兼容 `roleRef`，持久化时统一为 `roleId`。
 - `needs`：必须全部通过的前置 DAG 节点。
-- `kind`：`task | test | merge | integration | integration-test | other`。
+- `kind`：流程职责，可选 `task | review | test | approval | merge | integration | integration-test | delivery | other`。它描述“环节在流程里做什么”；具体采用讨论、编码、测试或审计等执行方式由 `workKind` 表达。
 - `task`：固定任务基线；领队可以补充或改写具体执行说明。
 - `requiredCapabilities`：节点执行所需能力，领队只能追加，不能移除。
 - `workKind`、`changeSet`：静态工作分类和变更边界，领队不能覆盖。

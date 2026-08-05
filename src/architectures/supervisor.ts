@@ -289,7 +289,7 @@ const supervisorConfigSchema = {
                     uniqueItems: true,
                     items: { type: "string", pattern: "^[a-z][a-z0-9-]*$" }
                   },
-                  kind: { enum: ["task", "test", "merge", "integration", "integration-test", "other"] },
+                  kind: { enum: ["task", "review", "test", "approval", "merge", "integration", "integration-test", "delivery", "other"] },
                   task: { type: "string", minLength: 1 },
                   requiredCapabilities: {
                     type: "array",

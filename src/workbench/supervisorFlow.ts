@@ -25,10 +25,13 @@ function text(value: unknown, label: string): string {
 
 const DAG_NODE_KINDS = new Set<SupervisorDagNodeKind>([
   "task",
+  "review",
   "test",
+  "approval",
   "merge",
   "integration",
   "integration-test",
+  "delivery",
   "other"
 ]);
 
@@ -43,6 +46,7 @@ const DAG_WORK_KINDS = new Set<SupervisorDagWorkKind>([
 
 function defaultDagWorkKind(kind: SupervisorDagNodeKind): SupervisorDagWorkKind {
   if (kind === "test" || kind === "integration-test") return "test";
+  if (kind === "review" || kind === "approval") return "audit";
   if (kind === "merge" || kind === "integration") return "integration";
   return "other";
 }

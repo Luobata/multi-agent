@@ -7,16 +7,41 @@ import type {
   SupervisorWorkKind
 } from "./types";
 
-export const DAG_NODE_KINDS: SupervisorDagNodeKind[] = ["task", "test", "merge", "integration", "integration-test", "other"];
+export const DAG_NODE_KINDS: SupervisorDagNodeKind[] = [
+  "task",
+  "review",
+  "test",
+  "approval",
+  "merge",
+  "integration",
+  "integration-test",
+  "delivery",
+  "other"
+];
 export const DAG_WORK_KINDS: SupervisorWorkKind[] = ["discussion", "code", "test", "audit", "integration", "other"];
 
 export const dagNodeKindLabels: Record<SupervisorDagNodeKind, string> = {
-  task: "开发任务",
-  test: "分支测试",
-  merge: "合并",
-  integration: "集成",
-  "integration-test": "集成测试",
+  task: "执行任务",
+  review: "评审 / 审核",
+  test: "测试 / 验证",
+  approval: "决策 / 审批",
+  merge: "分支合并",
+  integration: "汇总 / 集成",
+  "integration-test": "合并后测试",
+  delivery: "交付 / 发布",
   other: "其他"
+};
+
+export const dagNodeKindDescriptions: Record<SupervisorDagNodeKind, string> = {
+  task: "产出一项明确成果，可用于开发、设计、研究或内容工作",
+  review: "对已有产物进行评审、审计或质量检查",
+  test: "独立验证一个上游产物或分支",
+  approval: "由指定角色做出决定、确认或放行",
+  merge: "代码场景专用：合并至少两个已经单独测试通过的变更分支",
+  integration: "汇总多个工作成果，或连接多个系统与模块；不附加分支测试约束",
+  "integration-test": "代码场景专用：对分支合并后的整体结果进行再次测试",
+  delivery: "发布、移交或完成最终交付",
+  other: "以上类型无法表达时使用，不附加特殊流程约束"
 };
 
 export const dagWorkKindLabels: Record<SupervisorWorkKind, string> = {
@@ -42,6 +67,7 @@ export interface DagNodeDraft {
 
 export function defaultDagWorkKind(kind: SupervisorDagNodeKind): SupervisorWorkKind {
   if (kind === "test" || kind === "integration-test") return "test";
+  if (kind === "review" || kind === "approval") return "audit";
   if (kind === "merge" || kind === "integration") return "integration";
   return "other";
 }
@@ -219,8 +245,8 @@ export interface SupervisorDagLayout<T extends SupervisorDagLayoutInput = Superv
   cyclic: boolean;
 }
 
-export const DAG_NODE_WIDTH = 216;
-export const DAG_NODE_HEIGHT = 78;
+export const DAG_NODE_WIDTH = 244;
+export const DAG_NODE_HEIGHT = 86;
 
 /** Layered left-to-right layout so branch/fan-in/merge/integration-test stages read as distinct columns. */
 export function layoutSupervisorDag<T extends SupervisorDagLayoutInput>(nodes: readonly T[]): SupervisorDagLayout<T> {

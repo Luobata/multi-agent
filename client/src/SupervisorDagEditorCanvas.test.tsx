@@ -36,7 +36,9 @@ describe("SupervisorDagEditorCanvas", () => {
       onSelect={vi.fn()}
       onPositionsChange={vi.fn()}
       onConnect={vi.fn()}
-      roleDisplay={(roleId) => roleId === "tester" ? "测试员工" : "前端员工"}
+      roleVisual={(roleId) => roleId === "tester"
+        ? { displayName: "测试员工", presentation: { avatarUrl: "https://example.com/tester.png", accent: "#228855" } }
+        : { displayName: "前端员工", presentation: { initials: "前", accent: "#226688" } }}
     />));
 
     expect(container.querySelectorAll(".workflow-canvas-edges > path")).toHaveLength(1);
@@ -47,6 +49,7 @@ describe("SupervisorDagEditorCanvas", () => {
     expect(testerNodes).toHaveLength(2);
     expect(testerNodes[0]!.style.getPropertyValue("--role-accent")).toBe(testerNodes[1]!.style.getPropertyValue("--role-accent"));
     expect(testerNodes[0]!.textContent).toContain("测试员工");
+    expect(testerNodes[0]!.querySelector("img")?.getAttribute("src")).toBe("https://example.com/tester.png");
   });
 
   it("creates needs through output-to-input port clicks and keeps keyboard position editing", () => {

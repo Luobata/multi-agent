@@ -7,6 +7,7 @@ import {
   automaticDagPositions,
   buildSupervisorFlowPayload,
   dagNodeDrafts,
+  dagNodeKindDescriptions,
   dagNodeKindLabels,
   dagPayloadFromDrafts,
   dagWorkKindLabels,
@@ -164,10 +165,14 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
   ].filter((issue): issue is string => Boolean(issue));
   const [selectedDagIndex, setSelectedDagIndex] = useState(0);
   const selectedDagNode = draft.dagNodes[selectedDagIndex] ?? draft.dagNodes[0];
-  const dagRoleDisplay = (roleId: string): string | undefined => {
+  const dagRoleVisual = (roleId: string): { displayName: string; presentation?: Employee["presentation"] } | undefined => {
     const member = draft.members.find((candidate) => candidate.roleId.trim() === roleId);
     if (!member) return undefined;
-    return employees.find((employee) => employee.id === member.employeeId)?.identity.displayName ?? member.employeeId;
+    const employee = employees.find((candidate) => candidate.id === member.employeeId);
+    return {
+      displayName: employee?.identity.displayName ?? member.employeeId,
+      presentation: employee?.presentation
+    };
   };
   const setMember = (index: number, patch: Partial<MemberDraft>) => setDraft((current) => ({
     ...current,
@@ -324,21 +329,26 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
         <section className="workflow-contract"><div className="section-kicker"><b>05</b><span>声明式任务 DAG</span></div><div className="flow-editor-intro"><strong>可选：把分支开发 → 分支测试 → 合并 → 集成测试固定为声明式 DAG。</strong><p>启用后领队只能按 nodeId 派工，依赖未通过的环节不可执行；同一角色槽可负责多个环节（如 tester 同时负责 frontend-test、backend-test 与 integration-test）。不启用时保存 payload 不携带 dag，运行行为与旧版一致。</p></div><label className="switch-line dag-enable-switch"><span><b>启用 DAG 编排</b><small>{draft.dagEnabled ? "保存时随 stages/gates 一起提交 dag 定义" : "关闭时仅保留固定阶段与门禁"}</small></span><input type="checkbox" role="switch" checked={draft.dagEnabled} onChange={(event) => toggleDag(event.target.checked)} /></label>
           {draft.dagEnabled && <div className="workflow-builder supervisor-dag-builder">
             <header className="workflow-builder-toolbar"><div><p className="record-meta">DAG / VISUAL COMPOSER</p><h3>领队编排画布</h3></div><div className="canvas-actions"><button type="button" className="button secondary dag-scaffold-action" onClick={applyDagScaffold}>填入分支-合并示例骨架</button><button type="button" className="button ghost" onClick={addDagNode}><UtilityIcon name="add" />添加环节</button><button type="button" className="button ghost" onClick={() => setDraft((current) => ({ ...current, positions: automaticDagPositions(current.dagNodes) }))}>自动排版</button></div></header>
-            <div className="workflow-builder-grid"><div className="canvas-column"><div className="canvas-status"><span>拖动节点排版；从右侧端口连到下游左侧端口建立 needs，右侧检查器也可精确编辑。</span><Stamp status={dagIssues.length ? "blocked" : "passed"} label={dagIssues.length ? `${dagIssues.length} 项待修正` : "DAG 草稿通过预检"} /></div><SupervisorDagEditorCanvas nodes={draft.dagNodes} positions={draft.positions} selectedIndex={selectedDagIndex} issues={dagIssues} onSelect={setSelectedDagIndex} onPositionsChange={(positions) => setDraft((current) => ({ ...current, positions }))} onConnect={connectDagNodes} roleDisplay={dagRoleDisplay} />{dagIssues.length > 0 && <div className="canvas-issues" role="alert">{dagIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}</div>
-              <aside className="node-inspector">{selectedDagNode ? <><header><div><p className="record-meta">DAG NODE INSPECTOR</p><h4>{selectedDagNode.nodeId || "未命名节点"}</h4></div><button type="button" className="text-button danger-text" disabled={draft.dagNodes.length === 1} onClick={() => { removeDagNode(selectedDagIndex); setSelectedDagIndex(Math.max(0, selectedDagIndex - 1)); }}>移除</button></header>
-                <Field label="环节 ID (nodeId)"><input required pattern="[a-z][a-z0-9-]*" value={selectedDagNode.nodeId} placeholder="frontend-test" onChange={(event) => renameDagNode(selectedDagIndex, event.target.value)} /></Field>
-                <Field label="环节类型"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的环节类型`} value={selectedDagNode.kind} options={DAG_NODE_KINDS.map((kind) => ({ value: kind, label: dagNodeKindLabels[kind], description: kind }))} onChange={(value) => { const kind = value as SupervisorDagNodeKind; setDagNode(selectedDagIndex, { kind, ...(selectedDagNode.workKind === defaultDagWorkKind(selectedDagNode.kind) ? { workKind: defaultDagWorkKind(kind) } : {}) }); }} /></Field>
-                <Field label="执行角色槽"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的执行角色槽`} value={selectedDagNode.roleId} invalid={!draft.members.some((member) => member.roleId.trim() === selectedDagNode.roleId)} errorMessage={!draft.members.some((member) => member.roleId.trim() === selectedDagNode.roleId) ? "请选择第 03 节成员清册中的角色槽。" : undefined} options={[{ value: "", label: "选择成员角色槽", disabled: true }, ...draft.members.map((member) => ({ value: member.roleId.trim(), label: member.roleId.trim() || "(未命名角色槽)", description: member.description }))]} onChange={(roleId) => setDagNode(selectedDagIndex, { roleId })} /></Field>
-                <Field label="工作性质 (workKind)"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的工作性质`} value={selectedDagNode.workKind} options={DAG_WORK_KINDS.map((workKind) => ({ value: workKind, label: dagWorkKindLabels[workKind], description: workKind }))} onChange={(value) => setDagNode(selectedDagIndex, { workKind: value as SupervisorWorkKind })} /></Field>
-                <Field label="需要能力（逗号分隔）"><input value={selectedDagNode.capabilitiesText} placeholder="quality.test" onChange={(event) => setDagNode(selectedDagIndex, { capabilitiesText: event.target.value })} /></Field>
-                <Field label="变更集 changeSet（可空）"><input value={selectedDagNode.changeSet} placeholder="frontend" onChange={(event) => setDagNode(selectedDagIndex, { changeSet: event.target.value })} /></Field>
-                <fieldset className="dependency-checks"><legend>先行环节 (needs)</legend>{draft.dagNodes.map((candidate, candidateIndex) => {
-                  const needId = candidate.nodeId.trim();
-                  if (candidateIndex === selectedDagIndex || !needId) return null;
-                  return <label key={`${candidateIndex}-${needId}`}><input type="checkbox" checked={selectedDagNode.needs.includes(needId)} onChange={(event) => toggleDagNeed(selectedDagIndex, needId)} /><span><b>{needId}</b><small>{dagNodeKindLabels[candidate.kind]}</small></span></label>;
-                })}{draft.dagNodes.length <= 1 && <span className="muted">只有一个节点，无上游依赖。</span>}</fieldset>
-                <Field label="任务说明 (task)"><textarea required rows={3} value={selectedDagNode.task} onChange={(event) => setDagNode(selectedDagIndex, { task: event.target.value })} /></Field>
-                <label className="switch-line"><span><b>必需环节</b><small>未通过时禁止领队 finish</small></span><input type="checkbox" role="switch" checked={selectedDagNode.required} onChange={(event) => setDagNode(selectedDagIndex, { required: event.target.checked })} /></label>
+            <div className="workflow-builder-grid"><div className="canvas-column"><div className="canvas-status"><span>拖动节点排版；从右侧端口连到下游左侧端口建立前置依赖，右侧可补充环节说明。</span><Stamp status={dagIssues.length ? "blocked" : "passed"} label={dagIssues.length ? `${dagIssues.length} 项待修正` : "DAG 草稿通过预检"} /></div><SupervisorDagEditorCanvas nodes={draft.dagNodes} positions={draft.positions} selectedIndex={selectedDagIndex} issues={dagIssues} onSelect={setSelectedDagIndex} onPositionsChange={(positions) => setDraft((current) => ({ ...current, positions }))} onConnect={connectDagNodes} roleVisual={dagRoleVisual} />{dagIssues.length > 0 && <div className="canvas-issues" role="alert">{dagIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}</div>
+              <aside className="node-inspector supervisor-dag-inspector">{selectedDagNode ? <><header><div><p className="record-meta">环节设置</p><h4>{selectedDagNode.nodeId || "未命名节点"}</h4></div><button type="button" className="text-button danger-text" disabled={draft.dagNodes.length === 1} onClick={() => { removeDagNode(selectedDagIndex); setSelectedDagIndex(Math.max(0, selectedDagIndex - 1)); }}>移除</button></header>
+                <Field label="环节标识" hint="保存后用于运行记录与证据追踪，建议使用简短英文。"><input required pattern="[a-z][a-z0-9-]*" value={selectedDagNode.nodeId} placeholder="frontend-test" onChange={(event) => renameDagNode(selectedDagIndex, event.target.value)} /></Field>
+                <Field label="环节类型" hint="描述这个环节在流程中的职责，不限制员工采用的具体工作方式。"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的环节类型`} value={selectedDagNode.kind} options={DAG_NODE_KINDS.map((kind) => ({ value: kind, label: dagNodeKindLabels[kind], description: dagNodeKindDescriptions[kind] }))} onChange={(value) => { const kind = value as SupervisorDagNodeKind; setDagNode(selectedDagIndex, { kind, ...(selectedDagNode.workKind === defaultDagWorkKind(selectedDagNode.kind) ? { workKind: defaultDagWorkKind(kind) } : {}) }); }} /></Field>
+                <Field label="执行角色" hint="来自第 03 节成员清册；同一角色可以在多个环节重复使用。"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的执行角色槽`} value={selectedDagNode.roleId} invalid={!draft.members.some((member) => member.roleId.trim() === selectedDagNode.roleId)} errorMessage={!draft.members.some((member) => member.roleId.trim() === selectedDagNode.roleId) ? "请选择第 03 节成员清册中的角色槽。" : undefined} options={[{ value: "", label: "选择成员角色", disabled: true }, ...draft.members.map((member) => { const visual = dagRoleVisual(member.roleId.trim()); return { value: member.roleId.trim(), label: visual ? `${visual.displayName} · ${member.roleId.trim()}` : member.roleId.trim() || "(未命名角色槽)", description: member.description }; })]} onChange={(roleId) => setDagNode(selectedDagIndex, { roleId })} /></Field>
+                <Field label="任务说明" hint="说明该角色在这个环节要产出什么，以及完成标准。"><textarea required rows={4} value={selectedDagNode.task} onChange={(event) => setDagNode(selectedDagIndex, { task: event.target.value })} /></Field>
+                <label className="switch-line dag-required-switch"><span><b>交付必需</b><small>关闭后，这个环节失败不会阻止领队完成最终交付。</small></span><input type="checkbox" role="switch" checked={selectedDagNode.required} onChange={(event) => setDagNode(selectedDagIndex, { required: event.target.checked })} /></label>
+                <section className="dag-dependency-editor" aria-label="前置环节设置"><header><div><b>前置环节</b><small>连线表示：这些环节全部通过后，当前环节才可开始。</small></div><span>{selectedDagNode.needs.length}</span></header>
+                  <div className="dag-dependency-summary">{selectedDagNode.needs.length ? selectedDagNode.needs.map((needId) => { const candidate = draft.dagNodes.find((node) => node.nodeId === needId); return <button type="button" key={needId} title={`移除前置环节 ${needId}`} onClick={() => toggleDagNeed(selectedDagIndex, needId)}><span>{needId}</span><small>{candidate ? dagNodeKindLabels[candidate.kind] : "未知环节"}</small><i aria-hidden="true">×</i></button>; }) : <p>无前置环节 · 可立即开始</p>}</div>
+                  <details><summary><span>精确调整前置环节</span><small>{draft.dagNodes.length <= 1 ? "暂无其他环节" : "连线之外的键盘可访问方式"}</small><UtilityIcon name="toggle" /></summary><fieldset className="dependency-checks"><legend>可选前置环节</legend>{draft.dagNodes.map((candidate, candidateIndex) => {
+                    const needId = candidate.nodeId.trim();
+                    if (candidateIndex === selectedDagIndex || !needId) return null;
+                    return <label key={`${candidateIndex}-${needId}`}><input type="checkbox" checked={selectedDagNode.needs.includes(needId)} onChange={() => toggleDagNeed(selectedDagIndex, needId)} /><span><b>{needId}</b><small>{dagNodeKindLabels[candidate.kind]}</small></span></label>;
+                  })}{draft.dagNodes.length <= 1 && <span className="muted">只有一个环节，无可选前置环节。</span>}</fieldset></details>
+                </section>
+                <details className="dag-advanced-settings"><summary><span><b>高级设置</b><small>能力匹配、工作方式与变更范围</small></span><UtilityIcon name="toggle" /></summary><div>
+                  <Field label="工作方式" hint="供领队选择执行策略；通常会随环节类型自动设置。"><SelectControl ariaLabel={`节点 ${selectedDagNode.nodeId || "当前"} 的工作方式`} value={selectedDagNode.workKind} options={DAG_WORK_KINDS.map((workKind) => ({ value: workKind, label: dagWorkKindLabels[workKind], description: workKind }))} onChange={(value) => setDagNode(selectedDagIndex, { workKind: value as SupervisorWorkKind })} /></Field>
+                  <Field label="额外能力要求（可选）" hint="仅在执行角色还需具备特定能力时填写；多个能力用逗号分隔。"><input value={selectedDagNode.capabilitiesText} placeholder="例如 quality.test" onChange={(event) => setDagNode(selectedDagIndex, { capabilitiesText: event.target.value })} /></Field>
+                  <Field label="变更范围（可选）" hint="用于区分代码分支或产物边界，例如 frontend、backend；非开发任务通常留空。"><input value={selectedDagNode.changeSet} placeholder="例如 frontend" onChange={(event) => setDagNode(selectedDagIndex, { changeSet: event.target.value })} /></Field>
+                </div></details>
               </> : <div className="mini-empty">在画布选择一个环节开始编辑。</div>}</aside>
             </div>
           </div>}</section>

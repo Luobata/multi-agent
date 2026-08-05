@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent } from "react";
+import { EmployeeAvatar } from "./components";
 import {
   DAG_NODE_HEIGHT,
   DAG_NODE_WIDTH,
@@ -9,6 +10,7 @@ import {
   type DagNodeDraft,
   type DagNodePositions
 } from "./supervisorDag";
+import type { Employee } from "./types";
 
 const ROLE_ACCENTS = [
   "var(--season-winter)",
@@ -35,7 +37,7 @@ function roleAccent(roleId: string): string {
  * Graph-style editor for the Supervisor-owned DAG. It only edits presentation.positions and
  * node.needs; scheduling remains entirely in the Supervisor runtime.
  */
-export function SupervisorDagEditorCanvas({ nodes, positions, selectedIndex, issues = [], onSelect, onPositionsChange, onConnect, roleDisplay }: {
+export function SupervisorDagEditorCanvas({ nodes, positions, selectedIndex, issues = [], onSelect, onPositionsChange, onConnect, roleVisual }: {
   nodes: DagNodeDraft[];
   positions: DagNodePositions;
   selectedIndex?: number;
@@ -43,7 +45,7 @@ export function SupervisorDagEditorCanvas({ nodes, positions, selectedIndex, iss
   onSelect: (nodeIndex: number) => void;
   onPositionsChange: (positions: DagNodePositions) => void;
   onConnect: (sourceIndex: number, targetIndex: number) => void;
-  roleDisplay?: (roleId: string) => string | undefined;
+  roleVisual?: (roleId: string) => { displayName: string; presentation?: Employee["presentation"] } | undefined;
 }) {
   const drag = useRef<{ nodeIndex: number; nodeId: string; clientX: number; clientY: number; x: number; y: number; active: boolean } | undefined>(undefined);
   const [connection, setConnection] = useState<{ sourceIndex: number; x: number; y: number }>();
@@ -138,11 +140,13 @@ export function SupervisorDagEditorCanvas({ nodes, positions, selectedIndex, iss
       {nodes.map((node, index) => {
         const position = resolved[node.nodeId];
         if (!position) return null;
-        const roleName = roleDisplay?.(node.roleId);
+        const visual = roleVisual?.(node.roleId);
+        const roleName = visual?.displayName;
+        const assigneeName = roleName ?? (node.roleId || "未分派");
         const invalid = issues.some((issue) => dagIssueTargetsNode(issue, node.nodeId));
         return <div
           className={`supervisor-dag-editor-node supervisor-dag-editor-node--${node.kind} ${selectedIndex === index ? "selected" : ""} ${invalid ? "invalid" : ""}`}
-          style={{ transform: `translate(${position.x}px, ${position.y}px)`, "--role-accent": roleAccent(node.roleId) } as CSSProperties}
+          style={{ transform: `translate(${position.x}px, ${position.y}px)`, "--role-accent": visual?.presentation?.accent ?? roleAccent(node.roleId) } as CSSProperties}
           key={`${node.nodeId}-${index}`}
         >
           <button
@@ -158,10 +162,16 @@ export function SupervisorDagEditorCanvas({ nodes, positions, selectedIndex, iss
             onPointerCancel={() => { drag.current = undefined; }}
           >
             <span className="supervisor-dag-editor-node-index">{String(index + 1).padStart(2, "0")}</span>
+            <EmployeeAvatar
+              className="small supervisor-dag-node-avatar"
+              displayName={assigneeName}
+              presentation={visual?.presentation}
+              title={roleName ? `${roleName} · ${node.roleId}` : node.roleId || "未分派角色"}
+            />
             <span className="supervisor-dag-editor-node-copy">
               <em className="supervisor-dag-editor-node-kind">{dagNodeKindLabels[node.kind]}{node.required ? "" : " · 可选"}</em>
               <strong>{compactLabel(node.nodeId || "未命名节点")}</strong>
-              <small className="supervisor-dag-role-badge"><i aria-hidden="true" />{compactLabel(node.roleId || "未分派", 18)}{roleName ? ` · ${compactLabel(roleName, 12)}` : ""}</small>
+              <small className="supervisor-dag-role-badge">{roleName ? <><b>{compactLabel(roleName, 12)}</b><span>· {compactLabel(node.roleId || "未分派", 14)}</span></> : compactLabel(node.roleId || "未分派", 18)}</small>
             </span>
             {invalid && <span className="supervisor-dag-node-error" title="此节点有待修正问题" aria-label="此节点有待修正问题">!</span>}
           </button>
