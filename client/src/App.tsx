@@ -10,6 +10,7 @@ import { RunsPage } from "./RunsPage";
 import { SkillsPage } from "./SkillsPage";
 import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
+import { applyTheme, DEFAULT_THEME, readTheme, type ThemeName } from "./theme";
 
 type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications";
 const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
@@ -65,6 +66,8 @@ export function App() {
   const [notice, setNotice] = useState<{ message: string; kind: "success" | "error" }>();
   const [commandOpen, setCommandOpen] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [theme, setTheme] = useState<ThemeName>(() => (typeof window === "undefined" ? DEFAULT_THEME : readTheme()));
+  useEffect(() => { applyTheme(theme); }, [theme]);
   const bootstrapRequestSeq = useRef(0);
   const bootstrapLoaded = useRef(false);
 
@@ -170,16 +173,23 @@ export function App() {
   ];
 
   return <div className={`app-shell app-shell--${page}`}>
+    <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
+      <filter id="crayon-edge" x="-5%" y="-5%" width="110%" height="110%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.012 0.015" numOctaves="2" seed="7" result="noise" />
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="2.4" xChannelSelector="R" yChannelSelector="G" />
+      </filter>
+    </svg>
     <a className="skip-link" href="#main-content">跳到主内容</a>
     <header className={`daemon-strip daemon-strip--${daemon}`} aria-live="polite">
       <div><span className="daemon-dot" aria-hidden="true" /><strong>{daemon === "online" ? "小镇运行核心已连接" : daemon === "offline" ? "小镇运行核心未连接" : "正在核对小镇运行核心"}</strong><code>127.0.0.1 · LOOPBACK</code></div>
       <span>{daemon === "offline" ? "READ ONLY · 写入与运行暂不可用" : syncing ? "SYNCING · 正在同步最新档案" : "LOCAL GARDEN · EVIDENCE ON"}</span>
     </header>
     <nav className="side-nav" aria-label="主要导航">
-      <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>迪士尼乐园</strong><small>HEALING PIXEL DOSSIER</small></div></div>
+      <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>双叶幼儿园</strong><small>CRAYON KINDERGARTEN DOSSIER</small></div></div>
       <div className="nav-items">{nav.map((item) => <button type="button" className={page === item.id ? "active" : ""} aria-current={page === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
       <button type="button" className="command-hint" title="命令入口" onClick={() => setCommandOpen(true)}><Icon name="command" /><span>命令面板</span><kbd>⌘K</kbd></button>
-      <div className="nav-foot"><span>HP</span><div><strong>Town Workbench</strong><small>四季在册 · A2A 1.0</small></div></div>
+      <button type="button" className="theme-toggle" onClick={() => setTheme(theme === "crayon" ? "pixel" : "crayon")} title={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"} aria-label={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"}><span className="theme-toggle-dot" aria-hidden="true" /><span>{theme === "crayon" ? "蜡笔小新" : "治愈像素"}</span><small>{theme === "crayon" ? "CRAYON" : "PIXEL"}</small></button>
+      <div className="nav-foot"><span>KG</span><div><strong>Kindergarten Workbench</strong><small>班级在册 · A2A 1.0</small></div></div>
     </nav>
     <DaemonGate status={daemon}><div id="main-content" className="app-content" tabIndex={-1}>
       {page === "office" && <OfficePage data={data} streamStatus={activityStream} />}

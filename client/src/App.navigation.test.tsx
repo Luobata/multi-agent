@@ -312,4 +312,39 @@ describe("App navigation freshness", () => {
 
     expect(FakeEventSource.urls).toEqual(["/api/activity/stream"]);
   });
+
+  it("shows the Futaba Kindergarten brand name", async () => {
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    const brand = container.querySelector(".brand-mark strong");
+    expect(brand?.textContent).toBe("双叶幼儿园");
+  });
+
+  it("defaults to the crayon theme on the document element", async () => {
+    localStorage.removeItem("workbench-theme");
+    document.documentElement.removeAttribute("data-theme");
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    expect(document.documentElement.getAttribute("data-theme")).toBe("crayon");
+  });
+
+  it("toggles to the pixel theme via the sidebar control", async () => {
+    localStorage.removeItem("workbench-theme");
+    document.documentElement.removeAttribute("data-theme");
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    const toggle = container.querySelector<HTMLButtonElement>(".side-nav .theme-toggle");
+    expect(toggle?.getAttribute("aria-label")).toBe("切换到治愈像素主题");
+    click(toggle!);
+    await flush();
+
+    expect(document.documentElement.getAttribute("data-theme")).toBe("pixel");
+    expect(localStorage.getItem("workbench-theme")).toBe("pixel");
+  });
 });
