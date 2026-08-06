@@ -120,7 +120,9 @@ export interface ManagementPolicyLimits {
   maxRounds: number;
   maxDelegations: number;
   maxParallelDelegations: number;
-  maxDurationMs: number;
+  /** Optional absolute wall-clock ceiling. Omitted = unbounded: the run continues while work makes
+   *  progress and is stopped only by per-node idle timeouts or the round/delegation limits. */
+  maxDurationMs?: number;
 }
 
 export interface ManagementPolicyDefinition {

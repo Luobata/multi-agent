@@ -890,6 +890,51 @@ describe("Local Agent Workbench", () => {
     });
   });
 
+  it("runs without a wall-clock deadline when the policy omits maxDurationMs", async () => {
+    // A slow supervisor that would have tripped the old fixed default: with no maxDurationMs the run
+    // has no wall-clock deadline and completes on progress instead of being aborted by the clock.
+    const providers: ProviderRegistry = new Map([["unbounded-supervisor", {
+      id: "unbounded-supervisor",
+      validate: () => [],
+      invoke: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_050));
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Delivered without a clock.", result: { accepted: true } }),
+          stderr: "",
+          durationMs: 1_050
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("unbounded-provider", { adapter: "unbounded-supervisor", outputProtocol: "json" });
+    for (const id of ["unbounded-manager", "unbounded-worker"]) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Runs without a duration ceiling.", responsibilities: ["Work"] },
+        providerId: "unbounded-provider"
+      });
+    }
+    const policy = await service.createManagementPolicy({
+      id: "unbounded-supervision",
+      allowedRoleIds: ["worker"],
+      instructions: "Keep working while progress is made; no fixed wall clock.",
+      limits: { maxRounds: 3, maxDelegations: 4, maxParallelDelegations: 1 }
+    });
+    // The policy carries no absolute duration ceiling.
+    expect(policy.limits.maxDurationMs).toBeUndefined();
+    await service.createWorkflow({
+      id: "unbounded-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "unbounded-manager" },
+      managementPolicy: { id: "unbounded-supervision" },
+      members: [{ roleId: "worker", employeeId: "unbounded-worker" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("unbounded-team", { message: "Deliver without a deadline" });
+    expect(result.run.status).toBe("passed");
+    expect(JSON.stringify(result.run.output)).not.toContain("duration limit");
+  });
+
   it("allows a Supervisor to recover from a failed member while preserving the failed WorkInstance", async () => {
     const providers: ProviderRegistry = new Map([["recovering-supervisor", {
       id: "recovering-supervisor",

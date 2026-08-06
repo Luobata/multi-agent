@@ -165,6 +165,7 @@ import {
   type GraphWorkflowCreateInput,
   type ManagementPolicyCreateInput,
   type ManagementPolicyDefinition,
+  type ManagementPolicyLimits,
   type ManagementPolicyUpdateInput,
   type SkillCreateInput,
   type SkillUpdateInput,
@@ -5275,20 +5276,23 @@ export class WorkbenchService {
     const id = requireId(input.id, "management policy id");
     const allowedRoleIds = [...new Set(input.allowedRoleIds.map((roleId) => requireId(roleId, "management policy role id")))];
     if (allowedRoleIds.length === 0) throw new Error(`management policy ${id} must allow at least one member role`);
-    const limits = {
+    const maxDurationMs = input.limits?.maxDurationMs ?? current?.limits.maxDurationMs;
+    const limits: ManagementPolicyLimits = {
       maxRounds: input.limits?.maxRounds ?? current?.limits.maxRounds ?? 6,
       maxDelegations: input.limits?.maxDelegations ?? current?.limits.maxDelegations ?? 12,
       maxParallelDelegations: input.limits?.maxParallelDelegations ?? current?.limits.maxParallelDelegations ?? 3,
-      maxDurationMs: input.limits?.maxDurationMs ?? current?.limits.maxDurationMs ?? 600_000
+      // Optional: omitted = unbounded (progress-based). A value acts as an absolute safety ceiling.
+      ...(maxDurationMs === undefined ? {} : { maxDurationMs })
     };
     const bounds: Array<[keyof typeof limits, number, number]> = [
       ["maxRounds", 1, 32],
       ["maxDelegations", 1, 256],
       ["maxParallelDelegations", 1, 32],
-      ["maxDurationMs", 1_000, 86_400_000]
+      ...(limits.maxDurationMs === undefined ? [] : [["maxDurationMs", 1_000, 86_400_000] as [keyof typeof limits, number, number]])
     ];
     for (const [key, minimum, maximum] of bounds) {
-      if (!Number.isInteger(limits[key]) || limits[key] < minimum || limits[key] > maximum) {
+      const value = limits[key];
+      if (value === undefined || !Number.isInteger(value) || value < minimum || value > maximum) {
         throw new Error(`management policy ${key} must be an integer between ${minimum} and ${maximum}`);
       }
     }

@@ -26,7 +26,7 @@ interface SupervisorPolicyConfig {
     maxRounds: number;
     maxDelegations: number;
     maxParallelDelegations: number;
-    maxDurationMs: number;
+    maxDurationMs?: number;
   };
   failure: {
     workerFailure: "observe-and-replan" | "fail-fast";
@@ -229,7 +229,7 @@ const supervisorConfigSchema = {
         limits: {
           type: "object",
           additionalProperties: false,
-          required: ["maxRounds", "maxDelegations", "maxParallelDelegations", "maxDurationMs"],
+          required: ["maxRounds", "maxDelegations", "maxParallelDelegations"],
           properties: {
             maxRounds: { type: "integer", minimum: 1, maximum: 32 },
             maxDelegations: { type: "integer", minimum: 1, maximum: 256 },
@@ -694,7 +694,7 @@ async function executeGateActivation(
   activation: GateActivation,
   round: number,
   parentNodeId: string,
-  deadlineAt: number,
+  deadlineAt: number | undefined,
   sequence: number
 ): Promise<string | undefined> {
   tracker.activations.set(activation.key, activation);
@@ -796,7 +796,7 @@ async function runAfterDelegationGates(
   allDelegations: DelegationRecord[],
   round: number,
   parentNodeId: string,
-  deadlineAt: number,
+  deadlineAt: number | undefined,
   sequence: { value: number }
 ): Promise<string[]> {
   const nodeIds: string[] = [];
@@ -844,7 +844,7 @@ async function runCompletionGates(
   delegations: DelegationRecord[],
   round: number,
   parentNodeId: string,
-  deadlineAt: number,
+  deadlineAt: number | undefined,
   sequence: { value: number }
 ): Promise<string[]> {
   const nodeIds: string[] = [];
@@ -922,8 +922,13 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
   let round = 1;
   let delegationCount = 0;
   let latestNodeIds: string[] = [];
-  const deadlineAt = startedAt + value.policy.limits.maxDurationMs;
-  const durationExceeded = () => Date.now() >= deadlineAt;
+  // Absolute wall-clock ceiling is optional. When the policy omits maxDurationMs the run has no
+  // fixed deadline: it keeps going while nodes make progress and is bounded only by per-node idle
+  // timeouts and the round/delegation limits. A value still acts as a hard safety ceiling.
+  const deadlineAt = value.policy.limits.maxDurationMs === undefined
+    ? undefined
+    : startedAt + value.policy.limits.maxDurationMs;
+  const durationExceeded = () => deadlineAt !== undefined && Date.now() >= deadlineAt;
 
   while (true) {
     if (durationExceeded()) {
