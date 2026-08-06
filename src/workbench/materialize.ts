@@ -119,6 +119,33 @@ function skillVersion(state: WorkbenchState, id: string, version: number): Workb
   return found;
 }
 
+/**
+ * Build a bounded profile for a member so the supervisor can judge who fits a task by real signal
+ * (responsibilities + per-skill summaries) instead of exact capability-tag matching. Kept small on
+ * purpose — a few responsibilities and one line per skill — so the leader prompt does not balloon.
+ */
+function memberProfile(state: WorkbenchState, employee: EmployeeDefinition): {
+  responsibilities: string[];
+  skillSummaries: string[];
+} {
+  const responsibilities = (employee.identity.responsibilities ?? [])
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(0, 4);
+  const skillSummaries: string[] = [];
+  for (const binding of employee.skills) {
+    if (typeof binding !== "string" && binding.enabled === false) continue;
+    const skillId = typeof binding === "string" ? binding : binding.id;
+    const version = employee.skillVersions[skillId] ?? state.skills[skillId]?.version;
+    if (version === undefined) continue;
+    const skill = skillVersion(state, skillId, version);
+    if (skill.injection === "supervisor") continue; // system orchestration skill is not a specialist signal
+    const summary = skill.summary?.trim() || skill.displayName?.trim();
+    if (summary) skillSummaries.push(`${skill.displayName}: ${summary}`);
+  }
+  return { responsibilities, skillSummaries: skillSummaries.slice(0, 6) };
+}
+
 function requestTemplateFor(
   workflow: WorkbenchWorkflowDefinition,
   runtimeRoleId: string,
@@ -132,12 +159,12 @@ function requestTemplateFor(
       ? "Declarative DAG and current logical-node state:\n{{node.with.__supervisorDag}}\n\n"
       : "";
     const sequencingRules = workflow.flow.dag
-      ? "Treat listed capabilities as authoritative rather than inferring ability from a role name. Keep every assignment to one bounded, verifiable milestone. Delegate only DAG nodes reported ready by the runtime; never place a downstream verification node in the same round as an implementation dependency. A blocked result is evidence: do not repeat the same node until prerequisite evidence changes."
-      : "Treat listed capabilities as authoritative rather than inferring ability from a role name. Keep every assignment to one bounded, verifiable milestone. Never schedule a test, audit, merge, or integration task in parallel with implementation that must exist first; delegate downstream verification only after prerequisite evidence is available. A blocked result is evidence: do not repeat the same assignment until prerequisite evidence changes, and finish with a disclosed risk when policy and required Gates allow it.";
+      ? "Choose who fits each task from the member profiles below — weigh their responsibilities and skill summaries; capability tags are coarse hints, not hard requirements, and are never matched by exact string. Keep every assignment to one bounded, verifiable milestone. Delegate only DAG nodes reported ready by the runtime; never place a downstream verification node in the same round as an implementation dependency. A blocked result is evidence: do not repeat the same node until prerequisite evidence changes."
+      : "Choose who fits each task from the member profiles below — weigh their responsibilities and skill summaries; capability tags are coarse hints, not hard requirements, and are never matched by exact string. Keep every assignment to one bounded, verifiable milestone. Never schedule a test, audit, merge, or integration task in parallel with implementation that must exist first; delegate downstream verification only after prerequisite evidence is available. A blocked result is evidence: do not repeat the same assignment until prerequisite evidence changes, and finish with a disclosed risk when policy and required Gates allow it.";
     const decisionContract = workflow.flow.dag
       ? "In DAG mode every delegate assignment must name its declared nodeId and matching roleId; delegate only ready nodes whose dependencies passed."
       : "";
-    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself. ${sequencingRules}\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\n${dagSection}Management policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nAvailable member role slots and explicit capabilities:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, and Gate ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-decision validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nReturn exactly one JSON decision matching the supplied output schema. ${decisionContract} Use action \"delegate\" with one or more assignments, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
+    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself. ${sequencingRules}\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\n${dagSection}Management policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nMember role slots with their profiles (responsibilities, skill summaries, capability hints) — pick the best-fit member per task:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, and Gate ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-decision validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nReturn exactly one JSON decision matching the supplied output schema. ${decisionContract} Use action \"delegate\" with one or more assignments, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
   }
   return `${employee.requestPrompt.trim()}\n\n## Delegation from the workflow supervisor\n\nYour workflow-local role slot:\n{{node.with.__delegatedRoleId}}\n\nDelegated task:\n{{node.with.__delegatedTask}}\n\nRequired capabilities:\n{{node.with.__requiredCapabilities}}\n\nWork kind and change set:\n{{node.with.__workKind}} / {{node.with.__changeSet}}\n\nGate execution request, when present:\n{{node.with.__gateExecution}}\n\nDelegated context:\n{{node.with.__delegatedContext}}\n\nSupervisor summary:\n{{node.with.__supervisorSummary}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn the requested specialist result using your normal output contract.\n`;
 }
@@ -298,12 +325,18 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
           failure: { ...supervisorPolicy!.failure },
           completion: { ...supervisorPolicy!.completion }
         },
-        members: supervisorWorkflow!.members.map((member) => ({
-          roleId: member.roleId,
-          role: supervisorMemberRuntimeRoleId(member.roleId),
-          description: member.description,
-          capabilities: [...options.employees.get(supervisorMemberRuntimeRoleId(member.roleId))!.capabilities]
-        })),
+        members: supervisorWorkflow!.members.map((member) => {
+          const memberEmployee = options.employees.get(supervisorMemberRuntimeRoleId(member.roleId))!;
+          const profile = memberProfile(options.state, memberEmployee);
+          return {
+            roleId: member.roleId,
+            role: supervisorMemberRuntimeRoleId(member.roleId),
+            description: member.description,
+            capabilities: [...memberEmployee.capabilities],
+            responsibilities: profile.responsibilities,
+            skillSummaries: profile.skillSummaries
+          };
+        }),
         flow: {
           version: supervisorWorkflow!.flow.version,
           stages: supervisorWorkflow!.flow.stages.map((stage) => ({ ...stage })),

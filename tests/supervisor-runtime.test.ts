@@ -172,7 +172,14 @@ describe("Supervisor flow persistence and materialization", () => {
     expect(manifest.roles["member-builder"]?.identity.metadata.runtimeSkillInjections).toBeUndefined();
     expect(manifest.workflows[workflow.id]?.config).toMatchObject({
       supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 1 } },
-      members: [{ roleId: "builder", capabilities: ["code.backend"] }]
+      members: [{
+        roleId: "builder",
+        capabilities: ["code.backend"],
+        // The supervisor sees a bounded member profile to judge fit — responsibilities + per-skill summaries,
+        // not just capability tags. The injected system orchestration skill is excluded from member signal.
+        responsibilities: ["Build"],
+        skillSummaries: ["build-method: Build method"]
+      }]
     });
     expect(service.getEmployee("materialized-lead").skills).toEqual(["lead-method"]);
     expect(service.getEmployee("materialized-builder").skills).toEqual(["build-method"]);
@@ -212,24 +219,36 @@ describe("Supervisor flow persistence and materialization", () => {
 });
 
 describe("Supervisor deterministic capabilities and Gates", () => {
-  it("blocks an assignment when the selected member lacks its required capabilities", async () => {
+  it("delegates to the selected member even when its capability tags do not match the advisory requirement", async () => {
+    // Capability tags are advisory hints, not a hard gate: the supervisor picks who fits and the
+    // runtime delegates regardless of tag mismatch. (Previously this mismatch hard-blocked the run.)
+    let round = 0;
     const providers: ProviderRegistry = new Map([["capability-decision", {
       id: "capability-decision",
       validate: () => [],
-      invoke: async () => ({
-        stdout: JSON.stringify({
-          action: "delegate",
-          assignments: [{
-            roleId: "worker",
-            task: "Implement the backend change.",
-            requiredCapabilities: ["code.backend"],
-            workKind: "code",
-            changeSet: "backend"
-          }]
-        }),
-        stderr: "",
-        durationMs: 1
-      })
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role !== "supervisor") {
+          return { stdout: JSON.stringify({ message: "Implemented the backend change." }), stderr: "", durationMs: 1 };
+        }
+        round += 1;
+        return round === 1
+          ? {
+              stdout: JSON.stringify({
+                action: "delegate",
+                assignments: [{
+                  roleId: "worker",
+                  task: "Implement the backend change.",
+                  requiredCapabilities: ["code.backend"],
+                  workKind: "code",
+                  changeSet: "backend"
+                }]
+              }),
+              stderr: "",
+              durationMs: 1
+            }
+          : { stdout: JSON.stringify({ action: "finish", summary: "Delivered.", result: { delivered: true } }), stderr: "", durationMs: 1 };
+      }
     }]]);
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
     await service.putProvider("capability-provider", { adapter: "capability-decision", outputProtocol: "json" });
@@ -255,9 +274,10 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     });
 
     const result = await service.runWorkbenchWorkflow("capability-supervision", { message: "Build" });
-    expect(result.run.status).toBe("blocked");
-    expect(result.run.output).toMatchObject({ reason: expect.stringContaining("lacks required capabilities: code.backend") });
-    expect(Object.keys(result.run.nodes)).toEqual(["supervisor-r1"]);
+    // The mismatched capability tag no longer blocks: the worker is delegated and the run completes.
+    expect(result.run.status).toBe("passed");
+    expect(JSON.stringify(result.run.output)).not.toContain("lacks required capabilities");
+    expect(Object.keys(result.run.nodes)).toContain("worker-r1-1");
   });
 
   it("skips integration for one changeSet and runs it for two independent code changeSets", async () => {

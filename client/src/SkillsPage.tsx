@@ -13,6 +13,7 @@ interface SkillDraft {
   id: string;
   displayName: string;
   description: string;
+  summary: string;
   instructions: string;
   configSchema: string;
   tools: string;
@@ -22,6 +23,7 @@ const emptyDraft: SkillDraft = {
   id: "",
   displayName: "",
   description: "",
+  summary: "",
   instructions: "",
   configSchema: "",
   tools: ""
@@ -46,6 +48,7 @@ function draftFrom(skill?: Skill): SkillDraft {
     id: skill.id,
     displayName: skill.displayName,
     description: skill.description,
+    summary: skill.summary,
     instructions: skill.instructions,
     configSchema: skill.configSchema ? JSON.stringify(skill.configSchema, null, 2) : "",
     tools: skill.tools.join(", ")
@@ -69,6 +72,7 @@ function SkillEditor({ skill, onClose, onSaved, notify }: {
         id: draft.id.trim(),
         displayName: draft.displayName.trim(),
         description: draft.description.trim(),
+        summary: draft.summary.trim() || undefined,
         instructions: draft.instructions.trim(),
         configSchema: draft.configSchema.trim() ? parseObject(draft.configSchema, "配置 JSON Schema") : undefined,
         tools: draft.tools.split(",").map((value) => value.trim()).filter(Boolean)
@@ -91,6 +95,7 @@ function SkillEditor({ skill, onClose, onSaved, notify }: {
           <Field label="显示名"><input required value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} /></Field>
         </div>
         <Field label="能力说明"><input required value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></Field>
+        <Field label="功能摘要（可选）" hint="一句话概括这个 Skill 大致能做什么，供领队派工时判断谁合适；留空则自动取能力说明首句。"><input value={draft.summary} placeholder="例如：产出精确到组件与状态的交互设计规范" onChange={(event) => setDraft({ ...draft, summary: event.target.value })} /></Field>
         <Field label="可复用指令" hint="Role 只绑定 Skill；运行时按版本注入这些指令。"><textarea required rows={10} value={draft.instructions} onChange={(event) => setDraft({ ...draft, instructions: event.target.value })} /></Field>
         <div className="form-grid two">
           <Field label="配置 JSON Schema（可选）"><textarea className="mono" rows={8} value={draft.configSchema} onChange={(event) => setDraft({ ...draft, configSchema: event.target.value })} /></Field>

@@ -31,6 +31,8 @@ export interface WorkbenchSkillDefinition {
   injection: SkillInjection;
   displayName: string;
   description: string;
+  /** One-line summary of the skill's rough function, used to help the supervisor judge who fits a task. */
+  summary: string;
   instructions: string;
   configSchema?: JsonObject;
   tools: string[];
@@ -789,6 +791,8 @@ export interface SkillCreateInput {
   id: string;
   displayName?: string;
   description: string;
+  /** Optional one-line function summary; derived from the description's first sentence when omitted. */
+  summary?: string;
   instructions: string;
   configSchema?: JsonObject;
   tools?: string[];

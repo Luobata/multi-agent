@@ -46,6 +46,7 @@ const bootstrap: Bootstrap = {
     status: "active",
     displayName: "浏览器与 E2E 验收",
     description: "Validate browser behavior.",
+    summary: "Validate browser behavior.",
     instructions: "Validate in a browser.",
     tools: [],
     owner: "user",

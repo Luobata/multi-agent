@@ -19,6 +19,8 @@ export interface Skill {
   injection: SkillInjection;
   displayName: string;
   description: string;
+  /** One-line function summary shown to the supervisor when judging who fits a task. */
+  summary: string;
   instructions: string;
   tools: string[];
   configSchema?: JsonObject;

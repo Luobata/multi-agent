@@ -64,6 +64,9 @@ interface SupervisorTeamMemberConfig {
   role: string;
   description: string;
   capabilities: string[];
+  /** Bounded profile signals the supervisor uses to judge fit — not hard gates. */
+  responsibilities?: string[];
+  skillSummaries?: string[];
 }
 
 interface SupervisorWorkflowConfig {
@@ -262,7 +265,9 @@ const supervisorConfigSchema = {
           roleId: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
           role: { type: "string", minLength: 1 },
           description: { type: "string", minLength: 1 },
-          capabilities: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } }
+          capabilities: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } },
+          responsibilities: { type: "array", items: { type: "string", minLength: 1 } },
+          skillSummaries: { type: "array", items: { type: "string", minLength: 1 } }
         }
       }
     },
@@ -470,7 +475,13 @@ function supervisorWith(
     __supervisorRound: round,
     __managementPolicy: value.policy as unknown as JsonValue,
     __supervisorFlow: value.flow as unknown as JsonValue,
-    __supervisorTeam: value.members.map(({ roleId, description, capabilities }) => ({ roleId, description, capabilities })),
+    __supervisorTeam: value.members.map(({ roleId, description, capabilities, responsibilities, skillSummaries }) => ({
+      roleId,
+      description,
+      capabilities,
+      ...(responsibilities && responsibilities.length ? { responsibilities } : {}),
+      ...(skillSummaries && skillSummaries.length ? { skillSummaries } : {})
+    })),
     __supervisorCapabilities: value.supervisor.capabilities,
     __supervisorGates: gates,
     ...(dagTrackers ? { __supervisorDag: supervisorDagSnapshot(dagTrackers) } : {}),
@@ -1162,20 +1173,13 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           `supervisor delegated DAG node ${assignment.nodeId} with changeSet ${assignment.changeSet}; expected ${dagTracker.node.changeSet ?? "none"}`
         );
       }
+      // requiredCapabilities are advisory hints the supervisor may attach; they travel with the
+      // delegation as context but are NOT a hard gate. The supervisor picks who fits from each
+      // member's profile (responsibilities + skill summaries), so capability tags never block work.
       const requiredCapabilities = [...new Set([
         ...(dagTracker?.node.requiredCapabilities ?? []),
         ...(assignment.requiredCapabilities ?? [])
       ])];
-      const missing = requiredCapabilities.filter((capability) => !member.capabilities.includes(capability));
-      if (missing.length > 0) {
-        return blocked(
-          `supervisor member ${assignment.roleId} lacks required capabilities: ${missing.join(", ")}`,
-          round,
-          delegationCount,
-          trackers,
-          dagTrackers
-        );
-      }
       const role = context.loaded.manifest.roles[member.role];
       if (!role) throw new Error(`supervisor member runtime role not found: ${member.role}`);
       const delegatedTask = assignment.task?.trim() || dagTracker?.node.task;

@@ -45,11 +45,19 @@ function teamOrchestrationSkill(version = 1, createdAt = SYSTEM_SKILL_TIMESTAMP)
     injection: "supervisor",
     displayName: "Team orchestration",
     description: "System-owned guidance for a Supervisor runtime that plans, delegates, verifies, and delivers team work.",
+    summary: "Plan, delegate, verify, and deliver team work as the Supervisor runtime.",
     instructions: "Coordinate the assigned team within the Supervisor workflow policy. Delegate explicit work, preserve evidence, respect runtime limits and gates, and finish only when the required work is complete.",
     tools: [],
     createdAt,
     updatedAt: SYSTEM_SKILL_TIMESTAMP
   };
+}
+
+/** Derive a bounded one-line summary from a skill description for pre-summary persisted skills. */
+function backfillSkillSummary(description: string): string {
+  const source = (description ?? "").trim().split(/(?<=[.!?。！？])\s+/)[0] || (description ?? "").trim();
+  const collapsed = source.replace(/\s+/g, " ").trim();
+  return collapsed.length > 160 ? `${collapsed.slice(0, 159).trimEnd()}…` : collapsed;
 }
 
 function ensureSystemSkills(state: WorkbenchState): void {
@@ -291,12 +299,14 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     skill.status ??= "active";
     skill.owner ??= "user";
     skill.injection ??= "none";
+    skill.summary ??= backfillSkillSummary(skill.description);
   }
   for (const versions of Object.values(state.skillHistory)) {
     for (const skill of versions) {
       skill.status ??= "active";
       skill.owner ??= "user";
       skill.injection ??= "none";
+      skill.summary ??= backfillSkillSummary(skill.description);
     }
   }
   ensureSystemSkills(state);

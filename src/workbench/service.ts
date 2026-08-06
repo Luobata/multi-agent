@@ -335,6 +335,18 @@ function normalizeCapabilities(values: string[] | undefined, label: string): str
   return normalizedStringList(values ?? [], label) ?? [];
 }
 
+/**
+ * Produce a bounded one-line skill summary the supervisor can read when judging who fits a task.
+ * Uses an explicit summary when provided, otherwise the description's first sentence, capped so
+ * the leader prompt does not balloon as skill bodies grow.
+ */
+function deriveSkillSummary(summary: string | undefined, description: string): string {
+  const explicit = summary?.trim();
+  const source = explicit || description.trim().split(/(?<=[.!?。！？])\s+/)[0] || description.trim();
+  const collapsed = source.replace(/\s+/g, " ").trim();
+  return collapsed.length > 160 ? `${collapsed.slice(0, 159).trimEnd()}…` : collapsed;
+}
+
 function legacyMetadataProjectId(identity: RoleIdentityDefinition): string | undefined {
   const value = identity.metadata?.internalProjectId;
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -2172,6 +2184,7 @@ export class WorkbenchService {
         injection: "none",
         displayName: requireText(input.displayName ?? id, "skill displayName"),
         description: requireText(input.description, "skill description"),
+        summary: deriveSkillSummary(input.summary, input.description),
         instructions: requireText(input.instructions, "skill instructions"),
         configSchema: input.configSchema,
         tools: [...new Set(input.tools ?? [])],
@@ -2194,6 +2207,9 @@ export class WorkbenchService {
         ...current,
         displayName: input.displayName === undefined ? current.displayName : requireText(input.displayName, "skill displayName"),
         description: input.description === undefined ? current.description : requireText(input.description, "skill description"),
+        summary: input.summary === undefined && input.description === undefined
+          ? current.summary
+          : deriveSkillSummary(input.summary, input.description ?? current.description),
         instructions: input.instructions === undefined ? current.instructions : requireText(input.instructions, "skill instructions"),
         configSchema: input.configSchema === undefined ? current.configSchema : input.configSchema,
         tools: input.tools === undefined ? current.tools : [...new Set(input.tools)],

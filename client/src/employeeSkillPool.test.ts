@@ -9,6 +9,7 @@ function skill(id: string, status: Skill["status"] = "active"): Skill {
     status,
     displayName: id === "humanizer-zh" ? "Humanizer-zh" : id,
     description: `${id} description`,
+    summary: `${id} summary`,
     instructions: `${id} instructions`,
     tools: [],
     owner: "user",

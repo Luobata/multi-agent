@@ -13,6 +13,7 @@ const systemSkill: Skill = {
   injection: "supervisor",
   displayName: "Team orchestration",
   description: "System leader capability.",
+  summary: "System leader capability.",
   instructions: "Coordinate the team.",
   tools: [],
   createdAt: timestamp,

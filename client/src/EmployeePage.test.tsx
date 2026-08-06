@@ -15,6 +15,7 @@ const humanizer: Skill = {
   status: "active",
   displayName: "Humanizer-zh",
   description: "Naturalize Chinese copy.",
+  summary: "Naturalize Chinese copy.",
   instructions: "Preserve facts and edit the copy.",
   tools: [],
   owner: "user",
