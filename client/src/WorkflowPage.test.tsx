@@ -285,6 +285,11 @@ describe("WorkflowPage async run order", () => {
     });
     act(() => root.render(<WorkflowPage data={data} refresh={refresh} notify={notify} />));
     await flush(); // lets the version-history read settle inside act
+    const graphTab = Array.from(container.querySelectorAll<HTMLButtonElement>(".orchestration-switcher nav button"))
+      .find((button) => button.textContent?.includes("Graph 编排"));
+    if (!graphTab) throw new Error("Graph 编排 标签未找到");
+    click(graphTab);
+    await flush();
   });
 
   afterEach(() => {
@@ -294,6 +299,22 @@ describe("WorkflowPage async run order", () => {
     Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
     Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
     vi.unstubAllGlobals();
+  });
+
+  it("lands on the supervisor sub-tab by default", async () => {
+    const localContainer = document.createElement("div");
+    document.body.append(localContainer);
+    const localRoot = createRoot(localContainer);
+    const data = bootstrapWith({
+      employees: [employee("mihuhu-frontend-engineer", "米糊糊 · 前端"), employee("xiaomixiang-tester", "小米象 · 测试")]
+    });
+    act(() => localRoot.render(<WorkflowPage data={data} refresh={vi.fn(async () => undefined)} notify={vi.fn()} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const supervisorTab = Array.from(localContainer.querySelectorAll<HTMLButtonElement>(".orchestration-switcher nav button"))
+      .find((button) => button.textContent?.includes("协作编排"));
+    expect(supervisorTab?.getAttribute("aria-pressed")).toBe("true");
+    act(() => localRoot.unmount());
+    localContainer.remove();
   });
 
   it("posts the signed order to the async /start endpoint with debug-desk metadata", async () => {
