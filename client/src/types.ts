@@ -491,6 +491,12 @@ export interface Run {
   completedAt?: string;
   output?: JsonValue;
   error?: string;
+  /** Present on listRuns summaries (not on getRun detail): coarse run classification. */
+  category?: "single" | "graph" | "supervisor";
+  /** Present on listRuns summaries when the correlated invocation carried a project. */
+  project?: string;
+  /** Present on listRuns summaries: the trigger source of the correlated invocation. */
+  trigger?: "workbench" | "http" | "mcp" | "a2a";
   nodes: Record<string, RunNode>;
   effectiveProfiles?: Record<string, EffectiveExecutionProfile>;
 }
