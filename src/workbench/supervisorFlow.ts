@@ -1,3 +1,4 @@
+import { GATE_VALIDATORS } from "../architectures/gateValidators.js";
 import type {
   SupervisorDagDefinition,
   SupervisorDagNode,
@@ -205,6 +206,9 @@ export function normalizeSupervisorFlow(
     const validatorId = candidate.validatorId === undefined
       ? undefined
       : text(candidate.validatorId, `supervisor gate ${gateId} validatorId`);
+    if (validatorId !== undefined && validatorId !== "none" && !(validatorId in GATE_VALIDATORS)) {
+      throw new Error(`supervisor gate ${gateId} references unknown validator ${validatorId}`);
+    }
     return {
       id: gateId,
       requiredCapability,

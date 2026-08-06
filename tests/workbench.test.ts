@@ -1324,4 +1324,77 @@ describe("Local Agent Workbench", () => {
     expect(restored).toMatchObject({ status: "active", version: 4 });
     expect(service.getEmployeeTemplateVersions("backend-builder").map((version) => version.version)).toEqual([4, 3, 2, 1]);
   });
+
+  async function createSupervisorTeam(service: WorkbenchService): Promise<void> {
+    await service.createEmployee({
+      id: "validator-lead",
+      identity: { displayName: "Validator Lead", background: "Coordinates work.", responsibilities: ["Plan", "Deliver"] },
+      capabilities: ["quality.audit"],
+      providerId: "mock"
+    });
+    await service.createEmployee({
+      id: "validator-tester",
+      identity: { displayName: "Validator Tester", background: "Runs tests.", responsibilities: ["Test"] },
+      capabilities: ["quality.test"],
+      providerId: "mock"
+    });
+    await service.createManagementPolicy({
+      id: "validator-policy",
+      allowedRoleIds: ["tester"],
+      instructions: "Delegate testing and deliver only after required Gates pass."
+    });
+  }
+
+  function supervisorWorkflowWithGate(validatorId?: string) {
+    return {
+      id: "validator-workflow",
+      architecture: "supervisor" as const,
+      supervisor: { employeeId: "validator-lead" },
+      managementPolicy: { id: "validator-policy" },
+      members: [{ roleId: "tester", employeeId: "validator-tester" }],
+      flow: {
+        stages: [
+          { id: "plan", kind: "supervisor" as const, title: "Plan" },
+          { id: "delegation-loop", kind: "delegation-loop" as const, title: "Delegate" },
+          { id: "e2e", kind: "gate" as const, title: "E2E", gateId: "e2e" },
+          { id: "delivery", kind: "delivery" as const, title: "Deliver" }
+        ],
+        gates: [{
+          id: "e2e",
+          requiredCapability: "quality.test",
+          mode: "before-completion" as const,
+          required: true,
+          instructions: "Require real e2e evidence before delivery.",
+          fallback: "block" as const,
+          ...(validatorId === undefined ? {} : { validatorId })
+        }]
+      }
+    };
+  }
+
+  it("round-trips a gate validatorId through supervisor workflow authoring", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await createSupervisorTeam(service);
+    const workflow = await service.createWorkflow(supervisorWorkflowWithGate("e2e-evidence"));
+    if (workflow.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
+    expect(workflow.flow.gates.find((gate) => gate.id === "e2e")?.validatorId).toBe("e2e-evidence");
+
+    const reread = service.getWorkflow(workflow.id);
+    if (reread.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
+    expect(reread.flow.gates.find((gate) => gate.id === "e2e")?.validatorId).toBe("e2e-evidence");
+  });
+
+  it("rejects a gate that references an unknown validator at authoring time", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await createSupervisorTeam(service);
+    await expect(service.createWorkflow(supervisorWorkflowWithGate("nope"))).rejects.toThrow(/unknown validator/);
+  });
+
+  it("accepts and preserves the \"none\" validator disable sentinel", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await createSupervisorTeam(service);
+    const workflow = await service.createWorkflow(supervisorWorkflowWithGate("none"));
+    if (workflow.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
+    expect(workflow.flow.gates.find((gate) => gate.id === "e2e")?.validatorId).toBe("none");
+  });
 });
