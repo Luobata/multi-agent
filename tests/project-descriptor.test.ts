@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import YAML from "yaml";
 import { loadProjectDescriptor } from "../src/workbench/projectDescriptor.js";
 
 const directories: string[] = [];
@@ -80,6 +81,19 @@ describe("project descriptor", () => {
     await expect(loadProjectDescriptor({ rootPath: root })).rejects.toThrow(/must stay inside the project root/);
   });
 
+  it("requires e2e evidence in the tester project role output contract", async () => {
+    // The cart-fe descriptor's policyRef docs are not vendored in this repo, so
+    // loadProjectDescriptor cannot resolve them; assert the inline outputSchema
+    // deliverable directly via the same YAML parser the loader uses.
+    const descriptor = YAML.parse(
+      fs.readFileSync(path.resolve("templates/workbench/cart-fe-workflow-review.project.yaml"), "utf8")
+    ) as { roles: Record<string, { outputSchema?: any }> };
+    const tester = descriptor.roles.tester;
+    expect(tester?.outputSchema?.required).toEqual(["verdict", "summary", "e2eEvidence"]);
+    expect(tester?.outputSchema?.properties?.e2eEvidence?.items?.properties?.method?.enum)
+      .toEqual(["browser", "http-behavior", "automation-run"]);
+  });
+
   it("connects every current Employee through a bounded project role", async () => {
     const root = path.resolve(".");
     const project = await loadProjectDescriptor({ rootPath: root, descriptorPath: "multi-agent.project.yaml" });
@@ -150,6 +164,11 @@ describe("project descriptor", () => {
       "configuration_proposal_apply",
       "update_employee"
     ]));
+
+    const testEngineer = project.roles.find((role) => role.id === "test-engineer");
+    expect(testEngineer?.outputSchema?.required).toEqual(["verdict", "summary", "e2eEvidence"]);
+    expect((testEngineer?.outputSchema?.properties as any)?.e2eEvidence?.items?.properties?.method?.enum)
+      .toEqual(["browser", "http-behavior", "automation-run"]);
 
     const binding = JSON.parse(
       fs.readFileSync(path.join(root, "templates/workbench/local-agent-workbench.binding.json"), "utf8")
