@@ -594,8 +594,9 @@ describe("Local Agent Workbench", () => {
       managementPolicy: { id: policy.id, version: 1 },
       supervisor: { employeeVersion: 1 }
     });
-    const policyV2 = await service.updateManagementPolicy(policy.id, { instructions: "A newer policy that is not auto-adopted." });
+    const policyV2 = await service.updateManagementPolicy(policy.id, { instructions: "A newer policy adopted by the default latest updatePolicy at run time." });
     expect(policyV2.version).toBe(2);
+    // The stored workflow definition still pins v1; latest resolution happens per-run, not by rewriting it.
     expect(service.getWorkflow(workflow.id)).toMatchObject({ managementPolicy: { id: policy.id, version: 1 } });
 
     const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Investigate this topic" });
@@ -608,9 +609,11 @@ describe("Local Agent Workbench", () => {
     const invocation = service.getActivitySnapshot().invocations.find((item) => item.runId === result.run.id)!;
     const detail = await service.getInvocationDetail(invocation.id);
     expect(detail.invocation.status).toBe("completed");
+    // updatePolicy defaults to "latest", so the run adopts the newest policy version (v2) even though
+    // the stored workflow still pins v1.
     expect(detail.invocation.executionSnapshot).toMatchObject({
       workflow: { id: workflow.id, version: 1, architecture: "supervisor" },
-      managementPolicy: { id: policy.id, version: 1 }
+      managementPolicy: { id: policy.id, version: 2 }
     });
     expect(detail.instances.map((instance) => [instance.nodeId, instance.kind, instance.roleId, instance.round])).toEqual([
       ["supervisor-r1", "supervisor", "supervisor", 1],

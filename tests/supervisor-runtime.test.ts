@@ -695,3 +695,99 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(gateInstances).toHaveLength(2);
   });
 });
+
+describe("Supervisor workflow version tracking", () => {
+  async function seedTeam(service: WorkbenchService): Promise<void> {
+    await service.createEmployee({
+      id: "vt-lead",
+      identity: { displayName: "Lead", background: "Leads.", responsibilities: ["Lead"] },
+      providerId: "mock"
+    });
+    await service.createEmployee({
+      id: "vt-worker",
+      identity: { displayName: "Worker", background: "Works.", responsibilities: ["Work"] },
+      providerId: "mock"
+    });
+    await service.createManagementPolicy({
+      id: "vt-policy",
+      allowedRoleIds: ["worker"],
+      instructions: "Deliver.",
+      completion: { requireDelegation: false }
+    });
+    await service.createWorkflow({
+      id: "vt-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "vt-lead" },
+      managementPolicy: { id: "vt-policy" },
+      members: [{ roleId: "worker", employeeId: "vt-worker" }]
+    });
+  }
+
+  it("defaults to latest and re-resolves newer employee/policy versions at run time", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await seedTeam(service);
+    const created = service.getWorkflow("vt-team");
+    if (created.architecture !== "supervisor") throw new Error("expected supervisor workflow");
+    expect(created.updatePolicy).toBe("latest");
+    expect(created.supervisor.employeeVersion).toBe(1);
+
+    // Bump the member employee and the policy after the workflow was pinned at v1.
+    await service.updateEmployee("vt-worker", { description: "Works harder." });
+    await service.updateManagementPolicy("vt-policy", { instructions: "Deliver faster." });
+    expect(service.getEmployee("vt-worker").version).toBe(2);
+    expect(service.getManagementPolicy("vt-policy").version).toBe(2);
+
+    const result = await service.runWorkbenchWorkflow("vt-team", { message: "Go" });
+    // The run resolved and used the newest employee/policy versions (it completes without a version
+    // error), yet the stored workflow still pins v1 — latest resolves per-run, it does not rewrite
+    // the saved definition.
+    expect(result.run.status).toBe("passed");
+    expect(service.getWorkflow("vt-team").version).toBe(1);
+  });
+
+  it("keeps pinned versions when updatePolicy is locked", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await seedTeam(service);
+    await service.updateWorkflow("vt-team", { architecture: "supervisor", updatePolicy: "locked" });
+    await service.updateEmployee("vt-worker", { description: "Changed." });
+    expect(service.getEmployee("vt-worker").version).toBe(2);
+
+    const prepared = service.getWorkflow("vt-team");
+    if (prepared.architecture !== "supervisor") throw new Error("expected supervisor workflow");
+    expect(prepared.updatePolicy).toBe("locked");
+    // Locked keeps the member pinned at v1 in the stored definition.
+    expect(prepared.members[0]!.employeeVersion).toBe(1);
+  });
+
+  it("refresh re-pins to latest and reports the changes", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await seedTeam(service);
+    await service.updateWorkflow("vt-team", { architecture: "supervisor", updatePolicy: "locked" });
+    await service.updateEmployee("vt-worker", { description: "v2." });
+    await service.updateManagementPolicy("vt-policy", { instructions: "v2." });
+
+    const result = await service.refreshWorkflow("vt-team");
+    expect(result.changed).toBe(true);
+    const kinds = result.changes.map((change) => `${change.kind}:${change.from}->${change.to}`);
+    expect(kinds).toContain("member:1->2");
+    expect(kinds).toContain("management-policy:1->2");
+    const refreshed = service.getWorkflow("vt-team");
+    if (refreshed.architecture !== "supervisor") throw new Error("expected supervisor workflow");
+    expect(refreshed.members[0]!.employeeVersion).toBe(2);
+    expect(refreshed.managementPolicy.version).toBe(2);
+
+    // A second refresh with nothing new reports no change.
+    const again = await service.refreshWorkflow("vt-team");
+    expect(again.changed).toBe(false);
+    expect(again.changes).toEqual([]);
+  });
+
+  it("blocks a latest run when the newest policy no longer allows a member role", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await seedTeam(service);
+    // New policy version drops the "worker" role slot the workflow member relies on.
+    await service.updateManagementPolicy("vt-policy", { allowedRoleIds: ["reviewer"] });
+
+    await expect(service.runWorkbenchWorkflow("vt-team", { message: "Go" })).rejects.toThrow(/no longer allows member role worker/);
+  });
+});

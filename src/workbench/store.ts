@@ -314,6 +314,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   for (const record of Object.values(state.workflows)) {
     for (const workflow of record.versions) {
       if (workflow.architecture !== "supervisor") continue;
+      workflow.updatePolicy ??= "latest";
       workflow.orchestrationSkill ??= { id: "team-orchestration", version: orchestrationSkillVersion };
       workflow.flow ??= defaultSupervisorFlow();
       workflow.flow.version ??= 1;
@@ -322,6 +323,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     }
     record.current = record.versions.find((workflow) => workflow.version === record.current.version) ?? record.current;
     if (record.current.architecture === "supervisor") {
+      record.current.updatePolicy ??= "latest";
       record.current.orchestrationSkill ??= { id: "team-orchestration", version: orchestrationSkillVersion };
       record.current.flow ??= defaultSupervisorFlow();
     }

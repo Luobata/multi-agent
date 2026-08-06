@@ -430,6 +430,8 @@ export interface SupervisorFlowDefinition {
 
 export interface SupervisorWorkflow extends WorkflowBase {
   architecture: "supervisor";
+  /** "latest" re-resolves pinned versions to newest on every run; "locked" holds until synced. */
+  updatePolicy: SupervisorWorkflowUpdatePolicy;
   supervisor: { employeeId: string; employeeVersion: number };
   /** System skill pinned onto the supervisor position at materialization; members never receive it. */
   orchestrationSkill: { id: string; version: number };
@@ -444,6 +446,8 @@ export interface SupervisorWorkflow extends WorkflowBase {
 }
 
 export type Workflow = GraphWorkflow | SupervisorWorkflow;
+
+export type SupervisorWorkflowUpdatePolicy = "latest" | "locked";
 
 export interface ArchitectureTemplate {
   id: string;

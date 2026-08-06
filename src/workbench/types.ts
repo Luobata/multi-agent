@@ -271,6 +271,9 @@ export interface SupervisorFlowInput {
 
 export interface SupervisorWorkbenchWorkflowDefinition extends WorkbenchWorkflowBase {
   architecture: "supervisor";
+  /** How pinned versions track their sources. "latest" re-resolves supervisor/members/policy/skill
+   *  to their newest versions on every run; "locked" keeps the pinned versions until synced. */
+  updatePolicy: SupervisorWorkflowUpdatePolicy;
   supervisor: SupervisorEmployeeBinding;
   orchestrationSkill: {
     id: "team-orchestration";
@@ -282,6 +285,22 @@ export interface SupervisorWorkbenchWorkflowDefinition extends WorkbenchWorkflow
   };
   members: SupervisorMemberBinding[];
   flow: SupervisorFlowDefinition;
+}
+
+export type SupervisorWorkflowUpdatePolicy = "latest" | "locked";
+
+/** One version change surfaced by refreshing a workflow's pinned sources to latest. */
+export interface WorkflowRefreshChange {
+  kind: "supervisor" | "member" | "management-policy" | "orchestration-skill";
+  id: string;
+  from: number;
+  to: number;
+}
+
+export interface WorkflowRefreshResult {
+  workflow: SupervisorWorkbenchWorkflowDefinition;
+  changed: boolean;
+  changes: WorkflowRefreshChange[];
 }
 
 export type WorkbenchWorkflowDefinition =
@@ -874,6 +893,8 @@ export interface GraphWorkflowCreateInput extends WorkflowCreateBase {
 
 export interface SupervisorWorkflowCreateInput extends WorkflowCreateBase {
   architecture: "supervisor";
+  /** Defaults to "latest" when omitted. */
+  updatePolicy?: SupervisorWorkflowUpdatePolicy;
   supervisor: { employeeId: string; employeeVersion?: number };
   managementPolicy: { id: string; version?: number };
   members: Array<{

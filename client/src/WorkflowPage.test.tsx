@@ -73,6 +73,7 @@ const supervisorWorkflow: SupervisorWorkflow = {
   version: 1,
   status: "active",
   architecture: "supervisor",
+  updatePolicy: "latest",
   description: "动态组织评审成员。",
   supervisor: { employeeId: "team-manager", employeeVersion: 1 },
   orchestrationSkill: { id: "team-orchestration", version: 1 },

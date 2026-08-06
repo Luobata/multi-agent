@@ -559,6 +559,9 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.post("/api/workflows/:id/archive", asyncRoute(async (request, response) => {
     send(response, await service.archiveWorkflow(routeParam(request, "id")));
   }));
+  app.post("/api/workflows/:id/refresh", asyncRoute(async (request, response) => {
+    send(response, await service.refreshWorkflow(routeParam(request, "id")));
+  }));
   app.get("/api/workflows/:id/plan", asyncRoute(async (request, response) => {
     send(response, await service.planWorkflow(routeParam(request, "id")));
   }));

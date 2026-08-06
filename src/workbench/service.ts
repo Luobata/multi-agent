@@ -174,6 +174,8 @@ import {
   type WorkbenchWorkflowDefinition,
   type SupervisorWorkbenchWorkflowDefinition,
   type SupervisorWorkflowCreateInput,
+  type WorkflowRefreshResult,
+  type WorkflowRefreshChange,
   type WorkInstanceRecord,
   type WorkInstanceStatus,
   type WorkflowCreateInput,
@@ -5530,6 +5532,7 @@ export class WorkbenchService {
       version: current ? current.version + 1 : 1,
       status: current?.status ?? "active",
       architecture: "supervisor",
+      updatePolicy: input.updatePolicy ?? current?.updatePolicy ?? "latest",
       description: input.description?.trim() || `Supervisor workflow ${id}`,
       supervisor: { employeeId: supervisor.id, employeeVersion: supervisor.version },
       orchestrationSkill: current?.orchestrationSkill ?? {
@@ -5599,6 +5602,9 @@ export class WorkbenchService {
       : this.normalizeWorkflow({
           id,
           architecture: "supervisor",
+          updatePolicy: "updatePolicy" in input && input.updatePolicy
+            ? input.updatePolicy
+            : current.architecture === "supervisor" ? current.updatePolicy : undefined,
           description: input.description ?? current.description,
           supervisor: "supervisor" in input && input.supervisor ? input.supervisor : current.supervisor,
           managementPolicy:
@@ -5616,6 +5622,69 @@ export class WorkbenchService {
       record.versions.push(workflow);
       return workflow;
     });
+  }
+
+  /**
+   * Re-pin a supervisor workflow's sources (supervisor, members, management policy, orchestration
+   * skill) to their newest active versions and, when anything changed, persist a new workflow
+   * version. Works regardless of updatePolicy — the explicit "sync to latest" action. Returns the
+   * per-source changes so the UI can show what moved.
+   */
+  async refreshWorkflow(id: string): Promise<WorkflowRefreshResult> {
+    const current = this.getWorkflow(id);
+    if (current.architecture !== "supervisor") throw new Error(`workflow ${id} is not a supervisor workflow`);
+    const state = this.snapshot();
+    const changes: WorkflowRefreshChange[] = [];
+
+    const supervisorRecord = state.employees[current.supervisor.employeeId];
+    if (!supervisorRecord || supervisorRecord.current.status !== "active") {
+      throw new Error(`supervisor employee ${current.supervisor.employeeId} is unavailable; cannot sync`);
+    }
+    const policyRecord = state.managementPolicies[current.managementPolicy.id];
+    if (!policyRecord || policyRecord.current.status !== "active") {
+      throw new Error(`management policy ${current.managementPolicy.id} is unavailable; cannot sync`);
+    }
+    const skillRecord = state.skills[current.orchestrationSkill.id];
+    if (!skillRecord) throw new Error(`orchestration skill ${current.orchestrationSkill.id} is unavailable; cannot sync`);
+
+    const latestPolicy = policyRecord.current;
+    const allowed = new Set(latestPolicy.allowedRoleIds);
+    for (const member of current.members) {
+      if (!allowed.has(member.roleId)) {
+        throw new Error(
+          `management policy ${latestPolicy.id} v${latestPolicy.version} no longer allows member role ${member.roleId}; `
+          + `adjust the member roster to the latest policy's roles (${latestPolicy.allowedRoleIds.join(", ")}) before syncing`
+        );
+      }
+    }
+
+    if (supervisorRecord.current.version !== current.supervisor.employeeVersion) {
+      changes.push({ kind: "supervisor", id: current.supervisor.employeeId, from: current.supervisor.employeeVersion, to: supervisorRecord.current.version });
+    }
+    if (latestPolicy.version !== current.managementPolicy.version) {
+      changes.push({ kind: "management-policy", id: latestPolicy.id, from: current.managementPolicy.version, to: latestPolicy.version });
+    }
+    if (skillRecord.version !== current.orchestrationSkill.version) {
+      changes.push({ kind: "orchestration-skill", id: current.orchestrationSkill.id, from: current.orchestrationSkill.version, to: skillRecord.version });
+    }
+    for (const member of current.members) {
+      const record = state.employees[member.employeeId];
+      if (record && record.current.status === "active" && record.current.version !== member.employeeVersion) {
+        changes.push({ kind: "member", id: member.employeeId, from: member.employeeVersion, to: record.current.version });
+      }
+    }
+
+    if (changes.length === 0) return { workflow: current, changed: false, changes: [] };
+
+    const updated = await this.updateWorkflow(id, {
+      architecture: "supervisor",
+      supervisor: { employeeId: current.supervisor.employeeId },
+      managementPolicy: { id: current.managementPolicy.id },
+      members: current.members.map((member) => ({ roleId: member.roleId, description: member.description, employeeId: member.employeeId }))
+      // flow omitted → normalizeSupervisorFlow inherits the current flow unchanged.
+    });
+    if (updated.architecture !== "supervisor") throw new Error("expected supervisor workflow after refresh");
+    return { workflow: updated, changed: true, changes };
   }
 
   private resolveWorkflowEmployees(workflow: WorkbenchWorkflowDefinition): Map<string, EmployeeDefinition> {
@@ -5666,6 +5735,44 @@ export class WorkbenchService {
     return this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
   }
 
+  /**
+   * For a "latest" supervisor workflow, return an in-memory copy whose pinned versions are
+   * re-resolved to the newest active versions (supervisor, members, management policy,
+   * orchestration skill). This copy drives a single run only — it is not persisted, so run
+   * evidence still records the versions actually used. "locked" workflows are returned unchanged.
+   * Throws when the latest policy no longer allows a member role slot, so the caller can surface a
+   * clear "sync members" message instead of silently dropping members.
+   */
+  private resolveWorkflowForRun(workflow: WorkbenchWorkflowDefinition): WorkbenchWorkflowDefinition {
+    if (workflow.architecture !== "supervisor" || workflow.updatePolicy !== "latest") return workflow;
+    const state = this.snapshot();
+    const supervisorRecord = state.employees[workflow.supervisor.employeeId];
+    const policyRecord = state.managementPolicies[workflow.managementPolicy.id];
+    const skillRecord = state.skills[workflow.orchestrationSkill.id];
+    // Missing/archived sources are validated downstream with their own errors; keep pins as-is here.
+    if (!supervisorRecord || !policyRecord || !skillRecord) return workflow;
+    const latestPolicy = policyRecord.current;
+    const allowed = new Set(latestPolicy.allowedRoleIds);
+    for (const member of workflow.members) {
+      if (!allowed.has(member.roleId)) {
+        throw new Error(
+          `management policy ${latestPolicy.id} v${latestPolicy.version} no longer allows member role ${member.roleId}; `
+          + `sync this workflow's members to the latest policy (allowed roles: ${latestPolicy.allowedRoleIds.join(", ")})`
+        );
+      }
+    }
+    return {
+      ...workflow,
+      supervisor: { employeeId: workflow.supervisor.employeeId, employeeVersion: supervisorRecord.current.version },
+      orchestrationSkill: { id: workflow.orchestrationSkill.id, version: skillRecord.version },
+      managementPolicy: { id: latestPolicy.id, version: latestPolicy.version },
+      members: workflow.members.map((member) => {
+        const record = state.employees[member.employeeId];
+        return record ? { ...member, employeeVersion: record.current.version } : member;
+      })
+    };
+  }
+
   private async prepareWorkbenchWorkflowInvocation(
     id: string,
     input: JsonObject,
@@ -5678,7 +5785,11 @@ export class WorkbenchService {
   }> {
     const currentWorkflow = this.getWorkflow(id);
     if (currentWorkflow.status !== "active") throw new Error(`workflow ${id} is archived`);
-    const workflow = this.getWorkflow(id, options.workflowVersion);
+    // "latest" workflows re-resolve their pinned versions to newest before the run; a specific
+    // workflowVersion pin (e.g. from an entrance policy) opts out and runs exactly as recorded.
+    const workflow = options.workflowVersion === undefined
+      ? this.resolveWorkflowForRun(this.getWorkflow(id))
+      : this.getWorkflow(id, options.workflowVersion);
     if (workflow.status !== "active") throw new Error(`workflow ${id} v${workflow.version} is archived`);
     if (workflow.architecture === "supervisor") {
       const currentPolicy = this.getManagementPolicy(workflow.managementPolicy.id);
