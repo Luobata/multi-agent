@@ -672,11 +672,18 @@ function resolveGateExecutor(
   value: SupervisorWorkflowConfig,
   gate: SupervisorGateConfig
 ): { roleId: string; role: string } | undefined {
-  const member = value.members.find((candidate) => candidate.capabilities.includes(gate.requiredCapability));
-  if (member) return { roleId: member.roleId, role: member.role };
-  if (gate.fallback === "supervisor" && value.supervisor.capabilities.includes(gate.requiredCapability)) {
+  // Capability tags are hints, not a hard gate. Prefer a member whose tags mention the required
+  // capability; otherwise honor the gate's explicit fallback: "supervisor" lets the supervisor cover
+  // (no tag check — that string-match was the anti-pattern), while "block" is softened to let any
+  // member run it rather than blocking on a tag mismatch. Only report no executor when the team is
+  // genuinely empty and the supervisor is not an allowed fallback.
+  const hinted = value.members.find((candidate) => candidate.capabilities.includes(gate.requiredCapability));
+  if (hinted) return { roleId: hinted.roleId, role: hinted.role };
+  if (gate.fallback === "supervisor") {
     return { roleId: "supervisor", role: value.supervisor.role };
   }
+  const anyMember = value.members[0];
+  if (anyMember) return { roleId: anyMember.roleId, role: anyMember.role };
   return undefined;
 }
 

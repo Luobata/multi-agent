@@ -389,13 +389,29 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(Object.keys(multiple.run.nodes)).toContain("gate-integration-r2-1");
   });
 
-  it("blocks an applicable required Gate when neither a member nor the supervisor fallback has the capability", async () => {
+  it("routes an applicable required Gate to the supervisor fallback instead of blocking on a capability tag", async () => {
+    // No member advertises quality.test, but the gate's fallback is "supervisor": capability tags are
+    // hints, not a hard gate, so the gate routes to the supervisor rather than blocking. (Previously
+    // this hard-blocked with "no eligible member or supervisor fallback".)
     const providers: ProviderRegistry = new Map([["missing-gate-executor", {
       id: "missing-gate-executor",
       validate: () => [],
       invoke: async (invocation) => {
+        const node = invocation.templateContext.node as { metadata?: { kind?: string }; with?: { __supervisorRound?: number; __gateExecution?: { gateId?: string } } };
         const role = (invocation.templateContext.role as { id: string }).id;
-        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        const round = Number(node.with?.__supervisorRound ?? 0);
+        if (node.metadata?.kind === "gate") {
+          return {
+            stdout: JSON.stringify({
+              action: "satisfy-gate",
+              gateId: node.with?.__gateExecution?.gateId,
+              summary: "Supervisor covered the test gate.",
+              evidence: { tested: true }
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
         if (role === "supervisor" && round === 1) {
           return {
             stdout: JSON.stringify({
@@ -455,11 +471,15 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     });
 
     const result = await service.runWorkbenchWorkflow("missing-gate-supervision", { message: "Build" });
-    expect(result.run.status).toBe("blocked");
+    expect(result.run.status).toBe("passed");
     expect(result.run.output).toMatchObject({
-      reason: expect.stringContaining("no eligible member or supervisor fallback"),
-      gates: [{ gateId: "test", status: "blocked", requiredCapability: "quality.test" }]
+      gates: [{
+        gateId: "test",
+        status: "passed",
+        executions: [expect.objectContaining({ executorRoleId: "supervisor", status: "passed" })]
+      }]
     });
+    expect(JSON.stringify(result.run.output)).not.toContain("no eligible member");
   });
 
   it("runs after-each code Gates only for matching work and permits a capable supervisor fallback", async () => {
