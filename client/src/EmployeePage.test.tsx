@@ -218,6 +218,69 @@ describe("Employee runtime status", () => {
   });
 });
 
+describe("Employee e2e-evidence output-contract toggle", () => {
+  const fieldTextarea = (root: HTMLElement, label: string) => {
+    const field = Array.from(root.querySelectorAll("label.field")).find((el) => el.querySelector(".field-label")?.textContent === label);
+    return field?.querySelector<HTMLTextAreaElement>("textarea") ?? null;
+  };
+  const fieldInput = (root: HTMLElement, label: string) => {
+    const field = Array.from(root.querySelectorAll("label.field")).find((el) => el.querySelector(".field-label")?.textContent === label);
+    return field?.querySelector<HTMLInputElement>("input") ?? null;
+  };
+
+  it("injects the e2e output schema and prefills verdict fields when enabled", async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute("open", ""); }
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, "close", {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute("open"); }
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const flush = async () => { await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); }); };
+    const click = (element: Element) => { act(() => element.dispatchEvent(new MouseEvent("click", { bubbles: true }))); };
+    let unmounted = false;
+    try {
+      act(() => root.render(<EmployeePage data={bootstrap} refresh={vi.fn(async () => undefined)} notify={vi.fn()} />));
+      await flush();
+
+      const openEditor = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "高级表单");
+      if (!openEditor) throw new Error("高级表单 button not found");
+      click(openEditor);
+      await flush();
+
+      const toggle = container.querySelector<HTMLInputElement>('[role="switch"][aria-label="要求 e2e 证据"]');
+      if (!toggle) throw new Error("要求 e2e 证据 toggle not found");
+      expect(toggle.checked).toBe(false);
+
+      click(toggle);
+      await flush();
+
+      const schema = fieldTextarea(container, "输出 JSON Schema");
+      expect(schema?.value).toContain("\"e2eEvidence\"");
+      expect(fieldInput(container, "Verdict JSON path")?.value).toBe("/verdict");
+      expect(fieldInput(container, "Pass 值")?.value).toBe("pass");
+      expect(fieldInput(container, "Block 值")?.value).toBe("block");
+
+      // The derived checked-state now reads true because the schema declares e2eEvidence.
+      const toggleAfter = container.querySelector<HTMLInputElement>('[role="switch"][aria-label="要求 e2e 证据"]');
+      expect(toggleAfter?.checked).toBe(true);
+    } finally {
+      act(() => root.unmount());
+      unmounted = true;
+      container.remove();
+      document.body.replaceChildren();
+      Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+      Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
+      if (!unmounted) act(() => root.unmount());
+    }
+  });
+});
+
 describe("Employee runtime clock", () => {
   it("fades the completed chip after its dwell and clears the timer on unmount", () => {
     vi.useFakeTimers();
