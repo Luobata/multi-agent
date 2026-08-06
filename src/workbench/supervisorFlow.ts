@@ -202,13 +202,17 @@ export function normalizeSupervisorFlow(
     if (candidate.fallback !== "supervisor" && candidate.fallback !== "block") {
       throw new Error(`supervisor gate ${gateId} has unsupported fallback ${String(candidate.fallback)}`);
     }
+    const validatorId = candidate.validatorId === undefined
+      ? undefined
+      : text(candidate.validatorId, `supervisor gate ${gateId} validatorId`);
     return {
       id: gateId,
       requiredCapability,
       mode: candidate.mode,
       required: candidate.required,
       instructions: text(candidate.instructions, `supervisor gate ${gateId} instructions`),
-      fallback: candidate.fallback
+      fallback: candidate.fallback,
+      ...(validatorId ? { validatorId } : {})
     };
   });
 
