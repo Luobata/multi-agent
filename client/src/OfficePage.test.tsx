@@ -311,4 +311,21 @@ describe("OfficePage supervisor studio", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/api/invocations/inv-team-1/progress"))).toBe(true);
   });
+
+  it("lingers a recently-completed supervisor as a settled (non-running) studio card", async () => {
+    const settled: InvocationRecord = {
+      ...supervisorInvocation,
+      id: "inv-team-done",
+      status: "completed",
+      completedAt: new Date().toISOString()
+    };
+    const settledBootstrap = {
+      ...bootstrap,
+      activity: { invocations: [settled], instances: [] }
+    } as unknown as Bootstrap;
+    act(() => root.render(<OfficePage data={settledBootstrap} streamStatus="live" />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.querySelector(".studio-card--completed")).toBeTruthy();
+    expect(container.querySelector(".studio-progress--live")).toBeNull();
+  });
 });

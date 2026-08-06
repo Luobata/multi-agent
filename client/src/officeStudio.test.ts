@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSupervisorInvocations, completionRatio, progressTone } from "./officeStudio";
+import { activeSupervisorInvocations, completionRatio, progressTone, studioSupervisorInvocations } from "./officeStudio";
 import type { InvocationRecord, WorkInstanceStatus } from "./types";
 
 function tally(overrides: Partial<Record<WorkInstanceStatus, number>>): Record<WorkInstanceStatus, number> {
@@ -45,5 +45,26 @@ describe("activeSupervisorInvocations", () => {
     const graph: InvocationRecord = { ...base, id: "inv-2", executionSnapshot: { workflow: { id: "g", version: 1, architecture: "graph" }, employees: [] } };
     const doneSupervisor: InvocationRecord = { ...base, id: "inv-3", status: "completed" };
     expect(activeSupervisorInvocations([base, graph, doneSupervisor]).map((invocation) => invocation.id)).toEqual(["inv-1"]);
+  });
+});
+
+describe("studioSupervisorInvocations", () => {
+  const NOW = 1_000_000;
+  const supervisor = (id: string, overrides: Partial<InvocationRecord>): InvocationRecord => ({ ...base, id, ...overrides });
+
+  it("keeps active supervisors and recently-completed ones within the grace window", () => {
+    const active = supervisor("inv-active", { status: "running" });
+    const justDone = supervisor("inv-done", { status: "completed", completedAt: new Date(NOW - 10_000).toISOString() });
+    const longDone = supervisor("inv-old", { status: "completed", completedAt: new Date(NOW - 90_000).toISOString() });
+    const noStamp = supervisor("inv-nostamp", { status: "failed" });
+    const graph: InvocationRecord = { ...base, id: "inv-graph", status: "running", executionSnapshot: { workflow: { id: "g", version: 1, architecture: "graph" }, employees: [] } };
+    const result = studioSupervisorInvocations([active, justDone, longDone, noStamp, graph], NOW).map((i) => i.id);
+    expect(result).toEqual(["inv-active", "inv-done"]);
+  });
+
+  it("honors a custom grace window", () => {
+    const justDone = supervisor("inv-done", { status: "blocked", completedAt: new Date(NOW - 10_000).toISOString() });
+    expect(studioSupervisorInvocations([justDone], NOW, 5_000).map((i) => i.id)).toEqual([]);
+    expect(studioSupervisorInvocations([justDone], NOW, 20_000).map((i) => i.id)).toEqual(["inv-done"]);
   });
 });

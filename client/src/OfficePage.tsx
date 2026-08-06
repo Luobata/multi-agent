@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { api } from "./api";
 import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeStatus, formatTime } from "./components";
 import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
-import { activeSupervisorInvocations, completionRatio, progressTone } from "./officeStudio";
+import { activeSupervisorInvocations, completionRatio, progressTone, studioSupervisorInvocations } from "./officeStudio";
 import type {
   Bootstrap,
   Employee,
@@ -207,6 +207,10 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
     () => activeSupervisorInvocations(data.activity.invocations),
     [data.activity.invocations]
   );
+  const studioSupervisors = useMemo(
+    () => studioSupervisorInvocations(data.activity.invocations, clock),
+    [data.activity.invocations, clock]
+  );
   const activeSupervisorKey = activeSupervisors.map((invocation) => invocation.id).join(",");
   useEffect(() => {
     if (activeSupervisors.length === 0) return;
@@ -289,10 +293,10 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
     </header>
 
     <div className="office-layout">
-      {activeSupervisors.length > 0 && <section className="office-studio" aria-label="团队作战室">
-        <header className="office-studio-heading"><div><span>TEAM WAR ROOM</span><h2>领队工作室</h2></div><p>{activeSupervisors.length} 个团队正在运行</p></header>
+      {studioSupervisors.length > 0 && <section className="office-studio" aria-label="团队作战室">
+        <header className="office-studio-heading"><div><span>TEAM WAR ROOM</span><h2>领队工作室</h2></div><p>{studioSupervisors.length} 个团队在册</p></header>
         <div className="studio-grid">
-          {activeSupervisors.map((invocation) => {
+          {studioSupervisors.map((invocation) => {
             const progress = progressById[invocation.id];
             const ratio = progress ? completionRatio(progress.tally) : 0;
             const tone = progressTone(invocation.status);

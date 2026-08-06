@@ -19,3 +19,18 @@ export function activeSupervisorInvocations(invocations: InvocationRecord[]): In
     invocation.executionSnapshot?.workflow.architecture === "supervisor"
     && !TERMINAL_INVOCATION_STATUSES.has(invocation.status));
 }
+
+const STUDIO_TERMINAL_GRACE_MS = 45_000;
+
+export function studioSupervisorInvocations(
+  invocations: InvocationRecord[],
+  now: number,
+  graceMs: number = STUDIO_TERMINAL_GRACE_MS
+): InvocationRecord[] {
+  return invocations.filter((invocation) => {
+    if (invocation.executionSnapshot?.workflow.architecture !== "supervisor") return false;
+    if (!TERMINAL_INVOCATION_STATUSES.has(invocation.status)) return true;
+    if (!invocation.completedAt) return false;
+    return now - new Date(invocation.completedAt).getTime() <= graceMs;
+  });
+}
