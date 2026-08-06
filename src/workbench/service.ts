@@ -5963,10 +5963,43 @@ export class WorkbenchService {
         }
       })
     );
+    const invocationsByRunId = new Map<string, InvocationRecord>();
+    for (const invocation of Object.values(this.snapshot().invocations)) {
+      invocationsByRunId.set(invocation.runId, invocation);
+    }
     return records
       .filter((record): record is Record<string, unknown> => Boolean(record))
       .sort((left, right) => String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")))
-      .slice(0, Math.max(1, Math.min(200, limit)));
+      .slice(0, Math.max(1, Math.min(200, limit)))
+      .map((record) => this.classifyRunSummary(record, invocationsByRunId.get(String(record.id ?? ""))));
+  }
+
+  private classifyRunSummary(
+    record: Record<string, unknown>,
+    invocation: InvocationRecord | undefined
+  ): Record<string, unknown> {
+    const workflow = String(record.workflow ?? "");
+    const runArchitecture = String(record.architecture ?? "");
+    let category: "single" | "graph" | "supervisor";
+    if (invocation) {
+      category = invocation.target.kind === "employee"
+        ? "single"
+        : invocation.executionSnapshot?.workflow.architecture === "supervisor"
+          ? "supervisor"
+          : "graph";
+    } else {
+      category = runArchitecture === "supervisor"
+        ? "supervisor"
+        : workflow.startsWith("direct-")
+          ? "single"
+          : "graph";
+    }
+    return {
+      ...record,
+      category,
+      ...(invocation?.source.project ? { project: invocation.source.project } : {}),
+      ...(invocation ? { trigger: invocation.source.kind } : {})
+    };
   }
 
   async getRun(id: string): Promise<unknown> {

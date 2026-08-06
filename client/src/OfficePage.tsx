@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { api } from "./api";
 import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeStatus, formatTime } from "./components";
 import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
+import { activeSupervisorInvocations, completionRatio, progressTone, studioSupervisorInvocations } from "./officeStudio";
 import type {
   Bootstrap,
   Employee,
+  InvocationProgress,
   InvocationRecord,
   InvocationStatus,
   WorkInstanceRecord,
@@ -199,6 +202,33 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
     () => [...data.activity.invocations].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, 12),
     [data.activity.invocations]
   );
+  const [progressById, setProgressById] = useState<Record<string, InvocationProgress>>({});
+  const activeSupervisors = useMemo(
+    () => activeSupervisorInvocations(data.activity.invocations),
+    [data.activity.invocations]
+  );
+  const studioSupervisors = useMemo(
+    () => studioSupervisorInvocations(data.activity.invocations, clock),
+    [data.activity.invocations, clock]
+  );
+  const activeSupervisorKey = activeSupervisors.map((invocation) => invocation.id).join(",");
+  useEffect(() => {
+    if (activeSupervisors.length === 0) return;
+    let cancelled = false;
+    const poll = async () => {
+      await Promise.all(activeSupervisors.map(async (invocation) => {
+        try {
+          const value = await api<InvocationProgress>(`/api/invocations/${encodeURIComponent(invocation.id)}/progress`);
+          if (!cancelled) setProgressById((current) => ({ ...current, [invocation.id]: value }));
+        } catch {
+          // transient; next tick retries
+        }
+      }));
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [activeSupervisorKey]);
   const renderRoster = (employees: Employee[], systemLevel: boolean) => employees.map((employee, index) => {
     const employeeInstances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
     const active = employeeInstances.filter((instance) => activeInstanceStatuses.has(instance.status));
@@ -263,6 +293,41 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
     </header>
 
     <div className="office-layout">
+      {studioSupervisors.length > 0 && <section className="office-studio" aria-label="团队作战室">
+        <header className="office-studio-heading"><div><span>TEAM WAR ROOM</span><h2>领队工作室</h2></div><p>{studioSupervisors.length} 个团队在册</p></header>
+        <div className="studio-grid">
+          {studioSupervisors.map((invocation) => {
+            const progress = progressById[invocation.id];
+            const ratio = progress ? completionRatio(progress.tally) : 0;
+            const tone = progressTone(invocation.status);
+            const latestEntry = progress?.leaderReport.entries.at(-1);
+            const leaderEmployeeId = invocation.executionSnapshot?.employees[0]?.employeeId;
+            const leader = data.employees.find((employee) => employee.id === leaderEmployeeId);
+            return <article key={invocation.id} className={`studio-card studio-card--${tone}`}>
+              <header className="studio-card-head">
+                <div><span>{invocation.executionSnapshot?.workflow.id ?? invocation.target.id}</span><strong>{invocation.requestSummary}</strong></div>
+                <span className="studio-round">Round {progress?.round ?? invocation.executionSnapshot?.workflow.version ?? 1}</span>
+              </header>
+              <div className={`studio-progress ${tone === "running" ? "studio-progress--live" : ""}`}>
+                <i className="studio-progress-fill" style={{ width: `${Math.round(ratio * 100)}%` }} aria-hidden="true" />
+              </div>
+              <div className="studio-progress-legend"><span>{Math.round(ratio * 100)}% 完成</span>{progress && <span>{progress.tally.completed}/{Object.values(progress.tally).reduce((sum, count) => sum + count, 0)} 步</span>}</div>
+              {latestEntry && <p className="studio-leader-note"><code>{latestEntry.action.toUpperCase()}</code>{latestEntry.summary ?? "领队正在决策。"}</p>}
+              <div className="studio-team">
+                <div className="studio-leader"><EmployeeAvatar displayName={leader?.identity.displayName ?? leaderEmployeeId ?? "领队"} presentation={leader?.presentation} /><span>领队</span></div>
+                <div className="studio-members">
+                  {(latestEntry?.assignments ?? []).map((assignment, index) => {
+                    const member = data.employees.find((employee) => employee.identity.displayName === assignment.roleId) ?? undefined;
+                    return <div className="studio-member" key={`${assignment.roleId ?? "role"}-${index}`}><EmployeeAvatar className="small" displayName={assignment.roleId ?? "成员"} presentation={member?.presentation} /><small>{assignment.roleId}</small><span>{assignment.task ?? "待指派"}</span></div>;
+                  })}
+                  {(latestEntry?.assignments ?? []).length === 0 && <span className="studio-empty">领队尚未在本轮分派成员。</span>}
+                </div>
+              </div>
+              {progress && progress.leaderReport.gates.length > 0 && <div className="studio-gates">{progress.leaderReport.gates.map((gate) => <span key={gate.gateId} className={`studio-gate studio-gate--${gate.status}`}>{gate.gateId} · {gate.status}</span>)}</div>}
+            </article>;
+          })}
+        </div>
+      </section>}
       <section className="office-floor" aria-label="员工实时状态">
         <p className="sr-only" role="status" aria-live="polite" aria-atomic="true">{migrationNotice}</p>
         <header className="office-floor-heading"><div><span>SHIFT A</span><h2>实时员工席位</h2></div><p className={`stream-${streamStatus}`}><i /> {streamStatus === "live" ? "实时状态流已连接" : streamStatus === "reconnecting" ? "状态流重连中" : streamStatus === "offline" ? "状态流离线" : "正在连接状态流"}</p></header>

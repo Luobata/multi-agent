@@ -385,6 +385,61 @@ describe("Local Agent Workbench", () => {
     await expect(reopened.listRuns()).resolves.toHaveLength(3);
   });
 
+  it("classifies runs by category and project in listRuns", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await service.createSkill({ id: "noop", description: "noop", instructions: "Respond." });
+    const employee = await service.createEmployee({
+      id: "classify-worker",
+      identity: { displayName: "Classify Worker", background: "Test", responsibilities: ["Respond"] },
+      skills: [{ id: "noop", config: {} }],
+      providerId: "mock"
+    });
+
+    await service.invokeEmployee(
+      employee.id,
+      { message: "single task" },
+      { kind: "mcp", project: "demo-project" }
+    );
+
+    await service.createWorkflow({
+      id: "graph-flow",
+      description: "Graph flow.",
+      nodes: [{ id: "review", employeeId: employee.id, needs: [], with: {} }]
+    });
+    await service.runWorkbenchWorkflow("graph-flow", {}, { kind: "workbench" });
+
+    const runs = await service.listRuns() as Array<{ category: string; project?: string; trigger?: string; workflow: string }>;
+    const single = runs.find((run) => run.workflow.startsWith("direct-"));
+    const graph = runs.find((run) => run.workflow === "graph-flow");
+
+    expect(single?.category).toBe("single");
+    expect(single?.project).toBe("demo-project");
+    expect(single?.trigger).toBe("mcp");
+    expect(graph?.category).toBe("graph");
+    expect(graph?.trigger).toBe("workbench");
+  });
+
+  it("falls back to run architecture when no invocation is correlated", async () => {
+    const root = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot: root });
+    const runDir = path.join(root, "artifacts", "runs", "run-orphan-1");
+    await fs.promises.mkdir(runDir, { recursive: true });
+    await fs.promises.writeFile(path.join(runDir, "run.json"), JSON.stringify({
+      id: "run-orphan-1",
+      workflow: "direct-ghost",
+      architecture: "graph",
+      artifactDir: runDir,
+      status: "passed",
+      createdAt: "2026-08-06T00:00:00.000Z",
+      nodes: {}
+    }));
+    const runs = await service.listRuns() as Array<{ category: string; project?: string; trigger?: string; id: string }>;
+    const orphan = runs.find((run) => run.id === "run-orphan-1");
+    expect(orphan?.category).toBe("single");
+    expect(orphan?.project).toBeUndefined();
+    expect(orphan?.trigger).toBeUndefined();
+  });
+
   it("validates Skill configuration before saving an Employee", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     await service.createSkill({

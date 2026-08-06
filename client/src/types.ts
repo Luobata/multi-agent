@@ -227,6 +227,31 @@ export type ActivityEvent =
   | { type: "invocation.changed"; at: string; invocation: InvocationRecord }
   | { type: "instance.changed"; at: string; instance: WorkInstanceRecord };
 
+/** Client mirror of the server-side aggregated progress shape (src/workbench/invocationProgress.ts). */
+export interface InvocationProgress {
+  invocationId: string;
+  runId: string;
+  workflowId: string;
+  architecture: string;
+  status: InvocationStatus;
+  phase: string;
+  terminal: boolean;
+  startedAt?: string;
+  completedAt?: string;
+  updatedAt: string;
+  round: number;
+  tally: Record<WorkInstanceStatus, number>;
+  steps: Array<{ nodeId: string; roleId?: string; kind?: string; round?: number; employeeId: string; status: WorkInstanceStatus; phase: string; error?: string; startedAt?: string; completedAt?: string }>;
+  leaderReport: {
+    available: boolean;
+    rounds: number;
+    delegations: number;
+    entries: Array<{ round: number; action: string; summary?: string; assignments: Array<{ roleId?: string; task?: string; workKind?: string }>; status: WorkInstanceStatus | "pending" }>;
+    gates: Array<{ gateId: string; status: string }>;
+  };
+  outcome?: { status: string; summary?: string; reason?: string };
+}
+
 export interface WorkflowNode {
   id: string;
   employeeId: string;
@@ -491,6 +516,12 @@ export interface Run {
   completedAt?: string;
   output?: JsonValue;
   error?: string;
+  /** Present on listRuns summaries (not on getRun detail): coarse run classification. */
+  category?: "single" | "graph" | "supervisor";
+  /** Present on listRuns summaries when the correlated invocation carried a project. */
+  project?: string;
+  /** Present on listRuns summaries: the trigger source of the correlated invocation. */
+  trigger?: "workbench" | "http" | "mcp" | "a2a";
   nodes: Record<string, RunNode>;
   effectiveProfiles?: Record<string, EffectiveExecutionProfile>;
 }

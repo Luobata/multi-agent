@@ -252,7 +252,7 @@ function GraphWorkflowPage({ data, refresh, notify }: PageProps) {
 }
 
 export function WorkflowPage(props: PageProps) {
-  const [section, setSection] = useState<"entrance" | "graph" | "supervisor" | "policies">("graph");
+  const [section, setSection] = useState<"entrance" | "graph" | "supervisor" | "policies">("supervisor");
   const graphCount = props.data.workflows.filter((workflow) => workflow.architecture === "graph").length;
   const supervisorCount = props.data.workflows.filter((workflow) => workflow.architecture === "supervisor").length;
   const policyCount = props.data.managementPolicies?.length ?? 0;

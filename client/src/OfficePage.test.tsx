@@ -2,9 +2,9 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OfficePage } from "./OfficePage";
-import type { Bootstrap, Employee, WorkInstanceRecord, WorkInstanceStatus } from "./types";
+import type { Bootstrap, Employee, InvocationRecord, WorkInstanceRecord, WorkInstanceStatus } from "./types";
 
 const timestamp = "2026-08-01T00:00:00.000Z";
 
@@ -236,5 +236,96 @@ describe("Office floor live announcements", () => {
     // Re-rendering with unchanged statuses (e.g. elapsed-time ticks) does not re-announce.
     act(() => root.render(<OfficePage data={{ ...completed }} streamStatus="live" />));
     expect(liveRegion().textContent).toBe("米糊糊 · 前端 的工作实例已完成");
+  });
+});
+
+describe("OfficePage supervisor studio", () => {
+  const supervisorInvocation: InvocationRecord = {
+    id: "inv-team-1",
+    target: { kind: "workflow", id: "team-flow", version: 1 },
+    source: { kind: "workbench" },
+    status: "running",
+    phase: "provider",
+    requestSummary: "组织团队完成任务",
+    runId: "run-team-1",
+    instanceIds: [],
+    executionSnapshot: { workflow: { id: "team-flow", version: 1, architecture: "supervisor" }, employees: [] },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    transitions: []
+  };
+
+  const bootstrap = {
+    providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [],
+    employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [],
+    projects: [], projectBindings: [],
+    activity: { invocations: [supervisorInvocation], instances: [] }
+  } as unknown as Bootstrap;
+
+  const progress = {
+    invocationId: "inv-team-1", runId: "run-team-1", workflowId: "team-flow", architecture: "supervisor",
+    status: "running", phase: "provider", terminal: false, updatedAt: timestamp, round: 2,
+    tally: { queued: 0, waiting: 0, running: 1, completed: 3, blocked: 0, failed: 0, skipped: 0, cancelled: 0 },
+    steps: [],
+    leaderReport: { available: true, rounds: 2, delegations: 2, entries: [{ round: 2, action: "delegate", summary: "继续推进", assignments: [{ roleId: "researcher", task: "调研" }], status: "running" }], gates: [] }
+  };
+
+  let container: HTMLDivElement;
+  let root: Root;
+  const fetchMock = vi.fn();
+
+  beforeEach(async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.includes("/progress")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: progress }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root.render(<OfficePage data={bootstrap} streamStatus="live" />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    document.body.replaceChildren();
+    fetchMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  it("renders a studio card with a progress bar for the active supervisor invocation", async () => {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.querySelector(".studio-card")).toBeTruthy();
+    const bar = container.querySelector<HTMLElement>(".studio-progress-fill");
+    expect(bar).toBeTruthy();
+    // 3 completed of 4 total => 75%
+    expect(bar?.style.width).toBe("75%");
+    expect(container.textContent).toContain("Round 2");
+  });
+
+  it("polls the progress endpoint for the supervisor invocation", async () => {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/api/invocations/inv-team-1/progress"))).toBe(true);
+  });
+
+  it("lingers a recently-completed supervisor as a settled (non-running) studio card", async () => {
+    const settled: InvocationRecord = {
+      ...supervisorInvocation,
+      id: "inv-team-done",
+      status: "completed",
+      completedAt: new Date().toISOString()
+    };
+    const settledBootstrap = {
+      ...bootstrap,
+      activity: { invocations: [settled], instances: [] }
+    } as unknown as Bootstrap;
+    act(() => root.render(<OfficePage data={settledBootstrap} streamStatus="live" />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.querySelector(".studio-card--completed")).toBeTruthy();
+    expect(container.querySelector(".studio-progress--live")).toBeNull();
   });
 });
