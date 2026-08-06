@@ -12,7 +12,7 @@ import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
 
 type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications";
-const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
+const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], gateValidators: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
 
 function pageFromHash(): Page {
   const value = window.location.hash.replace("#", "");

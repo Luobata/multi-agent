@@ -1191,6 +1191,7 @@ export interface Bootstrap {
   knowledgeChanges?: KnowledgeChangeRequest[];
   configurationProposals?: ConfigurationProposal[];
   architectureTemplates: ArchitectureTemplate[];
+  gateValidators?: Array<{ id: string; description: string }>;
   employees: Employee[];
   employeeTemplates?: EmployeeTemplate[];
   managementPolicies?: ManagementPolicy[];

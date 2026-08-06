@@ -1519,4 +1519,12 @@ describe("Local Agent Workbench", () => {
     expect(result.status).toBe("passed");
     expect(result.output).toMatchObject({ verdict: "pass" });
   });
+
+  it("lists registered gate validators including the e2e-evidence validator", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const validators = service.listGateValidators();
+    const e2e = validators.find((validator) => validator.id === "e2e-evidence");
+    expect(e2e).toBeDefined();
+    expect(e2e?.description.length).toBeGreaterThan(0);
+  });
 });

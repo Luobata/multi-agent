@@ -11,6 +11,7 @@ import {
   type InstantiatedArchitectureTemplate
 } from "../architectures/templates.js";
 import type { ArchitectureRegistry } from "../architectures/types.js";
+import { listGateValidators as listRegisteredGateValidators } from "../architectures/gateValidators.js";
 import { compilePlan } from "../core/plan.js";
 import type {
   JsonObject,
@@ -3949,6 +3950,10 @@ export class WorkbenchService {
 
   listArchitectureTemplates(): ArchitectureTemplateDefinition[] {
     return listArchitectureTemplates();
+  }
+
+  listGateValidators(): Array<{ id: string; description: string }> {
+    return listRegisteredGateValidators();
   }
 
   instantiateArchitectureTemplate(id: string, employeeIds: string[]): InstantiatedArchitectureTemplate {
