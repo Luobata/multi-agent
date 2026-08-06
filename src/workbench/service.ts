@@ -44,6 +44,10 @@ import { resolveKnowledgeScope } from "../knowledge/resolver.js";
 import { activatedKnowledgeCollectionKeys, routeKnowledge } from "../knowledge/router.js";
 import { RestrictedKnowledgeUrlFetcher } from "../knowledge/urlFetcher.js";
 import { webpageToKnowledgeDocuments } from "../knowledge/urlImport.js";
+import { MemoryStore } from "../memory/store.js";
+import { MemoryRetriever } from "../memory/retriever.js";
+import { MemoryExtractor, type RunLike, type SummarizeFn } from "../memory/extractor.js";
+import type { MemoryEvidence, MemoryRecord, MemoryScope, MemorySearchQuery } from "../memory/types.js";
 import type {
   KnowledgeBaseCreateInput,
   KnowledgeBaseDefinition,
@@ -183,6 +187,10 @@ import {
 } from "./types.js";
 
 const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
+
+/** Internal Employee id used to summarize completed runs into reusable memory. */
+const MEMORY_SUMMARIZER_ID = "memory-summarizer";
+
 
 function now(): string {
   return new Date().toISOString();
@@ -1615,6 +1623,9 @@ export class WorkbenchService {
   private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly backgroundInvocations = new Map<string, Promise<void>>();
+  private memoryStore!: MemoryStore;
+  private memoryRetriever!: MemoryRetriever;
+  private memoryExtractor!: MemoryExtractor;
 
   private constructor(
     readonly store: WorkbenchStore,
@@ -1636,7 +1647,75 @@ export class WorkbenchService {
   static async open(options: WorkbenchServiceOptions = {}): Promise<WorkbenchService> {
     const store = await WorkbenchStore.open(options.dataRoot ?? WorkbenchService.defaultDataRoot());
     const knowledge = await KnowledgeRuntime.open(store.dataRoot);
-    return new WorkbenchService(store, knowledge, options);
+    const service = new WorkbenchService(store, knowledge, options);
+    await service.initMemory();
+    return service;
+  }
+
+  private async initMemory(): Promise<void> {
+    this.memoryStore = await MemoryStore.open(this.store.dataRoot);
+    this.memoryRetriever = new MemoryRetriever(this.memoryStore);
+    const summarize: SummarizeFn = async ({ run }) => {
+      // 优先复用内部提炼器 Employee；不存在或抛错则降级为规则摘要。
+      try {
+        const exists = this.listEmployees(true).some((employee) => employee.id === MEMORY_SUMMARIZER_ID);
+        if (exists) {
+          const result = await this.invokeEmployee(MEMORY_SUMMARIZER_ID, {
+            message:
+              `提炼这次运行的可复用经验（<=120字）：runId=${run.id} status=${run.status} ` +
+              `nodes=${Object.keys(run.nodes).join(",")}`
+          });
+          const output = (result as { output?: unknown }).output;
+          const content = typeof output === "string" ? output : JSON.stringify(output ?? "");
+          if (content) return { title: `运行 ${run.id}`, content };
+        }
+      } catch {
+        // fall through to rule summary
+      }
+      const nodeCount = Object.keys(run.nodes).length;
+      return { title: `运行 ${run.id}`, content: `状态=${run.status}，节点数=${nodeCount}。` };
+    };
+    let counter = 0;
+    this.memoryExtractor = new MemoryExtractor(
+      this.memoryStore,
+      summarize,
+      () => `mem_${Date.now().toString(36)}_${(counter += 1)}`
+    );
+  }
+
+  async searchMemory(query: MemorySearchQuery): Promise<MemoryEvidence[]> {
+    try {
+      return await this.memoryRetriever.search(query);
+    } catch {
+      return [];
+    }
+  }
+
+  async archiveMemory(id: string): Promise<MemoryRecord | null> {
+    return this.memoryStore.archive(id);
+  }
+
+  async reindexMemory(): Promise<number> {
+    return this.memoryStore.reindex();
+  }
+
+  private extractMemoryForRun(
+    runId: string,
+    scope: MemoryScope,
+    provenance: { invocationId?: string; source?: { caller?: string; contextId?: string } }
+  ): void {
+    // 内部提炼器 Employee 自身的运行不再触发提炼，避免后台无限递归。
+    if (scope.employeeId === MEMORY_SUMMARIZER_ID) return;
+    // 异步旁路：绝不阻塞返回、绝不把 memory 故障抛给主链路。
+    void (async () => {
+      try {
+        const run = (await this.getRun(runId)) as RunLike | null;
+        if (!run || !run.id) return;
+        await this.memoryExtractor.onRunComplete({ run, scope, provenance });
+      } catch {
+        // 尽力而为
+      }
+    })();
   }
 
   snapshot(): WorkbenchState {
@@ -4641,6 +4720,19 @@ export class WorkbenchService {
         target.updatedAt = timestamp;
         return target;
       });
+      // 运行已完成，异步提炼 memory（尽力而为，不阻塞返回、不抛给主链路）。
+      this.extractMemoryForRun(
+        result.run.id,
+        {
+          employeeId: employee.id,
+          employeeVersion: employee.version,
+          projectId: options.assignment?.projectId
+        },
+        {
+          invocationId: invocation.id,
+          source: { caller: source.caller, contextId: source.contextId }
+        }
+      );
       return {
         session: updatedSession,
         runId: result.run.id,
