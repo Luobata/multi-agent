@@ -415,6 +415,7 @@ export interface SupervisorGate {
   required: boolean;
   instructions: string;
   fallback: SupervisorGateFallback;
+  validatorId?: string;
 }
 
 export type SupervisorDagNodeKind =

@@ -170,6 +170,33 @@ describe("SupervisorWorkflowPage editor", () => {
     act(() => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   };
   const writeCalls = () => fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH" || init?.method === "POST");
+  const addGateButton = (): HTMLButtonElement => {
+    const button = Array.from(dialog().querySelectorAll<HTMLButtonElement>("button")).find((candidate) => candidate.textContent?.includes("添加能力门禁"));
+    if (!button) throw new Error("添加能力门禁按钮未找到");
+    return button;
+  };
+  const gateArticles = () => Array.from(dialog().querySelectorAll<HTMLElement>(".gate-editor-list article"));
+  const validatorTrigger = (index: number): HTMLButtonElement => {
+    const trigger = Array.from(gateArticles()[index]?.querySelectorAll<HTMLButtonElement>('button[role="combobox"]') ?? [])
+      .find((candidate) => candidate.getAttribute("aria-label")?.includes("证据校验"));
+    if (!trigger) throw new Error(`门禁 ${index + 1} 的证据校验选择器未找到`);
+    return trigger;
+  };
+  const validatorOptionLabels = (index: number): string[] => {
+    click(validatorTrigger(index));
+    const listId = validatorTrigger(index).getAttribute("aria-controls");
+    const listbox = listId ? document.getElementById(listId) : null;
+    return Array.from(listbox?.querySelectorAll<HTMLElement>(".select-option strong") ?? []).map((element) => element.textContent ?? "");
+  };
+  const chooseValidator = (index: number, label: string) => {
+    click(validatorTrigger(index));
+    const listId = validatorTrigger(index).getAttribute("aria-controls");
+    const listbox = listId ? document.getElementById(listId) : null;
+    const option = Array.from(listbox?.querySelectorAll<HTMLButtonElement>(".select-option") ?? [])
+      .find((candidate) => candidate.querySelector("strong")?.textContent === label);
+    if (!option) throw new Error(`证据校验选项 ${label} 未找到`);
+    click(option);
+  };
 
   beforeEach(async () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -195,6 +222,7 @@ describe("SupervisorWorkflowPage editor", () => {
       knowledgeBases: [],
       knowledgeProfiles: [],
       architectureTemplates: [],
+      gateValidators: [{ id: "e2e-evidence", description: "校验成员上报的 e2e 运行证据" }],
       employees: [
         employee("team-manager", "领队员工"),
         employee("mihuhu-frontend-engineer", "米糊糊 · 前端"),
@@ -289,5 +317,46 @@ describe("SupervisorWorkflowPage editor", () => {
     expect(container.querySelector(".editor-submit-error")).toBeNull();
     // 保存成功后弹窗关闭。
     expect(container.querySelector("dialog")).toBeNull();
+  });
+
+  it("renders a gate validator select offering auto, none, and the e2e-evidence validator", async () => {
+    await openEditor();
+    click(addGateButton());
+    await flush();
+    const labels = validatorOptionLabels(0);
+    expect(labels).toContain("自动（按能力）");
+    expect(labels).toContain("不校验");
+    expect(labels).toContain("e2e-evidence");
+  });
+
+  it("omits validatorId from the save payload when the gate keeps the auto default", async () => {
+    await openEditor();
+    click(addGateButton());
+    await flush();
+    submitForm();
+    await flush();
+
+    const patchCall = writeCalls().find(([input]) => String(input) === `/api/workflows/${supervisorWorkflow.id}`);
+    expect(patchCall).toBeDefined();
+    const body = JSON.parse(String(patchCall?.[1]?.body)) as { flow: { gates: Array<Record<string, unknown>> } };
+    expect(body.flow.gates).toHaveLength(1);
+    // 默认「自动（按能力）」不写入 validatorId 字段。
+    expect(body.flow.gates[0]).not.toHaveProperty("validatorId");
+  });
+
+  it("includes the chosen validatorId in the save payload", async () => {
+    await openEditor();
+    click(addGateButton());
+    await flush();
+    chooseValidator(0, "e2e-evidence");
+    await flush();
+    submitForm();
+    await flush();
+
+    const patchCall = writeCalls().find(([input]) => String(input) === `/api/workflows/${supervisorWorkflow.id}`);
+    expect(patchCall).toBeDefined();
+    const body = JSON.parse(String(patchCall?.[1]?.body)) as { flow: { gates: Array<{ validatorId?: string }> } };
+    expect(body.flow.gates).toHaveLength(1);
+    expect(body.flow.gates[0]?.validatorId).toBe("e2e-evidence");
   });
 });
