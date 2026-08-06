@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderRegistry } from "../src/runtime/providers.js";
+import type { JsonObject, RoleVerdictDefinition } from "../src/core/types.js";
 import { WorkbenchService } from "../src/workbench/service.js";
 
 const temporaryDirectories: string[] = [];
@@ -1396,5 +1397,126 @@ describe("Local Agent Workbench", () => {
     const workflow = await service.createWorkflow(supervisorWorkflowWithGate("none"));
     if (workflow.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
     expect(workflow.flow.gates.find((gate) => gate.id === "e2e")?.validatorId).toBe("none");
+  });
+
+  interface XiaomixiangTemplate {
+    identity: { constraints?: string[] };
+    systemPrompt: string;
+    requestPrompt: string;
+    outputSchema: JsonObject;
+    verdict?: RoleVerdictDefinition;
+  }
+
+  function loadXiaomixiangTemplate(): XiaomixiangTemplate {
+    const templatePath = path.resolve("templates", "workbench", "xiaomixiang-tester.employee.json");
+    return JSON.parse(fs.readFileSync(templatePath, "utf8")) as XiaomixiangTemplate;
+  }
+
+  it("declares the 小米象 e2e evidence constraint, prompt, output schema, and verdict in the template", () => {
+    const template = loadXiaomixiangTemplate();
+    expect(template.identity.constraints ?? []).toContain(
+      "任何验收必须包含真实 e2e/行为验证，禁止仅凭静态检查（读源码/类型/lint）判定通过"
+    );
+    expect(template.systemPrompt).toContain("严禁仅凭静态检查判定通过；每条结论必须有真实 e2e/行为证据。");
+    expect(template.verdict).toEqual({ path: "/verdict", pass: ["pass"], block: ["block"] });
+    expect(template.outputSchema).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["verdict", "summary", "e2eEvidence"],
+      properties: {
+        verdict: { enum: ["pass", "block"] },
+        summary: { type: "string", minLength: 1 },
+        e2eEvidence: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["method", "steps", "observed"],
+            properties: {
+              method: { enum: ["browser", "http-behavior", "automation-run"] },
+              steps: { type: "string", minLength: 1 },
+              observed: { type: "string", minLength: 1 }
+            }
+          }
+        }
+      }
+    });
+    // The requestPrompt must instruct returning the new e2e fields, not the retired e2eCoverage field.
+    expect(template.requestPrompt).not.toContain("e2eCoverage");
+    for (const field of ["verdict", "summary", "e2eEvidence", "risks"]) {
+      expect(template.requestPrompt).toContain(field);
+    }
+  });
+
+  async function openScriptedTester(): Promise<{
+    service: WorkbenchService;
+    employeeId: string;
+    setOutput: (value: unknown) => void;
+  }> {
+    const template = loadXiaomixiangTemplate();
+    let scriptedOutput: unknown = { message: "unset" };
+    const providers: ProviderRegistry = new Map([["scripted-tester", {
+      id: "scripted-tester",
+      validate: () => [],
+      invoke: async () => ({ stdout: JSON.stringify(scriptedOutput), stderr: "", durationMs: 1 })
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("scripted-tester-provider", { adapter: "scripted-tester", outputProtocol: "json" });
+    const employee = await service.createEmployee({
+      id: "xiaomixiang-tester-instance",
+      identity: {
+        displayName: "小米象 · 测试工程师",
+        background: "独立测试验收工程师。",
+        responsibilities: ["验证真实行为"]
+      },
+      providerId: "scripted-tester-provider",
+      outputSchema: template.outputSchema,
+      verdict: template.verdict
+    });
+    return { service, employeeId: employee.id, setOutput: (value) => { scriptedOutput = value; } };
+  }
+
+  it("fails 小米象 output-schema validation when the tester omits e2eEvidence", async () => {
+    const { service, employeeId, setOutput } = await openScriptedTester();
+    setOutput({ verdict: "pass", summary: "仅读了源码，看起来没问题", risks: [] });
+
+    const result = await service.invokeEmployee(employeeId, { message: "验收登录改动" });
+    expect(result.status).toBe("failed");
+    const run = JSON.parse(fs.readFileSync(path.join(result.runDir, "run.json"), "utf8")) as {
+      status: string;
+      nodes: Record<string, { status: string; error?: string }>;
+    };
+    expect(run.status).toBe("failed");
+    expect(run.nodes.respond?.status).toBe("failed");
+    expect(run.nodes.respond?.error).toMatch(/output schema validation failed/);
+    expect(run.nodes.respond?.error).toMatch(/e2eEvidence/);
+  });
+
+  it("blocks the 小米象 run when the tester returns verdict block with real e2e evidence", async () => {
+    const { service, employeeId, setOutput } = await openScriptedTester();
+    setOutput({
+      verdict: "block",
+      summary: "登录页在生产环境返回 500，阻塞发布。",
+      e2eEvidence: [{ method: "browser", steps: "打开登录页并提交表单", observed: "页面返回 500 错误" }],
+      risks: ["用户无法登录"]
+    });
+
+    const result = await service.invokeEmployee(employeeId, { message: "验收登录改动" });
+    expect(result.status).toBe("blocked");
+    expect(result.output).toMatchObject({ verdict: "block" });
+  });
+
+  it("passes the 小米象 run when the tester returns verdict pass with real e2e evidence", async () => {
+    const { service, employeeId, setOutput } = await openScriptedTester();
+    setOutput({
+      verdict: "pass",
+      summary: "关键路径全部通过。",
+      e2eEvidence: [{ method: "automation-run", steps: "运行 npm test", observed: "全部用例通过" }]
+    });
+
+    const result = await service.invokeEmployee(employeeId, { message: "验收登录改动" });
+    expect(result.status).toBe("passed");
+    expect(result.output).toMatchObject({ verdict: "pass" });
   });
 });
