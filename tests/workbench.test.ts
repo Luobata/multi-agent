@@ -1391,6 +1391,12 @@ describe("Local Agent Workbench", () => {
     await expect(service.createWorkflow(supervisorWorkflowWithGate("nope"))).rejects.toThrow(/unknown validator/);
   });
 
+  it("rejects a gate whose validatorId is a prototype key at authoring time", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await createSupervisorTeam(service);
+    await expect(service.createWorkflow(supervisorWorkflowWithGate("toString"))).rejects.toThrow(/unknown validator/);
+  });
+
   it("accepts and preserves the \"none\" validator disable sentinel", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     await createSupervisorTeam(service);

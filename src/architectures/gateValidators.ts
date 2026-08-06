@@ -48,6 +48,9 @@ const CAPABILITY_DEFAULT_VALIDATOR: Record<string, string> = {
 export function resolveGateValidator(gate: GateLike): GateValidator | undefined {
   const id = gate.validatorId ?? CAPABILITY_DEFAULT_VALIDATOR[gate.requiredCapability];
   if (!id || id === "none") return undefined;
+  if (!Object.prototype.hasOwnProperty.call(GATE_VALIDATORS, id)) {
+    throw new Error(`gate ${gate.id} references unknown validator ${id}`);
+  }
   const validator = GATE_VALIDATORS[id];
   if (!validator) throw new Error(`gate ${gate.id} references unknown validator ${id}`);
   return validator;

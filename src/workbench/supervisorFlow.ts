@@ -206,7 +206,7 @@ export function normalizeSupervisorFlow(
     const validatorId = candidate.validatorId === undefined
       ? undefined
       : text(candidate.validatorId, `supervisor gate ${gateId} validatorId`);
-    if (validatorId !== undefined && validatorId !== "none" && !(validatorId in GATE_VALIDATORS)) {
+    if (validatorId !== undefined && validatorId !== "none" && !Object.prototype.hasOwnProperty.call(GATE_VALIDATORS, validatorId)) {
       throw new Error(`supervisor gate ${gateId} references unknown validator ${validatorId}`);
     }
     return {

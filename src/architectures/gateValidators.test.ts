@@ -20,6 +20,10 @@ describe("resolveGateValidator", () => {
   it("throws on an unknown validatorId", () => {
     expect(() => resolveGateValidator(gate({ validatorId: "nope" }))).toThrow(/unknown validator/);
   });
+  it("throws on a prototype-key validatorId (fail-closed)", () => {
+    expect(() => resolveGateValidator(gate({ validatorId: "toString" }))).toThrow(/unknown validator/);
+    expect(() => resolveGateValidator(gate({ validatorId: "constructor" }))).toThrow(/unknown validator/);
+  });
 });
 
 describe("e2eEvidenceValidator", () => {
