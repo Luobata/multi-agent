@@ -1,10 +1,12 @@
-# Local Agent Workbench · 小镇四季档案设计契约
+# Local Agent Workbench · 双叶幼儿园设计契约
 
 状态：实现基线
 
-视觉方向：Healing Pixel Dossier / 治愈日式像素游戏档案
+品牌名：双叶幼儿园（固定，两套皮肤都显示）
 
-实现边界：原创 CSS/SVG 图形、本地字体、本地素材；不复制参考站商标、角色或美术资源
+视觉方向：两套可切换皮肤 —— `crayon`（蜡笔小新幼儿园，默认）与 `pixel`（治愈日式像素游戏档案）。以下 §1–§4 的天空蓝/四季描述为 `pixel` 皮肤基线；`crayon` 皮肤的差异见 §3.1。
+
+实现边界：原创 CSS/SVG 图形、本地字体、本地素材；不复制参考站商标、角色或美术资源（含蜡笔小新角色形象与双叶幼儿园官方 logo）
 
 ## 1. 产品隐喻
 
@@ -34,6 +36,13 @@ Workbench 是一间在天空与四季之间工作的本地数字员工档案室�
 - 不请求远程字体。缺少首选字体时必须由本地 CJK 字体自然回退。
 - 主要可交互轮廓为 2px；信息分区使用 2px 针脚虚线；圆角只用于卡片和圆形角色底，不做玻璃拟态。
 - 硬阴影使用 2–5px 无模糊偏移。按下时元素向右下移动 2px，并收回阴影。
+
+## 3.1 皮肤切换机制
+
+- 皮肤通过根元素 `data-theme` 生效：`crayon`（默认）与 `pixel`。切换入口在侧栏底部，选择用 localStorage（键 `workbench-theme`）持久化；App 挂载时立即应用，避免首帧闪烁。
+- 配色变量名在两皮肤间完全一致（`--sky`、`--ink`、`--season-*`、语义别名等），只是取值不同：`tokens.css` 的 `:root` 即 `crayon` 值，`[data-theme="pixel"]` 作为覆盖。因此组件层 CSS 不因主题而改动。
+- `crayon` 皮肤差异：暖阳黄/奶油白底、暖褐蜡笔墨；四季槽位重映射为草绿、小象黄、小新红、天蓝；手绘晃动描边由内联 SVG filter `#crayon-edge`（`feTurbulence` + `feDisplacementMap`）实现；蜡笔投影；品牌 mark 为原创双叶幼苗。质感差异集中在 `styles.css` 末尾 `[data-theme="crayon"]` 覆盖块。
+- 降级：`prefers-reduced-motion` 或不支持 SVG filter 时，`crayon` 描边回落为规整粗描边，功能与可读性不受影响。
 
 ## 4. 应用骨架与季节路由
 
