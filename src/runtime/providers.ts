@@ -55,6 +55,14 @@ export interface ProviderAdapter {
 
 export type ProviderRegistry = Map<string, ProviderAdapter>;
 
+/**
+ * Transient provider failures that are worth retrying (given maxAttempts > 1): rate limits,
+ * overload, connection resets, and upstream 5xx / internal-server errors. Matched against a
+ * lowercased stdout+stderr blob. Includes vendor-relay phrasings observed in practice, e.g.
+ * "InternalServerException" and the Chinese "厂商资源问题断连" (upstream resource disconnect).
+ */
+const TRANSIENT_FAILURE_PATTERN = /rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up|\b5\d{2}\b|internalservererror|internalserverexception|internal server error|service unavailable|bad gateway|gateway timeout|upstream|厂商资源|资源问题|断连/;
+
 function validateTimeoutPolicy(prefix: string, definition: Record<string, unknown>): string[] {
   const issues: string[] = [];
   for (const key of ["timeoutMs", "idleTimeoutMs", "hardTimeoutMs"] as const) {
@@ -393,7 +401,7 @@ class CommandProviderAdapter implements ProviderAdapter {
         if (/maximum budget|max_budget|budget exhausted/.test(detail)) {
           return { kind: "budget" as const, retryable: false, durationMs: Date.now() - started };
         }
-        if (/rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up/.test(detail)) {
+        if (TRANSIENT_FAILURE_PATTERN.test(detail)) {
           return { kind: "rate-limit" as const, retryable: true, durationMs: Date.now() - started };
         }
         return { kind: "exit" as const, retryable: status === 75, durationMs: Date.now() - started };
@@ -687,7 +695,7 @@ class CodexProviderAdapter implements ProviderAdapter {
         } else if (status !== 0) {
           const detail = `${stdout}\n${stderr}`.toLowerCase();
           const budget = /maximum budget|max_budget|budget exhausted/.test(detail);
-          const transient = /rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up/.test(detail);
+          const transient = TRANSIENT_FAILURE_PATTERN.test(detail);
           reject(new ProviderExecutionError(`provider ${invocation.providerId} exited with status ${status}`, stdout, stderr, {
             kind: budget ? "budget" : transient ? "rate-limit" : "exit",
             retryable: transient,

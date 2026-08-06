@@ -135,6 +135,26 @@ describe("provider adapters", () => {
     expect(failure).toMatchObject({ kind: "rate-limit", retryable: true });
   });
 
+  it("classifies an upstream 5xx / internal-server disconnect as transient and retryable", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    // Reproduces the observed claude-relay signature: the error text arrives in stdout (JSON body)
+    // with a non-zero exit, phrased as an upstream InternalServerException / 厂商资源问题断连.
+    const failure = await adapter.invoke({
+      providerId: "upstream-5xx-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", "process.stdout.write(JSON.stringify({ is_error: true, result: 'API Error: 厂商资源问题断连：InternalServerException: unexpected error' })); process.exit(1)"]
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {}
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "rate-limit", retryable: true });
+  });
+
   it("keeps an active Provider alive after the soft timeout", async () => {
     const adapter = createDefaultProviderRegistry().get("command")!;
     const progress: Array<{ kind: string; longRunning: boolean }> = [];
