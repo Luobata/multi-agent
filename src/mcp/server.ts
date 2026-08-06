@@ -785,5 +785,23 @@ export function createWorkbenchMcpServer(
     inputSchema: { limit: z.number().int().min(1).max(200).optional() }
   }, async ({ limit }) => content(await request(daemonUrl, `/api/runs?limit=${limit ?? 50}`)));
 
+  server.registerTool("search_memory", {
+    title: "Search employee memory",
+    description: "按 employee/project 维度检索该 Agent 过去运行的精炼经验；平时不注入以省 token，需要时才按需检索。默认返回运行级摘要。",
+    inputSchema: {
+      query: z.string().min(1),
+      employeeId: z.string().optional(),
+      projectId: z.string().optional(),
+      limit: z.number().int().min(1).max(40).optional(),
+      kind: z.enum(["run-summary", "node-detail", "preference"]).optional()
+    }
+  }, async (args) => {
+    const data = await request<{ evidence: unknown[] }>(daemonUrl, "/api/memory/search", {
+      method: "POST",
+      body: JSON.stringify(args)
+    });
+    return content(data.evidence);
+  });
+
   return server;
 }

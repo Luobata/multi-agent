@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { UserBuilder, jsonRpcHandler } from "@a2a-js/sdk/server/express";
 import type { JsonObject, ProviderDefinition } from "../core/types.js";
+import type { MemoryKind } from "../memory/types.js";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
@@ -683,6 +684,26 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   }));
   app.get("/api/runs/:id", asyncRoute(async (request, response) => {
     send(response, await service.getRun(routeParam(request, "id")));
+  }));
+
+  app.post("/api/memory/search", asyncRoute(async (request, response) => {
+    const body = (request.body ?? {}) as {
+      query?: unknown;
+      employeeId?: unknown;
+      projectId?: unknown;
+      limit?: unknown;
+      kind?: unknown;
+    };
+    const hits = await service.searchMemory({
+      query: typeof body.query === "string" ? body.query : "",
+      scope: {
+        employeeId: typeof body.employeeId === "string" ? body.employeeId : undefined,
+        projectId: typeof body.projectId === "string" ? body.projectId : undefined
+      },
+      limit: typeof body.limit === "number" ? body.limit : undefined,
+      kind: body.kind as MemoryKind | undefined
+    });
+    send(response, { evidence: hits });
   }));
 
   app.get("/api/publications", (request, response) => {
