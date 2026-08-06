@@ -1006,6 +1006,13 @@ input[type="color"] { padding: var(--space-1); }
 .run-card code { overflow: hidden; color: var(--ink-3); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
 .run-card strong { font-size: var(--text-sm); }
 .run-card small { color: var(--ink-2); font-size: var(--text-xs); }
+.run-filter-bar { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); padding: var(--space-2) var(--space-3); }
+.run-card-tags { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
+.run-category-tag { display: inline-flex; align-items: center; padding: 1px var(--space-2); border-radius: var(--radius-1); border: 1px solid var(--line-strong); font-size: var(--text-xs); font-weight: 700; }
+.run-category-tag--single { color: var(--ink); background: color-mix(in srgb, var(--season-run, #8bc9dc) 34%, transparent); border-color: color-mix(in srgb, var(--season-run, #8bc9dc) 70%, transparent); }
+.run-category-tag--graph { color: var(--ink); background: color-mix(in srgb, var(--season-spring, #9ed6ae) 34%, transparent); border-color: color-mix(in srgb, var(--season-spring, #9ed6ae) 70%, transparent); }
+.run-category-tag--supervisor { color: var(--ink); background: color-mix(in srgb, var(--season-winter, #c4b7e4) 34%, transparent); border-color: color-mix(in srgb, var(--season-winter, #c4b7e4) 70%, transparent); }
+.run-project-chip { display: inline-flex; align-items: center; padding: 1px var(--space-2); border-radius: var(--radius-1); border: 1px dashed var(--line-strong); font-size: var(--text-xs); color: var(--ink-2); }
 .mini-empty { padding: var(--space-7) var(--space-5); color: var(--ink-3); text-align: center; line-height: 1.6; }
 
 .stamp { width: fit-content; min-height: 24px; display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-3); border: var(--rule) solid currentColor; border-radius: var(--radius-1); font-family: var(--font-machine); font-size: var(--text-xs); font-weight: 700; letter-spacing: .04em; white-space: nowrap; }

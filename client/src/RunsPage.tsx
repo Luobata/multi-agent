@@ -1,9 +1,27 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "./api";
-import { DossierSection, EmptyState, Stamp, formatTime } from "./components";
+import { DossierSection, EmptyState, SelectControl, Stamp, formatTime } from "./components";
 import { SupervisorRunTopology } from "./SupervisorRunTopology";
 import { EffectiveProfileView } from "./EffectiveProfileView";
 import type { JsonValue, Run, RunNode } from "./types";
+
+const CATEGORY_LABELS: Record<"single" | "graph" | "supervisor", string> = {
+  single: "单任务",
+  graph: "Graph 编排",
+  supervisor: "领队协作"
+};
+
+export function filterRuns(
+  runs: Run[],
+  filters: { category: "all" | "single" | "graph" | "supervisor"; project: "all" | "none" | string }
+): Run[] {
+  return runs.filter((run) => {
+    if (filters.category !== "all" && (run.category ?? "graph") !== filters.category) return false;
+    if (filters.project === "none") return !run.project;
+    if (filters.project !== "all" && run.project !== filters.project) return false;
+    return true;
+  });
+}
 
 function objectValue(value: JsonValue | undefined): Record<string, JsonValue> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -37,6 +55,8 @@ export function RunsPage({ notify, activityRevision = "" }: { notify: (message: 
   const [selectedId, setSelectedId] = useState("");
   const [detail, setDetail] = useState<Run>();
   const [loading, setLoading] = useState(true);
+  const [categoryFilter, setCategoryFilter] = useState<"all" | "single" | "graph" | "supervisor">("all");
+  const [projectFilter, setProjectFilter] = useState<"all" | "none" | string>("all");
   useEffect(() => {
     let current = true;
     api<Run[]>("/api/runs?limit=100").then((value) => {
@@ -57,11 +77,19 @@ export function RunsPage({ notify, activityRevision = "" }: { notify: (message: 
       .catch((error: unknown) => { if (current) notify(error instanceof Error ? error.message : String(error), "error"); });
     return () => { current = false; };
   }, [selectedId, notify, activityRevision]);
-  const summary = runs.find((run) => run.id === selectedId) ?? runs[0];
+  const projectOptions = useMemo(
+    () => [...new Set(runs.map((run) => run.project).filter((project): project is string => Boolean(project)))].sort(),
+    [runs]
+  );
+  const visibleRuns = useMemo(
+    () => filterRuns(runs, { category: categoryFilter, project: projectFilter }),
+    [runs, categoryFilter, projectFilter]
+  );
+  const summary = visibleRuns.find((run) => run.id === selectedId) ?? visibleRuns[0];
   const selected = detail?.id === summary?.id ? detail : summary;
   const profileEntries = Object.entries(selected?.effectiveProfiles ?? {});
   return <div className="page-grid page-grid--runs">
-    <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="record-scroll run-list">{runs.map((run) => <button key={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {run.architecture} · {Object.keys(run.nodes).length} 节点</small></div><Stamp status={run.status} /></button>)}{!loading && runs.length === 0 && <div className="mini-empty">还没有 Run 证据。</div>}</div><footer className="list-footer"><span>{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
+    <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="run-filter-bar"><div data-testid="run-type-filter"><SelectControl ariaLabel="按类型筛选运行卷宗" value={categoryFilter} options={[{ value: "all", label: "全部类型" }, { value: "single", label: "单任务" }, { value: "graph", label: "Graph 编排" }, { value: "supervisor", label: "领队协作" }]} onChange={(value) => setCategoryFilter(value as typeof categoryFilter)} /></div><div data-testid="run-project-filter"><SelectControl ariaLabel="按项目筛选运行卷宗" value={projectFilter} options={[{ value: "all", label: "全部项目" }, { value: "none", label: "无项目" }, ...projectOptions.map((project) => ({ value: project, label: project }))]} onChange={(value) => setProjectFilter(value)} /></div></div><div className="record-scroll run-list">{visibleRuns.map((run) => <button key={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {run.architecture} · {Object.keys(run.nodes).length} 节点</small><div className="run-card-tags">{run.category && <span className={`run-category-tag run-category-tag--${run.category}`}>{CATEGORY_LABELS[run.category]}</span>}{run.project && <span className="run-project-chip">{run.project}</span>}</div></div><Stamp status={run.status} /></button>)}{!loading && visibleRuns.length === 0 && <div className="mini-empty">{runs.length === 0 ? "还没有 Run 证据。" : "没有符合筛选条件的卷宗。"}</div>}</div><footer className="list-footer"><span>{visibleRuns.length}/{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
     <main className="detail-pane">{loading ? <div className="skeleton-page" aria-label="正在调取运行卷宗"><i /><i /><i /></div> : !selected ? <EmptyState title="尚无运行卷宗">直接交办员工或签发一次 Workflow 后，这里会出现不可变的执行记录。</EmptyState> : <div className="dossier run-dossier">
       <header className="dossier-cover"><div className="file-index"><span>RUN EVIDENCE RECORD</span><code>{selected.id}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">证</div><div><h2>{selected.workflow}</h2><p>{selected.status === "blocked" ? "流程已完成，但存在业务阻塞结论。" : selected.status === "failed" ? "执行发生技术故障，可查看原始输出与错误证据。" : selected.status === "running" ? "执行仍在进行。" : "流程完成，证据已归档。"}</p></div><Stamp status={selected.status} /></div></header>
       <DossierSection number="01" title="运行元数据"><dl className="ledger"><dt>Run ID</dt><dd><code>{selected.id}</code></dd><dt>Architecture</dt><dd>{selected.architecture}</dd><dt>创建时间</dt><dd>{formatTime(selected.createdAt)}</dd><dt>完成时间</dt><dd>{formatTime(selected.completedAt)}</dd><dt>证据目录</dt><dd><code className="path-code">{selected.artifactDir}</code></dd></dl></DossierSection>
