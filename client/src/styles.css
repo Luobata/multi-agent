@@ -1759,7 +1759,7 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
   .side-nav { width: var(--rail-compact); }
   .brand-mark { height: 64px; padding: 0 var(--space-3); }
   .brand-mark > span { width: 34px; }
-  .brand-mark div, .nav-items span, .command-hint span, .command-hint kbd, .nav-foot div { display: none; }
+  .brand-mark div, .nav-items span, .command-hint span, .command-hint kbd, .nav-foot div, .theme-toggle small, .theme-toggle > span:not(.theme-toggle-dot) { display: none; }
   .nav-items { padding: var(--space-4) var(--space-2); }
   .nav-items button, .command-hint { justify-content: center; width: 44px; padding: 0; }
   .nav-items button.active::before { left: -5px; }
@@ -2174,6 +2174,29 @@ body {
   box-shadow: 2px 2px 0 var(--pixel-shadow);
 }
 .nav-foot small { color: var(--ink-2); }
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 44px;
+  margin: 0 var(--space-3) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: var(--rule) solid var(--line-strong);
+  border-radius: var(--radius-2);
+  background: var(--paper-raised);
+  color: var(--ink);
+  font-weight: 700;
+  cursor: pointer;
+}
+.theme-toggle:hover { background: var(--paper-hover); }
+.theme-toggle:focus-visible { outline: var(--rule) solid var(--focus); outline-offset: 2px; }
+.theme-toggle .theme-toggle-dot {
+  width: 12px; height: 12px; flex: 0 0 auto;
+  border: var(--rule) solid var(--line-strong); border-radius: 50%;
+  background: var(--stamp-red);
+}
+.theme-toggle small { margin-left: auto; color: var(--ink-3); font-family: var(--font-machine); font-size: var(--text-xs); letter-spacing: .06em; }
 
 .daemon-gate-notice {
   border-bottom: 2px dashed var(--seal-amber);
@@ -3154,7 +3177,7 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
   .side-nav { width: var(--rail-compact); }
   .brand-mark { min-height: 68px; padding: 0 var(--space-3); }
   .brand-mark > .brand-sprite { width: 38px; height: 38px; }
-  .brand-mark div, .nav-items span, .command-hint span, .command-hint kbd, .nav-foot div { display: none; }
+  .brand-mark div, .nav-items span, .command-hint span, .command-hint kbd, .nav-foot div, .theme-toggle small, .theme-toggle > span:not(.theme-toggle-dot) { display: none; }
   .nav-items { padding: var(--space-4) var(--space-2); }
   .nav-items button, .command-hint { justify-content: center; width: 46px; padding: 0; }
   .nav-foot { justify-content: center; padding: var(--space-3); }
