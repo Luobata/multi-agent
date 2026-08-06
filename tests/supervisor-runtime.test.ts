@@ -52,6 +52,29 @@ async function createTeam(service: WorkbenchService, providerId = "mock"): Promi
 }
 
 describe("Supervisor flow persistence and materialization", () => {
+  it("leaves maxDurationMs unbounded by default and lets an explicit null clear a set ceiling", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    // Omitted duration → no absolute ceiling.
+    const created = await service.createManagementPolicy({
+      id: "duration-policy",
+      allowedRoleIds: ["worker"],
+      instructions: "No fixed wall clock."
+    });
+    expect(created.limits.maxDurationMs).toBeUndefined();
+
+    // Setting a value pins a ceiling.
+    const withCeiling = await service.updateManagementPolicy("duration-policy", { limits: { maxDurationMs: 60_000 } });
+    expect(withCeiling.limits.maxDurationMs).toBe(60_000);
+
+    // A partial update that omits maxDurationMs inherits the current ceiling.
+    const inherited = await service.updateManagementPolicy("duration-policy", { instructions: "Same ceiling." });
+    expect(inherited.limits.maxDurationMs).toBe(60_000);
+
+    // An explicit null clears it back to unbounded.
+    const cleared = await service.updateManagementPolicy("duration-policy", { limits: { maxDurationMs: null } });
+    expect(cleared.limits.maxDurationMs).toBeUndefined();
+  });
+
   it("versions explicit flow changes while preserving the legacy no-Gate default and plan rendering", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     await createTeam(service);

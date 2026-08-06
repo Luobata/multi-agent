@@ -5276,7 +5276,10 @@ export class WorkbenchService {
     const id = requireId(input.id, "management policy id");
     const allowedRoleIds = [...new Set(input.allowedRoleIds.map((roleId) => requireId(roleId, "management policy role id")))];
     if (allowedRoleIds.length === 0) throw new Error(`management policy ${id} must allow at least one member role`);
-    const maxDurationMs = input.limits?.maxDurationMs ?? current?.limits.maxDurationMs;
+    // maxDurationMs: null explicitly clears the ceiling; undefined inherits the current value.
+    const maxDurationMs = input.limits?.maxDurationMs === null
+      ? undefined
+      : input.limits?.maxDurationMs ?? current?.limits.maxDurationMs;
     const limits: ManagementPolicyLimits = {
       maxRounds: input.limits?.maxRounds ?? current?.limits.maxRounds ?? 6,
       maxDelegations: input.limits?.maxDelegations ?? current?.limits.maxDelegations ?? 12,

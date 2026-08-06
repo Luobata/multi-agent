@@ -808,7 +808,8 @@ export interface ManagementPolicyCreateInput {
   description?: string;
   allowedRoleIds: string[];
   instructions: string;
-  limits?: Partial<ManagementPolicyLimits>;
+  /** maxDurationMs accepts null to explicitly clear an existing absolute ceiling (unbounded). */
+  limits?: Partial<Omit<ManagementPolicyLimits, "maxDurationMs">> & { maxDurationMs?: number | null };
   failure?: Partial<ManagementPolicyDefinition["failure"]>;
   completion?: Partial<ManagementPolicyDefinition["completion"]>;
 }
