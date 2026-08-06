@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import { loadManifest } from "../config/loadManifest.js";
+import { formatDateTime } from "../config/datetime.js";
 import { compilePlan, formatPlanMermaid, formatPlanText } from "../core/plan.js";
 import { resolveRoleProfile } from "../core/roles.js";
 import type { JsonObject, LoadedManifest } from "../core/types.js";
@@ -263,7 +264,8 @@ memory
       limit: options.limit,
       kind: options.kind
     });
-    process.stdout.write(`${JSON.stringify(hits, null, 2)}\n`);
+    const display = hits.map((h) => ({ ...h, displayCreatedAt: formatDateTime(h.createdAt) }));
+    process.stdout.write(`${JSON.stringify(display, null, 2)}\n`);
   });
 
 memory
