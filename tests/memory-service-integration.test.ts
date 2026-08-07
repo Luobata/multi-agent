@@ -26,6 +26,16 @@ describe("WorkbenchService memory integration", () => {
     expect(await svc.reindexMemory()).toBe(0);
   });
 
+  it("listMemoryScopes returns [] on a fresh service", async () => {
+    const svc = await freshService();
+    expect(await svc.listMemoryScopes()).toEqual([]);
+  });
+
+  it("listMemoryByScope returns [] for an unknown scope", async () => {
+    const svc = await freshService();
+    expect(await svc.listMemoryByScope("employee:nobody")).toEqual([]);
+  });
+
   // 主链路回归：一次真实 mock-provider employee 调用完成后，
   // 服务不因后台 memory 提炼而报错，且检索方法可安全调用。
   it("employee invocation completes even though memory extraction runs in background", async () => {
