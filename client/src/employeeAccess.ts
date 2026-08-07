@@ -21,7 +21,9 @@ export function systemEmployeeScope(employee: Employee): SystemEmployeeScope | u
 }
 
 export function isSystemEmployee(employee: Employee): boolean {
-  return systemEmployeeScope(employee) !== undefined;
+  // First-class systemRole is authoritative; legacy metadata scope remains a
+  // fallback so employees marked only via identity metadata still group as system.
+  return employee.systemRole !== undefined || systemEmployeeScope(employee) !== undefined;
 }
 
 export function isProjectEmployee(employee: Employee): boolean {

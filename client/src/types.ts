@@ -70,6 +70,8 @@ export interface Employee {
   permissions: { write: "none" | "artifacts-only" | "project"; tools?: string[] };
   contextPolicy: { historyLimit: number };
   presentation: { accent?: string; initials?: string; avatarUrl?: string };
+  /** First-class system-employee marker; absent means a business employee. */
+  systemRole?: "automatic" | "conversational";
   createdAt: string;
   updatedAt: string;
 }

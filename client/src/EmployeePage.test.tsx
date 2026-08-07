@@ -75,6 +75,14 @@ const projectEmployee: Employee = {
   template: { id: "orchestration-owner", version: 2 }
 };
 
+const roleSystemEmployee: Employee = {
+  ...employee,
+  id: "memory-summarizer",
+  identity: { ...employee.identity, displayName: "小忆 · 运行经验提炼器" },
+  description: "自动触发型系统员工。",
+  systemRole: "automatic"
+};
+
 const bootstrap: Bootstrap = {
   providers: [{ id: "mock", definition: { adapter: "mock", model: "deterministic-mock" } }],
   skills: [humanizer],
@@ -184,6 +192,25 @@ describe("Employee access grouping", () => {
     expect(html).toContain("orchestration-owner · 固定模板 v2");
     expect(html).toContain("quality.audit");
     expect(html).not.toContain("SYSTEM / INTERNAL ONLY");
+  });
+
+  it("groups a systemRole-marked Employee into the system section", () => {
+    const data: Bootstrap = { ...bootstrap, employees: [employee, roleSystemEmployee] };
+    const html = renderToStaticMarkup(<EmployeePage data={data} refresh={vi.fn()} notify={vi.fn()} />);
+
+    // The system section renders with a distinct heading and badge, and the
+    // systemRole-marked Employee sits inside it — not in the external roster.
+    expect(html).toContain("系统级员工");
+    expect(html).toContain("小忆 · 运行经验提炼器");
+    expect(html).toContain("system-level-badge");
+    const systemGroupStart = html.indexOf("employee-roster-group--system");
+    const roleEmployeeAt = html.indexOf("小忆 · 运行经验提炼器");
+    const externalGroupStart = html.indexOf("employee-roster-group--external");
+    expect(systemGroupStart).toBeGreaterThanOrEqual(0);
+    expect(roleEmployeeAt).toBeGreaterThan(systemGroupStart);
+    // The business employee stays out of the system group (before it in DOM order).
+    expect(html.indexOf("Product Manager")).toBeLessThan(systemGroupStart);
+    expect(html.indexOf("Product Manager")).toBeGreaterThan(externalGroupStart);
   });
 });
 
