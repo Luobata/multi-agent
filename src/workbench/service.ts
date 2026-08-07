@@ -2145,7 +2145,7 @@ export class WorkbenchService {
         .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
         .map((value) => value.trim());
       const materialized = await this.materialize(workflow, employees);
-      return await runWorkflow(materialized.loaded, materialized.workflowId, {
+      const runResult = await runWorkflow(materialized.loaded, materialized.workflowId, {
         runId: invocation.runId,
         input,
         providers: this.providers,
@@ -2194,6 +2194,22 @@ export class WorkbenchService {
         },
         onEvent: (event) => this.observeRunEvent(invocation.id, event, employees)
       });
+      // Supervisor runs are multi-node and finish as "passed"; attribute the
+      // distilled memory to the supervisor employee + project. Graph runs
+      // (including single-employee direct invocations) keep their own trigger
+      // in invokeResolvedEmployee, so this does not double-fire.
+      if (workflow.architecture === "supervisor") {
+        this.extractMemoryForRun(
+          runResult.run.id,
+          {
+            employeeId: workflow.supervisor.employeeId,
+            employeeVersion: workflow.supervisor.employeeVersion,
+            projectId: invocation.source.project
+          },
+          { invocationId: invocation.id, source: { caller: invocation.source.caller, contextId: invocation.source.contextId } }
+        );
+      }
+      return runResult;
     } catch (error) {
       await this.failInvocationActivity(invocation.id, error);
       throw error;

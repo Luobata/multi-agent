@@ -8,7 +8,7 @@ import { MemoryExtractor, type RunLike } from "../src/memory/extractor.js";
 import type { MemoryScope } from "../src/memory/types.js";
 
 const scope: MemoryScope = { employeeId: "r", employeeVersion: 1, projectId: "cart-fe" };
-const multiNodeRun: RunLike = { id: "run_1", status: "completed", nodes: { a: { status: "completed" }, b: { status: "completed" } } };
+const multiNodeRun: RunLike = { id: "run_1", status: "passed", nodes: { a: { status: "passed" }, b: { status: "passed" } } };
 let seq = 0;
 const makeId = () => `mem_${(seq += 1)}`;
 
@@ -32,7 +32,7 @@ describe("MemoryExtractor", () => {
 
   it("skips when gate rejects (trivial run)", async () => {
     const extractor = new MemoryExtractor(store, async () => ({ title: "t", content: "c" }), makeId);
-    const trivial: RunLike = { id: "run_2", status: "completed", nodes: { a: { status: "completed" } } };
+    const trivial: RunLike = { id: "run_2", status: "passed", nodes: { a: { status: "passed" } } };
     expect(await extractor.onRunComplete({ run: trivial, scope, provenance: {} })).toBeNull();
   });
 
