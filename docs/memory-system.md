@@ -49,11 +49,12 @@
 
 ## 检索入口
 
-三个入口最终都走 `WorkbenchService.searchMemory`：
+前三个是检索入口，最终都走 `WorkbenchService.searchMemory`；第 4 个是只读浏览 UI：
 
 1. **`search_memory` MCP 工具**：供 Agent 按需调用。参数 `query`（必填）、`employeeId`、`projectId`、`limit`（1–40）、`kind`。经 daemon 代理。
 2. **Daemon HTTP**：`POST /api/memory/search`，body 为 `{ query, employeeId?, projectId?, limit?, kind? }`，返回 `{ evidence: [...] }`。
 3. **CLI**：见下。
+4. **后台 UI「记忆档案」页**：档案室客户端左侧导航「记忆档案」。左栏按 employee/project 列出所有有 memory 的 scope 及条数；选中后中栏列出该 scope 的记录（可搜索、按 active/archived 过滤）；右栏详情默认高亮 summary，展开可见 kind/时间/scope/溯源字段，点 runId 跳转「运行卷宗」。只读——归档/删除仍走 CLI。对应只读接口 `GET /api/memory/scopes`、`GET /api/memory/scope?key=`。
 
 检索行为：
 
