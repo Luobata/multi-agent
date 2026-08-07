@@ -38,3 +38,103 @@ describe("systemRole field + helpers", () => {
     expect(e.systemRole).toBeUndefined();
   });
 });
+
+describe("block binding/publishing system employees", () => {
+  it("rejects publishing a system employee directly", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "sys-c",
+      identity: { displayName: "Conv", background: "b", responsibilities: ["r"] },
+      systemRole: "conversational"
+    });
+    await expect(svc.createPublication({
+      id: "pub-sys-c",
+      name: "System Publish",
+      target: { kind: "employee", id: "sys-c" }
+    })).rejects.toThrow(/系统员工/);
+  });
+
+  it("rejects publishing a workflow that contains a system employee member", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "sys-auto-wf",
+      identity: { displayName: "Auto", background: "b", responsibilities: ["r"] },
+      systemRole: "automatic"
+    });
+    await svc.createWorkflow({
+      id: "wf-with-system",
+      nodes: [{ id: "respond", employeeId: "sys-auto-wf" }]
+    });
+    await expect(svc.createPublication({
+      id: "pub-wf-system",
+      name: "Workflow Publish",
+      target: { kind: "workflow", id: "wf-with-system" }
+    })).rejects.toThrow(/系统员工/);
+  });
+
+  it("still publishes a business employee", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "biz-pub",
+      identity: { displayName: "Biz", background: "b", responsibilities: ["r"] }
+    });
+    const pub = await svc.createPublication({
+      id: "pub-biz",
+      name: "Biz Publish",
+      target: { kind: "employee", id: "biz-pub" }
+    });
+    expect(pub.status).toBe("active");
+  });
+
+  it("rejects binding a system employee to a project role", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "sys-bind",
+      identity: { displayName: "Auto", background: "b", responsibilities: ["r"] },
+      systemRole: "automatic"
+    });
+    await svc.createProject({
+      id: "proj-sys",
+      name: "Project Sys",
+      description: "System employee binding guard.",
+      rootPath: tmp(),
+      descriptorPath: path.join(tmp(), "multi-agent.project.yaml"),
+      connector: { kind: "generic", config: {} },
+      roles: [{
+        id: "role-a",
+        displayName: "Role A",
+        description: "Any role.",
+        permissions: { write: "none" }
+      }]
+    });
+    await expect(svc.saveProjectBinding("proj-sys", {
+      roles: [{ roleId: "role-a", employeeId: "sys-bind" }]
+    })).rejects.toThrow(/系统员工/);
+  });
+
+  it("still binds a business employee to a project role", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "biz-bind",
+      identity: { displayName: "Biz", background: "b", responsibilities: ["r"] }
+    });
+    await svc.createProject({
+      id: "proj-biz",
+      name: "Project Biz",
+      description: "Business employee binding.",
+      rootPath: tmp(),
+      descriptorPath: path.join(tmp(), "multi-agent.project.yaml"),
+      connector: { kind: "generic", config: {} },
+      roles: [{
+        id: "role-b",
+        displayName: "Role B",
+        description: "Any role.",
+        permissions: { write: "none" }
+      }]
+    });
+    const binding = await svc.saveProjectBinding("proj-biz", {
+      roles: [{ roleId: "role-b", employeeId: "biz-bind" }]
+    });
+    expect(binding.roles[0]?.employeeId).toBe("biz-bind");
+  });
+});

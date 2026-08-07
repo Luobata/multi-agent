@@ -4270,6 +4270,9 @@ export class WorkbenchService {
     if (!record) throw new Error(`employee not found: ${input.employeeId}`);
     if (record.current.status !== "active") throw new Error(`employee ${input.employeeId} is archived`);
     const employee = employeeVersion(record, input.employeeVersion);
+    if (isSystemEmployee(employee)) {
+      throw new Error(`员工 ${employee.id} 是系统员工（systemRole=${employee.systemRole}），不允许绑定为项目角色`);
+    }
     assertProjectRoleProviderCompatibility(state, role, employee);
     const scopedProjectId = internalProjectId(employee);
     if (scopedProjectId && scopedProjectId !== project.id) {
@@ -6012,8 +6015,19 @@ export class WorkbenchService {
     requireId(input.id, "publication id");
     const target = input.target.kind === "employee" ? this.getEmployee(input.target.id) : this.getWorkflow(input.target.id);
     if (target.status !== "active") throw new Error(`${input.target.kind} ${input.target.id} is archived`);
-    if (input.target.kind === "employee" && internalProjectId(target as EmployeeDefinition)) {
-      throw new Error(`employee ${input.target.id} is project-internal and cannot be published directly`);
+    if (input.target.kind === "employee") {
+      if (isSystemEmployee(target as EmployeeDefinition)) {
+        throw new Error(`员工 ${(target as EmployeeDefinition).id} 是系统员工（systemRole=${(target as EmployeeDefinition).systemRole}），不允许对外发布`);
+      }
+      if (internalProjectId(target as EmployeeDefinition)) {
+        throw new Error(`employee ${input.target.id} is project-internal and cannot be published directly`);
+      }
+    } else {
+      for (const member of this.resolveWorkflowEmployees(target as WorkbenchWorkflowDefinition).values()) {
+        if (isSystemEmployee(member)) {
+          throw new Error(`工作流 ${input.target.id} 含系统员工 ${member.id}（systemRole=${member.systemRole}），不允许对外发布`);
+        }
+      }
     }
     return this.store.mutate((state) => {
       if (state.publications[input.id]) throw new Error(`publication already exists: ${input.id}`);
