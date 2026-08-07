@@ -509,7 +509,7 @@ export function EmployeeAvatar({ displayName, presentation, className = "", titl
   </span>;
 }
 
-export function Icon({ name }: { name: "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "command" }) {
+export function Icon({ name }: { name: "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "command" | "memory" }) {
   const paths = {
     office: <><path d="M3 21h18M5 21V10l7-6 7 6v11"/><path d="M9 21v-6h6v6M8 11h2M14 11h2"/><path d="M12 8V5M12 6c-2 0-3-1-3-3 2 0 3 1 3 3Zm0-1c0-2 1-3 3-3 0 2-1 3-3 3Z"/></>,
     employees: <><path d="M5 21v-3l3-3h8l3 3v3"/><path d="M8 5h8v7H8zM10 8h1M13 8h1M10 11h4"/><path d="M6 7h2M16 7h2"/></>,
@@ -519,7 +519,8 @@ export function Icon({ name }: { name: "office" | "employees" | "projects" | "sk
     workflows: <><path d="M3 3h6v6H3zM15 15h6v6h-6z"/><path d="M9 6h4l4 4v5M14 12l3 3 3-3"/></>,
     runs: <><path d="M6 3h12v18H6zM9 8h6M9 12h6M9 16h4"/><path d="m16 2 .7 1.3L18 4l-1.3.7L16 6l-.7-1.3L14 4l1.3-.7L16 2Z"/></>,
     publications: <><path d="M4 10h16v11H4zM3 7h18v4H3zM12 7v14"/><path d="M12 7c-4 0-5-5-2-5 2 0 2 3 2 5Zm0 0c4 0 5-5 2-5-2 0-2 3-2 5Z"/></>,
-    command: <><path d="M4 5h16v14H4zM7 9l3 3-3 3M12 15h5"/></>
+    command: <><path d="M4 5h16v14H4zM7 9l3 3-3 3M12 15h5"/></>,
+    memory: <><path d="M5 3h11l3 3v15H5zM16 3v3h3"/><path d="M8 9h7M8 12h7M8 15h4"/><path d="M15 3v6l2-1.5L19 9V3"/></>
   };
   return <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" shapeRendering="crispEdges">{paths[name]}</svg>;
 }

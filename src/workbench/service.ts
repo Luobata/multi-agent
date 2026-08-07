@@ -1700,6 +1700,22 @@ export class WorkbenchService {
     return this.memoryStore.reindex();
   }
 
+  async listMemoryScopes(): Promise<Array<{ scopeKey: string; count: number }>> {
+    try {
+      return await this.memoryStore.listScopes();
+    } catch {
+      return [];
+    }
+  }
+
+  async listMemoryByScope(scopeKey: string): Promise<MemoryRecord[]> {
+    try {
+      return await this.memoryStore.listByScope(scopeKey);
+    } catch {
+      return [];
+    }
+  }
+
   private extractMemoryForRun(
     runId: string,
     scope: MemoryScope,

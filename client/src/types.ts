@@ -1279,3 +1279,34 @@ export interface ContextView {
   effectivePrompt?: { system: string; request: string; combined: string; runId: string; runDir: string };
   effectiveProfile?: EffectiveExecutionProfile;
 }
+
+export type MemoryKind = "run-summary" | "node-detail" | "preference";
+
+export interface MemoryScopeSummary {
+  scopeKey: string;
+  count: number;
+}
+
+export interface MemoryRecord {
+  id: string;
+  scope: { employeeId: string; employeeVersion: number; projectId?: string };
+  kind: MemoryKind;
+  title: string;
+  content: string;
+  provenance: { runId: string; traceId: string; invocationId?: string; nodeId?: string; source?: { caller?: string; contextId?: string } };
+  status: "active" | "archived";
+  tokens: number;
+  createdAt: string;
+  supersedesId: string | null;
+}
+
+export interface MemoryEvidence {
+  citationId: string;
+  memoryId: string;
+  kind: MemoryKind;
+  title: string;
+  content: string;
+  traceId: string;
+  score: number;
+  createdAt: string;
+}

@@ -74,4 +74,20 @@ describe("MemoryStore", () => {
     expect(count).toBe(1);
     expect((await store.listByScope("employee:researcher")).length).toBe(1);
   });
+
+  it("listScopes returns each scope key with its record count", async () => {
+    const store = await MemoryStore.open(dataRoot);
+    await store.put(sampleRecord({ id: "mem_1" }));
+    await store.put(sampleRecord({ id: "mem_2" }));
+    const scopes = await store.listScopes();
+    // sampleRecord scope 同时落 employee:researcher 与 project:cart-fe
+    const byKey = Object.fromEntries(scopes.map((s) => [s.scopeKey, s.count]));
+    expect(byKey["employee:researcher"]).toBe(2);
+    expect(byKey["project:cart-fe"]).toBe(2);
+  });
+
+  it("listScopes returns empty array on empty store", async () => {
+    const store = await MemoryStore.open(dataRoot);
+    expect(await store.listScopes()).toEqual([]);
+  });
 });

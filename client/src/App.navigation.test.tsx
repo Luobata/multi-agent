@@ -313,6 +313,19 @@ describe("App navigation freshness", () => {
     expect(FakeEventSource.urls).toEqual(["/api/activity/stream"]);
   });
 
+  it("shows the 记忆档案 nav item after the 运行卷宗 entry", async () => {
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    const labels = Array.from(container.querySelectorAll<HTMLButtonElement>(".side-nav .nav-items button"))
+      .map((button) => button.textContent ?? "");
+    expect(navButton("记忆档案")).toBeTruthy();
+    const runsIndex = labels.findIndex((label) => label.includes("运行卷宗"));
+    const memoryIndex = labels.findIndex((label) => label.includes("记忆档案"));
+    expect(memoryIndex).toBe(runsIndex + 1);
+  });
+
   it("shows the Futaba Kindergarten brand name", async () => {
     act(() => root.render(<App />));
     respond(0, bootstrapWith({}));
