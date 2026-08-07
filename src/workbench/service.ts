@@ -4727,6 +4727,14 @@ export class WorkbenchService {
     entrance?: EntrancePolicyExecutionSnapshot;
   }): Promise<EmployeeInvocationResult> {
     const { employee, input, source } = options;
+    // 自动型系统员工（systemRole=automatic）只能由系统内部触发（source.caller 以 "system:" 前缀标记），
+    // 不支持人工直接调用。守卫下沉到此汇聚点：invokeEmployee / invokePinnedEmployee / invokeProjectRole /
+    // invokePinnedProjectRole 都经此处，避免任一路径绕过。内部来源豁免必须保留，否则小忆
+    // （memory-summarizer，systemRole=automatic）经 extractMemoryForRun 的自动提炼会被拦死。
+    const isInternalCaller = typeof source.caller === "string" && source.caller.startsWith("system:");
+    if (systemRoleOf(employee) === "automatic" && !isInternalCaller) {
+      throw new Error(`员工 ${employee.id} 是自动型系统员工，只能由系统触发，不支持人工直接调用`);
+    }
     if (input.context !== undefined && (typeof input.context !== "object" || input.context === null || Array.isArray(input.context))) {
       throw new Error("invocation context must be a JSON object");
     }
@@ -4835,12 +4843,7 @@ export class WorkbenchService {
     requireText(input.message, "message");
     const current = this.getEmployee(employeeId);
     if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
-    // 自动型系统员工（systemRole=automatic）只能由系统内部触发（source.caller 以 "system:" 前缀标记），
-    // 不支持人工直接调用；否则会误伤如小忆（memory-summarizer）的自动提炼链路。
-    const isInternalCaller = typeof source.caller === "string" && source.caller.startsWith("system:");
-    if (systemRoleOf(current) === "automatic" && !isInternalCaller) {
-      throw new Error(`员工 ${employeeId} 是自动型系统员工，只能由系统触发，不支持人工直接调用`);
-    }
+    // 自动型系统员工守卫已下沉到 invokeResolvedEmployee 汇聚点，此处不再重复。
     const scopedProjectId = internalProjectId(current);
     if (scopedProjectId) throw new Error(`employee ${employeeId} is internal to project ${scopedProjectId}; invoke it through a project role`);
     const session = input.sessionId ? this.getSession(input.sessionId) : undefined;

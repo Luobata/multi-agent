@@ -181,4 +181,53 @@ describe("block human direct-invocation of automatic system employees", () => {
     const r = await svc.invokeEmployee("sys-conv2", { message: "hi" });
     expect(r.runId).toBeTruthy();
   });
+
+  it("blocks the invokeProjectRole bypass for an automatic system employee, but exempts internal callers", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    // 自动型系统员工只能绑定到「自身内部项目」的角色，这也是其唯一的项目角色调用入口。
+    await svc.createProject({
+      id: "sys-proj",
+      rootPath: tmp(),
+      descriptorPath: path.join(tmp(), "multi-agent.project.yaml"),
+      roles: [{ id: "auto-role", displayName: "Auto Role", description: "Internal automatic role.", instructions: "Work." }]
+    });
+    await svc.createEmployee({
+      id: "sys-auto-proj",
+      identity: {
+        displayName: "Auto",
+        background: "b",
+        responsibilities: ["r"],
+        metadata: { internalProjectId: "sys-proj", internalProjectRoleId: "auto-role" }
+      },
+      scope: { kind: "project", projectId: "sys-proj", projectVersion: 1 },
+      systemRole: "automatic"
+    });
+    await svc.saveProjectBinding("sys-proj", { roles: [{ roleId: "auto-role", employeeId: "sys-auto-proj" }] });
+    // 人工来源（默认 workbench，无 system: caller）经 invokeProjectRole 汇聚到 invokeResolvedEmployee 后应被拒。
+    await expect(svc.invokeProjectRole("sys-proj", "auto-role", { message: "hi" }))
+      .rejects.toThrow(/系统员工|自动|not.*directly/);
+    // 内部来源标记豁免；同一路径下自动提炼链路仍放行。
+    const r = await svc.invokeProjectRole("sys-proj", "auto-role", { message: "hi" }, { kind: "workbench", caller: "system:memory-extractor" });
+    expect(r.runId).toBeTruthy();
+  });
+
+  it("blocks the entrance-policy dispatch bypass for an automatic system employee, but exempts internal callers", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "sys-auto-ep", identity: { displayName: "Auto", background: "b", responsibilities: ["r"] }, systemRole: "automatic" });
+    await svc.createEntrancePolicy({
+      id: "auto-entrance",
+      direct: { mode: "employee", employeeId: "sys-auto-ep" },
+      default: { route: "direct" }
+    });
+    // dispatchEntrancePolicy -> invokePinnedEmployee -> invokeResolvedEmployee：人工来源应被拒。
+    await expect(svc.dispatchEntrancePolicy("auto-entrance", { route: "direct", tags: [], signals: {}, message: "hi", source: { kind: "workbench" } }))
+      .rejects.toThrow(/系统员工|自动|not.*directly/);
+    // 内部来源标记经同一路径应放行。
+    const result = await svc.dispatchEntrancePolicy(
+      "auto-entrance",
+      { route: "direct", tags: [], signals: {}, message: "hi", source: { kind: "workbench", caller: "system:memory-extractor" } }
+    );
+    expect(result.dispatch.kind).toBe("employee");
+    if (result.dispatch.kind === "employee") expect(result.dispatch.result.runId).toBeTruthy();
+  });
 });
