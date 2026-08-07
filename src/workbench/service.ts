@@ -47,7 +47,7 @@ import { RestrictedKnowledgeUrlFetcher } from "../knowledge/urlFetcher.js";
 import { webpageToKnowledgeDocuments } from "../knowledge/urlImport.js";
 import { MemoryStore } from "../memory/store.js";
 import { MemoryRetriever } from "../memory/retriever.js";
-import { MemoryExtractor, summarizerContent, type RunLike, type SummarizeFn } from "../memory/extractor.js";
+import { MemoryExtractor, summarizerContent, buildRunEvidence, type RunLike, type SummarizeFn } from "../memory/extractor.js";
 import type { MemoryEvidence, MemoryRecord, MemoryScope, MemorySearchQuery } from "../memory/types.js";
 import type {
   KnowledgeBaseCreateInput,
@@ -1663,8 +1663,8 @@ export class WorkbenchService {
         if (exists) {
           const result = await this.invokeEmployee(MEMORY_SUMMARIZER_ID, {
             message:
-              `提炼这次运行的可复用经验（<=120字）：runId=${run.id} status=${run.status} ` +
-              `nodes=${Object.keys(run.nodes).join(",")}`
+              `提炼这次运行的可复用经验（<=120字）。以下是运行证据（节点状态与产出、最终结果）：\n` +
+              buildRunEvidence(run)
           });
           const output = (result as { output?: unknown }).output;
           const content = summarizerContent(output);

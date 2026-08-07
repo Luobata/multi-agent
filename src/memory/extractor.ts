@@ -3,7 +3,38 @@ import { shouldExtract } from "./extractionGate.js";
 import type { MemoryStore } from "./store.js";
 import type { MemoryRecord, MemoryScope } from "./types.js";
 
-export type RunLike = { id: string; status: string; nodes: Record<string, { status: string }> };
+export type RunLike = {
+  id: string;
+  status: string;
+  nodes: Record<string, { status: string; output?: unknown }>;
+  output?: unknown;
+};
+
+const MAX_EVIDENCE_CHARS = 8000;
+const MAX_FIELD_CHARS = 1200;
+
+function renderOutput(output: unknown): string {
+  if (output === undefined || output === null) return "";
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+  return text.length > MAX_FIELD_CHARS ? `${text.slice(0, MAX_FIELD_CHARS)}…` : text;
+}
+
+/**
+ * Build a compact, human-readable evidence digest of a run for the summarizer:
+ * run id/status, each node's status and output, and the final run output. Bounded
+ * to MAX_EVIDENCE_CHARS so the prompt never blows up on large outputs.
+ */
+export function buildRunEvidence(run: RunLike): string {
+  const lines: string[] = [`run=${run.id} status=${run.status}`];
+  for (const [nodeId, node] of Object.entries(run.nodes ?? {})) {
+    const rendered = renderOutput(node.output);
+    lines.push(`- node ${nodeId} [${node.status}]${rendered ? `: ${rendered}` : ""}`);
+  }
+  const finalOutput = renderOutput(run.output);
+  if (finalOutput) lines.push(`final: ${finalOutput}`);
+  const text = lines.join("\n");
+  return text.length > MAX_EVIDENCE_CHARS ? `${text.slice(0, MAX_EVIDENCE_CHARS)}…` : text;
+}
 
 export type SummarizeFn = (input: {
   run: RunLike;
