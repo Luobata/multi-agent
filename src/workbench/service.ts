@@ -192,6 +192,11 @@ const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 /** Internal Employee id used to summarize completed runs into reusable memory. */
 const MEMORY_SUMMARIZER_ID = "memory-summarizer";
 
+/** Internal invocation caller marker. Callers prefixed with "system:" are treated as
+ * internal system triggers and are exempt from the human-direct-invocation guard on
+ * automatic system employees. */
+const INTERNAL_CALLER = "system:memory-extractor";
+
 
 function now(): string {
   return new Date().toISOString();
@@ -1673,11 +1678,17 @@ export class WorkbenchService {
       try {
         const exists = this.listEmployees(true).some((employee) => employee.id === MEMORY_SUMMARIZER_ID);
         if (exists) {
-          const result = await this.invokeEmployee(MEMORY_SUMMARIZER_ID, {
-            message:
-              `提炼这次运行的可复用经验（<=120字）。以下是运行证据（节点状态与产出、最终结果）：\n` +
-              buildRunEvidence(run)
-          });
+          const result = await this.invokeEmployee(
+            MEMORY_SUMMARIZER_ID,
+            {
+              message:
+                `提炼这次运行的可复用经验（<=120字）。以下是运行证据（节点状态与产出、最终结果）：\n` +
+                buildRunEvidence(run)
+            },
+            // 内部系统来源标记：豁免"禁人工直调 automatic 系统员工"守卫，
+            // 否则小忆（memory-summarizer，systemRole=automatic）的自动提炼会被拦死。
+            { kind: "workbench", caller: INTERNAL_CALLER }
+          );
           const output = (result as { output?: unknown }).output;
           const content = summarizerContent(output);
           if (content) return { title: `运行 ${run.id}`, content };
@@ -4820,6 +4831,12 @@ export class WorkbenchService {
     requireText(input.message, "message");
     const current = this.getEmployee(employeeId);
     if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
+    // 自动型系统员工（systemRole=automatic）只能由系统内部触发（source.caller 以 "system:" 前缀标记），
+    // 不支持人工直接调用；否则会误伤如小忆（memory-summarizer）的自动提炼链路。
+    const isInternalCaller = typeof source.caller === "string" && source.caller.startsWith("system:");
+    if (systemRoleOf(current) === "automatic" && !isInternalCaller) {
+      throw new Error(`员工 ${employeeId} 是自动型系统员工，只能由系统触发，不支持人工直接调用`);
+    }
     const scopedProjectId = internalProjectId(current);
     if (scopedProjectId) throw new Error(`employee ${employeeId} is internal to project ${scopedProjectId}; invoke it through a project role`);
     const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
