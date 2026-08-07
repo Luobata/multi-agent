@@ -38,6 +38,32 @@
 - **失败降级**：整个提炼链路 best-effort，任何异常都被吞掉，绝不影响主运行链路。
 - **防递归**：提炼器 Employee 自身的运行不再触发提炼。
 
+## 配置提炼器 Employee（让 content 变成真正的 LLM 提炼）
+
+不配提炼器时，content 只是规则摘要（如 `状态=passed，节点数=3`）。要得到真正的经验文本，建一个 **id 固定为 `memory-summarizer`** 的员工，系统会自动识别并调用它。仓库提供了模板：
+
+- Provider：`templates/workbench/codex-memory-summarizer.provider.json`（`adapter: codex`，纯提炼、不挂 MCP 控制面）
+- Employee：`templates/workbench/memory-summarizer.employee.json`（`scope: global`，输出 `{ summary }`，systemPrompt 要求 ≤120 字经验正文）
+
+创建步骤（Provider 经 daemon HTTP，Employee 经 CLI）：
+
+```bash
+# 1) 启动 daemon
+npm run workbench
+# 2) 注册提炼器 Provider（另开一个终端）
+curl -X PUT http://127.0.0.1:4318/api/providers/codex-memory-summarizer \
+  -H 'content-type: application/json' \
+  --data-binary @templates/workbench/codex-memory-summarizer.provider.json
+# 3) 创建提炼器 Employee
+npm run cli -- workbench employee create templates/workbench/memory-summarizer.employee.json
+```
+
+说明：
+
+- 提炼器读运行的 `{summary}` 字段作为 memory 的 `content`（结构化 output 会取 `summary` 字段，避免 JSON 噪声）。
+- **依赖本地 `codex` 命令**：`adapter: codex` 通过 `spawn` 启动本地 Codex CLI；若机器上没有可用的 `codex`（或未设 `MULTI_AGENT_CODEX_COMMAND`），调用会失败并**降级回规则摘要**——不会崩，但 content 仍是 `状态=…，节点数=…`。
+- 换成其它真模型 Provider 时，把 Employee 的 `providerId` 指过去即可；注意 `codex` adapter 强制要求 `outputProtocol: json` 且员工必须带 `outputSchema`。
+
 ## 归属维度（scope）
 
 每条记录归属两个维度：

@@ -745,8 +745,10 @@ describe("Local Agent Workbench", () => {
 
     const records = await service.listMemoryByScope(scopeKey);
     expect(records.length).toBeGreaterThan(0);
-    expect(records[0].kind).toBe("run-summary");
-    expect(records[0].provenance.runId).toBe(result.run.id);
+    const [first] = records;
+    expect(first).toBeDefined();
+    expect(first!.kind).toBe("run-summary");
+    expect(first!.provenance.runId).toBe(result.run.id);
   });
 
   it("runs an MCP-triggered Supervisor Workflow in the caller project root", async () => {

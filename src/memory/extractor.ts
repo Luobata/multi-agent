@@ -16,6 +16,23 @@ function estimateTokens(value: string): number {
   return Math.max(1, han + Math.ceil(remaining / 4));
 }
 
+/**
+ * Derive memory content from a summarizer employee's output. A codex-backed
+ * summarizer must declare an outputSchema, so its output is a JSON object; we
+ * prefer a non-empty string `summary` field for clean content, and fall back to
+ * a JSON dump only when no usable summary is present. Plain-string outputs
+ * (e.g. mock/raw providers) pass through unchanged.
+ */
+export function summarizerContent(output: unknown): string {
+  if (output === undefined || output === null) return "";
+  if (typeof output === "string") return output;
+  if (typeof output === "object" && !Array.isArray(output)) {
+    const summary = (output as { summary?: unknown }).summary;
+    if (typeof summary === "string" && summary.trim()) return summary.trim();
+  }
+  return JSON.stringify(output);
+}
+
 export class MemoryExtractor {
   constructor(
     private readonly store: MemoryStore,
