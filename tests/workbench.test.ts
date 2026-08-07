@@ -684,6 +684,71 @@ describe("Local Agent Workbench", () => {
     await expect(service.restoreManagementPolicy(policy.id)).resolves.toMatchObject({ status: "active", version: 4 });
   });
 
+  it("distills a memory from a passed multi-node Supervisor Workflow run", async () => {
+    const providers: ProviderRegistry = new Map([["scripted-supervisor", {
+      id: "scripted-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role === "supervisor" && round === 1) {
+          return { stdout: JSON.stringify({ action: "delegate", summary: "Collect evidence.", assignments: [{ roleId: "researcher", task: "Research it." }] }), stderr: "", durationMs: 1 };
+        }
+        if (role === "supervisor") {
+          return { stdout: JSON.stringify({ action: "finish", summary: "Done.", result: { answer: "ok" } }), stderr: "", durationMs: 1 };
+        }
+        return { stdout: JSON.stringify({ message: "Research complete." }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("scripted-provider", { adapter: "scripted-supervisor", model: "supervisor-test-model", outputProtocol: "json" });
+    const manager = await service.createEmployee({
+      id: "mem-manager",
+      identity: { displayName: "Mem Manager", background: "Coordinates.", responsibilities: ["Delegate"] },
+      providerId: "scripted-provider"
+    });
+    const researcher = await service.createEmployee({
+      id: "mem-researcher",
+      identity: { displayName: "Mem Researcher", background: "Collects.", responsibilities: ["Research"] },
+      providerId: "scripted-provider"
+    });
+    const policy = await service.createManagementPolicy({
+      id: "mem-policy",
+      displayName: "Mem Policy",
+      description: "Delegate then finish.",
+      allowedRoleIds: ["researcher"],
+      instructions: "Delegate then finish.",
+      limits: { maxRounds: 4, maxDelegations: 4, maxParallelDelegations: 2, maxDurationMs: 60_000 }
+    });
+    const workflow = await service.createWorkflow({
+      id: "mem-supervised",
+      architecture: "supervisor",
+      description: "Team that produces a memory.",
+      supervisor: { employeeId: manager.id },
+      managementPolicy: { id: policy.id },
+      members: [{ roleId: "researcher", description: "Collect.", employeeId: researcher.id }]
+    });
+
+    const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Investigate" });
+    expect(result.run.status).toBe("passed");
+    expect(Object.keys(result.run.nodes).length).toBeGreaterThan(1);
+
+    // Extraction is a fire-and-forget side path; poll until the supervisor's scope appears.
+    const scopeKey = `employee:${manager.id}`;
+    let scopes: Array<{ scopeKey: string; count: number }> = [];
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      scopes = await service.listMemoryScopes();
+      if (scopes.some((entry) => entry.scopeKey === scopeKey && entry.count > 0)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(scopes.some((entry) => entry.scopeKey === scopeKey && entry.count > 0)).toBe(true);
+
+    const records = await service.listMemoryByScope(scopeKey);
+    expect(records.length).toBeGreaterThan(0);
+    expect(records[0].kind).toBe("run-summary");
+    expect(records[0].provenance.runId).toBe(result.run.id);
+  });
+
   it("runs an MCP-triggered Supervisor Workflow in the caller project root", async () => {
     const callerRoot = temporaryRoot();
     const providerCwds: string[] = [];
