@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { EmployeePage } from "./EmployeePage";
 import { KnowledgePage } from "./KnowledgePage";
+import { MemoryPage } from "./MemoryPage";
 import { DaemonGate, Icon, Modal } from "./components";
 import { OfficePage } from "./OfficePage";
 import { PublicationsPage } from "./PublicationsPage";
@@ -200,7 +201,7 @@ export function App() {
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
       {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} />}
-      {page === "memory" && <div id="main-content">记忆档案（施工中）</div>}
+      {page === "memory" && <MemoryPage notify={notify} onOpenRun={() => navigate("runs")} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
     </div></DaemonGate>
     {notice && <div className={`toast toast--${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"} aria-live={notice.kind === "error" ? "assertive" : "polite"} aria-atomic="true">
