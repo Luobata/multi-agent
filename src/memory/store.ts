@@ -100,6 +100,25 @@ export class MemoryStore {
     return records;
   }
 
+  async listScopes(): Promise<Array<{ scopeKey: string; count: number }>> {
+    const indexDir = path.join(this.root, "index");
+    let files: string[];
+    try {
+      files = (await fs.readdir(indexDir)).filter((name) => name.endsWith(".json"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const scopes: Array<{ scopeKey: string; count: number }> = [];
+    for (const file of files) {
+      const index = await readJson<ScopeIndex>(path.join(indexDir, file));
+      if (!index) continue;
+      scopes.push({ scopeKey: index.scopeKey, count: index.memoryIds.length });
+    }
+    scopes.sort((left, right) => left.scopeKey.localeCompare(right.scopeKey));
+    return scopes;
+  }
+
   async reindex(): Promise<number> {
     const recordsDir = path.join(this.root, "records");
     const indexDir = path.join(this.root, "index");
