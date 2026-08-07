@@ -4513,7 +4513,15 @@ export class WorkbenchService {
     });
   }
 
-  async updateEmployee(id: string, input: EmployeeUpdateInput): Promise<EmployeeDefinition> {
+  async updateEmployee(
+    id: string,
+    input: EmployeeUpdateInput,
+    options?: { allowSystemEmployeeMutation?: boolean }
+  ): Promise<EmployeeDefinition> {
+    const current = this.getEmployee(id);
+    if (isSystemEmployee(current) && !options?.allowSystemEmployeeMutation) {
+      throw new Error(`员工 ${id} 是系统员工，默认受保护；如确需修改请显式确认（allowSystemEmployeeMutation）`);
+    }
     return this.store.mutate((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);
@@ -4575,7 +4583,14 @@ export class WorkbenchService {
     });
   }
 
-  async archiveEmployee(id: string): Promise<EmployeeDefinition> {
+  async archiveEmployee(
+    id: string,
+    options?: { allowSystemEmployeeMutation?: boolean }
+  ): Promise<EmployeeDefinition> {
+    const current = this.getEmployee(id);
+    if (isSystemEmployee(current) && !options?.allowSystemEmployeeMutation) {
+      throw new Error(`员工 ${id} 是系统员工，默认受保护；如确需归档请显式确认（allowSystemEmployeeMutation）`);
+    }
     return this.store.mutate((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);

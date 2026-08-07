@@ -138,3 +138,23 @@ describe("block binding/publishing system employees", () => {
     expect(binding.roles[0]?.employeeId).toBe("biz-bind");
   });
 });
+
+describe("soft-protect system employees from edit/archive", () => {
+  it("soft-protects system employees from edit/archive unless confirmed", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "sys-a", identity: { displayName: "A", background: "b", responsibilities: ["r"] }, systemRole: "automatic" });
+    await expect(svc.updateEmployee("sys-a", { description: "x" })).rejects.toThrow(/系统员工|confirm/);
+    const updated = await svc.updateEmployee("sys-a", { description: "x" }, { allowSystemEmployeeMutation: true });
+    expect(updated.description).toBe("x");
+    await expect(svc.archiveEmployee("sys-a")).rejects.toThrow(/系统员工|confirm/);
+    const archived = await svc.archiveEmployee("sys-a", { allowSystemEmployeeMutation: true });
+    expect(archived.status).toBe("archived");
+  });
+
+  it("does not affect business employees", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "biz2", identity: { displayName: "B", background: "b", responsibilities: ["r"] } });
+    const u = await svc.updateEmployee("biz2", { description: "y" });
+    expect(u.description).toBe("y");
+  });
+});
