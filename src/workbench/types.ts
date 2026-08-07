@@ -85,6 +85,7 @@ export interface EmployeeDefinition {
   verdict?: RoleVerdictDefinition;
   contextPolicy: EmployeeContextPolicy;
   presentation: EmployeePresentation;
+  systemRole?: "automatic" | "conversational";
   createdAt: string;
   updatedAt: string;
 }
@@ -791,6 +792,7 @@ export interface EmployeeCreateInput {
   verdict?: RoleVerdictDefinition | null;
   contextPolicy?: Partial<EmployeeContextPolicy>;
   presentation?: EmployeePresentation;
+  systemRole?: "automatic" | "conversational";
 }
 
 export type EmployeeUpdateInput = Partial<Omit<EmployeeCreateInput, "id">>;

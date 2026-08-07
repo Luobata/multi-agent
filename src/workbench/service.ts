@@ -477,6 +477,14 @@ function normalizeKnowledgeGrants(
   return profileIds.map((profileId) => normalized.find((grant) => grant.profileId === profileId)!);
 }
 
+export function systemRoleOf(e: { systemRole?: string }): "automatic" | "conversational" | undefined {
+  return e.systemRole === "automatic" || e.systemRole === "conversational" ? e.systemRole : undefined;
+}
+
+export function isSystemEmployee(e: { systemRole?: string }): boolean {
+  return systemRoleOf(e) !== undefined;
+}
+
 function buildEmployeeDefinition(
   state: WorkbenchState,
   input: EmployeeCreateInput,
@@ -507,6 +515,9 @@ function buildEmployeeDefinition(
   validateSchema(outputSchema, `employee ${id} outputSchema`);
   const verdict = input.verdict ?? undefined;
   validateVerdict(verdict, `employee ${id}`);
+  if (input.systemRole !== undefined && input.systemRole !== "automatic" && input.systemRole !== "conversational") {
+    throw new Error(`employee ${id} systemRole must be "automatic" or "conversational"`);
+  }
   return {
     id,
     version: 1,
@@ -535,6 +546,7 @@ function buildEmployeeDefinition(
     verdict,
     contextPolicy: { historyLimit: Math.max(0, Math.min(100, input.contextPolicy?.historyLimit ?? 20)) },
     presentation: input.presentation ?? {},
+    systemRole: input.systemRole,
     createdAt: timestamp,
     updatedAt: timestamp
   };
