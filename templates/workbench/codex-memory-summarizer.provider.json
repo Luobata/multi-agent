@@ -1,0 +1,8 @@
+{
+  "adapter": "codex",
+  "command": "codex",
+  "outputProtocol": "json",
+  "filesystemIsolation": "workspace-read-only",
+  "approvalPolicy": "never",
+  "timeoutMs": 120000
+}

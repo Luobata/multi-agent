@@ -47,7 +47,7 @@ import { RestrictedKnowledgeUrlFetcher } from "../knowledge/urlFetcher.js";
 import { webpageToKnowledgeDocuments } from "../knowledge/urlImport.js";
 import { MemoryStore } from "../memory/store.js";
 import { MemoryRetriever } from "../memory/retriever.js";
-import { MemoryExtractor, type RunLike, type SummarizeFn } from "../memory/extractor.js";
+import { MemoryExtractor, summarizerContent, type RunLike, type SummarizeFn } from "../memory/extractor.js";
 import type { MemoryEvidence, MemoryRecord, MemoryScope, MemorySearchQuery } from "../memory/types.js";
 import type {
   KnowledgeBaseCreateInput,
@@ -1667,7 +1667,7 @@ export class WorkbenchService {
               `nodes=${Object.keys(run.nodes).join(",")}`
           });
           const output = (result as { output?: unknown }).output;
-          const content = typeof output === "string" ? output : JSON.stringify(output ?? "");
+          const content = summarizerContent(output);
           if (content) return { title: `运行 ${run.id}`, content };
         }
       } catch {
