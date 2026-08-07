@@ -12,12 +12,12 @@ import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
 import { applyTheme, DEFAULT_THEME, readTheme, type ThemeName } from "./theme";
 
-type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications";
+type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "memory";
 const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], gateValidators: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
 
 function pageFromHash(): Page {
   const value = window.location.hash.replace("#", "");
-  return ["office", "employees", "projects", "skills", "knowledge", "workflows", "runs", "publications"].includes(value) ? value as Page : "office";
+  return ["office", "employees", "projects", "skills", "knowledge", "workflows", "runs", "publications", "memory"].includes(value) ? value as Page : "office";
 }
 
 function upsertById<T extends { id: string }>(items: T[], value: T): T[] {
@@ -169,6 +169,7 @@ export function App() {
     { id: "knowledge" as const, label: "知识控制台", icon: "knowledge" as const },
     { id: "workflows" as const, label: "协作编排", icon: "workflows" as const },
     { id: "runs" as const, label: "运行卷宗", icon: "runs" as const },
+    { id: "memory" as const, label: "记忆档案", icon: "memory" as const },
     { id: "publications" as const, label: "调用包", icon: "publications" as const }
   ];
 
@@ -199,6 +200,7 @@ export function App() {
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
       {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} />}
+      {page === "memory" && <div id="main-content">记忆档案（施工中）</div>}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
     </div></DaemonGate>
     {notice && <div className={`toast toast--${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"} aria-live={notice.kind === "error" ? "assertive" : "polite"} aria-atomic="true">
