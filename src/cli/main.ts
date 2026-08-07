@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import { loadManifest } from "../config/loadManifest.js";
+import { formatDateTime } from "../config/datetime.js";
 import { compilePlan, formatPlanMermaid, formatPlanText } from "../core/plan.js";
 import { resolveRoleProfile } from "../core/roles.js";
 import type { JsonObject, LoadedManifest } from "../core/types.js";
@@ -16,6 +17,7 @@ import type {
 } from "../knowledge/types.js";
 import { runWorkflow } from "../runtime/runner.js";
 import { startDaemon } from "../daemon/server.js";
+import type { MemoryKind } from "../memory/types.js";
 import { WorkbenchService } from "../workbench/service.js";
 import type {
   EmployeeCreateInput,
@@ -245,6 +247,38 @@ employee
   .argument("[profiles...]", "Knowledge Profile ids")
   .action(async (id: string, profiles: string[]) => {
     process.stdout.write(`${JSON.stringify(await (await workbenchService()).updateEmployee(id, { knowledgeProfileIds: profiles }), null, 2)}\n`);
+  });
+
+const memory = workbench.command("memory").description("检索、归档与重建本地 memory");
+
+memory
+  .command("search <query>")
+  .option("--employee <id>", "限定 employee scope")
+  .option("--project <id>", "限定 project scope")
+  .option("--limit <n>", "返回条数上限", (v: string) => Number.parseInt(v, 10))
+  .option("--kind <kind>", "run-summary | node-detail | preference")
+  .action(async (query: string, options: { employee?: string; project?: string; limit?: number; kind?: MemoryKind }) => {
+    const hits = await (await workbenchService()).searchMemory({
+      query,
+      scope: { employeeId: options.employee, projectId: options.project },
+      limit: options.limit,
+      kind: options.kind
+    });
+    const display = hits.map((h) => ({ ...h, displayCreatedAt: formatDateTime(h.createdAt) }));
+    process.stdout.write(`${JSON.stringify(display, null, 2)}\n`);
+  });
+
+memory
+  .command("archive <id>")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).archiveMemory(id), null, 2)}\n`);
+  });
+
+memory
+  .command("reindex")
+  .action(async () => {
+    const count = await (await workbenchService()).reindexMemory();
+    process.stdout.write(`${JSON.stringify({ reindexed: count }, null, 2)}\n`);
   });
 
 workbench
