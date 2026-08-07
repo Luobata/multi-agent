@@ -120,6 +120,43 @@ describe("RunsPage dossier validator verdict + e2e evidence", () => {
   });
 });
 
+describe("RunsPage pendingRunId cross-page selection", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  const fetchMock = vi.fn();
+  const onConsumePending = vi.fn();
+
+  beforeEach(async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: runs }) });
+      if (url.startsWith("/api/runs/")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: runs.find((run) => url.endsWith(run.id)) }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root.render(<RunsPage notify={vi.fn()} pendingRunId="run-graph-1" onConsumePending={onConsumePending} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    document.body.replaceChildren();
+    fetchMock.mockReset();
+    onConsumePending.mockReset();
+  });
+
+  it("auto-selects the run named by pendingRunId once loaded, not the first run", () => {
+    expect(container.querySelector("#run-graph-1")?.classList.contains("selected")).toBe(true);
+    expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
+    expect(onConsumePending).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("filterRuns", () => {
   it("filters by category and project", () => {
     expect(filterRuns(runs, { category: "single", project: "all" }).map((run) => run.id)).toEqual(["run-single-1"]);

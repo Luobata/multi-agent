@@ -66,6 +66,7 @@ export function App() {
   const [activityStream, setActivityStream] = useState<"connecting" | "live" | "reconnecting" | "offline">("connecting");
   const [notice, setNotice] = useState<{ message: string; kind: "success" | "error" }>();
   const [commandOpen, setCommandOpen] = useState(false);
+  const [pendingRunId, setPendingRunId] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [theme, setTheme] = useState<ThemeName>(() => (typeof window === "undefined" ? DEFAULT_THEME : readTheme()));
   useEffect(() => { applyTheme(theme); }, [theme]);
@@ -200,8 +201,8 @@ export function App() {
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
-      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} />}
-      {page === "memory" && <MemoryPage notify={notify} onOpenRun={() => navigate("runs")} />}
+      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} pendingRunId={pendingRunId} onConsumePending={() => setPendingRunId("")} />}
+      {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
     </div></DaemonGate>
     {notice && <div className={`toast toast--${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"} aria-live={notice.kind === "error" ? "assertive" : "polite"} aria-atomic="true">
