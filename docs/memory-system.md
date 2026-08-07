@@ -114,6 +114,17 @@ workbench memory reindex
 - 存储层：`createdAt` 一律 ISO 8601。
 - 展示层：`formatDateTime(iso)` 输出本地时区 `YYYY-MM-DD HH:mm:ss`；非法或空输入原样返回。
 
+## 运维与排障（实战踩坑）
+
+跑真实运行却看不到 memory 时，按下面从上到下排查：
+
+- **daemon 跑的是 `dist/` 编译产物，且长驻不自动重启**。改了 `src/` 下的提炼/gate/路由代码后，必须 `npm run build` 重新编译，再重启 daemon（`kill` 掉监听 4318 的进程，环境会自动拉起新进程；用 `ps -eo pid,etime,command | grep dist/daemon/main` 确认 `etime` 是新的）。只 merge 代码但不重建/重启，跑的还是旧逻辑——这是最容易踩的坑。
+- **只有能过价值 gate 的运行才产出**：成功状态是 `passed`（不是 `completed`）；单节点运行（含普通单员工直接调用）按 trivial 跳过；多节点 supervisor 运行、以及 `failed`/`blocked` 运行才提炼。要触发提炼，跑一个会 delegate 的多节点 supervisor workflow。
+- **提炼是运行结束后的异步旁路，且自身要调 codex**，落盘有分钟级延迟。运行 `passed` 后别急着断定失败，等几分钟或轮询 `~/.multi-agent/workbench/memory/records/`。
+- **content 是"无法提炼具体经验"之类的空话**：多半是提炼器输入或运行本身缺少节点产出证据；正常的多角色运行应能提炼出可复用经验。
+- **content 是 `状态=passed，节点数=N` 规则摘要**：说明没走到 LLM 提炼——要么没建 `memory-summarizer` 员工，要么其 provider 调用失败（如本地 `codex` 命令不可用）触发了降级。
+- **memory 故障永不影响主运行**：提炼整链 best-effort，异常被吞，Run 证据始终是权威。
+
 ## 非目标（当前**未**实现）
 
 以下能力不在当前实现范围内，文档不描述其行为：
