@@ -1,50 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="256" height="256" shape-rendering="crispEdges" role="img" aria-label="像素乐园帐篷图标">
-  <!-- Original 16x16 pixel carousel tent for the Healing Pixel Dossier workbench.
-       Palette from tokens.css: sky #9bcfe0, cloud #fffdf1, ink #294b5a,
-       season-rose #e49aae, season-spring #9ed6ae, season-summer #f2cf78, sky-deep #70aec5. -->
-  <rect width="16" height="16" rx="2" fill="#9bcfe0"/>
-  <!-- cream clouds -->
-  <g fill="#fffdf1">
-    <rect x="1" y="2" width="3" height="1"/><rect x="2" y="1" width="1" height="1"/>
-    <rect x="12" y="2" width="3" height="1"/><rect x="13" y="1" width="1" height="1"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="256" height="256" shape-rendering="crispEdges" role="img" aria-label="蜡笔双叶幼苗图标">
+  <!-- Original 16x16 crayon twin-leaf sprout for the Futaba Kindergarten workbench.
+       Palette from tokens.css crayon skin: sky #f6d97a, cloud #fffaf0, ink #4a3320,
+       season-spring #7fc06a, seal-green #4f8f3a, sky-deep #e7b84e. -->
+  <rect width="16" height="16" rx="2" fill="#f6d97a"/>
+  <!-- warm sun-yellow highlight corners -->
+  <g fill="#fffaf0">
+    <rect x="1" y="1" width="2" height="1"/><rect x="1" y="2" width="1" height="1"/>
+    <rect x="13" y="1" width="2" height="1"/><rect x="14" y="2" width="1" height="1"/>
   </g>
-  <!-- mint grass ground -->
-  <rect x="0" y="14" width="16" height="2" fill="#9ed6ae"/>
-  <!-- flag pole and tent ink structure -->
-  <g fill="#294b5a">
-    <rect x="8" y="0" width="1" height="3"/>
-    <rect x="7" y="4" width="1" height="1"/><rect x="9" y="4" width="1" height="1"/>
-    <rect x="6" y="5" width="1" height="1"/><rect x="10" y="5" width="1" height="1"/>
-    <rect x="5" y="6" width="1" height="1"/><rect x="11" y="6" width="1" height="1"/>
-    <rect x="4" y="7" width="1" height="1"/><rect x="12" y="7" width="1" height="1"/>
-    <rect x="4" y="8" width="1" height="1"/><rect x="12" y="8" width="1" height="1"/>
-    <rect x="4" y="9" width="1" height="4"/><rect x="12" y="9" width="1" height="4"/>
-    <rect x="4" y="13" width="9" height="1"/>
-    <rect x="8" y="10" width="1" height="1"/>
-    <rect x="7" y="11" width="3" height="2"/>
+  <!-- soil ground -->
+  <rect x="0" y="14" width="16" height="2" fill="#e7b84e"/>
+  <!-- centered crayon stem in warm brown ink -->
+  <rect x="7" y="7" width="2" height="7" fill="#4a3320"/>
+  <!-- left leaf: ink outline -->
+  <g fill="#4a3320">
+    <rect x="3" y="4" width="1" height="1"/>
+    <rect x="2" y="5" width="1" height="3"/>
+    <rect x="3" y="8" width="4" height="1"/>
   </g>
-  <!-- rose stripes, flag and flower -->
-  <g fill="#e49aae">
-    <rect x="9" y="0" width="2" height="1"/><rect x="9" y="1" width="1" height="1"/>
-    <rect x="8" y="3" width="1" height="3"/>
-    <rect x="6" y="6" width="1" height="1"/><rect x="10" y="6" width="1" height="1"/>
-    <rect x="6" y="7" width="1" height="1"/><rect x="8" y="7" width="1" height="1"/><rect x="10" y="7" width="1" height="1"/>
-    <rect x="6" y="8" width="1" height="1"/><rect x="8" y="8" width="1" height="1"/><rect x="10" y="8" width="1" height="1"/>
-    <rect x="2" y="13" width="1" height="1"/>
+  <!-- left leaf: spring green body, tucks into stem at x=7 -->
+  <g fill="#7fc06a">
+    <rect x="3" y="5" width="4" height="1"/>
+    <rect x="3" y="6" width="4" height="1"/>
+    <rect x="4" y="7" width="3" height="1"/>
   </g>
-  <!-- cream stripes and tent body -->
-  <g fill="#fffdf1">
-    <rect x="7" y="5" width="1" height="1"/><rect x="9" y="5" width="1" height="1"/>
-    <rect x="7" y="6" width="1" height="1"/><rect x="9" y="6" width="1" height="1"/>
-    <rect x="5" y="7" width="1" height="1"/><rect x="7" y="7" width="1" height="1"/><rect x="9" y="7" width="1" height="1"/><rect x="11" y="7" width="1" height="1"/>
-    <rect x="5" y="8" width="1" height="1"/><rect x="7" y="8" width="1" height="1"/><rect x="9" y="8" width="1" height="1"/><rect x="11" y="8" width="1" height="1"/>
-    <rect x="5" y="9" width="7" height="1"/>
-    <rect x="5" y="10" width="3" height="1"/><rect x="9" y="10" width="3" height="1"/>
-    <rect x="5" y="11" width="1" height="2"/><rect x="11" y="11" width="1" height="2"/>
-    <rect x="6" y="12" width="1" height="1"/><rect x="10" y="12" width="1" height="1"/>
+  <!-- right leaf: ink outline (mirror of left) -->
+  <g fill="#4a3320">
+    <rect x="12" y="4" width="1" height="1"/>
+    <rect x="13" y="5" width="1" height="3"/>
+    <rect x="9" y="8" width="4" height="1"/>
   </g>
-  <!-- sky-deep windows and summer flower -->
-  <rect x="6" y="11" width="1" height="1" fill="#70aec5"/>
-  <rect x="10" y="11" width="1" height="1" fill="#70aec5"/>
-  <rect x="13" y="13" width="1" height="1" fill="#f2cf78"/>
+  <!-- right leaf: deeper seal green body, tucks into stem at x=9 -->
+  <g fill="#4f8f3a">
+    <rect x="9" y="5" width="4" height="1"/>
+    <rect x="9" y="6" width="4" height="1"/>
+    <rect x="9" y="7" width="3" height="1"/>
+  </g>
+  <!-- leaf shine specks -->
+  <rect x="4" y="5" width="1" height="1" fill="#fffaf0"/>
+  <rect x="11" y="5" width="1" height="1" fill="#fffaf0"/>
 </svg>
