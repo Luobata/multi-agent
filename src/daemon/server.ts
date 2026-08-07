@@ -146,6 +146,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       knowledgeChanges: service.listKnowledgeChangeRequests(),
       configurationProposals: service.listConfigurationProposals(),
       architectureTemplates: service.listArchitectureTemplates(),
+      gateValidators: service.listGateValidators(),
       employees: service.listEmployees(true),
       employeeTemplates: service.listEmployeeTemplates(true),
       managementPolicies: service.listManagementPolicies(true),

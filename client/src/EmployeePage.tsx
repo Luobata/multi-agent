@@ -87,6 +87,45 @@ const defaultOutputSchema = JSON.stringify({
   properties: { message: { type: "string" } }
 }, null, 2);
 
+// Layer-1b e2e evidence output contract — identical in shape to the 小米象 tester
+// template (templates/workbench/xiaomixiang-tester.employee.json `outputSchema`).
+// The "要求 e2e 证据" toggle injects this so users don't hand-write the JSON Schema.
+const E2E_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["verdict", "summary", "e2eEvidence"],
+  properties: {
+    verdict: { enum: ["pass", "block"] },
+    summary: { type: "string", minLength: 1 },
+    e2eEvidence: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["method", "steps", "observed"],
+        properties: {
+          method: { enum: ["browser", "http-behavior", "automation-run"] },
+          steps: { type: "string", minLength: 1 },
+          observed: { type: "string", minLength: 1 }
+        }
+      }
+    },
+    risks: { type: "array", items: { type: "string" } }
+  }
+};
+
+// Best-effort: the toggle's checked state is derived from the raw outputSchema (the
+// source of truth) — true when the current schema parses to one declaring e2eEvidence.
+function schemaRequiresE2eEvidence(outputSchema: string): boolean {
+  try {
+    const parsed = JSON.parse(outputSchema) as { properties?: Record<string, unknown> };
+    return Boolean(parsed?.properties && "e2eEvidence" in parsed.properties);
+  } catch {
+    return false;
+  }
+}
+
 function bindingId(binding: SkillBinding): string {
   return typeof binding === "string" ? binding : binding.id;
 }
@@ -347,6 +386,12 @@ function EmployeeEditor({ employee, data, onClose, onSaved, notify }: {
           <Field label="Session 历史条数"><input type="number" min={0} max={100} value={draft.historyLimit} onChange={(e) => patch("historyLimit", Number(e.target.value))} /></Field>
         </div>
         <Field label="额外工具" hint="逗号分隔；这是声明，真正限制由 Provider/sandbox 执行。"><input value={draft.tools} onChange={(e) => patch("tools", e.target.value)} /></Field>
+        <label className="switch-line"><span><b>要求 e2e 证据</b><small>一键注入 e2e 证据输出契约并预填 verdict；下方原始字段仍是最终来源。</small></span><SwitchControl checked={schemaRequiresE2eEvidence(draft.outputSchema)} ariaLabel="要求 e2e 证据" onChange={(nextChecked) => {
+          // One-way convenience injector: enabling overwrites the schema + verdict fields;
+          // disabling intentionally does NOT auto-clear them so manual edits survive.
+          if (!nextChecked) return;
+          setDraft((current) => ({ ...current, outputSchema: JSON.stringify(E2E_OUTPUT_SCHEMA, null, 2), verdictPath: "/verdict", verdictPass: "pass", verdictBlock: "block" }));
+        }} /></label>
         <Field label="输出 JSON Schema"><textarea className="mono" rows={9} required value={draft.outputSchema} onChange={(e) => patch("outputSchema", e.target.value)} /></Field>
         <div className="form-grid three"><Field label="Verdict JSON path" hint="可选，如 verdict"><input value={draft.verdictPath} onChange={(e) => patch("verdictPath", e.target.value)} /></Field><Field label="Pass 值" hint="逗号分隔"><input value={draft.verdictPass} onChange={(e) => patch("verdictPass", e.target.value)} /></Field><Field label="Block 值" hint="逗号分隔"><input value={draft.verdictBlock} onChange={(e) => patch("verdictBlock", e.target.value)} /></Field></div>
       </DossierSection>

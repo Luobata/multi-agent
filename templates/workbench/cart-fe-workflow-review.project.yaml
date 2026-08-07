@@ -31,5 +31,35 @@ roles:
     requiredSkills: [browser-e2e-validation]
     knowledgeProfiles: [workbench-quality-knowledge]
     policyRef: docs/review-role-agents/xiaomixiang-tester/base.md
+    outputSchema:
+      type: object
+      additionalProperties: false
+      required: [verdict, summary, e2eEvidence]
+      properties:
+        verdict:
+          enum: [pass, block]
+        summary:
+          type: string
+          minLength: 1
+        e2eEvidence:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [method, steps, observed]
+            properties:
+              method:
+                enum: [browser, http-behavior, automation-run]
+              steps:
+                type: string
+                minLength: 1
+              observed:
+                type: string
+                minLength: 1
+        risks:
+          type: array
+          items:
+            type: string
     permissions:
       write: none

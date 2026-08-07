@@ -465,7 +465,10 @@ describe("Supervisor deterministic capabilities and Gates", () => {
           mode: "before-completion",
           required: true,
           instructions: "Test the code change.",
-          fallback: "supervisor"
+          fallback: "supervisor",
+          // This test exercises capability-tag routing/fallback, not e2e evidence. Disable the
+          // quality.test default validator here so the fallback's non-e2e evidence still passes.
+          validatorId: "none"
         }]
       }
     });
@@ -576,6 +579,137 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       }]
     });
     expect(Object.keys(result.run.nodes).filter((nodeId) => nodeId.startsWith("gate-audit"))).toEqual(["gate-audit-r1-1"]);
+  });
+
+  it("blocks a required quality.test Gate when the executor omits real e2e evidence and passes it when present", async () => {
+    // A quality.test gate resolves the e2e-evidence validator by default: the gate executor's output
+    // must carry at least one real e2e evidence entry. A tester member advertises quality.test, so it
+    // is the hinted gate executor. One workflow, two runs keyed by the input message — the block
+    // variant omits e2eEvidence (rejected), the pass variant supplies it (accepted).
+    const providers: ProviderRegistry = new Map([["e2e-gate", {
+      id: "e2e-gate",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const node = invocation.templateContext.node as { metadata?: { kind?: string }; with?: { __supervisorRound?: number } };
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number(node.with?.__supervisorRound ?? 0);
+        const message = String((invocation.templateContext.input as { message?: string }).message ?? "");
+        if (node.metadata?.kind === "gate") {
+          // The tester runs the gate. Only the pass variant returns real e2e evidence.
+          return message === "with-e2e"
+            ? {
+                stdout: JSON.stringify({
+                  message: "Ran the browser e2e suite.",
+                  e2eEvidence: [{ method: "browser", steps: "open /app, submit the form", observed: "success toast rendered" }]
+                }),
+                stderr: "",
+                durationMs: 1
+              }
+            : { stdout: JSON.stringify({ message: "Ran static type + lint checks only." }), stderr: "", durationMs: 1 };
+        }
+        if (role === "supervisor" && round === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              assignments: [{ roleId: "builder", task: "Build the feature.", workKind: "code", changeSet: "server" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (role === "supervisor") {
+          return { stdout: JSON.stringify({ action: "finish", summary: "Deliver.", result: { delivered: true } }), stderr: "", durationMs: 1 };
+        }
+        return { stdout: JSON.stringify({ message: "Built the feature." }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("e2e-gate-provider", { adapter: "e2e-gate", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "e2e-lead",
+      identity: { displayName: "Lead", background: "Leads.", responsibilities: ["Lead"] },
+      providerId: "e2e-gate-provider"
+    });
+    await service.createEmployee({
+      id: "e2e-builder",
+      identity: { displayName: "Builder", background: "Builds.", responsibilities: ["Build"] },
+      capabilities: ["code.backend"],
+      providerId: "e2e-gate-provider"
+    });
+    await service.createEmployee({
+      id: "e2e-tester",
+      identity: { displayName: "Tester", background: "Runs e2e.", responsibilities: ["Test"] },
+      capabilities: ["quality.test"],
+      providerId: "e2e-gate-provider",
+      // The tester's output contract admits the e2eEvidence array the validator inspects.
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message"],
+        properties: {
+          message: { type: "string" },
+          e2eEvidence: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["method", "steps", "observed"],
+              properties: {
+                method: { type: "string" },
+                steps: { type: "string" },
+                observed: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    });
+    await service.createManagementPolicy({
+      id: "e2e-gate-policy",
+      allowedRoleIds: ["builder", "tester"],
+      instructions: "Deliver only after the e2e gate passes.",
+      limits: { maxRounds: 2 }
+    });
+    await service.createWorkflow({
+      id: "e2e-gate-supervision",
+      architecture: "supervisor",
+      supervisor: { employeeId: "e2e-lead" },
+      managementPolicy: { id: "e2e-gate-policy" },
+      members: [
+        { roleId: "builder", employeeId: "e2e-builder" },
+        { roleId: "tester", employeeId: "e2e-tester" }
+      ],
+      flow: {
+        stages: [
+          { id: "plan", kind: "supervisor", title: "Plan" },
+          { id: "loop", kind: "delegation-loop", title: "Build" },
+          { id: "e2e", kind: "gate", title: "E2E", gateId: "e2e" },
+          { id: "delivery", kind: "delivery", title: "Deliver" }
+        ],
+        gates: [{
+          id: "e2e",
+          requiredCapability: "quality.test",
+          mode: "before-completion",
+          required: true,
+          instructions: "Run the end-to-end test suite and report real evidence.",
+          fallback: "block"
+        }]
+      }
+    });
+
+    // Block variant: no real e2e evidence → gate rejects, run blocks with the e2e reason surfaced.
+    const blockedRun = await service.runWorkbenchWorkflow("e2e-gate-supervision", { message: "no-e2e" });
+    expect(blockedRun.run.status).toBe("blocked");
+    const blockedGates = (blockedRun.run.output as { gates: Array<{ gateId: string; status: string; reason: string | null }> }).gates;
+    const blockedGate = blockedGates.find((gate) => gate.gateId === "e2e");
+    expect(blockedGate?.status).not.toBe("passed");
+    expect(String(blockedGate?.reason)).toMatch(/e2e/i);
+
+    // Pass variant: real e2e evidence present → gate passes and no longer blocks the run.
+    const passedRun = await service.runWorkbenchWorkflow("e2e-gate-supervision", { message: "with-e2e" });
+    expect(passedRun.run.status).toBe("passed");
+    const passedGates = (passedRun.run.output as { gates: Array<{ gateId: string; status: string }> }).gates;
+    expect(passedGates.find((gate) => gate.gateId === "e2e")?.status).toBe("passed");
   });
 
   it("retries an unsatisfied required Gate after finish interception and preserves both evidence attempts", async () => {

@@ -210,6 +210,8 @@ export interface SupervisorGate {
   required: boolean;
   instructions: string;
   fallback: "supervisor" | "block";
+  /** Optional evidence validator id; "none" disables the capability's default validator. */
+  validatorId?: string;
 }
 
 export type SupervisorDagNodeKind =

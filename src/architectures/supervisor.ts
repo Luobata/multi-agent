@@ -14,6 +14,7 @@ import {
   type SupervisorDagConfig,
   type SupervisorDagNodeTracker
 } from "./supervisorDag.js";
+import { resolveGateValidator } from "./gateValidators.js";
 
 type SupervisorWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
 
@@ -44,6 +45,7 @@ interface SupervisorGateConfig {
   required: boolean;
   instructions: string;
   fallback: "supervisor" | "block";
+  validatorId?: string;
 }
 
 type SupervisorFlowStageConfig =
@@ -304,7 +306,8 @@ const supervisorConfigSchema = {
               mode: { enum: ["after-each-delegation", "before-completion"] },
               required: { type: "boolean" },
               instructions: { type: "string", minLength: 1 },
-              fallback: { enum: ["supervisor", "block"] }
+              fallback: { enum: ["supervisor", "block"] },
+              validatorId: { type: "string", minLength: 1 }
             }
           }
         },
@@ -772,6 +775,14 @@ async function executeGateActivation(
     const gateDecision = decision(result.output);
     passed = gateDecision?.action === "satisfy-gate" && gateDecision.gateId === tracker.gate.id;
   }
+  let validatorReason: string | undefined;
+  if (passed) {
+    const validator = resolveGateValidator(tracker.gate);
+    if (validator) {
+      const verdict = validator(tracker.gate, result.output ?? null);
+      if (!verdict.passed) { passed = false; validatorReason = verdict.reason; }
+    }
+  }
   tracker.executions.push({
     nodeId: node.id,
     executorRoleId: executor.roleId,
@@ -780,10 +791,10 @@ async function executeGateActivation(
     sourceNodeIds: activation.sourceNodeIds,
     status: passed ? "passed" : result.status,
     evidence: result.output ?? null,
-    error: passed ? null : result.error ?? (executor.roleId === "supervisor" ? "supervisor fallback did not return satisfy-gate" : null)
+    error: passed ? null : validatorReason ?? result.error ?? (executor.roleId === "supervisor" ? "supervisor fallback did not return satisfy-gate" : null)
   });
   if (passed) tracker.passed.add(activation.key);
-  else tracker.reason = `gate ${tracker.gate.id} activation ${activation.key} has not passed`;
+  else tracker.reason = validatorReason ?? `gate ${tracker.gate.id} activation ${activation.key} has not passed`;
   trackerStatus(tracker);
   await context.emit(passed ? "gate.passed" : "gate.unsatisfied", node.id, {
     gateId: tracker.gate.id,

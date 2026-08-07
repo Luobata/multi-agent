@@ -41,6 +41,73 @@ function finalSummary(run: Run): string | undefined {
   return typeof output?.summary === "string" ? output.summary : undefined;
 }
 
+interface E2eEvidenceEntry {
+  method?: string;
+  steps?: string;
+  observed?: string;
+}
+
+/** Reads a structured `e2eEvidence` array off any output object; tolerant of missing/oddly-typed fields. */
+function e2eEvidenceEntries(value: JsonValue | undefined): E2eEvidenceEntry[] {
+  const raw = objectValue(value)?.e2eEvidence;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => objectValue(item))
+    .filter((item): item is Record<string, JsonValue> => item !== undefined)
+    .map((item) => ({
+      method: typeof item.method === "string" ? item.method : undefined,
+      steps: typeof item.steps === "string" ? item.steps : undefined,
+      observed: typeof item.observed === "string" ? item.observed : undefined
+    }))
+    .filter((entry) => entry.method || entry.steps || entry.observed);
+}
+
+function E2eEvidenceList({ entries }: { entries: E2eEvidenceEntry[] }) {
+  if (entries.length === 0) return null;
+  return <ul className="run-e2e-evidence">{entries.map((entry, index) => <li key={index}>
+    {entry.method && <code className="run-e2e-method">{entry.method}</code>}
+    {entry.steps && <span className="run-e2e-steps">{entry.steps}</span>}
+    {entry.observed && <><span className="run-e2e-arrow" aria-hidden="true">→</span><span className="run-e2e-observed">{entry.observed}</span></>}
+  </li>)}</ul>;
+}
+
+const GATE_STATUS_LABELS: Record<string, string> = {
+  passed: "通过",
+  blocked: "未通过",
+  pending: "待判定",
+  skipped: "跳过"
+};
+
+interface GateVerdict {
+  gateId: string;
+  status: string;
+  reason?: string;
+  requiredCapability?: string;
+}
+
+/** Reads the supervisor gate snapshot off `run.output.gates`; safe when absent or malformed. */
+function gateVerdicts(value: JsonValue | undefined): GateVerdict[] {
+  const raw = objectValue(value)?.gates;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => objectValue(item))
+    .filter((item): item is Record<string, JsonValue> => item !== undefined && typeof item.gateId === "string")
+    .map((item) => ({
+      gateId: String(item.gateId),
+      status: typeof item.status === "string" ? item.status : "unknown",
+      reason: typeof item.reason === "string" ? item.reason : undefined,
+      requiredCapability: typeof item.requiredCapability === "string" ? item.requiredCapability : undefined
+    }));
+}
+
+function GateVerdictList({ gates }: { gates: GateVerdict[] }) {
+  if (gates.length === 0) return null;
+  return <ul className="run-gate-list">{gates.map((gate) => <li key={gate.gateId} className={`run-gate-item run-gate-item--${gate.status}`}>
+    <div className="run-gate-head"><code>{gate.gateId}</code><span className={`gate-status gate-status--${gate.status}`}>{GATE_STATUS_LABELS[gate.status] ?? gate.status}</span>{gate.requiredCapability && <small>{gate.requiredCapability}</small>}</div>
+    {gate.status !== "passed" && gate.reason && <p className="gate-reason">{gate.reason}</p>}
+  </li>)}</ul>;
+}
+
 function dagFlowTag(node: RunNode): string {
   if (node.metadata?.kind !== "member" || typeof node.metadata.flowNodeId !== "string") return "";
   const kind = typeof node.metadata.flowNodeKind === "string" ? node.metadata.flowNodeKind : "dag";
@@ -95,8 +162,8 @@ export function RunsPage({ notify, activityRevision = "" }: { notify: (message: 
       <DossierSection number="01" title="运行元数据"><dl className="ledger"><dt>Run ID</dt><dd><code>{selected.id}</code></dd><dt>Architecture</dt><dd>{selected.architecture}</dd><dt>创建时间</dt><dd>{formatTime(selected.createdAt)}</dd><dt>完成时间</dt><dd>{formatTime(selected.completedAt)}</dd><dt>证据目录</dt><dd><code className="path-code">{selected.artifactDir}</code></dd></dl></DossierSection>
       {profileEntries.length > 0 && <DossierSection number="02" title="有效执行配置与来源"><div className="run-profile-list">{profileEntries.map(([nodeId, profile]) => <details key={nodeId} open={profileEntries.length === 1}><summary><strong>{nodeId}</strong><span>{profile.employee.displayName} · v{profile.employee.version}</span></summary><EffectiveProfileView profile={profile} /></details>)}</div></DossierSection>}
       {selected.architecture === "supervisor" && <DossierSection number={profileEntries.length > 0 ? "03" : "02"} title="动态执行图"><SupervisorRunTopology nodes={Object.values(selected.nodes)} /></DossierSection>}
-      <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "04" : "03") : (selected.architecture === "supervisor" ? "03" : "02")} title="节点结果"><div className="run-node-list">{Object.values(selected.nodes).map((node, index) => { const decision = supervisorDecision(node); return <article key={node.nodeId}><div className="run-node-head"><span className="node-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{node.nodeId}</strong><code>{node.roleId}{node.metadata?.kind === "supervisor" ? ` · 领队 Round ${node.metadata.round ?? "—"}` : node.metadata?.kind === "member" ? ` · 成员 Round ${node.metadata.round ?? "—"}` : ""}{dagFlowTag(node)}</code></div><Stamp status={node.status} /></div><dl className="ledger horizontal"><dt>尝试</dt><dd>{node.attempts}</dd><dt>开始</dt><dd>{formatTime(node.startedAt)}</dd><dt>结束</dt><dd>{formatTime(node.completedAt)}</dd></dl>{decision && <div className="supervisor-decision-summary"><code>{decision.action.toUpperCase()}</code><span>{decision.summary ?? "领队未提供本轮摘要。"}</span></div>}{node.error && <div className="inline-error">{node.error}</div>}{node.output !== undefined && <pre className="result-json">{JSON.stringify(node.output, null, 2)}</pre>}<code className="artifact-path">{node.artifactDir}</code></article>; })}</div></DossierSection>
-      {selected.output !== undefined && <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "05" : "04") : (selected.architecture === "supervisor" ? "04" : "03")} title="Workflow 最终输出">{finalSummary(selected) && <p className="workflow-final-summary">{finalSummary(selected)}</p>}<pre className="result-json">{JSON.stringify(selected.output, null, 2)}</pre></DossierSection>}
+      <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "04" : "03") : (selected.architecture === "supervisor" ? "03" : "02")} title="节点结果"><div className="run-node-list">{Object.values(selected.nodes).map((node, index) => { const decision = supervisorDecision(node); return <article key={node.nodeId}><div className="run-node-head"><span className="node-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{node.nodeId}</strong><code>{node.roleId}{node.metadata?.kind === "supervisor" ? ` · 领队 Round ${node.metadata.round ?? "—"}` : node.metadata?.kind === "member" ? ` · 成员 Round ${node.metadata.round ?? "—"}` : ""}{dagFlowTag(node)}</code></div><Stamp status={node.status} /></div><dl className="ledger horizontal"><dt>尝试</dt><dd>{node.attempts}</dd><dt>开始</dt><dd>{formatTime(node.startedAt)}</dd><dt>结束</dt><dd>{formatTime(node.completedAt)}</dd></dl>{decision && <div className="supervisor-decision-summary"><code>{decision.action.toUpperCase()}</code><span>{decision.summary ?? "领队未提供本轮摘要。"}</span></div>}{node.error && <div className="inline-error">{node.error}</div>}{node.output !== undefined && <><E2eEvidenceList entries={e2eEvidenceEntries(node.output)} /><pre className="result-json">{JSON.stringify(node.output, null, 2)}</pre></>}<code className="artifact-path">{node.artifactDir}</code></article>; })}</div></DossierSection>
+      {selected.output !== undefined && <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "05" : "04") : (selected.architecture === "supervisor" ? "04" : "03")} title="Workflow 最终输出">{finalSummary(selected) && <p className="workflow-final-summary">{finalSummary(selected)}</p>}<GateVerdictList gates={gateVerdicts(selected.output)} /><E2eEvidenceList entries={e2eEvidenceEntries(selected.output)} /><pre className="result-json">{JSON.stringify(selected.output, null, 2)}</pre></DossierSection>}
     </div>}</main>
   </div>;
 }

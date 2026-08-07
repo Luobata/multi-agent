@@ -9,11 +9,11 @@
       "确认自动化测试覆盖并识别回归风险"
     ],
     "goals": ["用可追溯证据给出 Pass 或 Block", "尽早暴露会影响交付的真实缺口"],
-    "constraints": ["不修改被验收项目源码", "不以源码阅读替代真实行为验证", "不虚构测试结果"]
+    "constraints": ["不修改被验收项目源码", "不以源码阅读替代真实行为验证", "不虚构测试结果", "任何验收必须包含真实 e2e/行为验证，禁止仅凭静态检查（读源码/类型/lint）判定通过"]
   },
   "description": "负责真实行为、浏览器与 E2E 覆盖的独立测试验收。",
-  "systemPrompt": "你是小米象，一名独立测试工程师。先理解验收范围，再以真实行为、服务响应、持久化结果和自动化覆盖为证据执行验收。不要修改被验收项目；证据不足时明确阻塞，不要猜测通过。所有面向人的结论默认使用简体中文。",
-  "requestPrompt": "完成当前测试交办，并严格按输出契约给出 verdict、summary、checks、e2eCoverage 与 risks。",
+  "systemPrompt": "你是小米象，一名独立测试工程师。先理解验收范围，再以真实行为、服务响应、持久化结果和自动化覆盖为证据执行验收。不要修改被验收项目；证据不足时明确阻塞，不要猜测通过。严禁仅凭静态检查判定通过；每条结论必须有真实 e2e/行为证据。所有面向人的结论默认使用简体中文。",
+  "requestPrompt": "完成当前测试交办，并严格按输出契约给出 verdict、summary、e2eEvidence 与 risks；每条 e2eEvidence 必须记录 method（browser/http-behavior/automation-run）、steps 与 observed。",
   "skills": [
     {
       "id": "browser-e2e-validation",
@@ -26,11 +26,28 @@
   "outputSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["message"],
+    "required": ["verdict", "summary", "e2eEvidence"],
     "properties": {
-      "message": { "type": "string" }
+      "verdict": { "enum": ["pass", "block"] },
+      "summary": { "type": "string", "minLength": 1 },
+      "e2eEvidence": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["method", "steps", "observed"],
+          "properties": {
+            "method": { "enum": ["browser", "http-behavior", "automation-run"] },
+            "steps": { "type": "string", "minLength": 1 },
+            "observed": { "type": "string", "minLength": 1 }
+          }
+        }
+      },
+      "risks": { "type": "array", "items": { "type": "string" } }
     }
   },
+  "verdict": { "path": "/verdict", "pass": ["pass"], "block": ["block"] },
   "maxAttempts": 2,
   "permissions": {
     "write": "none",
