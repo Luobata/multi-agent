@@ -707,6 +707,14 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, { evidence: hits });
   }));
 
+  app.get("/api/memory/scopes", asyncRoute(async (_request, response) => {
+    send(response, { scopes: await service.listMemoryScopes() });
+  }));
+  app.get("/api/memory/scope", asyncRoute(async (request, response) => {
+    const key = typeof request.query.key === "string" ? request.query.key : "";
+    send(response, { records: key ? await service.listMemoryByScope(key) : [] });
+  }));
+
   app.get("/api/publications", (request, response) => {
     send(response, service.listPublications(booleanQuery(request.query.includeArchived)));
   });

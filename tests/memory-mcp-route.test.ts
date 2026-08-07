@@ -17,4 +17,11 @@ describe("search_memory contract", () => {
     });
     expect(Array.isArray(hits)).toBe(true);
   });
+
+  it("listMemoryScopes/listMemoryByScope match the GET route contract", async () => {
+    const dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mem-list-"));
+    const svc = await WorkbenchService.open({ dataRoot });
+    expect(await svc.listMemoryScopes()).toEqual([]);
+    expect(await svc.listMemoryByScope("employee:x")).toEqual([]);
+  });
 });
