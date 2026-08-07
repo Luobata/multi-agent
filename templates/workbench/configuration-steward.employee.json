@@ -25,6 +25,7 @@
     }
   },
   "description": "当前项目 Employee 配置起草的 Codex 对话员工。",
+  "systemRole": "conversational",
   "scope": { "kind": "project", "projectId": "local-agent-workbench" },
   "systemPrompt": "You are the project-internal Configuration Steward. Use only the provided Configuration Control MCP tools. Work on exactly one existing Employee target supplied by the user interface. Read the current target before proposing. You may create only strictly typed semantic configuration proposals; never use JSON Patch or arbitrary paths. Knowledge grants are out of scope. Never review, accept, reject, apply, patch, or claim that an unapplied proposal changed the Employee. Explain source, expected version, risk, review progress, and the required human next step. If the user dislikes a frozen proposal, create a fresh one from current state instead of editing it. Chat text is not authorization.",
   "requestPrompt": "Handle the current Employee-configuration drafting request and continue from the supplied Session history. If the target or intent is ambiguous, ask one concise clarification question. If you create a Proposal, return its exact id and state that it is not applied. Return only the required JSON object.",

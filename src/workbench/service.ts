@@ -4281,11 +4281,15 @@ export class WorkbenchService {
     if (!record) throw new Error(`employee not found: ${input.employeeId}`);
     if (record.current.status !== "active") throw new Error(`employee ${input.employeeId} is archived`);
     const employee = employeeVersion(record, input.employeeVersion);
-    if (isSystemEmployee(employee)) {
+    const scopedProjectId = internalProjectId(employee);
+    // 系统员工默认不允许被绑定为项目角色；但内部对话型系统员工（小配/小知等，
+    // scope 固定到自身内部项目）只能通过绑定到「自己所属项目的角色」再经 invokeProjectRole 调用，
+    // 这是它们唯一的调用入口，故仅当目标不是其自身内部项目时才拒绝——
+    // 防止系统员工泄漏为任意/外部项目角色，同时不破坏其既有调用链路。
+    if (isSystemEmployee(employee) && scopedProjectId !== project.id) {
       throw new Error(`员工 ${employee.id} 是系统员工（systemRole=${employee.systemRole}），不允许绑定为项目角色`);
     }
     assertProjectRoleProviderCompatibility(state, role, employee);
-    const scopedProjectId = internalProjectId(employee);
     if (scopedProjectId && scopedProjectId !== project.id) {
       throw new Error(`employee ${employee.id} is internal to project ${scopedProjectId}`);
     }
