@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it, expect } from "vitest";
 import { WorkbenchService } from "../src/workbench/service.js";
-import type { WorkflowChangeRequest, WorkflowChangeOperation, SupervisorGate } from "../src/workbench/types.js";
+import type {
+  WorkflowChangeRequest,
+  WorkflowChangeOperation,
+  SupervisorGate,
+  SupervisorWorkbenchWorkflowDefinition
+} from "../src/workbench/types.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -205,5 +210,134 @@ describe("WorkflowChangeRequest approval chain (create/list/get)", () => {
   it("throws when getting a missing change request", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     expect(() => service.getWorkflowChangeRequest("wc-missing")).toThrow();
+  });
+});
+
+/** Seed an existing gate onto a supervisor workflow via updateWorkflow, returning the new version. */
+async function seedGate(service: WorkbenchService, workflowId: string, gate: Partial<SupervisorGate> = {}): Promise<number> {
+  const resolved: SupervisorGate = {
+    id: "e2e",
+    requiredCapability: "quality.test",
+    mode: "before-completion",
+    required: true,
+    instructions: "existing gate",
+    fallback: "block",
+    validatorId: "e2e-evidence",
+    ...gate
+  };
+  const updated = await service.updateWorkflow(workflowId, {
+    architecture: "supervisor",
+    flow: {
+      stages: [
+        { id: "plan", kind: "supervisor", title: "Plan" },
+        { id: "delegation-loop", kind: "delegation-loop", title: "Delegate" },
+        { id: `${resolved.id}-stage`, kind: "gate", title: "Gate", gateId: resolved.id },
+        { id: "delivery", kind: "delivery", title: "Deliver" }
+      ],
+      gates: [resolved]
+    }
+  });
+  return updated.version;
+}
+
+describe("WorkflowChangeRequest approval chain (approve/reject)", () => {
+  it("approve applies add-gate to flow.gates and bumps workflow version", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const workflowId = await createSupervisorWorkflow(service, "approve-add");
+    const before = service.getWorkflow(workflowId) as SupervisorWorkbenchWorkflowDefinition;
+    expect(before.flow.gates).toHaveLength(0);
+
+    const req = await service.createWorkflowChangeRequest({
+      workflowId, title: "加e2e门禁", reason: "Require real e2e evidence.", operations: [addGateOperation()]
+    });
+    const applied = await service.approveWorkflowChangeRequest(req.id, "local-owner", "looks good");
+
+    expect(applied.status).toBe("applied");
+    expect(applied.review?.actor).toBe("local-owner");
+    expect(applied.review?.comment).toBe("looks good");
+    expect(applied.review?.at).toBeTruthy();
+
+    const after = service.getWorkflow(workflowId) as SupervisorWorkbenchWorkflowDefinition;
+    expect(after.version).toBe(before.version + 1);
+    const gate = after.flow.gates.find((candidate) => candidate.id === "e2e");
+    expect(gate).toBeDefined();
+    expect(gate?.validatorId).toBe("e2e-evidence");
+    expect(after.flow.stages.some((stage) => stage.kind === "gate" && stage.gateId === "e2e")).toBe(true);
+  });
+
+  it("approve applies update-gate (patch merge) and remove-gate", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const updateWorkflowId = await createSupervisorWorkflow(service, "approve-update");
+    await seedGate(service, updateWorkflowId, { required: true, instructions: "before patch" });
+    const updateReq = await service.createWorkflowChangeRequest({
+      workflowId: updateWorkflowId, title: "改门禁", reason: "Relax the gate.",
+      operations: [{ kind: "update-gate", gateId: "e2e", patch: { required: false, instructions: "after patch" }, rationale: "r", risk: "low" }]
+    });
+    await service.approveWorkflowChangeRequest(updateReq.id);
+    const afterUpdate = service.getWorkflow(updateWorkflowId) as SupervisorWorkbenchWorkflowDefinition;
+    const patched = afterUpdate.flow.gates.find((candidate) => candidate.id === "e2e");
+    expect(patched?.required).toBe(false);
+    expect(patched?.instructions).toBe("after patch");
+    // Unpatched fields are preserved by the merge.
+    expect(patched?.requiredCapability).toBe("quality.test");
+    expect(patched?.validatorId).toBe("e2e-evidence");
+
+    const removeWorkflowId = await createSupervisorWorkflow(service, "approve-remove");
+    await seedGate(service, removeWorkflowId);
+    const removeReq = await service.createWorkflowChangeRequest({
+      workflowId: removeWorkflowId, title: "删门禁", reason: "Drop the gate.",
+      operations: [{ kind: "remove-gate", gateId: "e2e", rationale: "r", risk: "low" }]
+    });
+    await service.approveWorkflowChangeRequest(removeReq.id);
+    const afterRemove = service.getWorkflow(removeWorkflowId) as SupervisorWorkbenchWorkflowDefinition;
+    expect(afterRemove.flow.gates.some((candidate) => candidate.id === "e2e")).toBe(false);
+    expect(afterRemove.flow.stages.some((stage) => stage.kind === "gate" && stage.gateId === "e2e")).toBe(false);
+  });
+
+  it("rejects approve when workflow version is stale", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const workflowId = await createSupervisorWorkflow(service, "stale-approve");
+    const req = await service.createWorkflowChangeRequest({
+      workflowId, title: "t", reason: "r", operations: [addGateOperation({ id: "later" })]
+    });
+    // Independently bump the workflow version so the frozen version is now stale.
+    await service.updateWorkflow(workflowId, { architecture: "supervisor", description: "moved on" });
+    await expect(service.approveWorkflowChangeRequest(req.id)).rejects.toThrow(/版本|stale/i);
+    // The request stays awaiting-approval (no auto-rebase, no state mutation of flow).
+    expect(service.getWorkflowChangeRequest(req.id).status).toBe("awaiting-approval");
+  });
+
+  it("rejects re-approving an applied or rejected request", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const appliedWorkflowId = await createSupervisorWorkflow(service, "reapprove-applied");
+    const appliedReq = await service.createWorkflowChangeRequest({
+      workflowId: appliedWorkflowId, title: "t", reason: "r", operations: [addGateOperation()]
+    });
+    await service.approveWorkflowChangeRequest(appliedReq.id);
+    await expect(service.approveWorkflowChangeRequest(appliedReq.id)).rejects.toThrow();
+
+    const rejectedWorkflowId = await createSupervisorWorkflow(service, "reapprove-rejected");
+    const rejectedReq = await service.createWorkflowChangeRequest({
+      workflowId: rejectedWorkflowId, title: "t", reason: "r", operations: [addGateOperation()]
+    });
+    await service.rejectWorkflowChangeRequest(rejectedReq.id);
+    await expect(service.approveWorkflowChangeRequest(rejectedReq.id)).rejects.toThrow();
+  });
+
+  it("reject sets status rejected with review", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const workflowId = await createSupervisorWorkflow(service, "reject-change");
+    const req = await service.createWorkflowChangeRequest({
+      workflowId, title: "t", reason: "r", operations: [addGateOperation()]
+    });
+    const rejected = await service.rejectWorkflowChangeRequest(req.id, "reviewer", "not now");
+    expect(rejected.status).toBe("rejected");
+    expect(rejected.review?.actor).toBe("reviewer");
+    expect(rejected.review?.comment).toBe("not now");
+    expect(rejected.review?.at).toBeTruthy();
+    // The workflow was untouched by the rejection.
+    expect((service.getWorkflow(workflowId) as SupervisorWorkbenchWorkflowDefinition).flow.gates).toHaveLength(0);
+    // Rejecting again from a terminal state throws.
+    await expect(service.rejectWorkflowChangeRequest(req.id)).rejects.toThrow();
   });
 });

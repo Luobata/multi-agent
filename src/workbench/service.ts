@@ -185,6 +185,8 @@ import {
   type WorkflowChangeOperation,
   type WorkflowChangeCreateInput,
   type SupervisorGate,
+  type SupervisorFlowStage,
+  type SupervisorFlowInput,
   type WorkInstanceRecord,
   type WorkInstanceStatus,
   type WorkflowCreateInput,
@@ -2909,6 +2911,96 @@ export class WorkbenchService {
     const request = this.snapshot().workflowChangeRequests[id];
     if (!request) throw new Error(`工作流变更请求不存在：${id}`);
     return request;
+  }
+
+  /**
+   * Apply a change request's operations against the target supervisor workflow's flow.
+   *
+   * apply MUST go through updateWorkflow so the change is re-validated and produces a fresh
+   * workflow version — it never writes state.workflows directly and never bypasses gate checks.
+   * Because normalizeSupervisorFlow requires every gate to be referenced by exactly one gate stage,
+   * add-gate also inserts a gate stage before delivery and remove-gate drops the matching stage.
+   */
+  async approveWorkflowChangeRequest(id: string, actor = "local-owner", comment?: string): Promise<WorkflowChangeRequest> {
+    const request = this.getWorkflowChangeRequest(id);
+    if (request.status !== "awaiting-approval") {
+      throw new Error(`工作流变更请求 ${id} 当前状态为 ${request.status}，无法重复审批`);
+    }
+    const workflow = this.getWorkflow(request.workflowId);
+    if (workflow.architecture !== "supervisor") {
+      throw new Error(`工作流 ${request.workflowId} 是 ${workflow.architecture} 架构，只有 supervisor 工作流才有门禁可供变更`);
+    }
+    if (workflow.version !== request.workflowVersion) {
+      throw new Error(
+        `工作流 ${request.workflowId} 当前版本 ${workflow.version} 与提案冻结的版本 ${request.workflowVersion} 不一致（stale），请基于最新版本重新提案`
+      );
+    }
+    // Re-validate operations against the current flow before applying.
+    this.validateWorkflowChangeOperations(workflow, request.operations);
+
+    const gates: SupervisorGate[] = workflow.flow.gates.map((gate) => ({ ...gate }));
+    const stages: SupervisorFlowStage[] = workflow.flow.stages.map((stage) => ({ ...stage }));
+    const deliveryIndex = stages.findIndex((stage) => stage.kind === "delivery");
+    if (deliveryIndex < 0) throw new Error(`工作流 ${request.workflowId} 缺少 delivery 阶段，无法应用门禁变更`);
+    for (const operation of request.operations) {
+      switch (operation.kind) {
+        case "add-gate": {
+          gates.push({ ...operation.gate });
+          const insertAt = stages.findIndex((stage) => stage.kind === "delivery");
+          stages.splice(insertAt, 0, {
+            id: `${operation.gate.id}-stage`,
+            kind: "gate",
+            title: operation.gate.instructions.slice(0, 60) || operation.gate.id,
+            gateId: operation.gate.id
+          });
+          break;
+        }
+        case "update-gate": {
+          const index = gates.findIndex((gate) => gate.id === operation.gateId);
+          if (index < 0) throw new Error(`工作流 ${request.workflowId} 中不存在门禁 ${operation.gateId}，无法更新`);
+          gates[index] = { ...gates[index]!, ...operation.patch, id: operation.gateId };
+          break;
+        }
+        case "remove-gate": {
+          const index = gates.findIndex((gate) => gate.id === operation.gateId);
+          if (index < 0) throw new Error(`工作流 ${request.workflowId} 中不存在门禁 ${operation.gateId}，无法删除`);
+          gates.splice(index, 1);
+          for (let stageIndex = stages.length - 1; stageIndex >= 0; stageIndex -= 1) {
+            const stage = stages[stageIndex]!;
+            if (stage.kind === "gate" && stage.gateId === operation.gateId) stages.splice(stageIndex, 1);
+          }
+          break;
+        }
+      }
+    }
+    const flow: SupervisorFlowInput = { stages, gates, ...(workflow.flow.dag ? { dag: workflow.flow.dag } : {}) };
+    // apply through updateWorkflow → re-validates and produces a new workflow version.
+    await this.updateWorkflow(request.workflowId, { architecture: "supervisor", flow });
+
+    return this.store.mutate((state) => {
+      const stored = state.workflowChangeRequests[id];
+      if (!stored) throw new Error(`工作流变更请求不存在：${id}`);
+      const timestamp = now();
+      stored.status = "applied";
+      stored.review = { actor: requireText(actor, "工作流变更审批人"), at: timestamp, comment: comment?.trim() || undefined };
+      stored.updatedAt = timestamp;
+      return stored;
+    });
+  }
+
+  async rejectWorkflowChangeRequest(id: string, actor = "local-owner", comment?: string): Promise<WorkflowChangeRequest> {
+    return this.store.mutate((state) => {
+      const request = state.workflowChangeRequests[id];
+      if (!request) throw new Error(`工作流变更请求不存在：${id}`);
+      if (request.status !== "awaiting-approval") {
+        throw new Error(`工作流变更请求 ${id} 当前状态为 ${request.status}，无法重复审批`);
+      }
+      const timestamp = now();
+      request.status = "rejected";
+      request.review = { actor: requireText(actor, "工作流变更审批人"), at: timestamp, comment: comment?.trim() || undefined };
+      request.updatedAt = timestamp;
+      return request;
+    });
   }
 
   private knowledgeChangeImpactSummary(
