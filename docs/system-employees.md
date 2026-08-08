@@ -32,14 +32,15 @@
 
 ## 现有系统员工
 
-仓库内 `templates/workbench/` 下的三个内部员工模板已带 `systemRole`：
+仓库内 `templates/workbench/` 下的四个内部员工模板已带 `systemRole`：
 
 - `memory-summarizer.employee.json` → `"systemRole": "automatic"`（小忆 · 运行经验提炼器）
 - `configuration-steward.employee.json` → `"systemRole": "conversational"`（小配 · 员工配置管家）
 - `knowledge-steward.employee.json` → `"systemRole": "conversational"`（小知 · 项目知识管理员）
+- `gate-steward.employee.json` → `"systemRole": "conversational"`（小关 · 工作流门禁管家）
 
 这些模板同时保留了各自 `identity.metadata.employeeKind` 等既有元数据不变；`systemRole` 是新增的顶层标记，与旧元数据并存。
 
-## 预留：小关（Gate Steward）
+## 小关（Gate Steward）
 
-小关（Gate Steward）将于下一轮作为 `conversational` 系统员工实现。当前尚未落地，本文不描述其行为。
+小关（Gate Steward）作为 `conversational` 系统员工已实现，与小配 / 小知并列：通过受限的 Gate Control MCP 对话式管理 supervisor 工作流门禁，只提案 `WorkflowChangeRequest`、不审批、不 apply，审批走人工经 CLI / HTTP，UI 只读查看。详见 [小关（Gate Steward）· 工作流门禁管家](gate-steward.md)。
