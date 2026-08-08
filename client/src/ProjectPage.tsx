@@ -262,9 +262,14 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
         {data.projects.map((project) => {
           const projectBinding = data.projectBindings.find((candidate) => candidate.projectId === project.id);
           const passiveAccess = passiveAccessByProjectId.get(project.id);
+          const assignedEmployeeNames = passiveAccess
+            ? (projectBinding?.roles ?? [])
+                .map((role) => data.employees.find((employee) => employee.id === role.employeeId)?.identity.displayName)
+                .filter((name): name is string => Boolean(name))
+            : [];
           return <button type="button" key={project.id} className={`project-card ${selected?.id === project.id ? "selected" : ""}`} onClick={() => setSelectedId(project.id)}>
             <span className="project-card-mark" aria-hidden="true">项</span>
-            <div><strong>{project.name}</strong><code>{project.id} · v{project.version}</code><small>{projectBinding?.roles.length ?? 0}/{project.roles.length} 个角色已分派 · {project.connector.kind}</small>{passiveAccess && <small>MCP 最近触发 {formatTime(passiveAccess.lastSeenAt)} · {passiveAccess.requestCount} 次请求</small>}</div>
+            <div><strong>{project.name}</strong><code>{project.id} · v{project.version}</code><small>{projectBinding?.roles.length ?? 0}/{project.roles.length} 个角色已分派 · {project.connector.kind}</small>{passiveAccess && <small>MCP 最近触发 {formatTime(passiveAccess.lastSeenAt)} · {passiveAccess.requestCount} 次请求</small>}{assignedEmployeeNames.length > 0 && <small className="employee-inline">任用员工：{assignedEmployeeNames.join("、")}</small>}</div>
             <Stamp status={project.status} />
           </button>;
         })}

@@ -187,6 +187,30 @@ describe("Project connection page", () => {
     expect(html.match(/passive-project-card/g)).toHaveLength(1);
   });
 
+  it("shows assigned employee names inline on a project card reached via passive MCP access", () => {
+    const data: Bootstrap = {
+      ...bootstrap,
+      passiveProjectAccesses: [{
+        id: "mcp-cart-review",
+        rootPath: "/tmp/cart-review",
+        projectKeys: ["cart-review"],
+        displayName: "cart-review",
+        transport: "mcp",
+        requestCount: 5,
+        firstSeenAt: timestamp,
+        lastSeenAt: timestamp,
+        linkedProjectId: "cart-review"
+      }]
+    };
+
+    const html = renderToStaticMarkup(<ProjectPage data={data} refresh={vi.fn()} notify={vi.fn()} />);
+
+    // The linked project card should name the assigned employee inline, not just a count,
+    // so an MCP-accessed project's employee relationships are visible at a glance.
+    expect(html).toContain("小米象 · 测试工程师");
+    expect(html).toContain("employee-inline");
+  });
+
   it("shows a migrated MCP project key when historical evidence has no root path", () => {
     const data: Bootstrap = {
       ...bootstrap,
