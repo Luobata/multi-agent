@@ -1,0 +1,7 @@
+{
+  "id": "design-style-futaba",
+  "displayName": "双叶幼儿园设计语言",
+  "description": "Local Agent Workbench 的可注入视觉风格指令：治愈日式像素/蜡笔档案室风格的配色、字体、密度、组件与无障碍硬规则。绑定即让员工按此语言产出界面。",
+  "instructions": "按「双叶幼儿园 / 治愈像素档案」设计语言产出界面，只用原创 CSS/SVG 与本地字体，不复制参考站商标或素材。配色用语义 token 而非硬编码色值：--sky/--sky-pale 作 Shell 与页面背景，--cloud/--paper-raised 作档案/弹窗/选中卡/输入面，--season-spring/summer/rose/winter(-soft) 分别对应在册/Skills/员工档案/Workflow，--ink/--line-strong 作正文与 2px 外框；浅色面正文一律用深海蓝墨；状态必须同时带图标+文字，禁止把季节色当新业务状态，危险/阻塞/完成/运行中沿用既有语义 token。字体：标题 Hiragino Maru Gothic ProN/Yu Gothic/PingFang SC，正文 Hiragino Sans/Yu Gothic UI/PingFang SC，等宽 SFMono/Menlo/Cascadia 用于 ID/模型/命令/时间；不请求远程字体，缺失由本地 CJK 回退。密度：主要可交互轮廓 2px，信息分区用 2px 针脚虚线，圆角只用于卡片与圆形角色底、不做玻璃拟态；硬阴影 2–5px 无模糊偏移，按下时元素右下移 2px 并收回阴影。皮肤：通过根 data-theme 切换 crayon(默认)/pixel，两皮肤 token 变量名完全一致、只取值不同，组件层 CSS 不因主题改动；crayon 用暖阳黄/奶油白+蜡笔墨与手绘描边(SVG filter #crayon-edge)，prefers-reduced-motion 或不支持 filter 时回落规整粗描边。无障碍：语义化 button/input/dialog 或合规 ARIA combobox/listbox/option；focus-visible 即时可见且对比≥3:1；每类控件先列 idle/hover/focus/active/disabled/loading/success/warning/error/empty 状态矩阵；粗指针控件≥44px；错误态同时给错误文字+aria-invalid+aria-describedby，不只改边框色；支持键盘全流程与 Escape/遮罩关闭+焦点返回。动画仅 110–280ms 像素弹入/轻微位移，reduced-motion 下停用且不损失信息。游戏式文案不得替换真实 ID/版本/状态/错误/证据路径。",
+  "tools": []
+}
