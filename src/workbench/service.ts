@@ -18,7 +18,8 @@ import type {
   JsonValue,
   RoleIdentityDefinition,
   RolePermissionDefinition,
-  RoleSkillBinding
+  RoleSkillBinding,
+  WorkflowRunIsolation
 } from "../core/types.js";
 import {
   configurationPlanHash,
@@ -91,6 +92,7 @@ import type {
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
 import { isSystemManagedProviderId } from "../runtime/systemProviders.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
+import { createRunWorktree, removeRunWorktree } from "../runtime/worktree.js";
 import {
   materializeWorkflow,
   resolveSkillBinding,
@@ -2175,14 +2177,20 @@ export class WorkbenchService {
         .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
         .map((value) => value.trim());
       const materialized = await this.materialize(workflow, employees);
-      const runResult = await runWorkflow(materialized.loaded, materialized.workflowId, {
-        runId: invocation.runId,
-        input,
-        providers: this.providers,
-        architectures: this.architectures,
-        artifactRoot: path.join(this.store.dataRoot, "artifacts"),
-        providerCwd,
-        prepareNode: async (node) => {
+      // Resolve execution isolation from the (supervisor) management policy. Any worktree failure is
+      // contained here and never bubbles into the run: on failure we fall back to the original cwd.
+      const { providerCwd: effectiveProviderCwd, isolation, teardownWorktree } =
+        await this.resolveRunIsolation(workflow, invocation.runId, providerCwd, materialized.loaded.projectRoot);
+      try {
+        const runResult = await runWorkflow(materialized.loaded, materialized.workflowId, {
+          runId: invocation.runId,
+          input,
+          providers: this.providers,
+          architectures: this.architectures,
+          artifactRoot: path.join(this.store.dataRoot, "artifacts"),
+          providerCwd: effectiveProviderCwd,
+          isolation,
+          prepareNode: async (node) => {
           const employee = employees.get(node.role);
           if (!employee) throw new Error(`runtime role ${node.role} is not materialized`);
           const nodeTaskTags = (Array.isArray(node.with.taskTags) ? node.with.taskTags : [])
@@ -2240,9 +2248,86 @@ export class WorkbenchService {
         );
       }
       return runResult;
+      } finally {
+        // Always attempt teardown; teardownWorktree is a no-op when no worktree was created and
+        // never throws, so worktree cleanup cannot mask or replace the run's own result/error.
+        await teardownWorktree();
+      }
     } catch (error) {
       await this.failInvocationActivity(invocation.id, error);
       throw error;
+    }
+  }
+
+  /**
+   * Resolves execution isolation for a run from the workflow's management policy (supervisor only).
+   * When the policy requests `execution.isolation === "worktree"` and the execution root is a git
+   * repository, a detached worktree is created and returned as the effective providerCwd. Any
+   * failure — a non-git root, or a git/create error — degrades gracefully to running in the original
+   * cwd with `isolation.mode === "none"` and a fallbackReason. Never throws: worktree faults must not
+   * bubble into the main run path. `teardownWorktree` is always safe to call and is a no-op unless a
+   * worktree was actually created.
+   */
+  private async resolveRunIsolation(
+    workflow: WorkbenchWorkflowDefinition,
+    runId: string,
+    providerCwd: string | undefined,
+    projectRoot: string
+  ): Promise<{
+    providerCwd: string | undefined;
+    isolation?: WorkflowRunIsolation;
+    teardownWorktree: () => Promise<void>;
+  }> {
+    const noTeardown = async (): Promise<void> => {};
+    // Only supervisor workflows carry a management policy; graph workflows are never isolated.
+    if (workflow.architecture !== "supervisor") {
+      return { providerCwd, teardownWorktree: noTeardown };
+    }
+    let requested = false;
+    try {
+      const policy = this.getManagementPolicy(
+        workflow.managementPolicy.id,
+        workflow.managementPolicy.version
+      );
+      requested = policy.execution?.isolation === "worktree";
+    } catch {
+      // A policy lookup failure is surfaced by the main run path (materialize/validate); here we
+      // simply decline isolation rather than let it bubble.
+      return { providerCwd, teardownWorktree: noTeardown };
+    }
+    if (!requested) {
+      return { providerCwd, isolation: { mode: "none" }, teardownWorktree: noTeardown };
+    }
+    const repoRoot = providerCwd ?? projectRoot;
+    try {
+      const worktree = await createRunWorktree(repoRoot, runId);
+      if (!worktree) {
+        return {
+          providerCwd,
+          isolation: { mode: "none", fallbackReason: "target is not a git repository" },
+          teardownWorktree: noTeardown
+        };
+      }
+      return {
+        providerCwd: worktree.path,
+        isolation: { mode: "worktree", worktreePath: worktree.path },
+        teardownWorktree: async () => {
+          // removeRunWorktree already swallows its own errors; the extra guard is belt-and-suspenders
+          // so a teardown fault can never escape the run's finally block.
+          try {
+            await removeRunWorktree(repoRoot, worktree.path);
+          } catch (error) {
+            console.warn(`worktree teardown failed for ${worktree.path}: ${errorMessage(error)}`);
+          }
+        }
+      };
+    } catch (error) {
+      // Any git/create failure falls back to the original cwd; the run still proceeds normally.
+      return {
+        providerCwd,
+        isolation: { mode: "none", fallbackReason: `worktree setup failed: ${errorMessage(error)}` },
+        teardownWorktree: noTeardown
+      };
     }
   }
 
