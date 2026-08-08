@@ -477,6 +477,36 @@ export type Workflow = GraphWorkflow | SupervisorWorkflow;
 
 export type SupervisorWorkflowUpdatePolicy = "latest" | "locked";
 
+/** A single supervisor-workflow gate mutation. Client mirror of src/workbench/types.ts. */
+export type WorkflowChangeOperation =
+  | { kind: "add-gate"; gate: SupervisorGate; rationale: string; risk: string }
+  | { kind: "update-gate"; gateId: string; patch: Partial<Omit<SupervisorGate, "id">>; rationale: string; risk: string }
+  | { kind: "remove-gate"; gateId: string; rationale: string; risk: string };
+
+export type WorkflowChangeStatus = "awaiting-approval" | "applied" | "rejected";
+
+export interface WorkflowChangeReview {
+  actor: string;
+  comment?: string;
+  at: string;
+}
+
+/** A human-approved proposal to change a supervisor workflow's gates. Client mirror of the server record. */
+export interface WorkflowChangeRequest {
+  id: string;
+  workflowId: string;
+  /** Frozen at proposal time: the workflow version the operations were authored against. */
+  workflowVersion: number;
+  status: WorkflowChangeStatus;
+  title: string;
+  reason: string;
+  requestedBy: string;
+  operations: WorkflowChangeOperation[];
+  review?: WorkflowChangeReview;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ArchitectureTemplate {
   id: string;
   displayName: string;
@@ -1192,6 +1222,7 @@ export interface Bootstrap {
   knowledgeBases?: KnowledgeBase[];
   knowledgeProfiles?: KnowledgeProfile[];
   knowledgeChanges?: KnowledgeChangeRequest[];
+  workflowChanges?: WorkflowChangeRequest[];
   configurationProposals?: ConfigurationProposal[];
   architectureTemplates: ArchitectureTemplate[];
   gateValidators?: Array<{ id: string; description: string }>;

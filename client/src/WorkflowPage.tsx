@@ -7,6 +7,7 @@ import { automaticCanvasPositions, WorkflowCanvas, type CanvasPositions } from "
 import { ManagementPolicyPage } from "./ManagementPolicyPage";
 import { EntrancePolicyPage } from "./EntrancePolicyPage";
 import { SupervisorWorkflowPage } from "./SupervisorWorkflowPage";
+import { WorkflowChangePage } from "./WorkflowChangePage";
 import { WorkflowSessionGuide } from "./WorkflowSessionGuide";
 import { activeWorkflowPublications, buildWorkflowSessionPrompts } from "./workflowSessionPrompts";
 import type { Bootstrap, Employee, GraphWorkflow, InstantiatedArchitectureTemplate, InvocationRecord, JsonObject, Workflow, WorkflowNode } from "./types";
@@ -252,11 +253,12 @@ function GraphWorkflowPage({ data, refresh, notify }: PageProps) {
 }
 
 export function WorkflowPage(props: PageProps) {
-  const [section, setSection] = useState<"entrance" | "graph" | "supervisor" | "policies">("supervisor");
+  const [section, setSection] = useState<"entrance" | "graph" | "supervisor" | "policies" | "gate-changes">("supervisor");
   const graphCount = props.data.workflows.filter((workflow) => workflow.architecture === "graph").length;
   const supervisorCount = props.data.workflows.filter((workflow) => workflow.architecture === "supervisor").length;
   const policyCount = props.data.managementPolicies?.length ?? 0;
   const entranceCount = props.data.entrancePolicies?.length ?? 0;
+  const gateChangeCount = props.data.workflowChanges?.length ?? 0;
   return <div className="orchestration-workspace">
     <header className="orchestration-switcher" aria-label="协作编排类型">
       <div><span>WORKFLOW CONTROL PLANE</span><strong>默认继续讨论；明确交给员工或启动协作编排后，才创建工单与运行</strong></div>
@@ -265,11 +267,13 @@ export function WorkflowPage(props: PageProps) {
         <button type="button" className={section === "graph" ? "active" : ""} aria-pressed={section === "graph"} onClick={() => setSection("graph")}>Graph 编排 <small>{graphCount}</small></button>
         <button type="button" className={section === "supervisor" ? "active" : ""} aria-pressed={section === "supervisor"} onClick={() => setSection("supervisor")}>协作编排 <small>{supervisorCount}</small></button>
         <button type="button" className={section === "policies" ? "active" : ""} aria-pressed={section === "policies"} onClick={() => setSection("policies")}>管理策略库 <small>{policyCount}</small></button>
+        <button type="button" className={section === "gate-changes" ? "active" : ""} aria-pressed={section === "gate-changes"} onClick={() => setSection("gate-changes")}>门禁变更 <small>{gateChangeCount}</small></button>
       </nav>
     </header>
     {section === "entrance" && <EntrancePolicyPage {...props} />}
     {section === "graph" && <GraphWorkflowPage {...props} />}
     {section === "supervisor" && <SupervisorWorkflowPage {...props} />}
     {section === "policies" && <ManagementPolicyPage {...props} />}
+    {section === "gate-changes" && <WorkflowChangePage data={props.data} />}
   </div>;
 }
