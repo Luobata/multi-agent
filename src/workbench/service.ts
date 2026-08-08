@@ -170,6 +170,7 @@ import {
   type GraphWorkflowCreateInput,
   type ManagementPolicyCreateInput,
   type ManagementPolicyDefinition,
+  type ManagementPolicyExecution,
   type ManagementPolicyLimits,
   type ManagementPolicyUpdateInput,
   type SkillCreateInput,
@@ -5695,6 +5696,16 @@ export class WorkbenchService {
     if (workerFailure !== "observe-and-replan" && workerFailure !== "fail-fast") {
       throw new Error(`management policy workerFailure is invalid: ${String(workerFailure)}`);
     }
+    // execution: undefined inherits the current value; a provided value replaces it and is validated.
+    const executionInput = input.execution === undefined ? current?.execution : input.execution;
+    let execution: ManagementPolicyExecution | undefined;
+    if (executionInput !== undefined) {
+      const isolation = executionInput.isolation;
+      if (isolation !== undefined && isolation !== "worktree" && isolation !== "none") {
+        throw new Error(`management policy execution.isolation is invalid: ${String(isolation)}`);
+      }
+      execution = isolation === undefined ? {} : { isolation };
+    }
     const timestamp = now();
     return {
       id,
@@ -5713,6 +5724,7 @@ export class WorkbenchService {
           ?? current?.completion.requireAllDelegationsSuccessful
           ?? false
       },
+      ...(execution === undefined ? {} : { execution }),
       createdAt: current?.createdAt ?? timestamp,
       updatedAt: timestamp
     };
@@ -5737,7 +5749,8 @@ export class WorkbenchService {
       instructions: input.instructions ?? current.instructions,
       limits: input.limits ?? current.limits,
       failure: input.failure ?? current.failure,
-      completion: input.completion ?? current.completion
+      completion: input.completion ?? current.completion,
+      execution: input.execution ?? current.execution
     }, current);
     return this.store.mutate((state) => {
       const record = state.managementPolicies[id];

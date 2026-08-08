@@ -149,6 +149,12 @@ export interface NodeRunResult {
   artifactDir?: string;
 }
 
+export interface WorkflowRunIsolation {
+  mode: "worktree" | "none";
+  worktreePath?: string;
+  fallbackReason?: string;
+}
+
 export interface WorkflowRunRecord {
   id: string;
   workflow: string;
@@ -161,6 +167,8 @@ export interface WorkflowRunRecord {
   output?: JsonValue;
   error?: string;
   nodes: Record<string, NodeRunResult>;
+  /** Execution isolation evidence. Omitted = no isolation applied (current behavior). */
+  isolation?: WorkflowRunIsolation;
 }
 
 export interface ExecutionPlanNode {

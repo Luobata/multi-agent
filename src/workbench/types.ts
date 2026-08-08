@@ -117,6 +117,13 @@ export interface EmployeeTemplateRecord {
 
 export type ManagementPolicyWorkerFailure = "observe-and-replan" | "fail-fast";
 
+export type ManagementPolicyIsolationMode = "worktree" | "none";
+
+export interface ManagementPolicyExecution {
+  /** Execution isolation for delegated work. Omitted = no isolation (current behavior). */
+  isolation?: ManagementPolicyIsolationMode;
+}
+
 export interface ManagementPolicyLimits {
   maxRounds: number;
   maxDelegations: number;
@@ -144,6 +151,8 @@ export interface ManagementPolicyDefinition {
     requireDelegation: boolean;
     requireAllDelegationsSuccessful: boolean;
   };
+  /** Optional execution controls. Omitted = no isolation (current behavior). */
+  execution?: ManagementPolicyExecution;
   createdAt: string;
   updatedAt: string;
 }
@@ -869,6 +878,7 @@ export interface ManagementPolicyCreateInput {
   limits?: Partial<Omit<ManagementPolicyLimits, "maxDurationMs">> & { maxDurationMs?: number | null };
   failure?: Partial<ManagementPolicyDefinition["failure"]>;
   completion?: Partial<ManagementPolicyDefinition["completion"]>;
+  execution?: ManagementPolicyExecution;
 }
 
 export type ManagementPolicyUpdateInput = Partial<Omit<ManagementPolicyCreateInput, "id">>;
