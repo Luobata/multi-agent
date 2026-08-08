@@ -22,16 +22,15 @@
 - §7 交互与无障碍（键盘焦点、状态矩阵、对比度、reduced-motion）
 - 表达为 skill `instructions`：简洁、祈使句、可直接指导生成。`injection` 设为注入态（照现有 skill 模板的 injection 字段）。
 
-**Knowledge base `design-language-reference`（参考，检索）** —— 收纳理念与素材：
-- §1 产品隐喻、§4 应用骨架与季节路由、§6 Provider/架构边界、§8 验收清单
-- avatar-sources.md 内容
-- design.md 全文作为一个 source（保留完整上下文供检索）
+**Knowledge（参考，检索）—— 复用现有** `local-agent-workbench` 知识库的 `design` collection（交互与视觉设计），不新建重复知识库：
+- 参考材料（design.md 理念/骨架/验收、avatar-sources）作为该 collection 的 source 收纳。
+- §1 产品隐喻、§4 应用骨架、§6 边界、§8 验收、头像来源等归此。
 
 ## 3. 落地形态
 
-- **Skill 模板**：`templates/workbench/design-style-futaba.skill.json`（照现有 *.skill.json：id/version/status/displayName/description/summary/instructions/tools:[]/owner/injection/时间戳）。tools 为空（纯风格指令，不带工具）。
-- **Knowledge base 模板**：`templates/workbench/knowledge/design-language.knowledge-base.json`（照现有 knowledge-base 模板形态，collections + sources 指向 design.md/avatar-sources 内容）。
-- **文档**：docs/design-language.md 说明"风格如何沉淀与复用"——员工绑 design-style-futaba skill 即获得风格指令；需要理念/案例时查 design-language knowledge base。
+- **Skill 模板（本轮核心产物）**：`templates/workbench/design-style-futaba.skill.json`（照现有 *.skill.json：id/displayName/description/instructions/tools）。instructions = 从 design.md §2/§3/§3.1/§5/§7 提炼的可注入风格指令（简洁祈使句）。tools 为空（纯风格指令）。
+- **Knowledge**：复用已有 `templates/workbench/knowledge/local-agent-workbench.knowledge-base.json` 的 design collection；如需补充 design 参考 source 就加到该模板（不新建 knowledge base）。
+- **文档**：docs/design-language.md 说明"风格如何沉淀与复用"——员工绑 design-style-futaba skill 即获得可注入风格指令；理念/案例查 design collection。
 
 ## 4. 范围（YAGNI）
 
