@@ -33,6 +33,12 @@ const CONFIGURATION_CONTROL_TOOLS = [
   "configuration_proposal_get",
   "configuration_proposal_create"
 ];
+const GATE_CONTROL_TOOLS = [
+  "workflow_control_snapshot",
+  "workflow_change_list",
+  "workflow_change_get",
+  "workflow_change_propose"
+];
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const SYSTEM_SKILL_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 
@@ -168,6 +174,28 @@ function codexConfigurationControlProvider(): ProviderDefinition {
   };
 }
 
+function codexGateControlProvider(): ProviderDefinition {
+  return {
+    adapter: "codex",
+    runtimeProfiles: [...systemProviderRuntimeProfiles("codex-gate-control")!],
+    command: resolveCodexCommand(),
+    filesystemIsolation: "workspace-read-only",
+    workingDirectory: "{{run.materializedRoot}}",
+    approvalPolicy: "never",
+    timeoutMs: 600_000,
+    outputProtocol: "json",
+    mcpServers: {
+      gate_control: {
+        command: process.execPath,
+        args: [path.join(packageRoot, "dist", "mcp", "main.js"), "--profile", "gate-control"],
+        cwd: "{{run.projectRoot}}",
+        enabledTools: GATE_CONTROL_TOOLS,
+        defaultToolsApprovalMode: "approve"
+      }
+    }
+  };
+}
+
 function initialState(): WorkbenchState {
   return {
     schemaVersion: 1,
@@ -178,13 +206,15 @@ function initialState(): WorkbenchState {
         outputProtocol: "json"
       },
       "codex-knowledge-control": codexKnowledgeControlProvider(),
-      "codex-configuration-control": codexConfigurationControlProvider()
+      "codex-configuration-control": codexConfigurationControlProvider(),
+      "codex-gate-control": codexGateControlProvider()
     },
     skills: { "team-orchestration": teamOrchestrationSkill() },
     skillHistory: { "team-orchestration": [teamOrchestrationSkill()] },
     knowledgeBases: {},
     knowledgeProfiles: {},
     knowledgeChangeRequests: {},
+    workflowChangeRequests: {},
     configurationProposals: {},
     employees: {},
     employeeTemplates: {},
@@ -235,12 +265,18 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     ...codexConfigurationControlProvider(),
     ...(typeof currentConfigurationControl?.model === "string" ? { model: currentConfigurationControl.model } : {})
   };
+  const currentGateControl = state.providers["codex-gate-control"];
+  state.providers["codex-gate-control"] = {
+    ...codexGateControlProvider(),
+    ...(typeof currentGateControl?.model === "string" ? { model: currentGateControl.model } : {})
+  };
   state.skillHistory ??= Object.fromEntries(
     Object.entries(state.skills).map(([id, skill]) => [id, [skill]])
   );
   state.knowledgeBases ??= {};
   state.knowledgeProfiles ??= {};
   state.knowledgeChangeRequests ??= {};
+  state.workflowChangeRequests ??= {};
   state.configurationProposals ??= {};
   for (const proposal of Object.values(state.configurationProposals)) {
     proposal.progress = configurationReviewProgress(

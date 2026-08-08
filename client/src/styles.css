@@ -613,6 +613,38 @@ input[type="color"] { padding: var(--space-1); }
 .change-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3); padding: var(--space-3) var(--space-4); border-top: 1px dashed var(--line); }
 .change-actions .button { min-height: 34px; padding: 0 var(--space-3); font-size: var(--text-xs); }
 
+/* Gate change proposals — read-only viewer inside the orchestration workspace. */
+.workflow-change-console { display: grid; align-content: start; gap: var(--space-4); padding: var(--space-4); }
+.workflow-change-header { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.workflow-change-header h2 { margin: var(--space-1) 0 2px; font-family: var(--font-display); font-size: var(--text-title); }
+.workflow-change-header p { margin: 0; max-width: 62ch; color: var(--ink-3); font-size: var(--text-xs); line-height: 1.6; }
+.workflow-change-vitals { flex-shrink: 0; display: flex; gap: var(--space-3); }
+.workflow-change-vitals span { display: grid; color: var(--ink-3); font-family: var(--font-machine); font-size: 10px; text-align: right; }
+.workflow-change-vitals b { color: var(--ink); font-family: var(--font-display); font-size: var(--text-body); }
+.workflow-change-scroll { display: grid; gap: var(--space-4); }
+.workflow-change-ops { display: grid; gap: var(--space-3); margin: var(--space-3) var(--space-4) 0; }
+.workflow-change-op { border: 1px solid var(--line-strong); background: var(--paper-sunken); }
+.workflow-change-op > header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px dashed var(--line); }
+.workflow-change-op-target { margin: var(--space-2) var(--space-3) 0; color: var(--ink-2); font-size: var(--text-xs); }
+.workflow-change-op-target code { font-family: var(--font-machine); font-size: 10px; }
+.workflow-change-gate-facts { grid-template-columns: 1fr 1fr; }
+.workflow-change-gate-facts > div { display: flex; flex-direction: column; gap: 2px; }
+.workflow-change-gate-facts dd { white-space: normal; overflow-wrap: anywhere; }
+.workflow-change-gate-instructions { grid-column: 1 / -1; }
+.workflow-change-diff { padding: var(--space-2) var(--space-3) 0; }
+.workflow-change-diff-rows { display: grid; gap: var(--space-2); margin-top: var(--space-2); }
+.workflow-change-diff-row { display: grid; gap: 2px; padding: var(--space-2); border: 1px dashed var(--line); background: var(--paper); }
+.workflow-change-diff-field { display: flex; align-items: baseline; gap: var(--space-2); color: var(--ink-2); font-size: var(--text-xs); }
+.workflow-change-diff-field code { color: var(--ink-3); font-family: var(--font-machine); font-size: 10px; }
+.workflow-change-diff-values { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); font-family: var(--font-machine); font-size: var(--text-xs); }
+.workflow-change-diff-values del { color: var(--ink-3); text-decoration: line-through; overflow-wrap: anywhere; }
+.workflow-change-diff-values ins { color: var(--seal-green); text-decoration: none; overflow-wrap: anywhere; }
+.workflow-change-diff-values i { color: var(--ink-3); }
+.workflow-change-op-rationale { margin: var(--space-2) var(--space-3) var(--space-3); display: flex; gap: var(--space-2); color: var(--ink-3); font-size: var(--text-xs); line-height: 1.55; }
+.workflow-change-op-rationale span { flex-shrink: 0; color: var(--seal-amber); font-family: var(--font-machine); font-weight: 700; }
+.workflow-change-card .change-approval { margin: var(--space-3) var(--space-4) var(--space-4); }
+.workflow-change-card .change-approval strong { flex-shrink: 0; }
+
 /* Full wiki — three-column read-only browser: directory rail, reader, metadata rail. */
 .knowledge-wiki-browser { min-height: calc(100vh - var(--banner-height) - 220px); display: grid; grid-template-columns: minmax(300px, 352px) minmax(0, 1fr) minmax(250px, 310px); background: var(--paper); }
 .wiki-tree { min-width: 0; display: flex; flex-direction: column; border-right: var(--rule) solid var(--line-strong); background: var(--paper-raised); }

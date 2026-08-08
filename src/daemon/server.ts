@@ -145,6 +145,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       knowledgeBases: service.listKnowledgeBases(true),
       knowledgeProfiles: service.listKnowledgeProfiles(true),
       knowledgeChanges: service.listKnowledgeChangeRequests(),
+      workflowChanges: service.listWorkflowChangeRequests(),
       configurationProposals: service.listConfigurationProposals(),
       architectureTemplates: service.listArchitectureTemplates(),
       gateValidators: service.listGateValidators(),
@@ -327,6 +328,34 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, await service.cancelKnowledgeChangeRequest(
       routeParam(request, "id"),
       "local-owner",
+      typeof request.body?.comment === "string" ? request.body.comment : undefined
+    ));
+  }));
+
+  app.get("/api/workflow-changes", (_request, response) => {
+    send(response, { workflowChanges: service.listWorkflowChangeRequests() });
+  });
+  app.post("/api/workflow-changes", asyncRoute(async (request, response) => {
+    send(response, await service.createWorkflowChangeRequest(request.body), 201);
+  }));
+  app.get("/api/workflow-changes/:id", (request, response, next) => {
+    try {
+      send(response, service.getWorkflowChangeRequest(routeParam(request, "id")));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.post("/api/workflow-changes/:id/approve", asyncRoute(async (request, response) => {
+    send(response, await service.approveWorkflowChangeRequest(
+      routeParam(request, "id"),
+      typeof request.body?.actor === "string" ? request.body.actor : "local-owner",
+      typeof request.body?.comment === "string" ? request.body.comment : undefined
+    ));
+  }));
+  app.post("/api/workflow-changes/:id/reject", asyncRoute(async (request, response) => {
+    send(response, await service.rejectWorkflowChangeRequest(
+      routeParam(request, "id"),
+      typeof request.body?.actor === "string" ? request.body.actor : "local-owner",
       typeof request.body?.comment === "string" ? request.body.comment : undefined
     ));
   }));

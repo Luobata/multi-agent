@@ -437,7 +437,7 @@ describe("WorkflowPage async run order", () => {
     const entranceTab = Array.from(container.querySelectorAll<HTMLButtonElement>(".orchestration-switcher button"))
       .find((button) => button.textContent?.includes("开始一项工作"));
     if (!entranceTab) throw new Error("Entrance Policy tab not found");
-    expect(container.querySelectorAll(".orchestration-switcher nav button")).toHaveLength(4);
+    expect(container.querySelectorAll(".orchestration-switcher nav button")).toHaveLength(5);
     click(entranceTab);
     await flush();
     expect(container.textContent).toContain("REQUEST ROUTING POLICY RECORD");

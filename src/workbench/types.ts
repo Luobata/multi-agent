@@ -315,6 +315,39 @@ export interface WorkbenchWorkflowRecord {
   versions: WorkbenchWorkflowDefinition[];
 }
 
+/** A single gate mutation proposed against a supervisor workflow's flow. */
+export type WorkflowChangeOperation =
+  | { kind: "add-gate"; gate: SupervisorGate; rationale: string; risk: string }
+  | { kind: "update-gate"; gateId: string; patch: Partial<Omit<SupervisorGate, "id">>; rationale: string; risk: string }
+  | { kind: "remove-gate"; gateId: string; rationale: string; risk: string };
+
+/** A human-approved proposal to change a supervisor workflow's gates. Mirrors KnowledgeChangeRequest. */
+export interface WorkflowChangeRequest {
+  id: string;
+  workflowId: string;
+  /** Frozen at proposal time: the workflow version the operations were authored against. */
+  workflowVersion: number;
+  status: "awaiting-approval" | "applied" | "rejected";
+  title: string;
+  reason: string;
+  /** Defaults to "gate-steward". */
+  requestedBy: string;
+  operations: WorkflowChangeOperation[];
+  review?: { actor: string; comment?: string; at: string };
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Input for proposing a supervisor workflow gate change. Mirrors KnowledgeChangeCreateInput. */
+export interface WorkflowChangeCreateInput {
+  workflowId: string;
+  title: string;
+  reason: string;
+  /** Defaults to "gate-steward" when omitted. */
+  requestedBy?: string;
+  operations: WorkflowChangeOperation[];
+}
+
 export interface EmployeeSessionMessage {
   id: string;
   role: "user" | "employee" | "system";
@@ -718,6 +751,7 @@ export interface WorkbenchState {
   knowledgeBases: Record<string, KnowledgeBaseRecord>;
   knowledgeProfiles: Record<string, KnowledgeProfileRecord>;
   knowledgeChangeRequests: Record<string, KnowledgeChangeRequest>;
+  workflowChangeRequests: Record<string, WorkflowChangeRequest>;
   configurationProposals: Record<string, ConfigurationProposal>;
   employees: Record<string, EmployeeRecord>;
   employeeTemplates: Record<string, EmployeeTemplateRecord>;

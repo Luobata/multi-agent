@@ -8,11 +8,16 @@ program
   .name("multi-agent-mcp")
   .description("Expose the Local Agent Workbench as MCP tools over stdio")
   .option("--daemon-url <url>", "running workbench daemon URL", "http://127.0.0.1:4318")
-  .option("--profile <profile>", "tool profile: full, knowledge-control, or configuration-control", "full")
+  .option("--profile <profile>", "tool profile: full, knowledge-control, configuration-control, or gate-control", "full")
   .option("--source-run-id <runId>", "trusted Workbench Run context for a restricted control profile")
   .action(async (options: { daemonUrl: string; profile: string; sourceRunId?: string }) => {
-    if (options.profile !== "full" && options.profile !== "knowledge-control" && options.profile !== "configuration-control") {
-      throw new Error("profile must be full, knowledge-control, or configuration-control");
+    if (
+      options.profile !== "full"
+      && options.profile !== "knowledge-control"
+      && options.profile !== "configuration-control"
+      && options.profile !== "gate-control"
+    ) {
+      throw new Error("profile must be full, knowledge-control, configuration-control, or gate-control");
     }
     const server = createWorkbenchMcpServer(options.daemonUrl, {
       profile: options.profile as WorkbenchMcpProfile,
