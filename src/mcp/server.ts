@@ -37,7 +37,7 @@ function invocationHeaders(metadata: { project?: string; contextId?: string; cal
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0));
 }
 
-export type WorkbenchMcpProfile = "full" | "knowledge-control" | "configuration-control";
+export type WorkbenchMcpProfile = "full" | "knowledge-control" | "configuration-control" | "gate-control";
 
 const resourceId = z.string().regex(/^[a-z][a-z0-9-]*$/, "use a lowercase kebab-case resource id");
 const catalogValue = z.string().min(1);
@@ -220,6 +220,45 @@ const knowledgeChangeOperationSchema = z.discriminatedUnion("type", [
   }).strict()
 ]);
 
+const supervisorGateSchema = z.object({
+  id: resourceId,
+  requiredCapability: z.string().min(1),
+  mode: z.enum(["after-each-delegation", "before-completion"]),
+  required: z.boolean(),
+  instructions: z.string().min(1),
+  fallback: z.enum(["supervisor", "block"]),
+  validatorId: z.string().min(1).optional()
+}).strict();
+const supervisorGatePatchSchema = z.object({
+  requiredCapability: z.string().min(1).optional(),
+  mode: z.enum(["after-each-delegation", "before-completion"]).optional(),
+  required: z.boolean().optional(),
+  instructions: z.string().min(1).optional(),
+  fallback: z.enum(["supervisor", "block"]).optional(),
+  validatorId: z.string().min(1).optional()
+}).strict();
+const workflowChangeOperationSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("add-gate"),
+    gate: supervisorGateSchema,
+    rationale: z.string().min(1),
+    risk: z.string().min(1)
+  }).strict(),
+  z.object({
+    kind: z.literal("update-gate"),
+    gateId: z.string().min(1),
+    patch: supervisorGatePatchSchema,
+    rationale: z.string().min(1),
+    risk: z.string().min(1)
+  }).strict(),
+  z.object({
+    kind: z.literal("remove-gate"),
+    gateId: z.string().min(1),
+    rationale: z.string().min(1),
+    risk: z.string().min(1)
+  }).strict()
+]);
+
 const configurationRisk = z.enum(["low", "medium", "high"]);
 const configurationIdentitySchema = z.object({
   displayName: z.string().min(1),
@@ -370,6 +409,55 @@ export function createWorkbenchMcpServer(
           ...input,
           sourceRunId: sourceRunId()
         })
+      }
+    )));
+
+    return server;
+  }
+
+  if (options.profile === "gate-control") {
+    server.registerTool("workflow_control_snapshot", {
+      title: "Inspect the workflow gate control plane",
+      description: "Read supervisor workflows, their flow gates, and pending workflow change requests. Only supervisor workflows have gates. This tool never mutates state.",
+      inputSchema: {}
+    }, async () => {
+      const bootstrap = await request<Record<string, unknown>>(daemonUrl, "/api/bootstrap");
+      return content({
+        workflows: bootstrap.workflows,
+        workflowChanges: bootstrap.workflowChanges
+      });
+    });
+
+    server.registerTool("workflow_change_list", {
+      title: "List workflow gate change requests",
+      description: "List awaiting-approval, applied, and rejected supervisor workflow gate changes.",
+      inputSchema: {}
+    }, async () => content(await request(daemonUrl, "/api/workflow-changes")));
+
+    server.registerTool("workflow_change_get", {
+      title: "Inspect a workflow gate change request",
+      description: "Read the exact target workflow, frozen version, gate operations, rationale, risk, and review result for one change request.",
+      inputSchema: { changeRequestId: z.string().min(1) }
+    }, async ({ changeRequestId }) => content(await request(
+      daemonUrl,
+      `/api/workflow-changes/${encodeURIComponent(changeRequestId)}`
+    )));
+
+    server.registerTool("workflow_change_propose", {
+      title: "Propose a governed supervisor workflow gate change",
+      description: "Create one typed, validated change request that adds, updates, or removes supervisor workflow gates, for human review. This tool never approves or applies the change. Read the current workflow snapshot first and never invent workflow ids, gate ids, or validator ids.",
+      inputSchema: {
+        workflowId: z.string().min(1),
+        title: z.string().min(1),
+        reason: z.string().min(1),
+        operations: z.array(workflowChangeOperationSchema).min(1)
+      }
+    }, async ({ workflowId, title, reason, operations }) => content(await request(
+      daemonUrl,
+      "/api/workflow-changes",
+      {
+        method: "POST",
+        body: JSON.stringify({ workflowId, title, reason, requestedBy: "gate-steward", operations })
       }
     )));
 
