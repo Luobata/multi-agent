@@ -338,6 +338,16 @@ export interface WorkflowChangeRequest {
   updatedAt: string;
 }
 
+/** Input for proposing a supervisor workflow gate change. Mirrors KnowledgeChangeCreateInput. */
+export interface WorkflowChangeCreateInput {
+  workflowId: string;
+  title: string;
+  reason: string;
+  /** Defaults to "gate-steward" when omitted. */
+  requestedBy?: string;
+  operations: WorkflowChangeOperation[];
+}
+
 export interface EmployeeSessionMessage {
   id: string;
   role: "user" | "employee" | "system";

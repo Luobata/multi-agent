@@ -181,6 +181,10 @@ import {
   type SupervisorWorkflowCreateInput,
   type WorkflowRefreshResult,
   type WorkflowRefreshChange,
+  type WorkflowChangeRequest,
+  type WorkflowChangeOperation,
+  type WorkflowChangeCreateInput,
+  type SupervisorGate,
   type WorkInstanceRecord,
   type WorkInstanceStatus,
   type WorkflowCreateInput,
@@ -2796,6 +2800,114 @@ export class WorkbenchService {
   getKnowledgeChangeRequest(id: string): KnowledgeChangeRequest {
     const request = this.snapshot().knowledgeChangeRequests[id];
     if (!request) throw new Error(`knowledge change request not found: ${id}`);
+    return request;
+  }
+
+  private validateWorkflowChangeOperations(
+    workflow: SupervisorWorkbenchWorkflowDefinition,
+    operations: WorkflowChangeOperation[]
+  ): void {
+    if (!Array.isArray(operations) || operations.length === 0) {
+      throw new Error("工作流变更提案必须至少包含一个操作");
+    }
+    const validatorIds = new Set(listRegisteredGateValidators().map((validator) => validator.id));
+    const existingGateIds = new Set(workflow.flow.gates.map((gate) => gate.id));
+    const addedGateIds = new Set<string>();
+    const modes = new Set<SupervisorGate["mode"]>(["after-each-delegation", "before-completion"]);
+    const fallbacks = new Set<SupervisorGate["fallback"]>(["supervisor", "block"]);
+    operations.forEach((operation, index) => {
+      const label = `工作流变更操作 ${index + 1}`;
+      requireText(operation.rationale, `${label} rationale`);
+      requireText(operation.risk, `${label} risk`);
+      switch (operation.kind) {
+        case "add-gate": {
+          const gate = operation.gate;
+          const gateId = requireText(gate.id, `${label} gate id`);
+          if (existingGateIds.has(gateId) || addedGateIds.has(gateId)) {
+            throw new Error(`${label}：门禁 ${gateId} 已存在于工作流 ${workflow.id} 中，不能重复添加`);
+          }
+          requireText(gate.requiredCapability, `${label} gate requiredCapability`);
+          requireText(gate.instructions, `${label} gate instructions`);
+          if (!modes.has(gate.mode)) {
+            throw new Error(`${label}：门禁 ${gateId} 的 mode 非法（应为 after-each-delegation 或 before-completion），收到 ${String(gate.mode)}`);
+          }
+          if (typeof gate.required !== "boolean") {
+            throw new Error(`${label}：门禁 ${gateId} 的 required 必须是布尔值`);
+          }
+          if (!fallbacks.has(gate.fallback)) {
+            throw new Error(`${label}：门禁 ${gateId} 的 fallback 非法（应为 supervisor 或 block），收到 ${String(gate.fallback)}`);
+          }
+          if (gate.validatorId !== undefined && gate.validatorId !== "none" && !validatorIds.has(gate.validatorId)) {
+            throw new Error(`${label}：门禁 ${gateId} 引用了未知的 validator ${gate.validatorId}；合法取值为 ${[...validatorIds].join("、") || "（无）"} 或 none`);
+          }
+          addedGateIds.add(gateId);
+          break;
+        }
+        case "update-gate": {
+          const gateId = requireText(operation.gateId, `${label} gateId`);
+          if (!existingGateIds.has(gateId)) {
+            throw new Error(`${label}：门禁 ${gateId} 不存在于工作流 ${workflow.id} 中，无法更新`);
+          }
+          const patch = operation.patch ?? {};
+          if (patch.mode !== undefined && !modes.has(patch.mode)) {
+            throw new Error(`${label}：门禁 ${gateId} 的 mode 非法（应为 after-each-delegation 或 before-completion），收到 ${String(patch.mode)}`);
+          }
+          if (patch.fallback !== undefined && !fallbacks.has(patch.fallback)) {
+            throw new Error(`${label}：门禁 ${gateId} 的 fallback 非法（应为 supervisor 或 block），收到 ${String(patch.fallback)}`);
+          }
+          if (patch.required !== undefined && typeof patch.required !== "boolean") {
+            throw new Error(`${label}：门禁 ${gateId} 的 required 必须是布尔值`);
+          }
+          if (patch.validatorId !== undefined && patch.validatorId !== "none" && !validatorIds.has(patch.validatorId)) {
+            throw new Error(`${label}：门禁 ${gateId} 引用了未知的 validator ${patch.validatorId}；合法取值为 ${[...validatorIds].join("、") || "（无）"} 或 none`);
+          }
+          break;
+        }
+        case "remove-gate": {
+          const gateId = requireText(operation.gateId, `${label} gateId`);
+          if (!existingGateIds.has(gateId)) {
+            throw new Error(`${label}：门禁 ${gateId} 不存在于工作流 ${workflow.id} 中，无法删除`);
+          }
+          break;
+        }
+      }
+    });
+  }
+
+  async createWorkflowChangeRequest(input: WorkflowChangeCreateInput): Promise<WorkflowChangeRequest> {
+    const workflowId = requireText(input.workflowId, "workflow change workflowId");
+    const workflow = this.getWorkflow(workflowId);
+    if (workflow.architecture !== "supervisor") {
+      throw new Error(`工作流 ${workflowId} 是 ${workflow.architecture} 架构，只有 supervisor 工作流才有门禁可供变更`);
+    }
+    this.validateWorkflowChangeOperations(workflow, input.operations);
+    const timestamp = now();
+    const request: WorkflowChangeRequest = {
+      id: `wc-${timestamp.replaceAll(/[:.]/g, "-").toLowerCase()}-${randomUUID().slice(0, 8)}`,
+      workflowId,
+      workflowVersion: workflow.version,
+      status: "awaiting-approval",
+      title: requireText(input.title, "workflow change title"),
+      reason: requireText(input.reason, "workflow change reason"),
+      requestedBy: input.requestedBy?.trim() || "gate-steward",
+      operations: input.operations,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    return this.store.mutate((state) => {
+      state.workflowChangeRequests[request.id] = request;
+      return request;
+    });
+  }
+
+  listWorkflowChangeRequests(): WorkflowChangeRequest[] {
+    return Object.values(this.snapshot().workflowChangeRequests)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  getWorkflowChangeRequest(id: string): WorkflowChangeRequest {
+    const request = this.snapshot().workflowChangeRequests[id];
+    if (!request) throw new Error(`工作流变更请求不存在：${id}`);
     return request;
   }
 
