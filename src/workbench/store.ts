@@ -185,6 +185,7 @@ function initialState(): WorkbenchState {
     knowledgeBases: {},
     knowledgeProfiles: {},
     knowledgeChangeRequests: {},
+    workflowChangeRequests: {},
     configurationProposals: {},
     employees: {},
     employeeTemplates: {},
@@ -241,6 +242,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   state.knowledgeBases ??= {};
   state.knowledgeProfiles ??= {};
   state.knowledgeChangeRequests ??= {};
+  state.workflowChangeRequests ??= {};
   state.configurationProposals ??= {};
   for (const proposal of Object.values(state.configurationProposals)) {
     proposal.progress = configurationReviewProgress(
