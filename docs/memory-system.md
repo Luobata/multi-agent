@@ -28,11 +28,11 @@
 提炼发生在**员工运行结束后**，作为异步旁路执行，特点如下：
 
 - **触发点**：一次员工调用的运行完成后触发，绝不阻塞调用返回。
-- **价值 gate 筛选**（`shouldExtract`）：
+- **价值 gate 筛选**（`shouldExtract`，状态词表对齐 runner：成功运行是 `passed`，无 `completed`）：
   - `cancelled` 运行：跳过。
   - `failed` / `blocked` 运行：提炼（失败经验也可复用）。
-  - `completed` 且只有单节点：跳过（琐碎运行）。
-  - `completed` 且多节点：提炼。
+  - `passed` 且只有单节点：跳过（琐碎运行）。
+  - `passed` 且多节点：提炼。
 - **提炼器**：优先复用内部提炼器 Employee（id `memory-summarizer`）；若该员工不存在或调用抛错，则**降级为规则摘要**（记录运行状态与节点数），保证始终能落盘。
 - **幂等**：同一 `runId` 的 `run-summary` 已存在时直接返回已有记录，不重复写。
 - **失败降级**：整个提炼链路 best-effort，任何异常都被吞掉，绝不影响主运行链路。
