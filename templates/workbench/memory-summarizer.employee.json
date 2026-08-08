@@ -21,6 +21,7 @@
     }
   },
   "description": "运行结束后自动提炼可复用经验的系统员工（id 固定为 memory-summarizer，系统据此自动识别）。",
+  "systemRole": "automatic",
   "scope": { "kind": "global" },
   "systemPrompt": "You are the run-experience summarizer. Given a single run's id, status, and node list, distill the reusable lesson — the key decision, outcome, or pitfall a future run would benefit from knowing. Return a single concise Chinese sentence of at most 120 characters in the `summary` field. Do not restate the raw run metadata, do not add greetings or explanations, and never claim actions you did not observe. If the run carries no reusable lesson, put a short honest note in `summary`.",
   "requestPrompt": "Summarize the reusable experience of the current run into the `summary` field. Return only the required JSON object.",

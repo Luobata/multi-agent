@@ -192,6 +192,11 @@ const ID_PATTERN = /^[a-z][a-z0-9-]*$/;
 /** Internal Employee id used to summarize completed runs into reusable memory. */
 const MEMORY_SUMMARIZER_ID = "memory-summarizer";
 
+/** Internal invocation caller marker. Callers prefixed with "system:" are treated as
+ * internal system triggers and are exempt from the human-direct-invocation guard on
+ * automatic system employees. */
+const INTERNAL_CALLER = "system:memory-extractor";
+
 
 function now(): string {
   return new Date().toISOString();
@@ -477,6 +482,14 @@ function normalizeKnowledgeGrants(
   return profileIds.map((profileId) => normalized.find((grant) => grant.profileId === profileId)!);
 }
 
+export function systemRoleOf(e: { systemRole?: string }): "automatic" | "conversational" | undefined {
+  return e.systemRole === "automatic" || e.systemRole === "conversational" ? e.systemRole : undefined;
+}
+
+export function isSystemEmployee(e: { systemRole?: string }): boolean {
+  return systemRoleOf(e) !== undefined;
+}
+
 function buildEmployeeDefinition(
   state: WorkbenchState,
   input: EmployeeCreateInput,
@@ -507,6 +520,9 @@ function buildEmployeeDefinition(
   validateSchema(outputSchema, `employee ${id} outputSchema`);
   const verdict = input.verdict ?? undefined;
   validateVerdict(verdict, `employee ${id}`);
+  if (input.systemRole !== undefined && input.systemRole !== "automatic" && input.systemRole !== "conversational") {
+    throw new Error(`employee ${id} systemRole must be "automatic" or "conversational"`);
+  }
   return {
     id,
     version: 1,
@@ -535,6 +551,7 @@ function buildEmployeeDefinition(
     verdict,
     contextPolicy: { historyLimit: Math.max(0, Math.min(100, input.contextPolicy?.historyLimit ?? 20)) },
     presentation: input.presentation ?? {},
+    systemRole: input.systemRole,
     createdAt: timestamp,
     updatedAt: timestamp
   };
@@ -1661,11 +1678,17 @@ export class WorkbenchService {
       try {
         const exists = this.listEmployees(true).some((employee) => employee.id === MEMORY_SUMMARIZER_ID);
         if (exists) {
-          const result = await this.invokeEmployee(MEMORY_SUMMARIZER_ID, {
-            message:
-              `提炼这次运行的可复用经验（<=120字）。以下是运行证据（节点状态与产出、最终结果）：\n` +
-              buildRunEvidence(run)
-          });
+          const result = await this.invokeEmployee(
+            MEMORY_SUMMARIZER_ID,
+            {
+              message:
+                `提炼这次运行的可复用经验（<=120字）。以下是运行证据（节点状态与产出、最终结果）：\n` +
+                buildRunEvidence(run)
+            },
+            // 内部系统来源标记：豁免"禁人工直调 automatic 系统员工"守卫，
+            // 否则小忆（memory-summarizer，systemRole=automatic）的自动提炼会被拦死。
+            { kind: "workbench", caller: INTERNAL_CALLER }
+          );
           const output = (result as { output?: unknown }).output;
           const content = summarizerContent(output);
           if (content) return { title: `运行 ${run.id}`, content };
@@ -4258,8 +4281,15 @@ export class WorkbenchService {
     if (!record) throw new Error(`employee not found: ${input.employeeId}`);
     if (record.current.status !== "active") throw new Error(`employee ${input.employeeId} is archived`);
     const employee = employeeVersion(record, input.employeeVersion);
-    assertProjectRoleProviderCompatibility(state, role, employee);
     const scopedProjectId = internalProjectId(employee);
+    // 系统员工默认不允许被绑定为项目角色；但内部对话型系统员工（小配/小知等，
+    // scope 固定到自身内部项目）只能通过绑定到「自己所属项目的角色」再经 invokeProjectRole 调用，
+    // 这是它们唯一的调用入口，故仅当目标不是其自身内部项目时才拒绝——
+    // 防止系统员工泄漏为任意/外部项目角色，同时不破坏其既有调用链路。
+    if (isSystemEmployee(employee) && scopedProjectId !== project.id) {
+      throw new Error(`员工 ${employee.id} 是系统员工（systemRole=${employee.systemRole}），不允许绑定为项目角色`);
+    }
+    assertProjectRoleProviderCompatibility(state, role, employee);
     if (scopedProjectId && scopedProjectId !== project.id) {
       throw new Error(`employee ${employee.id} is internal to project ${scopedProjectId}`);
     }
@@ -4498,7 +4528,15 @@ export class WorkbenchService {
     });
   }
 
-  async updateEmployee(id: string, input: EmployeeUpdateInput): Promise<EmployeeDefinition> {
+  async updateEmployee(
+    id: string,
+    input: EmployeeUpdateInput,
+    options?: { allowSystemEmployeeMutation?: boolean }
+  ): Promise<EmployeeDefinition> {
+    const current = this.getEmployee(id);
+    if (isSystemEmployee(current) && !options?.allowSystemEmployeeMutation) {
+      throw new Error(`员工 ${id} 是系统员工，默认受保护；如确需修改请显式确认（allowSystemEmployeeMutation）`);
+    }
     return this.store.mutate((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);
@@ -4560,7 +4598,14 @@ export class WorkbenchService {
     });
   }
 
-  async archiveEmployee(id: string): Promise<EmployeeDefinition> {
+  async archiveEmployee(
+    id: string,
+    options?: { allowSystemEmployeeMutation?: boolean }
+  ): Promise<EmployeeDefinition> {
+    const current = this.getEmployee(id);
+    if (isSystemEmployee(current) && !options?.allowSystemEmployeeMutation) {
+      throw new Error(`员工 ${id} 是系统员工，默认受保护；如确需归档请显式确认（allowSystemEmployeeMutation）`);
+    }
     return this.store.mutate((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);
@@ -4682,6 +4727,14 @@ export class WorkbenchService {
     entrance?: EntrancePolicyExecutionSnapshot;
   }): Promise<EmployeeInvocationResult> {
     const { employee, input, source } = options;
+    // 自动型系统员工（systemRole=automatic）只能由系统内部触发（source.caller 以 "system:" 前缀标记），
+    // 不支持人工直接调用。守卫下沉到此汇聚点：invokeEmployee / invokePinnedEmployee / invokeProjectRole /
+    // invokePinnedProjectRole 都经此处，避免任一路径绕过。内部来源豁免必须保留，否则小忆
+    // （memory-summarizer，systemRole=automatic）经 extractMemoryForRun 的自动提炼会被拦死。
+    const isInternalCaller = typeof source.caller === "string" && source.caller.startsWith("system:");
+    if (systemRoleOf(employee) === "automatic" && !isInternalCaller) {
+      throw new Error(`员工 ${employee.id} 是自动型系统员工，只能由系统触发，不支持人工直接调用`);
+    }
     if (input.context !== undefined && (typeof input.context !== "object" || input.context === null || Array.isArray(input.context))) {
       throw new Error("invocation context must be a JSON object");
     }
@@ -4790,6 +4843,7 @@ export class WorkbenchService {
     requireText(input.message, "message");
     const current = this.getEmployee(employeeId);
     if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
+    // 自动型系统员工守卫已下沉到 invokeResolvedEmployee 汇聚点，此处不再重复。
     const scopedProjectId = internalProjectId(current);
     if (scopedProjectId) throw new Error(`employee ${employeeId} is internal to project ${scopedProjectId}; invoke it through a project role`);
     const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
@@ -6000,8 +6054,19 @@ export class WorkbenchService {
     requireId(input.id, "publication id");
     const target = input.target.kind === "employee" ? this.getEmployee(input.target.id) : this.getWorkflow(input.target.id);
     if (target.status !== "active") throw new Error(`${input.target.kind} ${input.target.id} is archived`);
-    if (input.target.kind === "employee" && internalProjectId(target as EmployeeDefinition)) {
-      throw new Error(`employee ${input.target.id} is project-internal and cannot be published directly`);
+    if (input.target.kind === "employee") {
+      if (isSystemEmployee(target as EmployeeDefinition)) {
+        throw new Error(`员工 ${(target as EmployeeDefinition).id} 是系统员工（systemRole=${(target as EmployeeDefinition).systemRole}），不允许对外发布`);
+      }
+      if (internalProjectId(target as EmployeeDefinition)) {
+        throw new Error(`employee ${input.target.id} is project-internal and cannot be published directly`);
+      }
+    } else {
+      for (const member of this.resolveWorkflowEmployees(target as WorkbenchWorkflowDefinition).values()) {
+        if (isSystemEmployee(member)) {
+          throw new Error(`工作流 ${input.target.id} 含系统员工 ${member.id}（systemRole=${member.systemRole}），不允许对外发布`);
+        }
+      }
     }
     return this.store.mutate((state) => {
       if (state.publications[input.id]) throw new Error(`publication already exists: ${input.id}`);

@@ -104,6 +104,23 @@ describe("Office floor runtime status", () => {
     expect(html).toContain("等待外部会话调度");
   });
 
+  it("routes a systemRole-marked Employee into the system roster", () => {
+    const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
+    const xiaoyi = { ...employee("memory-summarizer", "小忆 · 运行经验提炼器"), systemRole: "automatic" as const };
+    const html = renderToStaticMarkup(<OfficePage
+      streamStatus="live"
+      data={bootstrapWith({ employees: [mihuhu, xiaoyi] })}
+    />);
+
+    // The systemRole-marked Employee is rendered as a system seat, not an external one.
+    expect(html).toContain("小忆 · 运行经验提炼器");
+    const systemRosterAt = html.indexOf("office-roster-section--system");
+    const externalRosterAt = html.indexOf("office-roster-section--external");
+    expect(html.indexOf("小忆 · 运行经验提炼器")).toBeGreaterThan(systemRosterAt);
+    expect(html.indexOf("米糊糊 · 前端")).toBeGreaterThan(externalRosterAt);
+    expect(html.indexOf("米糊糊 · 前端")).toBeLessThan(systemRosterAt);
+  });
+
   it("renders a permanent status rail and a runtime chip per seat", () => {
     const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
     const xiaomixiang = employee("xiaomixiang-tester", "小米象 · 测试");

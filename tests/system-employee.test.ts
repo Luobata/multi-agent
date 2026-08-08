@@ -1,0 +1,233 @@
+import { describe, it, expect } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { WorkbenchService, isSystemEmployee, systemRoleOf } from "../src/workbench/service.js";
+
+function tmp(): string { return fs.mkdtempSync(path.join(os.tmpdir(), "sysemp-")); }
+
+describe("systemRole field + helpers", () => {
+  it("helpers classify employees", () => {
+    expect(isSystemEmployee({})).toBe(false);
+    expect(isSystemEmployee({ systemRole: "automatic" })).toBe(true);
+    expect(systemRoleOf({ systemRole: "conversational" })).toBe("conversational");
+    expect(systemRoleOf({})).toBeUndefined();
+  });
+
+  it("createEmployee persists systemRole", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    const e = await svc.createEmployee({
+      id: "sys-auto",
+      identity: { displayName: "Auto", background: "bg", responsibilities: ["r"] },
+      systemRole: "automatic"
+    });
+    expect(e.systemRole).toBe("automatic");
+  });
+
+  it("createEmployee rejects an invalid systemRole", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await expect(svc.createEmployee({
+      id: "bad", identity: { displayName: "X", background: "b", responsibilities: ["r"] },
+      systemRole: "nope" as never
+    })).rejects.toThrow(/systemRole/);
+  });
+
+  it("business employees have no systemRole", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    const e = await svc.createEmployee({ id: "biz", identity: { displayName: "Biz", background: "b", responsibilities: ["r"] } });
+    expect(e.systemRole).toBeUndefined();
+  });
+});
+
+describe("block binding/publishing system employees", () => {
+  it("rejects publishing a system employee directly", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "sys-c",
+      identity: { displayName: "Conv", background: "b", responsibilities: ["r"] },
+      systemRole: "conversational"
+    });
+    await expect(svc.createPublication({
+      id: "pub-sys-c",
+      name: "System Publish",
+      target: { kind: "employee", id: "sys-c" }
+    })).rejects.toThrow(/系统员工/);
+  });
+
+  it("rejects publishing a workflow that contains a system employee member", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "sys-auto-wf",
+      identity: { displayName: "Auto", background: "b", responsibilities: ["r"] },
+      systemRole: "automatic"
+    });
+    await svc.createWorkflow({
+      id: "wf-with-system",
+      nodes: [{ id: "respond", employeeId: "sys-auto-wf" }]
+    });
+    await expect(svc.createPublication({
+      id: "pub-wf-system",
+      name: "Workflow Publish",
+      target: { kind: "workflow", id: "wf-with-system" }
+    })).rejects.toThrow(/系统员工/);
+  });
+
+  it("still publishes a business employee", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "biz-pub",
+      identity: { displayName: "Biz", background: "b", responsibilities: ["r"] }
+    });
+    const pub = await svc.createPublication({
+      id: "pub-biz",
+      name: "Biz Publish",
+      target: { kind: "employee", id: "biz-pub" }
+    });
+    expect(pub.status).toBe("active");
+  });
+
+  it("rejects binding a system employee to a project role", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "sys-bind",
+      identity: { displayName: "Auto", background: "b", responsibilities: ["r"] },
+      systemRole: "automatic"
+    });
+    await svc.createProject({
+      id: "proj-sys",
+      name: "Project Sys",
+      description: "System employee binding guard.",
+      rootPath: tmp(),
+      descriptorPath: path.join(tmp(), "multi-agent.project.yaml"),
+      connector: { kind: "generic", config: {} },
+      roles: [{
+        id: "role-a",
+        displayName: "Role A",
+        description: "Any role.",
+        permissions: { write: "none" }
+      }]
+    });
+    await expect(svc.saveProjectBinding("proj-sys", {
+      roles: [{ roleId: "role-a", employeeId: "sys-bind" }]
+    })).rejects.toThrow(/系统员工/);
+  });
+
+  it("still binds a business employee to a project role", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({
+      id: "biz-bind",
+      identity: { displayName: "Biz", background: "b", responsibilities: ["r"] }
+    });
+    await svc.createProject({
+      id: "proj-biz",
+      name: "Project Biz",
+      description: "Business employee binding.",
+      rootPath: tmp(),
+      descriptorPath: path.join(tmp(), "multi-agent.project.yaml"),
+      connector: { kind: "generic", config: {} },
+      roles: [{
+        id: "role-b",
+        displayName: "Role B",
+        description: "Any role.",
+        permissions: { write: "none" }
+      }]
+    });
+    const binding = await svc.saveProjectBinding("proj-biz", {
+      roles: [{ roleId: "role-b", employeeId: "biz-bind" }]
+    });
+    expect(binding.roles[0]?.employeeId).toBe("biz-bind");
+  });
+});
+
+describe("soft-protect system employees from edit/archive", () => {
+  it("soft-protects system employees from edit/archive unless confirmed", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "sys-a", identity: { displayName: "A", background: "b", responsibilities: ["r"] }, systemRole: "automatic" });
+    await expect(svc.updateEmployee("sys-a", { description: "x" })).rejects.toThrow(/系统员工|confirm/);
+    const updated = await svc.updateEmployee("sys-a", { description: "x" }, { allowSystemEmployeeMutation: true });
+    expect(updated.description).toBe("x");
+    await expect(svc.archiveEmployee("sys-a")).rejects.toThrow(/系统员工|confirm/);
+    const archived = await svc.archiveEmployee("sys-a", { allowSystemEmployeeMutation: true });
+    expect(archived.status).toBe("archived");
+  });
+
+  it("does not affect business employees", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "biz2", identity: { displayName: "B", background: "b", responsibilities: ["r"] } });
+    const u = await svc.updateEmployee("biz2", { description: "y" });
+    expect(u.description).toBe("y");
+  });
+});
+
+describe("block human direct-invocation of automatic system employees", () => {
+  it("blocks human direct-invocation of an automatic system employee", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "sys-auto2", identity: { displayName: "Auto", background: "b", responsibilities: ["r"] }, systemRole: "automatic" });
+    // 人工来源（默认 workbench，无 system: caller）应被拒
+    await expect(svc.invokeEmployee("sys-auto2", { message: "hi" })).rejects.toThrow(/系统员工|自动|not.*directly/);
+  });
+
+  it("allows internal system-caller invocation of an automatic employee", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "sys-auto3", identity: { displayName: "Auto", background: "b", responsibilities: ["r"] }, systemRole: "automatic" });
+    // 内部来源标记豁免；mock provider 会正常返回
+    const r = await svc.invokeEmployee("sys-auto3", { message: "hi" }, { kind: "workbench", caller: "system:memory-extractor" });
+    expect(r.runId).toBeTruthy();
+  });
+
+  it("allows human invocation of a conversational system employee", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "sys-conv2", identity: { displayName: "Conv", background: "b", responsibilities: ["r"] }, systemRole: "conversational" });
+    const r = await svc.invokeEmployee("sys-conv2", { message: "hi" });
+    expect(r.runId).toBeTruthy();
+  });
+
+  it("blocks the invokeProjectRole bypass for an automatic system employee, but exempts internal callers", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    // 自动型系统员工只能绑定到「自身内部项目」的角色，这也是其唯一的项目角色调用入口。
+    await svc.createProject({
+      id: "sys-proj",
+      rootPath: tmp(),
+      descriptorPath: path.join(tmp(), "multi-agent.project.yaml"),
+      roles: [{ id: "auto-role", displayName: "Auto Role", description: "Internal automatic role.", instructions: "Work." }]
+    });
+    await svc.createEmployee({
+      id: "sys-auto-proj",
+      identity: {
+        displayName: "Auto",
+        background: "b",
+        responsibilities: ["r"],
+        metadata: { internalProjectId: "sys-proj", internalProjectRoleId: "auto-role" }
+      },
+      scope: { kind: "project", projectId: "sys-proj", projectVersion: 1 },
+      systemRole: "automatic"
+    });
+    await svc.saveProjectBinding("sys-proj", { roles: [{ roleId: "auto-role", employeeId: "sys-auto-proj" }] });
+    // 人工来源（默认 workbench，无 system: caller）经 invokeProjectRole 汇聚到 invokeResolvedEmployee 后应被拒。
+    await expect(svc.invokeProjectRole("sys-proj", "auto-role", { message: "hi" }))
+      .rejects.toThrow(/系统员工|自动|not.*directly/);
+    // 内部来源标记豁免；同一路径下自动提炼链路仍放行。
+    const r = await svc.invokeProjectRole("sys-proj", "auto-role", { message: "hi" }, { kind: "workbench", caller: "system:memory-extractor" });
+    expect(r.runId).toBeTruthy();
+  });
+
+  it("blocks the entrance-policy dispatch bypass for an automatic system employee, but exempts internal callers", async () => {
+    const svc = await WorkbenchService.open({ dataRoot: tmp() });
+    await svc.createEmployee({ id: "sys-auto-ep", identity: { displayName: "Auto", background: "b", responsibilities: ["r"] }, systemRole: "automatic" });
+    await svc.createEntrancePolicy({
+      id: "auto-entrance",
+      direct: { mode: "employee", employeeId: "sys-auto-ep" },
+      default: { route: "direct" }
+    });
+    // dispatchEntrancePolicy -> invokePinnedEmployee -> invokeResolvedEmployee：人工来源应被拒。
+    await expect(svc.dispatchEntrancePolicy("auto-entrance", { route: "direct", tags: [], signals: {}, message: "hi", source: { kind: "workbench" } }))
+      .rejects.toThrow(/系统员工|自动|not.*directly/);
+    // 内部来源标记经同一路径应放行。
+    const result = await svc.dispatchEntrancePolicy(
+      "auto-entrance",
+      { route: "direct", tags: [], signals: {}, message: "hi", source: { kind: "workbench", caller: "system:memory-extractor" } }
+    );
+    expect(result.dispatch.kind).toBe("employee");
+    if (result.dispatch.kind === "employee") expect(result.dispatch.result.runId).toBeTruthy();
+  });
+});

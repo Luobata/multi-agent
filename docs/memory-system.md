@@ -45,6 +45,8 @@
 - Provider：`templates/workbench/codex-memory-summarizer.provider.json`（`adapter: codex`，纯提炼、不挂 MCP 控制面）
 - Employee：`templates/workbench/memory-summarizer.employee.json`（`scope: global`，输出 `{ summary }`，systemPrompt 要求 ≤120 字经验正文）
 
+提炼器 Employee 是一个**系统员工**（`systemRole: "automatic"`）：只能由系统内部触发、不参与外部绑定/发布、且默认受软保护。系统员工的整体概念与约束见 [`docs/system-employees.md`](./system-employees.md)。
+
 创建步骤（Provider 经 daemon HTTP，Employee 经 CLI）：
 
 ```bash
