@@ -120,6 +120,82 @@ describe("RunsPage dossier validator verdict + e2e evidence", () => {
   });
 });
 
+const worktreeRun: Run = {
+  id: "run-iso-worktree",
+  workflow: "team-iso",
+  architecture: "supervisor",
+  artifactDir: "/iso",
+  status: "passed",
+  createdAt: "2026-08-06T05:00:00.000Z",
+  category: "supervisor",
+  nodes: {},
+  isolation: { mode: "worktree", worktreePath: "/x/.multi-agent/worktrees/run-1" }
+};
+
+const fallbackRun: Run = {
+  id: "run-iso-fallback",
+  workflow: "team-iso",
+  architecture: "supervisor",
+  artifactDir: "/iso",
+  status: "passed",
+  createdAt: "2026-08-06T05:00:00.000Z",
+  category: "supervisor",
+  nodes: {},
+  isolation: { mode: "none", fallbackReason: "worktree 创建失败" }
+};
+
+function renderRunDetail(run: Run): { container: HTMLDivElement; root: Root } {
+  const fetchMock = vi.fn((input: RequestInfo) => {
+    const url = String(input);
+    if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [run] }) });
+    if (url.startsWith("/api/runs/")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: run }) });
+    return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  return { container, root };
+}
+
+describe("RunsPage dossier isolation status", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    document.body.replaceChildren();
+    vi.unstubAllGlobals();
+  });
+
+  it("renders a worktree isolation row with its worktree path", async () => {
+    ({ container, root } = renderRunDetail(worktreeRun));
+    act(() => root.render(<RunsPage notify={vi.fn()} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const isolation = container.querySelector(".run-isolation");
+    expect(isolation).toBeTruthy();
+    const text = isolation?.textContent ?? "";
+    expect(text).toContain("worktree");
+    expect(text).toContain("/x/.multi-agent/worktrees/run-1");
+  });
+
+  it("renders a fallback isolation row with the fallback reason", async () => {
+    ({ container, root } = renderRunDetail(fallbackRun));
+    act(() => root.render(<RunsPage notify={vi.fn()} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const isolation = container.querySelector(".run-isolation");
+    expect(isolation).toBeTruthy();
+    const text = isolation?.textContent ?? "";
+    expect(text).toContain("回退");
+    expect(text).toContain("worktree 创建失败");
+  });
+});
+
 describe("RunsPage pendingRunId cross-page selection", () => {
   let container: HTMLDivElement;
   let root: Root;
