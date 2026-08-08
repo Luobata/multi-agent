@@ -30,6 +30,7 @@ import type {
   PublicationDefinition,
   ProjectBindingInput,
   SkillCreateInput,
+  WorkflowChangeCreateInput,
   WorkflowCreateInput
 } from "../workbench/types.js";
 import { scaffoldWorkflow } from "./scaffold.js";
@@ -453,6 +454,39 @@ knowledgeChange
   .option("--comment <comment>", "Human cancellation reason")
   .action(async (id: string, options: { comment?: string }) => {
     process.stdout.write(`${JSON.stringify(await (await workbenchService()).cancelKnowledgeChangeRequest(id, "local-cli-owner", options.comment), null, 2)}\n`);
+  });
+
+const workflowChange = workbench.command("workflow-change").description("Review and apply governed workflow change requests");
+workflowChange
+  .command("list")
+  .action(async () => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).listWorkflowChangeRequests(), null, 2)}\n`);
+  });
+workflowChange
+  .command("get")
+  .argument("<id>", "Workflow change request id")
+  .action(async (id: string) => {
+    process.stdout.write(`${JSON.stringify((await workbenchService()).getWorkflowChangeRequest(id), null, 2)}\n`);
+  });
+workflowChange
+  .command("propose")
+  .argument("<file>", "WorkflowChangeCreateInput JSON")
+  .action(async (file: string) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).createWorkflowChangeRequest(readJsonFile<WorkflowChangeCreateInput>(file)), null, 2)}\n`);
+  });
+workflowChange
+  .command("approve")
+  .argument("<id>", "Workflow change request id")
+  .option("--comment <comment>", "Human approval comment")
+  .action(async (id: string, options: { comment?: string }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).approveWorkflowChangeRequest(id, "local-cli-owner", options.comment), null, 2)}\n`);
+  });
+workflowChange
+  .command("reject")
+  .argument("<id>", "Workflow change request id")
+  .option("--comment <comment>", "Human rejection reason")
+  .action(async (id: string, options: { comment?: string }) => {
+    process.stdout.write(`${JSON.stringify(await (await workbenchService()).rejectWorkflowChangeRequest(id, "local-cli-owner", options.comment), null, 2)}\n`);
   });
 
 const workbenchProject = workbench.command("project").description("Connect projects and assign Employees to project role slots");
