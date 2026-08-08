@@ -14,6 +14,7 @@ import type {
   JsonValue,
   LoadedManifest,
   NodeRunResult,
+  WorkflowRunIsolation,
   WorkflowRunRecord
 } from "../core/types.js";
 import { RunStore, type RunEvent } from "./artifacts.js";
@@ -29,6 +30,8 @@ export interface RunWorkflowOptions {
   providers?: ProviderRegistry;
   architectures?: ArchitectureRegistry;
   initialArtifacts?: Record<string, JsonValue>;
+  /** Execution isolation evidence recorded verbatim on the run record. */
+  isolation?: WorkflowRunIsolation;
   prepareNode?: (node: ExecutionPlanNode) => Promise<{
     node: ExecutionPlanNode;
     artifacts?: Record<string, JsonValue>;
@@ -365,6 +368,7 @@ export async function runWorkflow(
     artifactDir: store.runDir,
     status: "running",
     createdAt: now(),
+    ...(options.isolation ? { isolation: options.isolation } : {}),
     nodes: Object.fromEntries(
       plan.nodes.map((node) => [node.id, {
         nodeId: node.id,

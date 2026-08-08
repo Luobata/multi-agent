@@ -556,6 +556,8 @@ export interface Run {
   /** Present on listRuns summaries: the trigger source of the correlated invocation. */
   trigger?: "workbench" | "http" | "mcp" | "a2a";
   nodes: Record<string, RunNode>;
+  /** Present when the run recorded worktree-isolation evidence (WI-T1/T3). */
+  isolation?: { mode: "worktree" | "none"; worktreePath?: string; fallbackReason?: string };
   effectiveProfiles?: Record<string, EffectiveExecutionProfile>;
 }
 
