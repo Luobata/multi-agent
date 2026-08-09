@@ -210,7 +210,7 @@ describe("App navigation freshness", () => {
     respond(0, bootstrapWith({}));
     await flush();
 
-    click(navButton("项目接入")); // request 1
+    click(navButton("项目")); // request 1
     click(navButton("员工档案")); // request 2 supersedes request 1
     expect(bootstrapRequests).toHaveLength(3);
 
@@ -223,14 +223,29 @@ describe("App navigation freshness", () => {
     expect(container.textContent).not.toContain("旧数据员工");
   });
 
+  it("exposes one project entry instead of separate project-space and onboarding entries", async () => {
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    const labels = Array.from(container.querySelectorAll<HTMLButtonElement>(".side-nav .nav-items button"))
+      .map((button) => button.textContent?.trim());
+    expect(labels.filter((label) => label === "项目")).toHaveLength(1);
+    expect(labels).not.toContain("项目空间");
+    expect(labels).not.toContain("项目接入");
+  });
+
   it("enters read-only offline only when the very first bootstrap fails", async () => {
+    window.location.hash = "#projects";
     act(() => root.render(<App />));
     respondError(0, "连接中断，请检查本地核心");
     await flush();
 
     expect(container.textContent).toContain("小镇运行核心未连接");
     expect(container.textContent).toContain("READ ONLY");
-    expect(container.querySelector("[role='alert']")?.textContent).toContain("连接中断，请检查本地核心");
+    expect(container.textContent).toContain("项目目录同步失败");
+    expect(container.textContent).not.toContain("正在同步已接入项目");
+    expect(Array.from(container.querySelectorAll("[role='alert']")).some((alert) => alert.textContent?.includes("连接中断，请检查本地核心"))).toBe(true);
   });
 
   it("keeps daemon online, data and the live stream when a background refresh fails", async () => {

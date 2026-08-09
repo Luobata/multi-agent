@@ -9,18 +9,19 @@ import { MemoryPage } from "./MemoryPage";
 import { DaemonGate, Icon, Modal } from "./components";
 import { OfficePage } from "./OfficePage";
 import { ProjectDetailPage } from "./ProjectDetailPage";
+import { ProjectsHubPage } from "./ProjectsHubPage";
 import { PublicationsPage } from "./PublicationsPage";
-import { ProjectPage } from "./ProjectPage";
 import { RequirementDetailPage } from "./RequirementDetailPage";
 import { RunsPage } from "./RunsPage";
 import { SettingsPage } from "./SettingsPage";
 import { SkillsPage } from "./SkillsPage";
-import { SpacesPage } from "./SpacesPage";
+import { dashboardService } from "./dashboard/service";
+import { ErrorBlock, SkeletonBlock } from "./dashboard/view";
 import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
 import { applyTheme, DEFAULT_THEME, readTheme, type ThemeName } from "./theme";
 
-type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "memory" | "dashboard" | "spaces" | "project" | "board" | "requirement" | "archive" | "settings";
+type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "memory" | "dashboard" | "project" | "board" | "requirement" | "archive" | "settings";
 
 export interface PageRoute {
   page: Page;
@@ -28,16 +29,17 @@ export interface PageRoute {
   requirementId?: string;
 }
 
-const TOP_LEVEL_PAGES: Page[] = ["office", "employees", "projects", "skills", "knowledge", "workflows", "runs", "publications", "memory", "dashboard", "spaces", "board", "archive", "settings"];
+const TOP_LEVEL_PAGES: Page[] = ["office", "employees", "projects", "skills", "knowledge", "workflows", "runs", "publications", "memory", "dashboard", "board", "archive", "settings"];
 const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], gateValidators: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
 
-/** 二级 hash：#spaces/<id>、#spaces/<id>/board、#requirements/<id>，其余按顶层页面解析。 */
+/** 二级 hash：#projects/<id>、#projects/<id>/board、#requirements/<id>；旧 #spaces 路由兼容收敛到项目。 */
 export function pageFromHash(hash = window.location.hash): PageRoute {
   const segments = hash.replace(/^#/, "").split("/").filter(Boolean);
   const [head, second, third] = segments;
-  if (head === "spaces" && second) {
+  if ((head === "projects" || head === "spaces") && second) {
     return third === "board" ? { page: "board", spaceId: decodeURIComponent(second) } : { page: "project", spaceId: decodeURIComponent(second) };
   }
+  if (head === "spaces") return { page: "projects" };
   if (head === "requirements" && second) return { page: "requirement", requirementId: decodeURIComponent(second) };
   return TOP_LEVEL_PAGES.includes(head as Page) ? { page: head as Page } : { page: "office" };
 }
@@ -109,6 +111,7 @@ export function App() {
       const bootstrap = await api<Bootstrap>("/api/bootstrap");
       if (seq !== bootstrapRequestSeq.current) return; // a newer navigation already superseded this response
       assertKnowledgeControlPlane(bootstrap);
+      dashboardService.syncConnectedProjects(bootstrap.projects);
       // Live SSE events that arrived while this request was in flight are newer
       // evidence than the snapshot: merge by id + updatedAt so they survive.
       setData((current) => ({ ...bootstrap, activity: mergeActivity(current.activity, bootstrap.activity) }));
@@ -190,10 +193,9 @@ export function App() {
   const nav = [
     { id: "office" as const, label: "员工大厅", icon: "office" as const },
     { id: "dashboard" as const, label: "工作台", icon: "dashboard" as const },
-    { id: "spaces" as const, label: "项目空间", icon: "spaces" as const },
+    { id: "projects" as const, label: "项目", icon: "projects" as const },
     { id: "board" as const, label: "需求看板", icon: "board" as const },
     { id: "employees" as const, label: "员工档案", icon: "employees" as const },
-    { id: "projects" as const, label: "项目接入", icon: "projects" as const },
     { id: "skills" as const, label: "技能台账", icon: "skills" as const },
     { id: "knowledge" as const, label: "知识控制台", icon: "knowledge" as const },
     { id: "workflows" as const, label: "协作编排", icon: "workflows" as const },
@@ -205,8 +207,8 @@ export function App() {
     { id: "archive" as const, label: "归档中心", icon: "archive" as const },
     { id: "settings" as const, label: "设置·集成", icon: "settings" as const }
   ];
-  // 项目详情归入项目空间，需求详情归入需求看板，侧栏高亮跟随信息架构而不是路由名。
-  const activeNav: Page = page === "project" ? "spaces" : page === "requirement" ? "board" : page;
+  // 项目详情归入统一项目入口，需求详情归入需求看板。
+  const activeNav: Page = page === "project" ? "projects" : page === "requirement" ? "board" : page;
   const [moreOpen, setMoreOpen] = useState(false);
   const commandItems = [...nav, ...utilityNav];
 
@@ -234,7 +236,11 @@ export function App() {
     <DaemonGate status={daemon}><div id="main-content" className="app-content" tabIndex={-1}>
       {page === "office" && <OfficePage data={data} streamStatus={activityStream} />}
       {page === "employees" && <EmployeePage data={data} refresh={refresh} notify={notify} />}
-      {page === "projects" && <ProjectPage data={data} refresh={refresh} notify={notify} />}
+      {page === "projects" && (daemon === "online"
+        ? <ProjectsHubPage data={data} refresh={refresh} go={go} notify={notify} />
+        : daemon === "checking"
+          ? <main className="dash-page"><SkeletonBlock rows={5} label="正在同步已接入项目" /></main>
+          : <main className="dash-page"><ErrorBlock message="项目目录同步失败；请确认本地运行核心已启动后重试。" onRetry={refreshQuietly} /></main>)}
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
@@ -242,9 +248,8 @@ export function App() {
       {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
       {page === "dashboard" && <DashboardPage go={go} />}
-      {page === "spaces" && <SpacesPage go={go} notify={notify} />}
-      {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} />}
-      {page === "board" && <BoardPage spaceId={route.spaceId} go={go} notify={notify} />}
+      {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} />}
+      {page === "board" && <BoardPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} />}
       {page === "requirement" && route.requirementId && <RequirementDetailPage requirementId={route.requirementId} go={go} notify={notify} />}
       {page === "archive" && <ArchivePage go={go} notify={notify} />}
       {page === "settings" && <SettingsPage />}

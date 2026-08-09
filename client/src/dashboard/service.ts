@@ -18,8 +18,11 @@ import type {
   SpaceNode
 } from "./types";
 import { REQUIREMENT_LANES, requirementLaneLabel } from "./types";
+import type { Project as ConnectedProject } from "../types";
 
 export interface DashboardService {
+  /** Project 是事实源；Folder / 收藏 / 排序只是按 projectId 关联的 UI 覆盖层。 */
+  syncConnectedProjects(projects: ConnectedProject[]): void;
   getDashboardSummary(): Promise<DashboardSummary>;
   listSpaces(): Promise<SpaceNode[]>;
   createFolder(input: { parentId: string | null; name: string }): Promise<FolderNode>;
@@ -138,6 +141,9 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   let idCounter = 0;
   const nextId = options.idSeed ?? ((prefix: string) => `${prefix}-local-${++idCounter}`);
   const store = seed();
+  let connectedProjectIds: Set<string> | null = null;
+  let connectedCatalogIds = new Set<string>();
+  let catalogSeedRemapped = false;
 
   const respond = <T>(produce: () => T): Promise<T> =>
     new Promise<T>((resolve, reject) => {
@@ -195,6 +201,63 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   const copyNode = (node: SpaceNode): SpaceNode => ({ ...node });
 
   return {
+    syncConnectedProjects(projects) {
+      const previousProjects = store.nodes.filter((node): node is ManagedProject => node.kind === "project");
+      const previousById = new Map(previousProjects.map((project) => [project.id, project]));
+      const folders = store.nodes.filter((node): node is FolderNode => node.kind === "folder");
+      const active = projects.filter((project) => project.status === "active");
+      connectedProjectIds = new Set(active.map((project) => project.id));
+      connectedCatalogIds = new Set(projects.map((project) => project.id));
+
+      // 首次接入真实目录时，把演示需求稳定映射到真实 active Project；
+      // 后续刷新不再改写用户已经选择过的 projectId。
+      if (!catalogSeedRemapped && active.length > 0) {
+        const replacement = new Map(previousProjects.map((project, index) => [project.id, active[index % active.length]!.id]));
+        for (const requirement of store.requirements) {
+          requirement.projectId = replacement.get(requirement.projectId) ?? requirement.projectId;
+        }
+        catalogSeedRemapped = true;
+      }
+
+      const mapped = projects.map((project): ManagedProject => {
+        const overlay = previousById.get(project.id);
+        const defaultBranch = overlay?.defaultBranch ?? "main";
+        return {
+          kind: "project",
+          id: project.id,
+          parentId: overlay?.parentId ?? null,
+          name: project.name,
+          repositoryPath: project.rootPath,
+          defaultBranch,
+          repositories: overlay?.repositories ?? [{
+            id: `repo-connected-${project.id}`,
+            label: "项目根目录",
+            path: project.rootPath,
+            defaultBranch,
+            primary: true
+          }],
+          favorite: overlay?.favorite ?? false,
+          archivedAt: project.status === "archived" ? project.updatedAt : null,
+          createdAt: project.createdAt,
+          updatedAt: project.updatedAt
+        };
+      });
+      store.nodes = [...folders, ...mapped];
+
+      store.archive = store.archive.filter((entry) => entry.kind !== "project");
+      for (const project of projects.filter((candidate) => candidate.status === "archived")) {
+        store.archive.push({
+          id: `arc-connected-${project.id}`,
+          nodeId: project.id,
+          kind: "project",
+          name: project.name,
+          breadcrumb: "已接入项目",
+          archivedAt: project.updatedAt,
+          archivedBy: "Workbench",
+          restoreDisabledReason: "当前运行核心尚未提供项目恢复入口；接入历史与运行证据仍完整保留"
+        });
+      }
+    },
     getDashboardSummary() {
       return respond(() => {
         const live = store.nodes.filter((node) => !node.archivedAt);
@@ -324,6 +387,9 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         const index = store.archive.findIndex((entry) => entry.id === archiveId);
         const entry = index >= 0 ? store.archive[index] : undefined;
         if (!entry) throw failure("没有找到这条归档记录", "请刷新归档中心后重试", "归档内容仍然完整保留");
+        if (entry.kind === "project" && connectedCatalogIds.has(entry.nodeId)) {
+          throw failure("当前运行核心尚未提供项目恢复入口", "请保留这条归档记录，待恢复能力接入后再操作", "项目声明、任用关系与运行证据仍完整保留");
+        }
         if (entry.kind === "requirement") {
           const requirement = store.requirements.find((candidate) => candidate.id === entry.nodeId);
           if (!requirement) throw failure("没有找到归档需求", "请刷新归档中心后重试", "其它归档记录未受影响");
@@ -348,11 +414,12 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       return respond(() => {
         if (projectId) {
           const project = findNode(projectId);
-          if (!project || project.kind !== "project") throw failure("没有找到这个项目", "请回到项目空间重新进入看板", "需求数据未受影响");
+          if (!project || project.kind !== "project") throw failure("没有找到这个项目", "请回到项目页选择已正式接入的项目", "需求数据未受影响");
           if (project.archivedAt) throw failure("项目已归档，看板进入只读保护", "可在归档中心恢复后再查看与迁移需求", "需求与历史证据完整保留");
         }
+        const activeProjectIds = new Set(store.nodes.filter((node) => node.kind === "project" && !node.archivedAt).map((node) => node.id));
         return store.requirements
-          .filter((requirement) => !requirement.archivedAt && (!projectId || requirement.projectId === projectId))
+          .filter((requirement) => !requirement.archivedAt && activeProjectIds.has(requirement.projectId) && (!projectId || requirement.projectId === projectId))
           .map(({ rawRequirement: _raw, acceptanceCriteria: _ac, dag: _dag, timeline: _tl, resourceOverview: _ro, evidence: _ev, ...requirement }) => ({ ...requirement }))
           .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
       });
@@ -360,7 +427,9 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
     createRequirement(input) {
       return respond(() => {
         const project = findNode(input.projectId);
-        if (!project || project.kind !== "project" || project.archivedAt) throw failure("目标项目不可用", "请选择一个未归档项目后重试", "未写入任何需求");
+        if (!project || project.kind !== "project" || project.archivedAt || (connectedProjectIds !== null && !connectedProjectIds.has(project.id))) {
+          throw failure("目标项目尚未正式接入或已归档", "请先在项目页完成接入并确认项目处于 active 状态", "未写入任何需求");
+        }
         const title = input.title.trim();
         if (!title) throw failure("需求标题不能为空", "请输入标题后重试", "未写入任何需求");
         const stamp = touch();
@@ -424,7 +493,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
     getProjectProfile(id) {
       return respond(() => {
         const node = findNode(id);
-        if (!node || node.kind !== "project") throw failure("没有找到这个项目", "请回到项目空间重新选择", "其它项目配置未受影响");
+        if (!node || node.kind !== "project") throw failure("没有找到这个项目", "请回到项目页重新选择", "其它项目配置未受影响");
         return {
           project: copyNode(node) as ManagedProject,
           members: [

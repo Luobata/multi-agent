@@ -60,7 +60,7 @@ export function RequirementDetailPage({ requirementId, go, notify, service = das
   };
 
   return <main className="dash-page">
-    <PageHeader eyebrow="REQUIREMENT / DOSSIER" title="需求详情" description="第一阶段列迁移在此完成；DAG 与时间线展示以数据徽标为准。" actions={<button type="button" className="button secondary" onClick={() => go(detail ? `spaces/${detail.projectId}/board` : "board")}>← 返回看板</button>} />
+    <PageHeader eyebrow="REQUIREMENT / DOSSIER" title="需求详情" description="第一阶段列迁移在此完成；DAG 与时间线展示以数据徽标为准。" actions={<button type="button" className="button secondary" onClick={() => go(detail ? `projects/${detail.projectId}/board` : "board")}>← 返回看板</button>} />
     <OfflineNotice />
     {state.status === "loading" && <SkeletonBlock rows={5} label="正在加载需求详情" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}

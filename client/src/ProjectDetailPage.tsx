@@ -15,17 +15,15 @@ const PROJECT_DETAIL_TABS: DashTab[] = [
   { id: "settings", label: "项目设置" }
 ];
 
-export function ProjectDetailPage({ spaceId, go, notify, service = dashboardService }: {
+export function ProjectDetailPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "" }: {
   spaceId: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
+  catalogRevision?: string;
 }) {
   const daemonAvailable = useDaemonAvailable();
-  const { state, reload, setData } = useServiceData<ProjectProfile>(() => service.getProjectProfile(spaceId), [service, spaceId]);
-  const [editing, setEditing] = useState(false);
-  const [draftName, setDraftName] = useState("");
-  const [archiveOpen, setArchiveOpen] = useState(false);
+  const { state, reload, setData } = useServiceData<ProjectProfile>(() => service.getProjectProfile(spaceId), [service, spaceId, catalogRevision]);
   const [repoOpen, setRepoOpen] = useState(false);
   const [repoLabel, setRepoLabel] = useState("");
   const [repoPath, setRepoPath] = useState("");
@@ -40,16 +38,6 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
   const fail = (error: unknown) => notify(error instanceof Error ? error.message : String(error), "error");
   const replaceProject = (updated: ManagedProject) => profile && setData({ ...profile, project: updated });
 
-  const rename = async (target: ManagedProject) => {
-    const next = draftName.trim();
-    setEditing(false);
-    if (!next || next === target.name) return;
-    try {
-      replaceProject(await service.renameNode(target.id, next) as ManagedProject);
-      notify(`项目已重命名为「${next}」`);
-    } catch (error) { fail(error); }
-  };
-
   const favorite = (target: ManagedProject) => {
     if (!daemonAvailable || !profile) return;
     const snapshot = profile;
@@ -59,15 +47,6 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
       revert: () => service.toggleFavorite(target.id)
     });
     service.toggleFavorite(target.id).then((updated) => replaceProject(updated as ManagedProject)).catch((error: unknown) => { setData(snapshot); setUndo(null); fail(error); });
-  };
-
-  const archive = async (target: ManagedProject) => {
-    setArchiveOpen(false);
-    try {
-      await service.archiveNode(target.id);
-      notify(`「${target.name}」已归档；可在归档中心恢复，磁盘文件不动`);
-      go("archive");
-    } catch (error) { fail(error); }
   };
 
   const bindRepository = async () => {
@@ -82,18 +61,18 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
   };
 
   return <main className="dash-page">
-    <PageHeader eyebrow="SPACE / PROJECT DOSSIER" title="项目详情" description="项目管理控制面：逻辑项目与真实 Repository path 始终分离。" actions={<button type="button" className="button secondary" onClick={() => go("spaces")}>← 返回项目空间</button>} />
+    <PageHeader eyebrow="PROJECT / CONNECTED DOSSIER" title="项目详情" description="项目事实来自正式接入声明；虚拟文件夹只负责分类，不会移动 Repository path。" actions={<button type="button" className="button secondary" onClick={() => go("projects")}>← 返回项目</button>} />
     <OfflineNotice />
     {state.status === "loading" && <SkeletonBlock rows={5} label="正在加载项目详情" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
-    {state.status === "ready" && !project && <EmptyState title="没有找到这个项目" action={<button type="button" className="button secondary" onClick={() => go("spaces")}>返回项目空间</button>}><p>项目可能已归档，请从归档中心恢复。</p></EmptyState>}
+    {state.status === "ready" && !project && <EmptyState title="没有找到这个项目" action={<button type="button" className="button secondary" onClick={() => go("projects")}>返回项目</button>}><p>它可能尚未正式接入或已归档；只有 active 项目可承接需求。</p></EmptyState>}
     {state.status === "ready" && profile && project && <div className="dash-dossier">
       <div className="dash-panel dash-project-cover">
         <div className="dash-project-title">
-          {editing ? <input className="space-rename-input" aria-label="重命名项目" value={draftName} autoFocus maxLength={40} onChange={(event) => setDraftName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void rename(project); if (event.key === "Escape") setEditing(false); }} onBlur={() => setEditing(false)} /> : <h2>{project.name}</h2>}
-          <Stamp status="active" label="在册项目" />
+          <h2>{project.name}</h2>
+          <Stamp status="active" label="已正式接入" />
         </div>
-        <div className="dash-project-actions"><button type="button" className="button primary" onClick={() => go(`spaces/${project.id}/board`)}>打开需求看板 →</button><button type="button" className="button secondary" disabled={!daemonAvailable} onClick={() => { setEditing(true); setDraftName(project.name); }}>重命名</button><button type="button" className="button danger" disabled={!daemonAvailable} onClick={() => setArchiveOpen(true)}>归档项目</button></div>
+        <div className="dash-project-actions"><button type="button" className="button primary" onClick={() => go(`projects/${project.id}/board`)}>打开需求看板 →</button><button type="button" className="button secondary" onClick={() => go("projects")}>查看项目目录</button></div>
       </div>
 
       <DashTabs baseId={`project-${project.id}`} ariaLabel={`${project.name} 项目分区`} tabs={PROJECT_DETAIL_TABS} activeTab={activeTab} onChange={(tabId) => setActiveTab(tabId as ProjectDetailTab)} />
@@ -123,14 +102,13 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
         </DossierSection>}
 
         {activeTab === "settings" && <DossierSection number="05" title="项目设置">
-          <p className="dash-hint-line">阶段一只开放名称、收藏、仓库绑定与归档。Provider、并发、Worktree 和 Gate 在全局设置中只读展示。</p>
+          <p className="dash-hint-line">项目名称与状态来自接入声明；收藏、目录和附加仓库是本地管理配置。Provider、并发、Worktree 和 Gate 在全局设置中只读展示。</p>
           <button type="button" className="text-button" onClick={() => go("settings")}>打开设置·集成 →</button>
         </DossierSection>}
       </section>
     </div>}
 
     {repoOpen && <Modal title="绑定本地仓库" eyebrow="REPOSITORY · CONFIG ONLY" onClose={() => setRepoOpen(false)}><form className="modal-body compact-form" onSubmit={(event) => { event.preventDefault(); void bindRepository(); }}><Field label="显示名称"><input required value={repoLabel} onChange={(event) => setRepoLabel(event.target.value)} placeholder="例如：服务端仓库" /></Field><Field label="Repository path" hint="仅保存配置，不会移动磁盘上的文件。"><input required value={repoPath} onChange={(event) => setRepoPath(event.target.value)} placeholder="/path/to/repository" /></Field><Field label="默认分支"><input value={repoBranch} onChange={(event) => setRepoBranch(event.target.value)} /></Field>{repoError && <p className="dash-form-error" role="alert">{repoError}</p>}<div className="modal-actions"><button type="button" className="button secondary" onClick={() => setRepoOpen(false)}>取消</button><button type="submit" className="button primary" disabled={savingRepo}>{savingRepo ? "保存中…" : "保存绑定"}</button></div></form></Modal>}
-    {archiveOpen && project && <Modal title={`归档「${project.name}」`} eyebrow="ARCHIVE · RECOVERABLE" onClose={() => setArchiveOpen(false)}><div className="modal-body"><div className="danger-notice"><b>归档后从空间树隐藏，看板进入只读保护。</b><p>可在归档中心恢复；不会删除磁盘上的文件。</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setArchiveOpen(false)}>取消</button><button type="button" className="button danger-filled" disabled={!daemonAvailable} onClick={() => void archive(project)}>确认归档</button></div></div></Modal>}
     {undo && <UndoToast message={undo.message} onUndo={() => { const current = undo; setUndo(null); void current.revert().then((reverted) => { if (reverted.kind === "project") replaceProject(reverted); notify("已撤销"); }).catch(fail); }} onClose={() => setUndo(null)} />}
   </main>;
 }

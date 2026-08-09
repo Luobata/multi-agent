@@ -163,6 +163,8 @@ export interface ArchiveRecord {
   breadcrumb: string;
   archivedAt: string;
   archivedBy: string;
+  /** 真实接入项目尚无恢复端点时，归档中心只展示历史并说明原因。 */
+  restoreDisabledReason?: string;
 }
 
 export interface SettingsEntry {

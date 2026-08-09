@@ -35,12 +35,15 @@ describe("Workbench capability compatibility", () => {
 describe("multi-project console routes", () => {
   it("parses top-level management pages", () => {
     expect(pageFromHash("#dashboard")).toEqual({ page: "dashboard" });
-    expect(pageFromHash("#spaces")).toEqual({ page: "spaces" });
+    expect(pageFromHash("#projects")).toEqual({ page: "projects" });
+    expect(pageFromHash("#spaces")).toEqual({ page: "projects" });
     expect(pageFromHash("#archive")).toEqual({ page: "archive" });
     expect(pageFromHash("#settings")).toEqual({ page: "settings" });
   });
 
   it("keeps project and requirement ids in nested routes", () => {
+    expect(pageFromHash("#projects/prj-workbench")).toEqual({ page: "project", spaceId: "prj-workbench" });
+    expect(pageFromHash("#projects/prj-workbench/board")).toEqual({ page: "board", spaceId: "prj-workbench" });
     expect(pageFromHash("#spaces/prj-workbench")).toEqual({ page: "project", spaceId: "prj-workbench" });
     expect(pageFromHash("#spaces/prj-workbench/board")).toEqual({ page: "board", spaceId: "prj-workbench" });
     expect(pageFromHash("#requirements/req%20101")).toEqual({ page: "requirement", requirementId: "req 101" });

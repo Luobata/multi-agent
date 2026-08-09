@@ -13,16 +13,17 @@ function exceptionChip(exception: Requirement["exception"]) {
   return null;
 }
 
-export function BoardPage({ spaceId, go, notify, service = dashboardService }: {
+export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "" }: {
   spaceId?: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
+  catalogRevision?: string;
 }) {
   const daemonAvailable = useDaemonAvailable();
   const { state, reload, setData } = useServiceData<{ requirements: Requirement[]; nodes: SpaceNode[] }>(
     async () => ({ requirements: await service.listBoard(spaceId), nodes: await service.listSpaces() }),
-    [service, spaceId]
+    [service, spaceId, catalogRevision]
   );
   const [query, setQuery] = useState("");
   const [projectFilter, setProjectFilter] = useState(spaceId ?? "all");
@@ -89,7 +90,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService }: {
       eyebrow="BOARD / SEVEN LANES"
       title={project ? `${project.name} · 需求看板` : "需求看板"}
       description="七列流转；阻塞 / 失败 / 取消与列正交叠加。第一阶段不支持拖拽，列迁移请在需求详情页选择目标列。"
-      actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`spaces/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button primary" disabled={!daemonAvailable} onClick={openCreate}>创建需求</button></>}
+      actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button primary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>创建需求</button></>}
     />
     <OfflineNotice />
     <div className="board-toolbar">
@@ -101,7 +102,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService }: {
     {state.status === "loading" && <SkeletonBlock rows={4} label="正在加载需求看板" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
     {state.status === "ready" && data && (filtered.length === 0
-      ? <EmptyState title="看板还没有需求"><p>需求会按列出现在这里；先由产品经理登记第一批需求。</p></EmptyState>
+      ? <EmptyState title={projects.length === 0 ? "还没有可承接需求的项目" : "看板还没有需求"} action={projects.length === 0 ? <button type="button" className="button primary" onClick={() => go("projects")}>前往项目</button> : undefined}><p>{projects.length === 0 ? "只有正式接入且 active 的项目可以创建需求；被动 MCP 记录需要先升级。" : "需求会按列出现在这里；先由产品经理登记第一批需求。"}</p></EmptyState>
       : <div className="board-scroll" role="region" aria-label="需求看板（可横向滚动）" tabIndex={0}>
         <div className="board-grid">
           {REQUIREMENT_LANES.map((lane) => {

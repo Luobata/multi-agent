@@ -1,4 +1,4 @@
-/** 项目空间：虚拟 Folder 树 + Project 管理（新建 / 重命名 / 移动 / 归档 / 搜索 / 筛选 / 收藏）。 */
+/** 统一项目页的目录分区：Folder 只组织真实接入 Project，不创建第二套逻辑项目。 */
 import { useMemo, useState, type CSSProperties, type ReactElement } from "react";
 import { EmptyState, Field, Modal, SelectControl, Stamp, useDaemonAvailable } from "./components";
 import { dashboardService, type DashboardService } from "./dashboard/service";
@@ -28,19 +28,22 @@ function isDescendantOf(nodes: SpaceNode[], ancestorId: string, candidateId: str
   return false;
 }
 
-export function SpacesPage({ go, notify, service = dashboardService }: {
+export function SpacesPage({ go, notify, service = dashboardService, embedded = false, onConnect, onOpenAccess, catalogRevision = "" }: {
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
+  embedded?: boolean;
+  onConnect?: () => void;
+  onOpenAccess?: (projectId: string) => void;
+  catalogRevision?: string;
 }) {
   const daemonAvailable = useDaemonAvailable();
-  const { state, reload, setData } = useServiceData<SpaceNode[]>(() => service.listSpaces(), [service]);
+  const { state, reload, setData } = useServiceData<SpaceNode[]>(() => service.listSpaces(), [service, catalogRevision]);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<SpaceFilter>("all");
-  const [createKind, setCreateKind] = useState<"folder" | "project" | null>(null);
+  const [createKind, setCreateKind] = useState<"folder" | null>(null);
   const [createParentId, setCreateParentId] = useState<string | null>(null);
   const [createName, setCreateName] = useState("");
-  const [createPath, setCreatePath] = useState("");
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
   const [editingId, setEditingId] = useState("");
@@ -79,18 +82,11 @@ export function SpacesPage({ go, notify, service = dashboardService }: {
     setSaving(true);
     setFormError("");
     try {
-      if (createKind === "folder") {
-        const folder = await service.createFolder({ parentId: createParentId, name: createName });
-        setData([...nodes, folder]);
-        notify(`文件夹「${folder.name}」已建好`);
-      } else if (createKind === "project") {
-        const project = await service.createProject({ parentId: createParentId, name: createName, repositoryPath: createPath });
-        setData([...nodes, project]);
-        notify(`项目「${project.name}」已登记；Repository path 仅保存配置`);
-      }
+      const folder = await service.createFolder({ parentId: createParentId, name: createName });
+      setData([...nodes, folder]);
+      notify(`文件夹「${folder.name}」已建好`);
       setCreateKind(null);
       setCreateName("");
-      setCreatePath("");
     } catch (error) {
       setFormError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -194,17 +190,18 @@ export function SpacesPage({ go, notify, service = dashboardService }: {
             }}
             onBlur={() => setEditingId("")}
           />
-        : <button type="button" className="space-name" onClick={() => { if (node.kind === "project") go(`spaces/${node.id}`); }} title={node.kind === "project" ? "打开项目详情" : node.name}>
+        : <button type="button" className="space-name" onClick={() => { if (node.kind === "project") go(`projects/${node.id}`); }} title={node.kind === "project" ? "打开项目详情" : node.name}>
             {node.name}
             {node.favorite && <span className="space-fav" aria-label="已收藏">★</span>}
           </button>}
       {node.kind === "project" && <code className="space-path" title="仅保存配置，不会移动磁盘上的文件">{node.repositoryPath}</code>}
       <span className="space-actions">
-        {node.kind === "project" && <button type="button" className="text-button" onClick={() => go(`spaces/${node.id}/board`)}>看板</button>}
-        <button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => { setEditingId(node.id); setEditingName(node.name); }}>重命名</button>
+        {node.kind === "project" && <button type="button" className="text-button" onClick={() => go(`projects/${node.id}/board`)}>看板</button>}
+        {node.kind === "project" && <button type="button" className="text-button" onClick={() => onOpenAccess?.(node.id)}>接入配置</button>}
+        {node.kind === "folder" && <button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => { setEditingId(node.id); setEditingName(node.name); }}>重命名</button>}
         <button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => { setMovingNode(node); setMoveTarget(node.parentId ?? "root"); }}>移动</button>
         <button type="button" className="text-button" disabled={!daemonAvailable} aria-pressed={node.favorite} onClick={() => favorite(node)}>{node.favorite ? "取消收藏" : "收藏"}</button>
-        <button type="button" className="text-button space-danger" disabled={!daemonAvailable} onClick={() => setArchivingNode(node)}>归档</button>
+        {node.kind === "folder" && <button type="button" className="text-button space-danger" disabled={!daemonAvailable} onClick={() => setArchivingNode(node)}>归档</button>}
       </span>
     </div>;
   };
@@ -219,12 +216,14 @@ export function SpacesPage({ go, notify, service = dashboardService }: {
 
   const rootNodes = childrenOf(null);
 
-  return <main className="dash-page">
-    <PageHeader eyebrow="SPACES / VIRTUAL TREE" title="项目空间" description="虚拟文件夹组织项目；Repository path 仅保存配置，不会移动磁盘上的文件。" actions={<>
+  return <section className={embedded ? "projects-hub-panel" : "dash-page"} aria-label={embedded ? "项目目录" : undefined}>
+    {!embedded && <PageHeader eyebrow="PROJECTS / VIRTUAL FOLDERS" title="项目" description="真实接入项目是唯一项目源；虚拟文件夹只负责分类，不会移动磁盘代码。" actions={<>
       <button type="button" className="button secondary" disabled={!daemonAvailable} onClick={() => { setCreateKind("folder"); setCreateParentId(null); setFormError(""); }}>新建文件夹</button>
-      <button type="button" className="button primary" disabled={!daemonAvailable} onClick={() => { setCreateKind("project"); setCreateParentId(null); setFormError(""); }}>新建项目</button>
-    </>} />
+      <button type="button" className="button primary" disabled={!daemonAvailable} onClick={onConnect}>接入项目</button>
+    </>} />}
     <OfflineNotice />
+
+    {embedded && <div className="projects-directory-intro"><div><strong>虚拟目录</strong><span>这里只组织已接入项目；移动和收藏不会改动 Repository path。</span></div><div><button type="button" className="button secondary" disabled={!daemonAvailable} onClick={() => { setCreateKind("folder"); setCreateParentId(null); setFormError(""); }}>新建文件夹</button><button type="button" className="button primary" disabled={!daemonAvailable} onClick={onConnect}>接入项目</button></div></div>}
 
     <div className="space-toolbar">
       <label className="space-search"><span className="sr-only">搜索节点</span><input placeholder="搜索名称或 Repository path…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
@@ -234,21 +233,18 @@ export function SpacesPage({ go, notify, service = dashboardService }: {
     {state.status === "loading" && <SkeletonBlock rows={5} label="正在加载空间树" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
     {state.status === "ready" && ((browsing ? visibleNodes : rootNodes).length === 0
-      ? <EmptyState title={browsing ? "没有匹配的节点" : "空间树还是空的"} action={!browsing ? <button type="button" className="button primary" disabled={!daemonAvailable} onClick={() => setCreateKind("project")}>登记第一个项目</button> : undefined}>
-        <p>{browsing ? "换个关键词或清除筛选后再试。" : "先建一个虚拟文件夹，或直接把项目登记到根层。"}</p>
+      ? <EmptyState title={browsing ? "没有匹配的节点" : "还没有已接入项目"} action={!browsing ? <button type="button" className="button primary" disabled={!daemonAvailable} onClick={onConnect}>接入第一个项目</button> : undefined}>
+        <p>{browsing ? "换个关键词或清除筛选后再试。" : "项目只能通过声明文件正式接入；不能在目录里单独创建逻辑项目。"}</p>
       </EmptyState>
       : browsing
         ? <ul className="space-tree space-tree--flat" aria-label="匹配节点">{visibleNodes.map((node) => <li key={node.id}>{renderRow(node, 0)}</li>)}</ul>
         : <ul className="space-tree" aria-label="空间树">{rootNodes.map((node) => renderNode(node, 0))}</ul>)}
 
-    {state.status === "ready" && liveNodes.length > 0 && <p className="space-count"><Stamp status="active" label={`${liveNodes.length} 节点在册`} /></p>}
+    {state.status === "ready" && liveNodes.length > 0 && <p className="space-count"><Stamp status="active" label={`${liveNodes.filter((node) => node.kind === "project").length} 个已接入项目`} /></p>}
 
-    {createKind && <Modal title={createKind === "folder" ? "新建文件夹" : "新建项目"} eyebrow="SPACE · CONFIG ONLY" onClose={() => setCreateKind(null)}>
+    {createKind && <Modal title="新建虚拟文件夹" eyebrow="FOLDER · UI CONFIG ONLY" onClose={() => setCreateKind(null)}>
       <form className="modal-body compact-form" onSubmit={(event) => { event.preventDefault(); void submitCreate(); }}>
         <Field label="名称"><input required maxLength={40} disabled={saving} value={createName} onChange={(event) => setCreateName(event.target.value)} /></Field>
-        {createKind === "project" && <Field label="Repository path" hint="仅保存配置，不会移动磁盘上的文件。">
-          <input required disabled={saving} placeholder="/path/to/repository" value={createPath} onChange={(event) => setCreatePath(event.target.value)} />
-        </Field>}
         <Field label="父级文件夹" hint="不选则放到空间树根层。">
           <SelectControl ariaLabel="父级文件夹" value={createParentId ?? "root"} onChange={(value) => setCreateParentId(value === "root" ? null : value)}
             options={[{ value: "root", label: "根层（不归入文件夹）" }, ...folders.map((folder) => ({ value: folder.id, label: folder.name }))]} />
@@ -287,5 +283,5 @@ export function SpacesPage({ go, notify, service = dashboardService }: {
     {undo && <UndoToast message={undo.message}
       onUndo={() => { const current = undo; setUndo(null); void current.revert().then((reverted) => { replaceNode(reverted); notify("已撤销"); }).catch(() => undefined); }}
       onClose={() => setUndo(null)} />}
-  </main>;
+  </section>;
 }

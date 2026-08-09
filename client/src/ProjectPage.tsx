@@ -30,6 +30,11 @@ interface PageProps {
   data: Bootstrap;
   refresh: () => Promise<void>;
   notify: (message: string, kind?: "success" | "error") => void;
+  /** 统一项目页从目录 Tab 打开接入配置时，保持同一个 projectId。 */
+  initialProjectId?: string;
+  /** 父级每次递增时直接打开接入声明 Modal。 */
+  connectRequest?: number;
+  onConnectRequestHandled?: () => void;
 }
 
 interface RoleDraft {
@@ -100,7 +105,7 @@ function policyLabel(policy: ProjectBindingUpdatePolicy): string {
   return "兼容更新";
 }
 
-export function ProjectPage({ data, refresh, notify }: PageProps) {
+export function ProjectPage({ data, refresh, notify, initialProjectId, connectRequest = 0, onConnectRequestHandled }: PageProps) {
   const daemonAvailable = useDaemonAvailable();
   // Lightweight page clock so a short-lived "completed" chip actually fades
   // after its dwell while someone stays on this page. Cleaned up on unmount.
@@ -118,7 +123,7 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
       .map((access) => [access.linkedProjectId, access])
   );
   const assignableEmployees = data.employees.filter((employee) => employee.status === "active");
-  const [selectedId, setSelectedId] = useState(activeProjects[0]?.id ?? data.projects[0]?.id ?? "");
+  const [selectedId, setSelectedId] = useState(initialProjectId ?? activeProjects[0]?.id ?? data.projects[0]?.id ?? "");
   const selected = data.projects.find((project) => project.id === selectedId) ?? data.projects[0];
   const binding = data.projectBindings.find((candidate) => candidate.projectId === selected?.id);
   const [connectOpen, setConnectOpen] = useState(false);
@@ -141,6 +146,16 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
     if (!selected) return;
     setRoleDrafts(initialRoleDrafts(selected, binding, data.employees));
   }, [selected?.id, selected?.version, binding?.version, data.employees]);
+  useEffect(() => {
+    if (initialProjectId) setSelectedId(initialProjectId);
+  }, [initialProjectId]);
+  useEffect(() => {
+    if (connectRequest > 0) {
+      setConnectDraft({ rootPath: "", descriptorPath: "multi-agent.project.yaml" });
+      setConnectOpen(true);
+      onConnectRequestHandled?.();
+    }
+  }, [connectRequest, onConnectRequestHandled]);
 
   const readiness = useMemo(() => selected?.roles.map((role) => {
     const draft = roleDrafts[role.id];
@@ -256,7 +271,7 @@ export function ProjectPage({ data, refresh, notify }: PageProps) {
 
   return <div className="page-grid page-grid--projects">
     <aside className="record-list">
-      <header className="list-header"><h1>项目接入</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setConnectOpen(true)} aria-label="接入项目"><UtilityIcon name="add" /></button></header>
+      <header className="list-header"><h1>已接入项目</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setConnectOpen(true)} aria-label="接入项目"><UtilityIcon name="add" /></button></header>
       <div className="list-tools"><span className="project-list-note">声明需求，再分派员工</span><button className="text-button" disabled={!daemonAvailable} onClick={() => setConnectOpen(true)}>读取项目声明</button></div>
       <div className="record-scroll project-list">
         {data.projects.map((project) => {

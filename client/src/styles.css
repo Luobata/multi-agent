@@ -2138,6 +2138,18 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
 .dash-tabs button[aria-selected="true"] { background: color-mix(in srgb, var(--page-season, var(--season-spring)) 42%, var(--cloud)); color: var(--ink); box-shadow: inset 0 -3px 0 var(--page-season, var(--season-spring)), 3px 3px 0 var(--pixel-shadow); }
 .dash-tabs button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .dash-tabs button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
+
+/* 统一项目入口：目录与接入配置共享一个页头和纸签 Tab，不再表现成两个并列产品。 */
+.projects-hub > .dash-tabs { margin-bottom: var(--space-4); }
+.projects-hub > [role="tabpanel"] { min-width: 0; }
+.projects-hub-panel { min-width: 0; }
+.projects-directory-intro { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-3); padding: var(--space-3) var(--space-4); border: var(--rule) solid var(--line-strong); border-radius: var(--radius-2); background: var(--paper); box-shadow: var(--shadow-paper-small); }
+.projects-directory-intro > div { min-width: 0; display: flex; align-items: center; gap: var(--space-3); }
+.projects-directory-intro span { color: var(--ink-3); font-size: var(--text-sm); }
+.projects-hub .page-grid--projects { min-height: 680px; overflow: clip; border: var(--rule) solid var(--line-strong); border-radius: var(--radius-2); box-shadow: var(--shadow-paper); }
+.projects-hub .page-grid--projects .record-list { position: relative; top: 0; height: 680px; }
+.projects-hub .page-grid--projects .detail-pane { min-height: 680px; }
+.archive-disabled-reason { grid-column: 2 / -1; color: var(--ink-3); font-size: var(--text-xs); text-align: right; }
 .dash-tabpanel { min-width: 0; background: var(--paper-raised); }
 .dash-tabpanel > .dossier-section { margin: 0; border: 0; border-radius: 0 0 var(--radius-3) var(--radius-3); box-shadow: none; }
 .dash-tabpanel:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
@@ -3820,6 +3832,20 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
   .entrance-advanced-actions { align-items: stretch; flex-direction: column; }
 }
 
+@media (max-width: 900px) {
+  .projects-directory-intro { align-items: stretch; flex-direction: column; }
+  .projects-directory-intro > div { justify-content: space-between; }
+  .projects-hub .page-grid--projects,
+  .projects-hub .page-grid--projects .detail-pane { min-height: 0; }
+  .projects-hub .page-grid--projects .record-list { height: auto; }
+}
+
+@media (max-width: 640px) {
+  .projects-directory-intro > div { align-items: stretch; flex-direction: column; }
+  .projects-directory-intro .button { width: 100%; }
+  .archive-disabled-reason { grid-column: 2; text-align: left; }
+}
+
 /* ============ Crayon Shin-chan theme overrides ============ */
 /* §四.2 · 控制台组件补登晃动描边。SelectControl 弹层 createPortal 到 body / 最近 dialog（components.tsx），
    已逃逸被 filter 的祖先，故 .dash-panel / .dash-dossier 等含 SelectControl 的容器施加 filter 安全。 */
@@ -3837,6 +3863,7 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
 [data-theme="crayon"] .empty-state,
 [data-theme="crayon"] .archive-list,
 [data-theme="crayon"] .space-tree,
+[data-theme="crayon"] .projects-directory-intro,
 [data-theme="crayon"] .brand-mark > .brand-sprite {
   filter: url(#crayon-edge);
 }
@@ -3886,6 +3913,7 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
   [data-theme="crayon"] .empty-state,
   [data-theme="crayon"] .archive-list,
   [data-theme="crayon"] .space-tree,
+  [data-theme="crayon"] .projects-directory-intro,
   [data-theme="crayon"] .brand-mark > .brand-sprite {
     filter: none;
   }

@@ -25,11 +25,11 @@ export function ArchivePage({ go, notify, service = dashboardService }: {
   };
 
   return <main className="dash-page">
-    <PageHeader eyebrow="ARCHIVE / RECOVERABLE" title="归档中心" description="归档只隐藏配置视图：可在归档中心恢复，不会删除磁盘上的文件。" actions={<button type="button" className="button secondary" onClick={() => go("spaces")}>← 返回项目空间</button>} />
+    <PageHeader eyebrow="ARCHIVE / RECOVERABLE" title="归档中心" description="文件夹与需求可恢复；已接入项目保留完整历史，恢复入口等待运行核心补齐。" actions={<button type="button" className="button secondary" onClick={() => go("projects")}>← 返回项目</button>} />
     <OfflineNotice />
     {state.status === "loading" && <SkeletonBlock rows={3} label="正在加载归档中心" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
-    {state.status === "ready" && records.length === 0 && <EmptyState title="归档中心是空的" action={<button type="button" className="button secondary" onClick={() => go("spaces")}>前往项目空间</button>}>
+    {state.status === "ready" && records.length === 0 && <EmptyState title="归档中心是空的" action={<button type="button" className="button secondary" onClick={() => go("projects")}>前往项目</button>}>
       <p>归档的文件夹、项目与需求会列在这里，随时可恢复。</p>
     </EmptyState>}
     {state.status === "ready" && records.length > 0 && <ul className="archive-list" aria-label="归档记录">
@@ -41,7 +41,8 @@ export function ArchivePage({ go, notify, service = dashboardService }: {
           <small>归档于 {formatTime(record.archivedAt)} · 操作人 {record.archivedBy}</small>
         </div>
         <Stamp status="archived" />
-        <button type="button" className="button secondary" disabled={!daemonAvailable} onClick={() => void restore(record)}>恢复</button>
+        <button type="button" className="button secondary" disabled={!daemonAvailable || Boolean(record.restoreDisabledReason)} title={record.restoreDisabledReason} onClick={() => void restore(record)}>恢复</button>
+        {record.restoreDisabledReason && <small className="archive-disabled-reason">{record.restoreDisabledReason}</small>}
       </li>)}
     </ul>}
   </main>;

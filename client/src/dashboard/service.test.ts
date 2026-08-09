@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { createDashboardService, type DashboardService } from "./service";
 import { REQUIREMENT_LANES } from "./types";
+import type { Project } from "../types";
 
 const FIXED_NOW = new Date("2026-08-09T06:00:00.000Z");
 
@@ -12,6 +13,23 @@ function makeService(): DashboardService {
     now: () => FIXED_NOW,
     idSeed: (prefix) => `${prefix}-test-${++counter}`
   });
+}
+
+function connectedProject(id: string, status: Project["status"] = "active"): Project {
+  return {
+    id,
+    version: 2,
+    status,
+    name: id === "connected-a" ? "正式项目 A" : "正式项目 B",
+    description: "测试接入项目",
+    scope: "repository",
+    rootPath: `/workspace/${id}`,
+    descriptorPath: `/workspace/${id}/multi-agent.project.yaml`,
+    connector: { kind: "repository-development", config: {} },
+    roles: [],
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-09T00:00:00.000Z"
+  };
 }
 
 /** 中文三段式：发生了什么；怎么办；数据是否安全。 */
@@ -77,6 +95,31 @@ describe("createProject", () => {
   it("拒绝同级重名项目", async () => {
     const service = makeService();
     expect(await expectFailure(service.createProject({ parentId: "fld-product", name: "多智能体工作台", repositoryPath: "~/dev/x" }))).toContain("同一层级已存在");
+  });
+});
+
+describe("syncConnectedProjects", () => {
+  it("以 bootstrap active Project 替换 mock 项目，并把演示需求稳定映射到正式项目", async () => {
+    const service = makeService();
+    service.syncConnectedProjects([connectedProject("connected-a"), connectedProject("connected-b")]);
+    const nodes = await service.listSpaces();
+    const projects = nodes.filter((node) => node.kind === "project");
+    expect(projects.map((project) => project.id)).toEqual(["connected-a", "connected-b"]);
+    expect(projects.map((project) => project.repositoryPath)).toEqual(["/workspace/connected-a", "/workspace/connected-b"]);
+    expect(projects.every((project) => project.parentId === null && !project.favorite)).toBe(true);
+    expect((await service.listBoard()).every((requirement) => ["connected-a", "connected-b"].includes(requirement.projectId))).toBe(true);
+  });
+
+  it("只有正式接入且 active 的项目可以承接需求，归档项目恢复入口保持禁用说明", async () => {
+    const service = makeService();
+    service.syncConnectedProjects([connectedProject("connected-a"), connectedProject("connected-b", "archived")]);
+    const input = { title: "接入后需求", summary: "", priority: "medium" as const, rawRequirement: "说明", acceptanceCriteria: [] };
+    await expect(service.createRequirement({ ...input, projectId: "connected-a" })).resolves.toMatchObject({ projectId: "connected-a" });
+    expect(await expectFailure(service.createRequirement({ ...input, projectId: "connected-b" }))).toContain("尚未正式接入或已归档");
+    expect(await expectFailure(service.createRequirement({ ...input, projectId: "prj-workbench" }))).toContain("尚未正式接入或已归档");
+    const archived = (await service.listArchive()).find((record) => record.nodeId === "connected-b");
+    expect(archived?.restoreDisabledReason).toContain("尚未提供项目恢复入口");
+    expect(await expectFailure(service.restoreArchived(archived!.id))).toContain("尚未提供项目恢复入口");
   });
 });
 
@@ -199,8 +242,8 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
   it("拒绝给归档或未知项目创建需求", async () => {
     const service = makeService();
     const input = { title: "新需求", summary: "", priority: "medium" as const, rawRequirement: "说明", acceptanceCriteria: [] };
-    expect(await expectFailure(service.createRequirement({ ...input, projectId: "prj-legacy-site" }))).toContain("目标项目不可用");
-    expect(await expectFailure(service.createRequirement({ ...input, projectId: "missing" }))).toContain("目标项目不可用");
+    expect(await expectFailure(service.createRequirement({ ...input, projectId: "prj-legacy-site" }))).toContain("尚未正式接入或已归档");
+    expect(await expectFailure(service.createRequirement({ ...input, projectId: "missing" }))).toContain("尚未正式接入或已归档");
   });
 
   it("看板七列契约完整，按项目过滤且去掉详情字段", async () => {
