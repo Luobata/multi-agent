@@ -367,6 +367,14 @@ export function Stamp({ status, label }: { status: StampStatus; label?: string }
   </span>;
 }
 
+/**
+ * 演示数据徽标：奶油底 + 针脚虚线框 + mono，不占用任何业务状态色。
+ * 是否渲染完全由数据上的 demo 标记驱动，组件本身不判断业务语义。
+ */
+export function DemoBadge({ label = "尚未接入调度器 · 演示数据" }: { label?: string }) {
+  return <span className="demo-badge"><i aria-hidden="true" />{label}</span>;
+}
+
 export function DossierSection({ number, title, action, children }: PropsWithChildren<{
   number: string;
   title: string;
@@ -509,7 +517,7 @@ export function EmployeeAvatar({ displayName, presentation, className = "", titl
   </span>;
 }
 
-export function Icon({ name }: { name: "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "command" | "memory" }) {
+export function Icon({ name }: { name: "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "command" | "memory" | "dashboard" | "spaces" | "board" | "archive" | "settings" }) {
   const paths = {
     office: <><path d="M3 21h18M5 21V10l7-6 7 6v11"/><path d="M9 21v-6h6v6M8 11h2M14 11h2"/><path d="M12 8V5M12 6c-2 0-3-1-3-3 2 0 3 1 3 3Zm0-1c0-2 1-3 3-3 0 2-1 3-3 3Z"/></>,
     employees: <><path d="M5 21v-3l3-3h8l3 3v3"/><path d="M8 5h8v7H8zM10 8h1M13 8h1M10 11h4"/><path d="M6 7h2M16 7h2"/></>,
@@ -520,7 +528,12 @@ export function Icon({ name }: { name: "office" | "employees" | "projects" | "sk
     runs: <><path d="M6 3h12v18H6zM9 8h6M9 12h6M9 16h4"/><path d="m16 2 .7 1.3L18 4l-1.3.7L16 6l-.7-1.3L14 4l1.3-.7L16 2Z"/></>,
     publications: <><path d="M4 10h16v11H4zM3 7h18v4H3zM12 7v14"/><path d="M12 7c-4 0-5-5-2-5 2 0 2 3 2 5Zm0 0c4 0 5-5 2-5-2 0-2 3-2 5Z"/></>,
     command: <><path d="M4 5h16v14H4zM7 9l3 3-3 3M12 15h5"/></>,
-    memory: <><path d="M5 3h11l3 3v15H5zM16 3v3h3"/><path d="M8 9h7M8 12h7M8 15h4"/><path d="M15 3v6l2-1.5L19 9V3"/></>
+    memory: <><path d="M5 3h11l3 3v15H5zM16 3v3h3"/><path d="M8 9h7M8 12h7M8 15h4"/><path d="M15 3v6l2-1.5L19 9V3"/></>,
+    dashboard: <><path d="M4 4h7v7H4zM13 4h7v4h-7z"/><path d="M13 11h7v9h-7zM4 14h7v6H4z"/></>,
+    spaces: <><path d="M3 8h7l2-2h9v12H3z"/><path d="M3 8V5h6l2 2"/><path d="M8 12h8M8 15h5"/></>,
+    board: <><path d="M4 4h4v16H4zM10 4h4v10h-4z"/><path d="M16 4h4v13h-4z"/></>,
+    archive: <><path d="M3 7h18v4H3zM5 11h14v9H5z"/><path d="M10 13h4"/></>,
+    settings: <><path d="M4 7h16M4 12h16M4 17h16"/><path d="M9 5v4M15 10v4M7 15v4"/></>
   };
   return <svg className="nav-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="square" strokeLinejoin="miter" shapeRendering="crispEdges">{paths[name]}</svg>;
 }

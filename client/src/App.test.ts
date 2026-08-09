@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertKnowledgeControlPlane } from "./App";
+import { assertKnowledgeControlPlane, pageFromHash } from "./App";
 import type { Bootstrap } from "./types";
 
 function bootstrap(): Bootstrap {
@@ -29,5 +29,20 @@ describe("Workbench capability compatibility", () => {
   it("rejects a stale daemon that does not expose task entrance policies", () => {
     expect(() => assertKnowledgeControlPlane({ ...bootstrap(), knowledgeBases: [], knowledgeProfiles: [] }))
       .toThrow(/运行核心版本早于工作启动策略/);
+  });
+});
+
+describe("multi-project console routes", () => {
+  it("parses top-level management pages", () => {
+    expect(pageFromHash("#dashboard")).toEqual({ page: "dashboard" });
+    expect(pageFromHash("#spaces")).toEqual({ page: "spaces" });
+    expect(pageFromHash("#archive")).toEqual({ page: "archive" });
+    expect(pageFromHash("#settings")).toEqual({ page: "settings" });
+  });
+
+  it("keeps project and requirement ids in nested routes", () => {
+    expect(pageFromHash("#spaces/prj-workbench")).toEqual({ page: "project", spaceId: "prj-workbench" });
+    expect(pageFromHash("#spaces/prj-workbench/board")).toEqual({ page: "board", spaceId: "prj-workbench" });
+    expect(pageFromHash("#requirements/req%20101")).toEqual({ page: "requirement", requirementId: "req 101" });
   });
 });

@@ -30,7 +30,7 @@
     "typecheck": "npm run typecheck:server && npm run typecheck:client",
     "typecheck:server": "tsc --noEmit -p tsconfig.json",
     "typecheck:client": "tsc --noEmit -p client/tsconfig.json",
-    "test": "vitest run",
+    "test": "NODE_OPTIONS=--no-experimental-webstorage vitest run",
     "check": "npm run typecheck && npm test && npm run build",
     "cli": "tsx src/cli/main.ts",
     "workbench": "tsx src/daemon/main.ts",

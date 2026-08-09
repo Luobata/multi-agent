@@ -1,24 +1,45 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
+import { ArchivePage } from "./ArchivePage";
+import { BoardPage } from "./BoardPage";
+import { DashboardPage } from "./DashboardPage";
 import { EmployeePage } from "./EmployeePage";
 import { KnowledgePage } from "./KnowledgePage";
 import { MemoryPage } from "./MemoryPage";
 import { DaemonGate, Icon, Modal } from "./components";
 import { OfficePage } from "./OfficePage";
+import { ProjectDetailPage } from "./ProjectDetailPage";
 import { PublicationsPage } from "./PublicationsPage";
 import { ProjectPage } from "./ProjectPage";
+import { RequirementDetailPage } from "./RequirementDetailPage";
 import { RunsPage } from "./RunsPage";
+import { SettingsPage } from "./SettingsPage";
 import { SkillsPage } from "./SkillsPage";
+import { SpacesPage } from "./SpacesPage";
 import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
 import { applyTheme, DEFAULT_THEME, readTheme, type ThemeName } from "./theme";
 
-type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "memory";
+type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "memory" | "dashboard" | "spaces" | "project" | "board" | "requirement" | "archive" | "settings";
+
+export interface PageRoute {
+  page: Page;
+  spaceId?: string;
+  requirementId?: string;
+}
+
+const TOP_LEVEL_PAGES: Page[] = ["office", "employees", "projects", "skills", "knowledge", "workflows", "runs", "publications", "memory", "dashboard", "spaces", "board", "archive", "settings"];
 const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], gateValidators: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
 
-function pageFromHash(): Page {
-  const value = window.location.hash.replace("#", "");
-  return ["office", "employees", "projects", "skills", "knowledge", "workflows", "runs", "publications", "memory"].includes(value) ? value as Page : "office";
+/** 二级 hash：#spaces/<id>、#spaces/<id>/board、#requirements/<id>，其余按顶层页面解析。 */
+export function pageFromHash(hash = window.location.hash): PageRoute {
+  const segments = hash.replace(/^#/, "").split("/").filter(Boolean);
+  const [head, second, third] = segments;
+  if (head === "spaces" && second) {
+    return third === "board" ? { page: "board", spaceId: decodeURIComponent(second) } : { page: "project", spaceId: decodeURIComponent(second) };
+  }
+  if (head === "requirements" && second) return { page: "requirement", requirementId: decodeURIComponent(second) };
+  return TOP_LEVEL_PAGES.includes(head as Page) ? { page: head as Page } : { page: "office" };
 }
 
 function upsertById<T extends { id: string }>(items: T[], value: T): T[] {
@@ -60,7 +81,8 @@ export function assertKnowledgeControlPlane(bootstrap: Bootstrap): void {
 }
 
 export function App() {
-  const [page, setPage] = useState<Page>(pageFromHash);
+  const [route, setRoute] = useState<PageRoute>(pageFromHash);
+  const page = route.page;
   const [data, setData] = useState<Bootstrap>(emptyBootstrap);
   const [daemon, setDaemon] = useState<"checking" | "online" | "offline">("checking");
   const [activityStream, setActivityStream] = useState<"connecting" | "live" | "reconnecting" | "offline">("connecting");
@@ -136,7 +158,7 @@ export function App() {
     return () => stream.close();
   }, [daemon]);
   useEffect(() => {
-    const update = () => setPage(pageFromHash());
+    const update = () => setRoute(pageFromHash());
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
   }, []);
@@ -159,12 +181,17 @@ export function App() {
   const navigate = (next: Page) => {
     if (next === page) { refreshQuietly(); return; }
     window.location.hash = next;
-    setPage(next);
+    setRoute({ page: next });
   };
+  /** Dashboard 子路由（项目详情 / 项目看板 / 需求详情）只换 hash，由 hashchange 统一收编。 */
+  const go = (hash: string) => { window.location.hash = hash; };
   const invocationRevision = data.activity.invocations.reduce((latest, invocation) => invocation.updatedAt > latest ? invocation.updatedAt : latest, "");
   const activityRevision = data.activity.instances.reduce((latest, instance) => instance.updatedAt > latest ? instance.updatedAt : latest, invocationRevision);
   const nav = [
     { id: "office" as const, label: "员工大厅", icon: "office" as const },
+    { id: "dashboard" as const, label: "工作台", icon: "dashboard" as const },
+    { id: "spaces" as const, label: "项目空间", icon: "spaces" as const },
+    { id: "board" as const, label: "需求看板", icon: "board" as const },
     { id: "employees" as const, label: "员工档案", icon: "employees" as const },
     { id: "projects" as const, label: "项目接入", icon: "projects" as const },
     { id: "skills" as const, label: "技能台账", icon: "skills" as const },
@@ -174,6 +201,14 @@ export function App() {
     { id: "memory" as const, label: "记忆档案", icon: "memory" as const },
     { id: "publications" as const, label: "调用包", icon: "publications" as const }
   ];
+  const utilityNav = [
+    { id: "archive" as const, label: "归档中心", icon: "archive" as const },
+    { id: "settings" as const, label: "设置·集成", icon: "settings" as const }
+  ];
+  // 项目详情归入项目空间，需求详情归入需求看板，侧栏高亮跟随信息架构而不是路由名。
+  const activeNav: Page = page === "project" ? "spaces" : page === "requirement" ? "board" : page;
+  const [moreOpen, setMoreOpen] = useState(false);
+  const commandItems = [...nav, ...utilityNav];
 
   return <div className={`app-shell app-shell--${page}`}>
     <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
@@ -189,7 +224,9 @@ export function App() {
     </header>
     <nav className="side-nav" aria-label="主要导航">
       <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>双叶幼儿园</strong><small>CRAYON KINDERGARTEN DOSSIER</small></div></div>
-      <div className="nav-items">{nav.map((item) => <button type="button" className={page === item.id ? "active" : ""} aria-current={page === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
+      <div className="nav-items">{nav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
+      <div className="nav-items nav-utility">{utilityNav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
+      <button type="button" className="mobile-more" aria-expanded={moreOpen} onClick={() => setMoreOpen(true)}><Icon name="command" /><span>更多</span></button>
       <button type="button" className="command-hint" title="命令入口" onClick={() => setCommandOpen(true)}><Icon name="command" /><span>命令面板</span><kbd>⌘K</kbd></button>
       <button type="button" className="theme-toggle" onClick={() => setTheme(theme === "crayon" ? "pixel" : "crayon")} title={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"} aria-label={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"}><span className="theme-toggle-dot" aria-hidden="true" /><span>{theme === "crayon" ? "蜡笔小新" : "治愈像素"}</span><small>{theme === "crayon" ? "CRAYON" : "PIXEL"}</small></button>
       <div className="nav-foot"><span>KG</span><div><strong>Kindergarten Workbench</strong><small>班级在册 · A2A 1.0</small></div></div>
@@ -204,6 +241,13 @@ export function App() {
       {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} pendingRunId={pendingRunId} onConsumePending={() => setPendingRunId("")} />}
       {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
+      {page === "dashboard" && <DashboardPage go={go} />}
+      {page === "spaces" && <SpacesPage go={go} notify={notify} />}
+      {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} />}
+      {page === "board" && <BoardPage spaceId={route.spaceId} go={go} notify={notify} />}
+      {page === "requirement" && route.requirementId && <RequirementDetailPage requirementId={route.requirementId} go={go} notify={notify} />}
+      {page === "archive" && <ArchivePage go={go} notify={notify} />}
+      {page === "settings" && <SettingsPage />}
     </div></DaemonGate>
     {notice && <div className={`toast toast--${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"} aria-live={notice.kind === "error" ? "assertive" : "polite"} aria-atomic="true">
       <span>{notice.message}</span>
@@ -219,6 +263,9 @@ export function App() {
       const current = Math.max(0, buttons.indexOf(document.activeElement as HTMLButtonElement));
       const next = event.key === "ArrowDown" ? (current + 1) % buttons.length : (current - 1 + buttons.length) % buttons.length;
       buttons[next]?.focus();
-    }}>{nav.map((item, index) => <button type="button" key={item.id} onClick={() => { navigate(item.id); setCommandOpen(false); }}><Icon name={item.icon} /><strong>{item.label}</strong><kbd>0{index + 1}</kbd></button>)}</div></Modal>}
+    }}>{commandItems.map((item, index) => <button type="button" key={item.id} onClick={() => { navigate(item.id); setCommandOpen(false); }}><Icon name={item.icon} /><strong>{item.label}</strong><kbd>{String(index + 1).padStart(2, "0")}</kbd></button>)}</div></Modal>}
+    {moreOpen && <Modal title="更多功能" eyebrow="WORKBENCH · NAVIGATION" onClose={() => setMoreOpen(false)}>
+      <div className="command-list mobile-more-list">{commandItems.slice(4).map((item) => <button type="button" key={item.id} onClick={() => { navigate(item.id); setMoreOpen(false); }}><Icon name={item.icon} /><strong>{item.label}</strong></button>)}</div>
+    </Modal>}
   </div>;
 }
