@@ -1,8 +1,8 @@
 /** service adapter 边界单测：正常路径 + 中文三段式错误路径 + demo:true 数据驱动断言。 */
 import { describe, expect, it } from "vitest";
-import { createDashboardService, type DashboardService } from "./service";
+import { DASHBOARD_STORAGE_KEY, createDashboardService, mcpCatalogNodeId, type DashboardService } from "./service";
 import { REQUIREMENT_LANES } from "./types";
-import type { Project } from "../types";
+import type { PassiveProjectAccess, Project } from "../types";
 
 const FIXED_NOW = new Date("2026-08-09T06:00:00.000Z");
 
@@ -11,9 +11,70 @@ function makeService(): DashboardService {
   return createDashboardService({
     delayMs: () => 0,
     now: () => FIXED_NOW,
-    idSeed: (prefix) => `${prefix}-test-${++counter}`
+    idSeed: (prefix) => `${prefix}-test-${++counter}`,
+    initialData: "demo"
   });
 }
+
+function memoryStorage(initial = new Map<string, string>()) {
+  return {
+    values: initial,
+    getItem: (key: string) => initial.get(key) ?? null,
+    setItem: (key: string, value: string) => { initial.set(key, value); },
+    removeItem: (key: string) => { initial.delete(key); }
+  };
+}
+
+describe("empty production board and versioned persistence", () => {
+  it("starts without demo nodes, requirements, activities, or archive records", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    expect(await service.listSpaces()).toEqual([]);
+    expect(await service.listBoard()).toEqual([]);
+    expect(await service.listArchive()).toEqual([]);
+    expect(await service.getDashboardSummary()).toMatchObject({
+      projects: { total: 0, active: 0 },
+      requirements: { total: 0, active: 0 },
+      activities: []
+    });
+  });
+
+  it("deletes the pre-launch v1 test board and starts the v2 production board empty", async () => {
+    const legacyKey = "local-agent-workbench.requirement-board.v1";
+    const storage = memoryStorage(new Map([[legacyKey, JSON.stringify({ version: 1, store: { nodes: [], requirements: [{ id: "test-data" }], activities: [], archive: [] } })]]));
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    expect(storage.values.has(legacyKey)).toBe(false);
+    expect(await service.listBoard()).toEqual([]);
+    expect(storage.values.has(DASHBOARD_STORAGE_KEY)).toBe(true);
+  });
+
+  it("persists a confirmed requirement across service recreation without restoring demo data", async () => {
+    const storage = memoryStorage();
+    const first = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    first.syncConnectedProjects([connectedProject("connected-a")]);
+    const created = await first.createRequirement({
+      projectId: "connected-a",
+      title: "首条真实需求",
+      summary: "由用户确认创建",
+      priority: "high",
+      rawRequirement: "保留我的原话",
+      acceptanceCriteria: ["可以独立验收"]
+    });
+    expect(storage.values.has(DASHBOARD_STORAGE_KEY)).toBe(true);
+
+    const restored = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    restored.syncConnectedProjects([connectedProject("connected-a")]);
+    expect(await restored.listBoard()).toEqual([expect.objectContaining({ id: created.id, title: "首条真实需求" })]);
+    expect(await restored.getRequirement(created.id)).toMatchObject({ rawRequirement: "保留我的原话" });
+    expect((await restored.listSpaces()).filter((node) => node.kind === "project")).toHaveLength(1);
+  });
+
+  it("ignores corrupt or unsupported persisted data and safely falls back to empty", async () => {
+    const storage = memoryStorage(new Map([[DASHBOARD_STORAGE_KEY, JSON.stringify({ version: 99, store: { nodes: [{ id: "bad" }] } })]]));
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    expect(await service.listSpaces()).toEqual([]);
+    expect(await service.listBoard()).toEqual([]);
+  });
+});
 
 function connectedProject(id: string, status: Project["status"] = "active"): Project {
   return {
@@ -29,6 +90,20 @@ function connectedProject(id: string, status: Project["status"] = "active"): Pro
     roles: [],
     createdAt: "2026-08-01T00:00:00.000Z",
     updatedAt: "2026-08-09T00:00:00.000Z"
+  };
+}
+
+function passiveProjectAccess(overrides: Partial<PassiveProjectAccess> = {}): PassiveProjectAccess {
+  return {
+    id: "access-a",
+    rootPath: "/workspace/mcp-project",
+    projectKeys: ["mcp-project", "client-a"],
+    displayName: "MCP 发现项目",
+    transport: "mcp",
+    requestCount: 6,
+    firstSeenAt: "2026-08-07T00:00:00.000Z",
+    lastSeenAt: "2026-08-09T02:30:00.000Z",
+    ...overrides
   };
 }
 
@@ -120,6 +195,65 @@ describe("syncConnectedProjects", () => {
     const archived = (await service.listArchive()).find((record) => record.nodeId === "connected-b");
     expect(archived?.restoreDisabledReason).toContain("尚未提供项目恢复入口");
     expect(await expectFailure(service.restoreArchived(archived!.id))).toContain("尚未提供项目恢复入口");
+  });
+
+  it("把未关联的 MCP 发现记录放入同一目录，并允许移动与收藏", async () => {
+    const service = makeService();
+    const access = passiveProjectAccess();
+    service.syncConnectedProjects([connectedProject("connected-a")], [access]);
+
+    const observed = (await service.listSpaces()).find((node) => node.id === mcpCatalogNodeId(access.id));
+    expect(observed).toMatchObject({
+      kind: "mcp-observed",
+      accessId: access.id,
+      name: "MCP 发现项目",
+      rootPath: "/workspace/mcp-project",
+      projectKeys: ["mcp-project", "client-a"],
+      historical: false,
+      parentId: null,
+      favorite: false
+    });
+
+    const moved = await service.moveNode(mcpCatalogNodeId(access.id), "fld-product");
+    expect(moved.parentId).toBe("fld-product");
+    const favorite = await service.toggleFavorite(mcpCatalogNodeId(access.id));
+    expect(favorite.favorite).toBe(true);
+  });
+
+  it("关联正式项目后去重 MCP 行，并迁移目录位置、收藏和接入证据", async () => {
+    const service = makeService();
+    const access = passiveProjectAccess();
+    service.syncConnectedProjects([], [access]);
+    await service.moveNode(mcpCatalogNodeId(access.id), "fld-infra");
+    await service.toggleFavorite(mcpCatalogNodeId(access.id));
+
+    service.syncConnectedProjects([connectedProject("connected-a")], [{ ...access, linkedProjectId: "connected-a", requestCount: 9 }]);
+    const nodes = await service.listSpaces();
+    expect(nodes.some((node) => node.kind === "mcp-observed")).toBe(false);
+    expect(nodes.find((node) => node.id === "connected-a")).toMatchObject({
+      kind: "project",
+      parentId: "fld-infra",
+      favorite: true,
+      mcpAccess: {
+        accessId: "access-a",
+        projectKeys: ["mcp-project", "client-a"],
+        requestCount: 9,
+        lastSeenAt: "2026-08-09T02:30:00.000Z"
+      }
+    });
+  });
+
+  it("MCP 发现记录不能承接需求、重命名或归档，历史记录保留缺目录状态", async () => {
+    const service = makeService();
+    const access = passiveProjectAccess({ rootPath: undefined, projectKeys: ["legacy-key"] });
+    service.syncConnectedProjects([], [access]);
+    const nodeId = mcpCatalogNodeId(access.id);
+    const observed = (await service.listSpaces()).find((node) => node.id === nodeId);
+    expect(observed).toMatchObject({ kind: "mcp-observed", historical: true, rootPath: undefined });
+    const input = { title: "不应创建", summary: "", priority: "medium" as const, rawRequirement: "说明", acceptanceCriteria: [] };
+    expect(await expectFailure(service.createRequirement({ ...input, projectId: nodeId }))).toContain("尚未正式接入或已归档");
+    expect(await expectFailure(service.renameNode(nodeId, "改名"))).toContain("MCP 发现记录不能重命名");
+    expect(await expectFailure(service.archiveNode(nodeId))).toContain("MCP 发现记录不能归档");
   });
 });
 
@@ -289,6 +423,55 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
     expect(same.lane).toBe("queued");
   });
 
+  it("fail-closed：普通列迁移不能绕过 Run 验收快照", async () => {
+    const service = makeService();
+    const message = await expectFailure(service.updateRequirementLane("req-102", "acceptance"));
+    expect(message).toContain("缺少验收证据：Run 验收快照");
+    expect((await service.getRequirement("req-102")).lane).toBe("planned");
+  });
+
+  it("fail-closed：eligible 或 test / audit / 交付证据缺失时原子提交不落半份数据", async () => {
+    const service = makeService();
+    const message = await expectFailure(service.submitRequirementForAcceptance("req-102", {
+      runId: "run-incomplete",
+      eligible: false,
+      worktreePath: "/repo/.multi-agent/worktrees/run-incomplete",
+      mediaCount: 0,
+      structuredE2eCount: 0,
+      diffFiles: [],
+      capturedAt: FIXED_NOW.toISOString()
+    }));
+    expect(message).toContain("交付门禁 eligible");
+    expect(message).toContain("quality.test");
+    expect(message).toContain("quality.audit");
+    expect(message).toContain("截图、录屏或结构化 E2E");
+    expect(message).toContain("Diff 文件清单");
+    const detail = await service.getRequirement("req-102");
+    expect(detail.lane).toBe("planned");
+    expect(detail.evidence.acceptance).toBeUndefined();
+  });
+
+  it("双门禁和真实证据齐全后，固定 Run 快照并迁移到待验收", async () => {
+    const service = makeService();
+    const snapshot = {
+      runId: "run-acceptance-102",
+      eligible: true,
+      worktreePath: "/repo/.multi-agent/worktrees/run-acceptance-102",
+      testGate: { gateId: "quality-test", status: "passed" },
+      reviewGate: { gateId: "independent-review", status: "passed" },
+      mediaCount: 1,
+      structuredE2eCount: 2,
+      diffFiles: ["client/src/RunsPage.tsx"],
+      capturedAt: FIXED_NOW.toISOString()
+    };
+    const submitted = await service.submitRequirementForAcceptance("req-102", snapshot);
+    expect(submitted.lane).toBe("acceptance");
+    const detail = await service.getRequirement("req-102");
+    expect(detail.evidence.acceptance).toEqual(snapshot);
+    expect(detail.evidence.testReport).toContain("quality-test");
+    expect(detail.evidence.reviewNotes).toContain("independent-review");
+  });
+
   it("拒绝未知需求、非法目标列与已取消需求", async () => {
     const service = makeService();
     expect(await expectFailure(service.updateRequirementLane("missing", "done"))).toContain("没有找到这条需求");
@@ -303,11 +486,11 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
 });
 
 describe("getSettingsSnapshot", () => {
-  it("调度器集成区声明未接入，Repository path 策略固定文案", async () => {
+  it("声明 Run 证据、人工合并门禁与 Repository path 安全策略", async () => {
     const service = makeService();
     const snapshot = await service.getSettingsSnapshot();
     const scheduler = snapshot.sections.find((section) => section.id === "scheduler");
-    expect(scheduler?.entries.some((entry) => entry.value.includes("尚未接入调度器"))).toBe(true);
+    expect(scheduler?.entries.some((entry) => entry.value.includes("Run 证据已接入"))).toBe(true);
     const workspace = snapshot.sections.find((section) => section.id === "workspace");
     expect(workspace?.entries.some((entry) => entry.hint?.includes("仅保存配置，不会移动磁盘上的文件"))).toBe(true);
     const execution = snapshot.sections.find((section) => section.id === "execution");

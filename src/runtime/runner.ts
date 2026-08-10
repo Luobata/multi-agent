@@ -14,6 +14,8 @@ import type {
   JsonValue,
   LoadedManifest,
   NodeRunResult,
+  RuntimeHumanDecisionOutcome,
+  RuntimeHumanDecisionRequest,
   WorkflowRunIsolation,
   WorkflowRunRecord
 } from "../core/types.js";
@@ -37,6 +39,11 @@ export interface RunWorkflowOptions {
     artifacts?: Record<string, JsonValue>;
   }>;
   onEvent?: (event: ObservedRunEvent) => void | Promise<void>;
+  /** Opens a durable human-decision request and returns a live waiter for the same Run. */
+  openHumanDecision?: (request: RuntimeHumanDecisionRequest) => Promise<{
+    requestId: string;
+    decision: Promise<RuntimeHumanDecisionOutcome>;
+  }>;
   signal?: AbortSignal;
 }
 
@@ -465,6 +472,26 @@ export async function runWorkflow(
       run,
       scheduleNode,
       executeNode: executePreparedNode,
+      requestHumanDecision: options.openHumanDecision
+        ? async (request) => {
+            const opened = await options.openHumanDecision!(request);
+            await emit("human-decision.requested", request.nodeId, {
+              requestId: opened.requestId,
+              round: request.round,
+              riskCategory: request.riskCategory,
+              summary: request.summary,
+              proposedAction: request.proposedAction
+            });
+            const outcome = await opened.decision;
+            await emit(`human-decision.${outcome.decision}`, request.nodeId, {
+              requestId: outcome.requestId,
+              decision: outcome.decision,
+              decidedBy: outcome.decidedBy ?? null,
+              comment: outcome.comment ?? null
+            });
+            return outcome;
+          }
+        : undefined,
       persist: () => store.writeRun(run),
       emit
     });

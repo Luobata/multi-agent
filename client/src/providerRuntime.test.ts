@@ -5,11 +5,11 @@ describe("providerRuntimeSummary", () => {
   it("reports explicit model metadata and the exact command argv", () => {
     const summary = providerRuntimeSummary({
       id: "local-cli",
-      definition: { adapter: "command", model: "k3-256k", command: "zsh", args: ["-ic", "claude-kimi --print"] }
+      definition: { adapter: "command", model: "auto_model/alwaysday1_max", command: "zsh", args: ["-ic", "claude-day1 --print"] }
     });
-    expect(summary.model).toBe("k3-256k");
-    expect(summary.launchCommand).toBe("zsh -ic 'claude-kimi --print'");
-    expect(summary.launchPreview).toBe("zsh → claude-kimi");
+    expect(summary.model).toBe("auto_model/alwaysday1_max");
+    expect(summary.launchCommand).toBe("zsh -ic 'claude-day1 --print'");
+    expect(summary.launchPreview).toBe("zsh → claude-day1");
   });
 
   it("derives a model flag and labels built-in adapters honestly", () => {

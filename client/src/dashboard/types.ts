@@ -37,7 +37,7 @@ export function requirementLaneLabel(lane: RequirementLane): string {
   return REQUIREMENT_LANES.find((entry) => entry.id === lane)?.label ?? lane;
 }
 
-export type SpaceNodeKind = "folder" | "project";
+export type SpaceNodeKind = "folder" | "project" | "mcp-observed";
 
 interface SpaceNodeBase {
   id: string;
@@ -61,9 +61,29 @@ export interface ManagedProject extends SpaceNodeBase {
   repositoryPath: string;
   defaultBranch: string;
   repositories: RepositoryBinding[];
+  /** MCP 只作为接入证据；正式 Project 仍是需求、角色和权限的唯一事实源。 */
+  mcpAccess?: McpAccessEvidence;
 }
 
-export type SpaceNode = FolderNode | ManagedProject;
+export interface McpAccessEvidence {
+  accessId: string;
+  projectKeys: string[];
+  requestCount: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+}
+
+/**
+ * MCP 自动发现的目录节点。它可以被分类和收藏，但尚不是正式 Project，
+ * 因此不能承接需求、配置角色或被当成另一套项目事实源。
+ */
+export interface McpObservedProject extends SpaceNodeBase, McpAccessEvidence {
+  kind: "mcp-observed";
+  rootPath?: string;
+  historical: boolean;
+}
+
+export type SpaceNode = FolderNode | ManagedProject | McpObservedProject;
 
 export interface Requirement {
   id: string;
@@ -112,11 +132,38 @@ export interface TimelineEntry {
   detail: string;
 }
 
+/** 单条 Gate 的可追溯快照；status 必须为服务端真实结论。 */
+export interface RunGateSnapshot {
+  gateId: string;
+  status: string;
+}
+
+/**
+ * Run 验收快照：把一次合格交付预览的关键证据固定到需求上。
+ * 所有字段都来自 merge-preview 的真实返回值，不接受占位字符串。
+ */
+export interface RunAcceptanceSnapshot {
+  runId: string;
+  /** 对应服务端完整门禁计算后的 preview.eligible；旧 acceptedVerdict 不能替代硬门禁。 */
+  eligible: boolean;
+  worktreePath: string;
+  /** 对应 requiredCapability === "quality.test" 的 Gate。 */
+  testGate?: RunGateSnapshot;
+  /** 对应 requiredCapability === "quality.audit" 的 Gate。 */
+  reviewGate?: RunGateSnapshot;
+  mediaCount: number;
+  structuredE2eCount: number;
+  diffFiles: string[];
+  capturedAt: string;
+}
+
 export interface RequirementEvidence {
   diffSummary: string;
   testReport: string;
   reviewNotes: string;
   deliverables: string[];
+  /** fail-closed 验收闸：迁移到「待验收」前必须存在的真实 Run 证据。 */
+  acceptance?: RunAcceptanceSnapshot;
 }
 
 export interface RequirementDetail extends Requirement {
@@ -153,7 +200,7 @@ export interface DashboardSummary {
   resourceOverview: { demo: true; agents: ResourceAgentLoad[] };
 }
 
-export type ArchiveKind = SpaceNodeKind | "requirement";
+export type ArchiveKind = Exclude<SpaceNodeKind, "mcp-observed"> | "requirement";
 
 export interface ArchiveRecord {
   id: string;

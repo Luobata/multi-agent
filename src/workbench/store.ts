@@ -80,6 +80,33 @@ function ensureSystemSkills(state: WorkbenchState): void {
   (state.skillHistory[skill.id] ??= [existing]).push(skill);
 }
 
+/**
+ * Backfill the first-class `systemRole` on the built-in internal employees
+ * (小忆 automatic summarizer, 小知/小配/小关 conversational stewards) and repair
+ * the summarizer's provider if a legacy record left it on the generic `codex`.
+ *
+ * This is pure field migration — it never creates employees or skills, so it is
+ * safe to run on every load/mutation. Creation of the stewards is a domain-level
+ * bootstrap concern (version-pinned project roles + skills), not normalization.
+ *
+ * Keyed strictly on `employeeKind` (the marker the four system-employee templates
+ * carry) plus the fixed summarizer id — NOT on `internalProjectId` alone, so
+ * ad-hoc legacy project-internal employees are left to their existing behavior.
+ */
+function backfillSystemEmployeeRoles(state: WorkbenchState): void {
+  for (const record of Object.values(state.employees)) {
+    for (const employee of record.versions) {
+      const kind = employee.identity.metadata?.employeeKind;
+      if (kind === "system-automatic-summarizer" || employee.id === "memory-summarizer") {
+        employee.systemRole ??= "automatic";
+        if (employee.providerId === "codex") employee.providerId = "codex-memory-summarizer";
+      } else if (kind === "project-internal-control-agent") {
+        employee.systemRole ??= "conversational";
+      }
+    }
+  }
+}
+
 function legacyProjectScope(employee: EmployeeDefinition): EmployeeDefinition["scope"] {
   const projectId = employee.identity.metadata?.internalProjectId;
   return typeof projectId === "string" && projectId.trim()
@@ -196,6 +223,20 @@ function codexGateControlProvider(): ProviderDefinition {
   };
 }
 
+// The memory-summarizer (小忆) runs codex read-only with no control MCP profile;
+// mirrors templates/workbench/codex-memory-summarizer.provider.json. Unlike the
+// control providers it carries no runtime profile, so it is NOT system-managed.
+function codexMemorySummarizerProvider(): ProviderDefinition {
+  return {
+    adapter: "codex",
+    command: resolveCodexCommand(),
+    filesystemIsolation: "workspace-read-only",
+    approvalPolicy: "never",
+    timeoutMs: 120_000,
+    outputProtocol: "json"
+  };
+}
+
 function initialState(): WorkbenchState {
   return {
     schemaVersion: 1,
@@ -207,7 +248,8 @@ function initialState(): WorkbenchState {
       },
       "codex-knowledge-control": codexKnowledgeControlProvider(),
       "codex-configuration-control": codexConfigurationControlProvider(),
-      "codex-gate-control": codexGateControlProvider()
+      "codex-gate-control": codexGateControlProvider(),
+      "codex-memory-summarizer": codexMemorySummarizerProvider()
     },
     skills: { "team-orchestration": teamOrchestrationSkill() },
     skillHistory: { "team-orchestration": [teamOrchestrationSkill()] },
@@ -227,7 +269,8 @@ function initialState(): WorkbenchState {
     projectBindings: {},
     passiveProjectAccesses: {},
     invocations: {},
-    workInstances: {}
+    workInstances: {},
+    humanDecisionRequests: {}
   };
 }
 
@@ -269,6 +312,11 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   state.providers["codex-gate-control"] = {
     ...codexGateControlProvider(),
     ...(typeof currentGateControl?.model === "string" ? { model: currentGateControl.model } : {})
+  };
+  const currentMemorySummarizer = state.providers["codex-memory-summarizer"];
+  state.providers["codex-memory-summarizer"] = {
+    ...codexMemorySummarizerProvider(),
+    ...(typeof currentMemorySummarizer?.model === "string" ? { model: currentMemorySummarizer.model } : {})
   };
   state.skillHistory ??= Object.fromEntries(
     Object.entries(state.skills).map(([id, skill]) => [id, [skill]])
@@ -319,6 +367,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   state.entrancePolicies ??= {};
   state.invocations ??= {};
   state.workInstances ??= {};
+  state.humanDecisionRequests ??= {};
   state.projects ??= {};
   state.projectBindings ??= {};
   state.passiveProjectAccesses ??= {};
@@ -346,6 +395,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     }
   }
   ensureSystemSkills(state);
+  backfillSystemEmployeeRoles(state);
   const orchestrationSkillVersion = state.skills["team-orchestration"]!.version;
   for (const record of Object.values(state.workflows)) {
     for (const workflow of record.versions) {

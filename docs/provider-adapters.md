@@ -39,7 +39,8 @@ providers:
       - --agents
       - "{{role.nativeDefinitionJson}}"
       - --output-format
-      - json
+      - stream-json
+      - --verbose
       - --json-schema
       - "{{role.outputSchemaJson}}"
       - --permission-mode
@@ -52,9 +53,9 @@ providers:
     timeoutMs: 600000
     # 连续无 stdout/stderr 的空闲时限；未填时等于 timeoutMs
     idleTimeoutMs: 600000
-    # 即使持续输出也不能越过的安全上限；未填时至少为 1 小时
+    # 可选的绝对安全上限；不填时不限制总时长，只依赖真实流式进度和 idleTimeoutMs
     hardTimeoutMs: 3600000
-    outputProtocol: claude-json
+    outputProtocol: claude-stream-json
 ```
 
 Role 仍然拥有“是谁、负责什么、会什么、需要哪些工具”的声明；Provider 负责把通用身份翻译为供应商的注册参数，并真正执行工具限制。仅填写 `permissions` 或 Skill 的 `tools` 不会自动创建 sandbox。
@@ -72,7 +73,7 @@ Workbench 默认登记 `codex-knowledge-control`。它使用 `codex exec --ephem
 - 环境、凭据、alias 或容器启动需要专门解析；
 - 需要取消、心跳、租约或恢复。
 
-Adapter 应继续返回 stdout、stderr 和持续时间；规范化、Schema 校验、verdict 与证据存储仍由通用 runtime 处理。Command 与 Codex Adapter 会把 stdout/stderr 活动记录为进度：`timeoutMs` 是长任务软时限，不再直接杀死进程；只有连续无输出达到 `idleTimeoutMs`，或总耗时达到 `hardTimeoutMs`，才会终止调用。这样可以区分仍在执行的大任务、疑似卡死和无限输出循环。
+Adapter 应继续返回 stdout、stderr 和持续时间；规范化、Schema 校验、verdict 与证据存储仍由通用 runtime 处理。Command 与 Codex Adapter 会把 stdout/stderr 活动记录为进度：`timeoutMs` 是长任务软时限，不再直接杀死进程；连续无输出达到 `idleTimeoutMs` 才按疑似卡死终止。`hardTimeoutMs` 只有显式配置时才是绝对上限，默认不限制总时长。对默认静默到结束的 CLI，应启用流式 JSON/JSONL 输出，让思考、工具调用和部分消息持续刷新空闲租约，避免把正常长任务误判成卡死。
 
 Supervisor Management Policy 的 `maxDurationMs` 仍是整个编排的显式硬上限，会早于单个 Provider 的硬上限时优先生效。它与 Provider 的软时限、空闲时限不是同一概念；长任务团队应把该值配置为可接受的端到端最长交付窗口。
 

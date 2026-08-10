@@ -9,8 +9,11 @@ import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
 import type {
+  EmployeeInvocationInput,
   EntrancePolicyDispatchInput,
   EntrancePolicyEvaluationInput,
+  HumanDecisionRequestDecisionInput,
+  HumanDecisionRequestStatus,
   InvocationSource,
   InvocationSourceKind
 } from "../workbench/types.js";
@@ -50,6 +53,29 @@ function jsonObject(value: unknown, label = "input"): JsonObject {
   return value as JsonObject;
 }
 
+function humanDecisionRequestFilter(query: Record<string, unknown>): {
+  invocationId?: string;
+  status?: HumanDecisionRequestStatus;
+} {
+  const status = typeof query.status === "string" ? query.status : undefined;
+  if (status && !["pending", "approved", "rejected", "voided"].includes(status)) {
+    throw new Error(`unsupported human decision request status: ${status}`);
+  }
+  return {
+    invocationId: typeof query.invocationId === "string" ? query.invocationId : undefined,
+    status: status as HumanDecisionRequestStatus | undefined
+  };
+}
+
+function humanDecisionRequestDecision(value: unknown): HumanDecisionRequestDecisionInput {
+  const body = jsonObject(value ?? {}, "human decision input");
+  return {
+    decision: body.decision as "approve" | "reject",
+    decidedBy: typeof body.decidedBy === "string" ? body.decidedBy : "local-owner",
+    comment: typeof body.comment === "string" ? body.comment : undefined
+  };
+}
+
 function providerDefinition(value: unknown): ProviderDefinition {
   const definition = jsonObject(value, "provider definition");
   if (typeof definition.adapter !== "string" || !definition.adapter) {
@@ -84,6 +110,43 @@ function mcpExecutionRoot(request: Request, source: InvocationSource): string | 
   return source.kind === "mcp" ? headerText(request, "x-multi-agent-mcp-root", 4096) : undefined;
 }
 
+function contentDispositionFileName(value: string): string {
+  return encodeURIComponent(value).replace(/['()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+export async function sendConversationAttachment(
+  service: WorkbenchService,
+  attachmentId: string,
+  response: Response
+): Promise<void> {
+  const attachment = await service.getConversationImageAttachment(attachmentId);
+  response.status(200);
+  response.type(attachment.mediaType);
+  response.set("X-Content-Type-Options", "nosniff");
+  response.set("Content-Disposition", `inline; filename*=UTF-8''${contentDispositionFileName(attachment.name)}`);
+  await new Promise<void>((resolve, reject) => {
+    response.sendFile(attachment.filePath, (error) => error ? reject(error) : resolve());
+  });
+}
+
+export async function sendRunEvidenceAsset(
+  service: WorkbenchService,
+  runId: string,
+  assetId: string,
+  response: Response
+): Promise<void> {
+  const evidence = await service.getRunEvidenceAsset(runId, assetId);
+  response.status(200);
+  response.type(evidence.asset.mediaType);
+  response.set("X-Content-Type-Options", "nosniff");
+  response.set("Content-Disposition", `inline; filename*=UTF-8''${contentDispositionFileName(evidence.asset.name)}`);
+  await new Promise<void>((resolve, reject) => {
+    response.sendFile(evidence.filePath, (error) => error ? reject(error) : resolve());
+  });
+}
+
 export interface DaemonAppOptions {
   baseUrl?: string;
   staticDir?: string;
@@ -95,7 +158,9 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   const a2aHandlers = new Map<string, { version: number; handler: ReturnType<typeof jsonRpcHandler> }>();
 
   app.disable("x-powered-by");
-  app.use("/api", express.json({ limit: "2mb" }));
+  // 20 MiB of decoded images expands to roughly 26.7 MiB as base64. Domain validation in the
+  // WorkbenchService enforces the tighter decoded limits after this transport-level ceiling.
+  app.use("/api", express.json({ limit: "30mb" }));
   app.use("/api", (request, _response, next) => {
     const mcpRoot = headerText(request, "x-multi-agent-mcp-root", 4096);
     if (!mcpRoot) {
@@ -126,8 +191,9 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
         knowledgeChangeApproval: true,
         configurationProposal: "review-items-v1",
         configurationConversation: "codex-mcp-v1",
-        asyncWorkflowInvocations: "v1",
+        asyncWorkflowInvocations: "long-poll-v2",
         supervisorWorkflows: "v1",
+        humanDecisionGate: "supervisor-high-risk-v1",
         managementPolicies: "versioned-v1",
         entrancePolicies: "versioned-routing-v1",
         employeeTemplates: "versioned-static-v1",
@@ -159,6 +225,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       projects: service.listProjects(true),
       projectBindings: service.listProjectBindings(),
       passiveProjectAccesses: service.listPassiveProjectAccesses(),
+      humanDecisionRequests: service.listHumanDecisionRequests(),
       activity: service.getActivitySnapshot()
     });
   });
@@ -172,6 +239,49 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   }));
   app.get("/api/invocations/:id/progress", asyncRoute(async (request, response) => {
     send(response, await service.getInvocationProgress(routeParam(request, "id")));
+  }));
+  app.get("/api/invocations/:id/progress/wait", asyncRoute(async (request, response) => {
+    const controller = new AbortController();
+    const onClose = () => {
+      if (!response.writableEnded) controller.abort();
+    };
+    response.once("close", onClose);
+    try {
+      const cursor = typeof request.query.cursor === "string" && request.query.cursor
+        ? request.query.cursor
+        : undefined;
+      const parsedTimeout = request.query.timeoutMs === undefined ? undefined : Number(request.query.timeoutMs);
+      const result = await service.waitForWorkflowProgress(routeParam(request, "id"), {
+        cursor,
+        timeoutMs: Number.isFinite(parsedTimeout) ? parsedTimeout : undefined,
+        signal: controller.signal
+      });
+      if (!controller.signal.aborted) send(response, result);
+    } catch (error) {
+      if (!controller.signal.aborted) throw error;
+    } finally {
+      response.off("close", onClose);
+    }
+  }));
+  app.get("/api/human-decision-requests", (request, response, next) => {
+    try {
+      send(response, service.listHumanDecisionRequests(humanDecisionRequestFilter(request.query)));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.get("/api/human-decision-requests/:id", (request, response, next) => {
+    try {
+      send(response, service.getHumanDecisionRequest(routeParam(request, "id")));
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.post("/api/human-decision-requests/:id/decide", asyncRoute(async (request, response) => {
+    send(response, await service.decideHumanDecisionRequest(
+      routeParam(request, "id"),
+      humanDecisionRequestDecision(request.body)
+    ));
   }));
   app.get("/api/activity/stream", (request, response) => {
     response.status(200);
@@ -478,6 +588,14 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       invocationSource(request, "http")
     ));
   }));
+  app.post("/api/projects/:id/conversations/:roleId/invoke", asyncRoute(async (request, response) => {
+    send(response, await service.invokeProjectConversation(
+      routeParam(request, "id"),
+      routeParam(request, "roleId"),
+      request.body,
+      invocationSource(request, "http")
+    ));
+  }));
 
   app.get("/api/employee-templates", (request, response) => {
     send(response, service.listEmployeeTemplates(booleanQuery(request.query.includeArchived)));
@@ -569,6 +687,26 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       next(error);
     }
   });
+  app.get("/api/conversation-attachments/:id", asyncRoute(async (request, response) => {
+    await sendConversationAttachment(service, routeParam(request, "id"), response);
+  }));
+  app.post("/api/workflow-conversations/continue", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "workflow conversation continuation");
+    const leaderSessionId = typeof body.leaderSessionId === "string" ? body.leaderSessionId : "";
+    const message = typeof body.message === "string" ? body.message : "";
+    const source = invocationSource(request, "http");
+    send(response, await service.continueWorkflowConversation(
+      leaderSessionId,
+      {
+        message,
+        ...(body.attachments !== undefined
+          ? { attachments: body.attachments as unknown as EmployeeInvocationInput["attachments"] }
+          : {})
+      },
+      source,
+      { providerCwd: mcpExecutionRoot(request, source) }
+    ));
+  }));
 
   app.get("/api/workflows", (request, response) => {
     send(response, service.listWorkflows(booleanQuery(request.query.includeArchived)));
@@ -617,6 +755,10 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       ...started,
       statusUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}`,
       progressUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}/progress`,
+      monitor: {
+        ...started.monitor,
+        waitUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}/progress/wait`
+      },
       streamUrl: "/api/activity/stream"
     }, 202);
   }));
@@ -701,8 +843,16 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       ...result,
       dispatch: {
         ...result.dispatch,
+        receipt: {
+          ...result.dispatch.receipt,
+          monitor: {
+            ...result.dispatch.receipt.monitor,
+            waitUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress/wait`
+          }
+        },
         statusUrl: `/api/invocations/${encodeURIComponent(invocationId)}`,
         progressUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress`,
+        waitProgressUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress/wait`,
         streamUrl: "/api/activity/stream"
       }
     }, 202);
@@ -711,6 +861,51 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.get("/api/runs", asyncRoute(async (request, response) => {
     const parsed = Number(request.query.limit ?? 50);
     send(response, await service.listRuns(Number.isFinite(parsed) ? parsed : 50));
+  }));
+  app.get("/api/runs/:id/merge-preview", asyncRoute(async (request, response) => {
+    send(response, await service.getRunMergePreview(routeParam(request, "id")));
+  }));
+  app.post("/api/runs/:id/open-worktree", asyncRoute(async (request, response) => {
+    send(response, await service.openRunWorktree(routeParam(request, "id")));
+  }));
+  app.post("/api/runs/:id/merge", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "run merge input");
+    if (typeof body.confirmation !== "string") throw new Error("run merge confirmation is required");
+    if (typeof body.targetBranch !== "string" || !body.targetBranch.trim()) {
+      throw new Error("run merge targetBranch is required");
+    }
+    send(response, await service.mergeRun(routeParam(request, "id"), {
+      confirmation: body.confirmation,
+      targetBranch: body.targetBranch
+    }));
+  }));
+  app.post("/api/runs/:id/keep", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "run keep input");
+    if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("run keep actor is required");
+    if (body.note !== undefined && typeof body.note !== "string") throw new Error("run keep note must be a string");
+    send(response, await service.keepRun(routeParam(request, "id"), {
+      actor: body.actor,
+      ...(typeof body.note === "string" ? { note: body.note } : {})
+    }));
+  }));
+  app.post("/api/runs/:id/discard", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "run discard input");
+    if (typeof body.confirmation !== "string") throw new Error("run discard confirmation is required");
+    if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("run discard actor is required");
+    if (body.note !== undefined && typeof body.note !== "string") throw new Error("run discard note must be a string");
+    send(response, await service.discardRun(routeParam(request, "id"), {
+      confirmation: body.confirmation,
+      actor: body.actor,
+      ...(typeof body.note === "string" ? { note: body.note } : {})
+    }));
+  }));
+  app.get("/api/runs/:id/evidence/:assetId", asyncRoute(async (request, response) => {
+    await sendRunEvidenceAsset(
+      service,
+      routeParam(request, "id"),
+      routeParam(request, "assetId"),
+      response
+    );
   }));
   app.get("/api/runs/:id", asyncRoute(async (request, response) => {
     send(response, await service.getRun(routeParam(request, "id")));

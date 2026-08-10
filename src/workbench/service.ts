@@ -16,9 +16,12 @@ import { compilePlan } from "../core/plan.js";
 import type {
   JsonObject,
   JsonValue,
+  RuntimeHumanDecisionOutcome,
+  RuntimeHumanDecisionRequest,
   RoleIdentityDefinition,
   RolePermissionDefinition,
   RoleSkillBinding,
+  WorkflowRunRecord,
   WorkflowRunIsolation
 } from "../core/types.js";
 import {
@@ -92,21 +95,49 @@ import type {
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
 import { isSystemManagedProviderId } from "../runtime/systemProviders.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
-import { createRunWorktree, removeRunWorktree } from "../runtime/worktree.js";
+import { createRunWorktree, removeRunWorktree, worktreeHasChanges } from "../runtime/worktree.js";
+import {
+  discardRunWorktree,
+  keepRunWorktree,
+  mergeAcceptedRun,
+  openManagedRunWorktree,
+  previewRunMerge,
+  resolveRunEvidenceAsset,
+  type RunDeliveryActionResult,
+  type RunEvidenceAsset,
+  type RunMergePreview,
+  type RunMergeResult
+} from "../runtime/worktreeDelivery.js";
 import {
   materializeWorkflow,
   resolveSkillBinding,
   SUPERVISOR_RUNTIME_ROLE_ID,
   supervisorMemberRuntimeRoleId
 } from "./materialize.js";
-import { loadProjectDescriptor } from "./projectDescriptor.js";
+import { ensureProjectDescriptor, loadProjectDescriptor } from "./projectDescriptor.js";
 import {
   observePassiveProjectAccess,
   passiveProjectAccessLinkedProjectId
 } from "./passiveProjectAccess.js";
 import { WorkbenchStore } from "./store.js";
+import {
+  conversationDocumentPath,
+  conversationImagePath,
+  isConversationAttachmentId,
+  LarkCliDocumentFetcher,
+  prepareConversationEvidence,
+  resolvePersistedConversationImage,
+  validateConversationImages,
+  type LarkDocumentFetcher
+} from "./conversationEvidence.js";
 import { normalizeSupervisorFlow } from "./supervisorFlow.js";
-import { computeInvocationProgress, type InvocationProgress } from "./invocationProgress.js";
+import {
+  computeInvocationProgress,
+  formatInvocationProgressReport,
+  invocationProgressCursor,
+  type InvocationProgress,
+  type WorkflowProgressWaitResult
+} from "./invocationProgress.js";
 import { compileEffectiveExecutionProfile } from "./effectiveProfile.js";
 import {
   evaluateEntrancePolicyDefinition,
@@ -138,6 +169,7 @@ import {
   type EmployeeInvocationResult,
   type EmployeeRecord,
   type EmployeeSession,
+  type EmployeeSessionMessage,
   type EntrancePolicyCreateInput,
   type EntrancePolicyDecision,
   type EntrancePolicyDefinition,
@@ -156,6 +188,9 @@ import {
   type InvocationStartResult,
   type InvocationSource,
   type InvocationStatus,
+  type HumanDecisionRequest,
+  type HumanDecisionRequestCreateInput,
+  type HumanDecisionRequestDecisionInput,
   type PassiveProjectAccessRecord,
   type PublicationDefinition,
   type ProjectBindingDefinition,
@@ -205,6 +240,10 @@ const MEMORY_SUMMARIZER_ID = "memory-summarizer";
  * internal system triggers and are exempt from the human-direct-invocation guard on
  * automatic system employees. */
 const INTERNAL_CALLER = "system:memory-extractor";
+
+export const WORKFLOW_PROGRESS_DEFAULT_TIMEOUT_MS = 30_000;
+export const WORKFLOW_PROGRESS_MAX_TIMEOUT_MS = 55_000;
+const WORKFLOW_PROGRESS_MIN_TIMEOUT_MS = 1_000;
 
 
 function now(): string {
@@ -1640,6 +1679,7 @@ export interface WorkbenchServiceOptions {
   providers?: ProviderRegistry;
   architectures?: ArchitectureRegistry;
   knowledgeUrlFetcher?: Pick<RestrictedKnowledgeUrlFetcher, "fetch">;
+  larkDocumentFetcher?: LarkDocumentFetcher;
 }
 
 export class WorkbenchService {
@@ -1647,9 +1687,15 @@ export class WorkbenchService {
   readonly architectures: ArchitectureRegistry;
   readonly knowledge: KnowledgeRuntime;
   readonly knowledgeUrlFetcher: Pick<RestrictedKnowledgeUrlFetcher, "fetch">;
+  readonly larkDocumentFetcher: LarkDocumentFetcher;
   private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly backgroundInvocations = new Map<string, Promise<void>>();
+  private readonly humanDecisionWaiters = new Map<string, {
+    promise: Promise<RuntimeHumanDecisionOutcome>;
+    resolve: (outcome: RuntimeHumanDecisionOutcome) => void;
+    reject: (error: Error) => void;
+  }>();
   private memoryStore!: MemoryStore;
   private memoryRetriever!: MemoryRetriever;
   private memoryExtractor!: MemoryExtractor;
@@ -1663,6 +1709,7 @@ export class WorkbenchService {
     this.architectures = options.architectures ?? createDefaultArchitectureRegistry();
     this.knowledge = knowledge;
     this.knowledgeUrlFetcher = options.knowledgeUrlFetcher ?? new RestrictedKnowledgeUrlFetcher();
+    this.larkDocumentFetcher = options.larkDocumentFetcher ?? new LarkCliDocumentFetcher();
   }
 
   static defaultDataRoot(): string {
@@ -1774,8 +1821,10 @@ export class WorkbenchService {
   async recoverInterruptedActivity(): Promise<void> {
     const state = this.snapshot();
     const hasInterrupted = Object.values(state.invocations).some((invocation) => !isInvocationTerminal(invocation.status));
-    if (!hasInterrupted) return;
+    const hasPendingDecision = Object.values(state.humanDecisionRequests).some((request) => request.status === "pending");
+    if (!hasInterrupted && !hasPendingDecision) return;
     const timestamp = now();
+    const voidedDecisionKeys: string[] = [];
     await this.store.mutate((next) => {
       for (const invocation of Object.values(next.invocations)) {
         if (isInvocationTerminal(invocation.status)) continue;
@@ -1805,7 +1854,31 @@ export class WorkbenchService {
           message: instance.error
         });
       }
+      for (const request of Object.values(next.humanDecisionRequests)) {
+        if (request.status !== "pending") continue;
+        request.status = "voided";
+        request.decidedBy = "runtime-recovery";
+        request.comment = "Local runtime restarted before the human decision was received.";
+        request.updatedAt = timestamp;
+        request.decidedAt = timestamp;
+        voidedDecisionKeys.push(request.idempotencyKey);
+      }
     });
+    for (const key of voidedDecisionKeys) {
+      const waiter = this.humanDecisionWaiters.get(key);
+      waiter?.reject(new Error("human decision request was voided after local runtime restart"));
+      this.humanDecisionWaiters.delete(key);
+    }
+    const recovered = this.snapshot();
+    for (const invocation of Object.values(recovered.invocations)) {
+      if (invocation.phase !== "interrupted" || invocation.completedAt !== timestamp) continue;
+      this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+      for (const instanceId of invocation.instanceIds) {
+        const instance = recovered.workInstances[instanceId];
+        if (instance) this.emitActivity({ type: "instance.changed", at: timestamp, instance });
+      }
+      await this.persistSupervisorSessionProgress(invocation.id);
+    }
   }
 
   subscribeActivity(listener: (event: ActivityEvent) => void): () => void {
@@ -1851,7 +1924,225 @@ export class WorkbenchService {
     } catch (error) {
       if (!/run not found/.test(errorMessage(error))) throw error;
     }
-    return { invocation, instances, run };
+    const humanDecisionRequests = Object.values(state.humanDecisionRequests)
+      .filter((request) => request.invocationId === id)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    return { invocation, instances, humanDecisionRequests, run };
+  }
+
+  listHumanDecisionRequests(filter: { invocationId?: string; status?: HumanDecisionRequest["status"] } = {}): HumanDecisionRequest[] {
+    return Object.values(this.snapshot().humanDecisionRequests)
+      .filter((request) => !filter.invocationId || request.invocationId === filter.invocationId)
+      .filter((request) => !filter.status || request.status === filter.status)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  getHumanDecisionRequest(id: string): HumanDecisionRequest {
+    const request = this.snapshot().humanDecisionRequests[id];
+    if (!request) throw new Error(`human decision request not found: ${id}`);
+    return request;
+  }
+
+  private humanDecisionIdempotencyKey(input: HumanDecisionRequestCreateInput): string {
+    return [
+      "human-decision",
+      input.invocationId,
+      input.runId,
+      input.workflowId,
+      `v${input.workflowVersion}`,
+      `r${input.round}`
+    ].join(":");
+  }
+
+  /** Supervisor-only creation path. The deterministic pin makes repeated creation idempotent. */
+  async createHumanDecisionRequest(input: HumanDecisionRequestCreateInput): Promise<HumanDecisionRequest> {
+    const summary = requireText(input.summary, "human decision summary");
+    if (summary.length > 4_000) throw new Error("human decision summary must not exceed 4000 characters");
+    if (!Number.isInteger(input.round) || input.round < 1) throw new Error("human decision round must be a positive integer");
+    if (!Number.isInteger(input.workflowVersion) || input.workflowVersion < 1) {
+      throw new Error("human decision workflowVersion must be a positive integer");
+    }
+    const risks = new Set(["dependency-install", "data-migration", "scope-expansion", "irreversible-other"]);
+    if (!risks.has(input.riskCategory)) throw new Error(`unsupported human decision risk category: ${input.riskCategory}`);
+    if (input.proposedAction.action !== "delegate" || !Array.isArray(input.proposedAction.assignments)
+      || input.proposedAction.assignments.length === 0) {
+      throw new Error("human decision proposedAction must be a delegate action with assignments");
+    }
+    if (JSON.stringify(input.proposedAction).length > 65_536) {
+      throw new Error("human decision proposedAction must not exceed 65536 JSON characters");
+    }
+    const idempotencyKey = this.humanDecisionIdempotencyKey(input);
+    const timestamp = now();
+    let created = false;
+    const request = await this.store.mutate((state) => {
+      const existing = Object.values(state.humanDecisionRequests)
+        .find((candidate) => candidate.idempotencyKey === idempotencyKey);
+      if (existing) return existing;
+      const invocation = state.invocations[input.invocationId];
+      if (!invocation) throw new Error(`invocation not found: ${input.invocationId}`);
+      const snapshot = invocation.executionSnapshot?.workflow;
+      if (
+        invocation.runId !== input.runId
+        || snapshot?.architecture !== "supervisor"
+        || snapshot.id !== input.workflowId
+        || snapshot.version !== input.workflowVersion
+      ) {
+        throw new Error("human decision request does not match the pinned Supervisor invocation/run/workflow version");
+      }
+      if (isInvocationTerminal(invocation.status)) {
+        throw new Error(`cannot request a human decision for terminal invocation ${invocation.id}`);
+      }
+      const supervisorInstance = invocation.instanceIds
+        .map((instanceId) => state.workInstances[instanceId])
+        .find((instance) => instance?.nodeId === input.supervisorNodeId);
+      if (supervisorInstance?.kind !== "supervisor" || supervisorInstance.round !== input.round) {
+        throw new Error("human decision request does not match the pinned Supervisor node/round");
+      }
+      const next: HumanDecisionRequest = {
+        id: `human-decision-${randomUUID()}`,
+        idempotencyKey,
+        invocationId: invocation.id,
+        runId: invocation.runId,
+        workflowId: snapshot.id,
+        workflowVersion: snapshot.version,
+        supervisorNodeId: input.supervisorNodeId,
+        round: input.round,
+        riskCategory: input.riskCategory,
+        summary,
+        proposedAction: structuredClone(input.proposedAction),
+        status: "pending",
+        createdAt: timestamp,
+        updatedAt: timestamp
+      };
+      state.humanDecisionRequests[next.id] = next;
+      invocation.status = "awaiting-human-decision";
+      invocation.phase = "awaiting-human-decision";
+      invocation.updatedAt = timestamp;
+      invocation.transitions.push({
+        at: timestamp,
+        status: "awaiting-human-decision",
+        phase: "awaiting-human-decision",
+        message: `${input.riskCategory}: ${summary}`
+      });
+      created = true;
+      return next;
+    });
+    if (created) {
+      const invocation = this.snapshot().invocations[input.invocationId];
+      if (invocation) this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+    }
+    return request;
+  }
+
+  async decideHumanDecisionRequest(
+    id: string,
+    input: HumanDecisionRequestDecisionInput
+  ): Promise<HumanDecisionRequest> {
+    if (input.decision !== "approve" && input.decision !== "reject") {
+      throw new Error("human decision must be approve or reject");
+    }
+    const decidedBy = requireText(input.decidedBy, "human decision actor");
+    if (decidedBy.length > 240) throw new Error("human decision actor must not exceed 240 characters");
+    const comment = input.comment?.trim() || undefined;
+    if (comment && comment.length > 4_000) throw new Error("human decision comment must not exceed 4000 characters");
+    const timestamp = now();
+    let invocationAfter: InvocationRecord | undefined;
+    const request = await this.store.mutate((state) => {
+      const target = state.humanDecisionRequests[id];
+      if (!target) throw new Error(`human decision request not found: ${id}`);
+      if (target.status !== "pending") {
+        throw new Error(`human decision request ${id} was already decided as ${target.status}`);
+      }
+      const invocation = state.invocations[target.invocationId];
+      if (!invocation
+        || invocation.runId !== target.runId
+        || invocation.executionSnapshot?.workflow.id !== target.workflowId
+        || invocation.executionSnapshot.workflow.version !== target.workflowVersion) {
+        throw new Error("human decision request no longer matches its pinned invocation/run/workflow version");
+      }
+      if (invocation.status !== "awaiting-human-decision") {
+        throw new Error(`invocation ${invocation.id} is not awaiting a human decision`);
+      }
+      target.status = input.decision === "approve" ? "approved" : "rejected";
+      target.decidedBy = decidedBy;
+      target.comment = comment;
+      target.updatedAt = timestamp;
+      target.decidedAt = timestamp;
+      invocation.status = "running";
+      invocation.phase = input.decision === "approve" ? "resuming-after-human-approval" : "replanning-after-human-rejection";
+      invocation.updatedAt = timestamp;
+      invocation.transitions.push({
+        at: timestamp,
+        status: "running",
+        phase: invocation.phase,
+        message: comment
+      });
+      invocationAfter = invocation;
+      return target;
+    });
+    if (invocationAfter) this.emitActivity({ type: "invocation.changed", at: timestamp, invocation: invocationAfter });
+    const waiter = this.humanDecisionWaiters.get(request.idempotencyKey);
+    waiter?.resolve({
+      requestId: request.id,
+      decision: request.status === "approved" ? "approved" : "rejected",
+      ...(request.decidedBy ? { decidedBy: request.decidedBy } : {}),
+      ...(request.comment ? { comment: request.comment } : {})
+    });
+    return request;
+  }
+
+  private async openHumanDecisionRequest(
+    invocation: InvocationRecord,
+    workflow: WorkbenchWorkflowDefinition,
+    runtimeRequest: RuntimeHumanDecisionRequest
+  ): Promise<{ requestId: string; decision: Promise<RuntimeHumanDecisionOutcome> }> {
+    const createInput: HumanDecisionRequestCreateInput = {
+      invocationId: invocation.id,
+      runId: invocation.runId,
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      supervisorNodeId: runtimeRequest.nodeId,
+      round: runtimeRequest.round,
+      riskCategory: runtimeRequest.riskCategory,
+      summary: runtimeRequest.summary,
+      proposedAction: runtimeRequest.proposedAction
+    };
+    const idempotencyKey = this.humanDecisionIdempotencyKey(createInput);
+    let waiter = this.humanDecisionWaiters.get(idempotencyKey);
+    if (!waiter) {
+      let resolve!: (outcome: RuntimeHumanDecisionOutcome) => void;
+      let reject!: (error: Error) => void;
+      const promise = new Promise<RuntimeHumanDecisionOutcome>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      waiter = { promise, resolve, reject };
+      this.humanDecisionWaiters.set(idempotencyKey, waiter);
+    }
+    let request: HumanDecisionRequest;
+    try {
+      request = await this.createHumanDecisionRequest(createInput);
+    } catch (error) {
+      if (this.humanDecisionWaiters.get(idempotencyKey) === waiter) this.humanDecisionWaiters.delete(idempotencyKey);
+      throw error;
+    }
+    const latest = this.getHumanDecisionRequest(request.id);
+    if (latest.status === "approved" || latest.status === "rejected") {
+      waiter.resolve({
+        requestId: latest.id,
+        decision: latest.status,
+        ...(latest.decidedBy ? { decidedBy: latest.decidedBy } : {}),
+        ...(latest.comment ? { comment: latest.comment } : {})
+      });
+    } else if (latest.status === "voided") {
+      waiter.reject(new Error(`human decision request ${latest.id} was voided`));
+    }
+    return {
+      requestId: request.id,
+      decision: waiter.promise.finally(() => {
+        if (this.humanDecisionWaiters.get(idempotencyKey) === waiter) this.humanDecisionWaiters.delete(idempotencyKey);
+      })
+    };
   }
 
   async waitForInvocation(id: string): Promise<InvocationDetail> {
@@ -1864,6 +2155,130 @@ export class WorkbenchService {
     return computeInvocationProgress(await this.getInvocationDetail(id));
   }
 
+  private async workflowProgressWaitResult(
+    id: string,
+    cursor: string | undefined,
+    heartbeat = false
+  ): Promise<WorkflowProgressWaitResult> {
+    const detail = await this.getInvocationDetail(id);
+    const progress = computeInvocationProgress(detail);
+    const nextCursor = invocationProgressCursor(progress);
+    const changed = cursor === undefined || cursor !== nextCursor;
+    const session = detail.invocation.sessionId
+      ? this.snapshot().sessions[detail.invocation.sessionId]
+      : undefined;
+    const leaderSessionId = session?.supervisor?.invocationId === id ? session.id : undefined;
+    return {
+      invocationId: id,
+      ...(leaderSessionId ? { leaderSessionId } : {}),
+      nextCursor,
+      changed,
+      terminal: progress.terminal,
+      reason: progress.terminal ? "terminal" : changed ? "changed" : heartbeat ? "heartbeat" : "changed",
+      progressReport: formatInvocationProgressReport(progress, changed),
+      progress
+    };
+  }
+
+  /** Event-driven long poll; the listener and timer are always released on change, heartbeat, terminal, or abort. */
+  async waitForWorkflowProgress(
+    id: string,
+    options: { cursor?: string; timeoutMs?: number; signal?: AbortSignal } = {}
+  ): Promise<WorkflowProgressWaitResult> {
+    const timeoutMs = Math.round(boundedNumber(
+      options.timeoutMs,
+      WORKFLOW_PROGRESS_DEFAULT_TIMEOUT_MS,
+      WORKFLOW_PROGRESS_MIN_TIMEOUT_MS,
+      WORKFLOW_PROGRESS_MAX_TIMEOUT_MS
+    ));
+    const initial = await this.workflowProgressWaitResult(id, options.cursor);
+    if (initial.changed || initial.terminal) return initial;
+    if (options.signal?.aborted) throw new Error("workflow progress wait aborted");
+
+    return new Promise<WorkflowProgressWaitResult>((resolve, reject) => {
+      let settled = false;
+      let unsubscribe = () => {};
+      let timer: NodeJS.Timeout | undefined;
+      const onAbort = () => settleError(new Error("workflow progress wait aborted"));
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        unsubscribe();
+        options.signal?.removeEventListener("abort", onAbort);
+      };
+      const settle = (result: WorkflowProgressWaitResult) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+      const settleError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const inspect = async (heartbeat = false) => {
+        if (settled) return;
+        try {
+          const result = await this.workflowProgressWaitResult(id, options.cursor, heartbeat);
+          if (heartbeat || result.changed || result.terminal) settle(result);
+        } catch (error) {
+          settleError(error instanceof Error ? error : new Error(String(error)));
+        }
+      };
+      unsubscribe = this.subscribeActivity((event) => {
+        const relevant = event.type === "invocation.changed"
+          ? event.invocation.id === id
+          : event.instance.invocationId === id;
+        if (relevant) void inspect();
+      });
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      // The signal can flip between the pre-Promise guard and listener registration.
+      // Re-check it here so a disconnect can never leave a long-poll listener stranded.
+      if (options.signal?.aborted) {
+        onAbort();
+        return;
+      }
+      timer = setTimeout(() => void inspect(true), timeoutMs);
+      // Close the race between the initial snapshot and listener registration.
+      void inspect();
+    });
+  }
+
+  private async persistSupervisorSessionProgress(invocationId: string): Promise<void> {
+    const detail = await this.getInvocationDetail(invocationId);
+    const { invocation } = detail;
+    if (invocation.executionSnapshot?.workflow.architecture !== "supervisor" || !invocation.sessionId) return;
+    const progress = computeInvocationProgress(detail);
+    const terminal = progress.terminal;
+    const completedLeaderEntry = [...progress.leaderReport.entries].reverse().find((entry) =>
+      entry.action !== "unknown" && ["completed", "blocked", "failed"].includes(entry.status)
+    );
+    // Live MCP monitoring reports every changed snapshot and heartbeat. Keep the durable Session
+    // concise: accepted task, completed leader rounds, and terminal delivery only.
+    if (!terminal && !completedLeaderEntry) return;
+    const dedupeKey = terminal
+      ? `supervisor-delivery:${invocation.runId}`
+      : `supervisor-round:${invocation.runId}:${completedLeaderEntry!.round}:${completedLeaderEntry!.action}`;
+    const content = formatInvocationProgressReport(progress, true);
+    const timestamp = now();
+    await this.store.mutate((state) => {
+      const session = state.sessions[invocation.sessionId!];
+      if (!session?.supervisor || session.supervisor.invocationId !== invocationId) return;
+      if (session.messages.some((message) => message.dedupeKey === dedupeKey)) return;
+      session.messages.push({
+        id: randomUUID(),
+        role: terminal ? "employee" : "system",
+        content,
+        at: timestamp,
+        dedupeKey,
+        runId: invocation.runId,
+        output: terminal && progress.outcome ? progress.outcome as unknown as JsonValue : undefined
+      });
+      session.updatedAt = timestamp;
+    });
+  }
+
   private async createInvocationActivity(options: {
     target: InvocationRecord["target"];
     source: InvocationSource;
@@ -1871,12 +2286,57 @@ export class WorkbenchService {
     employees: Map<string, EmployeeDefinition>;
     input: JsonObject;
     sessionId?: string;
+    createLeaderSession?: boolean;
     entrance?: EntrancePolicyExecutionSnapshot;
   }): Promise<InvocationRecord> {
     const timestamp = now();
     const runId = runIdentifier();
     const invocationId = `inv-${randomUUID()}`;
     const state = this.snapshot();
+    const leaderSession: EmployeeSession | undefined = options.workflow.architecture === "supervisor" && options.createLeaderSession
+      ? {
+          id: randomUUID(),
+          employeeId: options.workflow.supervisor.employeeId,
+          employeeVersion: options.workflow.supervisor.employeeVersion,
+          title: summarizeInput(options.input).slice(0, 72),
+          status: "active",
+          context: typeof options.input.context === "object"
+            && options.input.context !== null
+            && !Array.isArray(options.input.context)
+            ? options.input.context as JsonObject
+            : undefined,
+          supervisor: {
+            architecture: "supervisor",
+            invocationId,
+            runId,
+            workflowId: options.workflow.id,
+            workflowVersion: options.workflow.version
+          },
+          messages: [
+            {
+              id: randomUUID(),
+              role: "user",
+              content: typeof options.input.message === "string"
+                ? options.input.message.trim()
+                : JSON.stringify(options.input),
+              at: timestamp,
+              dedupeKey: `supervisor-task:${invocationId}`,
+              runId
+            },
+            {
+              id: randomUUID(),
+              role: "system",
+              content: `领队已接单，Supervisor Workflow ${options.workflow.id} v${options.workflow.version} 正在后台执行；后续进度与最终交付会继续写入本会话。`,
+              at: timestamp,
+              dedupeKey: `supervisor-start:${invocationId}`,
+              runId
+            }
+          ],
+          createdAt: timestamp,
+          updatedAt: timestamp
+        }
+      : undefined;
+    const sessionId = leaderSession?.id ?? options.sessionId;
     const graphNodes = options.workflow.architecture === "graph" ? options.workflow.nodes : [];
     const instances: WorkInstanceRecord[] = graphNodes.map((node) => {
       const employee = options.employees.get(node.employeeId);
@@ -1895,7 +2355,7 @@ export class WorkbenchService {
         roleId: node.id,
         kind: "graph",
         runId,
-        sessionId: options.sessionId,
+        sessionId,
         providerId: employee.providerId,
         model: state.providers[employee.providerId]?.model,
         source: options.source,
@@ -1919,7 +2379,7 @@ export class WorkbenchService {
         ? options.input.context as JsonObject
         : undefined,
       runId,
-      sessionId: options.sessionId,
+      sessionId,
       instanceIds: instances.map((instance) => instance.id),
       executionSnapshot: {
         workflow: {
@@ -1956,6 +2416,7 @@ export class WorkbenchService {
     };
     await this.store.mutate((next) => {
       next.invocations[invocation.id] = invocation;
+      if (leaderSession) next.sessions[leaderSession.id] = leaderSession;
       for (const instance of instances) next.workInstances[instance.id] = instance;
     });
     this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
@@ -2045,6 +2506,9 @@ export class WorkbenchService {
       return target;
     });
     this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+    if (isInvocationTerminal(status) && invocation.executionSnapshot?.workflow.architecture === "supervisor") {
+      await this.persistSupervisorSessionProgress(id);
+    }
     return invocation;
   }
 
@@ -2074,7 +2538,12 @@ export class WorkbenchService {
       }
       return target;
     });
-    if (instance) this.emitActivity({ type: "instance.changed", at: timestamp, instance });
+    if (instance) {
+      this.emitActivity({ type: "instance.changed", at: timestamp, instance });
+      if (instance.kind === "supervisor" && isInstanceTerminal(status)) {
+        await this.persistSupervisorSessionProgress(invocationId);
+      }
+    }
     return instance;
   }
 
@@ -2177,19 +2646,26 @@ export class WorkbenchService {
         .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
         .map((value) => value.trim());
       const materialized = await this.materialize(workflow, employees);
-      // Resolve execution isolation from the (supervisor) management policy. Any worktree failure is
-      // contained here and never bubbles into the run: on failure we fall back to the original cwd.
+      // Resolve execution isolation before runWorkflow can schedule or invoke a Provider. Worktree
+      // isolation is fail-closed: setup failures terminate the Invocation instead of running code in
+      // the caller's original checkout.
       const { providerCwd: effectiveProviderCwd, isolation, teardownWorktree } =
         await this.resolveRunIsolation(workflow, invocation.runId, providerCwd, materialized.loaded.projectRoot);
       try {
         const runResult = await runWorkflow(materialized.loaded, materialized.workflowId, {
           runId: invocation.runId,
           input,
+          initialArtifacts: input.conversationEvidence
+            ? { "conversation/evidence.json": input.conversationEvidence }
+            : undefined,
           providers: this.providers,
           architectures: this.architectures,
           artifactRoot: path.join(this.store.dataRoot, "artifacts"),
           providerCwd: effectiveProviderCwd,
           isolation,
+          openHumanDecision: workflow.architecture === "supervisor"
+            ? (request) => this.openHumanDecisionRequest(invocation, workflow, request)
+            : undefined,
           prepareNode: async (node) => {
           const employee = employees.get(node.role);
           if (!employee) throw new Error(`runtime role ${node.role} is not materialized`);
@@ -2262,11 +2738,10 @@ export class WorkbenchService {
   /**
    * Resolves execution isolation for a run from the workflow's management policy (supervisor only).
    * When the policy requests `execution.isolation === "worktree"` and the execution root is a git
-   * repository, a detached worktree is created and returned as the effective providerCwd. Any
-   * failure — a non-git root, or a git/create error — degrades gracefully to running in the original
-   * cwd with `isolation.mode === "none"` and a fallbackReason. Never throws: worktree faults must not
-   * bubble into the main run path. `teardownWorktree` is always safe to call and is a no-op unless a
-   * worktree was actually created.
+   * repository, a detached worktree is created and returned as the effective providerCwd. A non-git
+   * root or worktree creation failure throws before runWorkflow can invoke a Provider. Non-worktree
+   * policies retain the historical non-isolated behavior. `teardownWorktree` is always safe to call
+   * and is a no-op unless a worktree was actually created.
    */
   private async resolveRunIsolation(
     workflow: WorkbenchWorkflowDefinition,
@@ -2283,51 +2758,35 @@ export class WorkbenchService {
     if (workflow.architecture !== "supervisor") {
       return { providerCwd, teardownWorktree: noTeardown };
     }
-    let requested = false;
-    try {
-      const policy = this.getManagementPolicy(
-        workflow.managementPolicy.id,
-        workflow.managementPolicy.version
-      );
-      requested = policy.execution?.isolation === "worktree";
-    } catch {
-      // A policy lookup failure is surfaced by the main run path (materialize/validate); here we
-      // simply decline isolation rather than let it bubble.
-      return { providerCwd, teardownWorktree: noTeardown };
-    }
+    const policy = this.getManagementPolicy(
+      workflow.managementPolicy.id,
+      workflow.managementPolicy.version
+    );
+    const requested = policy.execution?.isolation === "worktree";
     if (!requested) {
       return { providerCwd, isolation: { mode: "none" }, teardownWorktree: noTeardown };
     }
     const repoRoot = providerCwd ?? projectRoot;
     try {
       const worktree = await createRunWorktree(repoRoot, runId);
-      if (!worktree) {
-        return {
-          providerCwd,
-          isolation: { mode: "none", fallbackReason: "target is not a git repository" },
-          teardownWorktree: noTeardown
-        };
-      }
+      if (!worktree) throw new Error(`worktree isolation requires a Git execution root: ${repoRoot}`);
       return {
         providerCwd: worktree.path,
-        isolation: { mode: "worktree", worktreePath: worktree.path },
+        isolation: { mode: "worktree", worktreePath: worktree.path, baseCommit: worktree.baseCommit },
         teardownWorktree: async () => {
-          // removeRunWorktree already swallows its own errors; the extra guard is belt-and-suspenders
-          // so a teardown fault can never escape the run's finally block.
+          // A changed worktree is the candidate delivery and must survive the Run for explicit
+          // human acceptance. Inspection failure also preserves it: cleanup must never destroy
+          // code merely because Git status could not be read.
           try {
+            if (await worktreeHasChanges(worktree.path, worktree.baseCommit)) return;
             await removeRunWorktree(repoRoot, worktree.path);
           } catch (error) {
-            console.warn(`worktree teardown failed for ${worktree.path}: ${errorMessage(error)}`);
+            console.warn(`worktree cleanup skipped for ${worktree.path}: ${errorMessage(error)}`);
           }
         }
       };
     } catch (error) {
-      // Any git/create failure falls back to the original cwd; the run still proceeds normally.
-      return {
-        providerCwd,
-        isolation: { mode: "none", fallbackReason: `worktree setup failed: ${errorMessage(error)}` },
-        teardownWorktree: noTeardown
-      };
+      throw new Error(`worktree isolation setup failed before Provider execution: ${errorMessage(error)}`);
     }
   }
 
@@ -4541,6 +5000,7 @@ export class WorkbenchService {
   }
 
   async connectProject(input: ProjectConnectInput): Promise<ProjectDefinition> {
+    if (input.createDescriptorIfMissing) await ensureProjectDescriptor(input);
     const definition = await loadProjectDescriptor(input);
     return this.snapshot().projects[definition.id]
       ? this.updateProject(definition.id, definition)
@@ -5006,6 +5466,65 @@ export class WorkbenchService {
     });
   }
 
+  private formatSessionHistoryMessage(sessionId: string, message: EmployeeSessionMessage): string {
+    const evidence: string[] = [];
+    for (const attachment of message.attachments ?? []) {
+      evidence.push(
+        `IMAGE ${attachment.id}: name=${JSON.stringify(attachment.name)}, mediaType=${attachment.mediaType}, `
+        + `sizeBytes=${attachment.sizeBytes}, sha256=${attachment.sha256}, `
+        + `absolutePath=${JSON.stringify(conversationImagePath(this.store.dataRoot, sessionId, attachment))}`
+      );
+    }
+    for (const document of message.documents ?? []) {
+      if (document.status === "available") {
+        evidence.push(
+          `LARK_DOCUMENT ${document.id}: url=${JSON.stringify(document.url)}, revisionId=${document.revisionId ?? "unknown"}, `
+          + `sha256=${document.sha256 ?? "unknown"}, `
+          + `absolutePath=${JSON.stringify(conversationDocumentPath(this.store.dataRoot, sessionId, document.id))}`
+        );
+      } else {
+        evidence.push(
+          `LARK_DOCUMENT ${document.id}: url=${JSON.stringify(document.url)}, status=failed, `
+          + `error=${JSON.stringify(document.error?.message ?? "fetch failed")}, `
+          + `action=${JSON.stringify(document.error?.action ?? "Ask the user to verify authentication and access.")}`
+        );
+      }
+    }
+    return `${message.role.toUpperCase()}: ${message.content}${evidence.length ? `\nEVIDENCE:\n${evidence.join("\n")}` : ""}`;
+  }
+
+  async getConversationImageAttachment(id: string): Promise<{
+    id: string;
+    name: string;
+    mediaType: string;
+    sizeBytes: number;
+    filePath: string;
+  }> {
+    if (!isConversationAttachmentId(id)) throw new Error("conversation attachment id is invalid");
+    let found: { sessionId: string; attachment: NonNullable<EmployeeSessionMessage["attachments"]>[number] } | undefined;
+    for (const session of Object.values(this.snapshot().sessions)) {
+      for (const message of session.messages) {
+        const attachment = message.attachments?.find((candidate) => candidate.id === id);
+        if (!attachment) continue;
+        if (found) throw new Error(`conversation attachment id is not unique: ${id}`);
+        found = { sessionId: session.id, attachment };
+      }
+    }
+    if (!found) throw new Error(`conversation attachment not found: ${id}`);
+    const filePath = await resolvePersistedConversationImage({
+      dataRoot: this.store.dataRoot,
+      sessionId: found.sessionId,
+      attachment: found.attachment
+    });
+    return {
+      id,
+      name: found.attachment.name,
+      mediaType: found.attachment.mediaType,
+      sizeBytes: found.attachment.sizeBytes,
+      filePath
+    };
+  }
+
   private async invokeResolvedEmployee(options: {
     employee: EmployeeDefinition;
     input: EmployeeInvocationInput;
@@ -5028,6 +5547,7 @@ export class WorkbenchService {
     if (input.context !== undefined && (typeof input.context !== "object" || input.context === null || Array.isArray(input.context))) {
       throw new Error("invocation context must be a JSON object");
     }
+    const validatedAttachments = validateConversationImages(input.attachments);
     let session = options.session;
     if (session && !jsonEqual(session.context, input.context)) {
       throw new Error(`session ${session.id} belongs to another structured invocation context`);
@@ -5051,6 +5571,18 @@ export class WorkbenchService {
         state.sessions[newSession.id] = newSession;
       });
     }
+    const conversationEvidence = await prepareConversationEvidence({
+      dataRoot: this.store.dataRoot,
+      sessionId: session.id,
+      message: input.message.trim(),
+      attachments: input.attachments,
+      validatedAttachments,
+      larkDocumentFetcher: this.larkDocumentFetcher
+    });
+    const hasConversationEvidence = conversationEvidence.attachments.length > 0 || conversationEvidence.documents.length > 0;
+    const promptEvidence = hasConversationEvidence
+      ? JSON.parse(JSON.stringify(conversationEvidence.prompt)) as JsonObject
+      : undefined;
     const workflow = this.directWorkflow(employee, options.workflow);
     const employees = new Map([[employee.id, employee]]);
     const invocation = await this.createInvocationActivity({
@@ -5060,7 +5592,8 @@ export class WorkbenchService {
       employees,
       input: {
         message: input.message.trim(),
-        ...(input.context ? { context: input.context } : {})
+        ...(input.context ? { context: input.context } : {}),
+        ...(promptEvidence ? { conversationEvidence: promptEvidence } : {})
       },
       sessionId: session.id,
       entrance: options.entrance
@@ -5072,12 +5605,13 @@ export class WorkbenchService {
       const latestSession = this.getSession(sessionId);
       const history = latestSession.messages
         .slice(-employee.contextPolicy.historyLimit)
-        .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+        .map((message) => this.formatSessionHistoryMessage(sessionId, message))
         .join("\n\n");
       const result = await this.runTrackedWorkflow(invocation, workflow, employees, {
         message: input.message.trim(),
         sessionHistory: history,
-        ...(input.context ? { context: input.context } : {})
+        ...(input.context ? { context: input.context } : {}),
+        ...(promptEvidence ? { conversationEvidence: promptEvidence } : {})
       }, options.providerCwd);
       const node = result.run.nodes.respond;
       const responseMessage = invocationMessage(node?.output);
@@ -5086,7 +5620,16 @@ export class WorkbenchService {
         const target = state.sessions[sessionId];
         if (!target) throw new Error(`session not found: ${sessionId}`);
         target.messages.push(
-          { id: randomUUID(), role: "user", content: input.message.trim(), at: timestamp, runId: result.run.id, runDir: result.runDir },
+          {
+            id: randomUUID(),
+            role: "user",
+            content: input.message.trim(),
+            at: timestamp,
+            runId: result.run.id,
+            runDir: result.runDir,
+            ...(conversationEvidence.attachments.length > 0 ? { attachments: conversationEvidence.attachments } : {}),
+            ...(conversationEvidence.documents.length > 0 ? { documents: conversationEvidence.documents } : {})
+          },
           {
             id: randomUUID(),
             role: node?.status === "failed" ? "system" : "employee",
@@ -5138,6 +5681,7 @@ export class WorkbenchService {
     if (scopedProjectId) throw new Error(`employee ${employeeId} is internal to project ${scopedProjectId}; invoke it through a project role`);
     const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
     if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
+    if (session?.supervisor) throw new Error(`session ${session.id} is a Supervisor leader session; use continue_workflow_conversation`);
     if (session?.assignment) throw new Error(`session ${session.id} belongs to project ${session.assignment.projectId}/${session.assignment.roleId}`);
     const employee = session ? this.getEmployee(employeeId, session.employeeVersion) : current;
     const providerCwd = await this.validatedProviderCwd(options.providerCwd);
@@ -5160,6 +5704,7 @@ export class WorkbenchService {
     const employee = this.getEmployee(employeeId, employeeVersionValue);
     const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
     if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
+    if (session?.supervisor) throw new Error(`session ${session.id} is a Supervisor leader session; use continue_workflow_conversation`);
     if (session?.assignment) throw new Error(`session ${session.id} belongs to project ${session.assignment.projectId}/${session.assignment.roleId}`);
     if (session && session.employeeVersion !== employee.version) {
       throw new Error(`session ${session.id} pins employee ${employeeId} v${session.employeeVersion}, not v${employee.version}`);
@@ -5171,6 +5716,61 @@ export class WorkbenchService {
       session,
       entrance,
       providerCwd: await this.validatedProviderCwd(providerCwd)
+    });
+  }
+
+  async continueWorkflowConversation(
+    leaderSessionId: string,
+    input: string | EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" },
+    options: { providerCwd?: string } = {}
+  ): Promise<EmployeeInvocationResult> {
+    const continuation = typeof input === "string" ? { message: input } : input;
+    const normalizedMessage = requireText(continuation.message, "message");
+    const session = this.getSession(requireText(leaderSessionId, "leader session id"));
+    if (session.status !== "active") throw new Error(`leader session ${session.id} is closed`);
+    const supervisor = session.supervisor;
+    if (!supervisor || supervisor.architecture !== "supervisor") {
+      throw new Error(`session ${session.id} is not a Supervisor workflow leader session`);
+    }
+    const state = this.snapshot();
+    const originalInvocation = state.invocations[supervisor.invocationId];
+    if (!originalInvocation
+      || originalInvocation.sessionId !== session.id
+      || originalInvocation.runId !== supervisor.runId
+      || originalInvocation.target.kind !== "workflow"
+      || originalInvocation.target.id !== supervisor.workflowId
+      || originalInvocation.target.version !== supervisor.workflowVersion
+      || originalInvocation.executionSnapshot?.workflow.architecture !== "supervisor") {
+      throw new Error(`leader session ${session.id} has invalid or missing Supervisor workflow provenance`);
+    }
+    const supervisorBinding = originalInvocation.executionSnapshot.employees.find((binding) => binding.roleId === "supervisor");
+    if (!supervisorBinding
+      || supervisorBinding.employeeId !== session.employeeId
+      || supervisorBinding.employeeVersion !== session.employeeVersion) {
+      throw new Error(`leader session ${session.id} does not match the pinned Supervisor Employee`);
+    }
+    if (!isInvocationTerminal(originalInvocation.status)) {
+      throw new Error(`Supervisor workflow ${supervisor.workflowId} is still running; keep monitoring before continuing the leader conversation`);
+    }
+    const current = this.getEmployee(session.employeeId);
+    if (current.status !== "active") throw new Error(`employee ${session.employeeId} is archived`);
+    const employee = this.getEmployee(session.employeeId, session.employeeVersion);
+    return this.invokeResolvedEmployee({
+      employee,
+      input: {
+        message: normalizedMessage,
+        context: session.context,
+        ...(continuation.attachments ? { attachments: continuation.attachments } : {})
+      },
+      source: { ...originalInvocation.source, ...source },
+      session,
+      providerCwd: await this.validatedProviderCwd(options.providerCwd),
+      workflow: {
+        id: `leader-session-${supervisor.workflowId}`,
+        version: supervisor.workflowVersion,
+        description: `Continue leader conversation for Supervisor workflow ${supervisor.workflowId}`
+      }
     });
   }
 
@@ -5221,6 +5821,61 @@ export class WorkbenchService {
         description: `${resolved.project.name} / ${resolved.project.roles.find((role) => role.id === roleId)?.displayName ?? roleId}`
       }
     });
+  }
+
+  /**
+   * Invoke a conversational role for a target project. Projects may intentionally
+   * omit global intake roles from their own descriptor, so a compatible assigned
+   * role from another active project can host the read-only conversation. The
+   * target project remains explicit in both the prompt and persisted provenance.
+   */
+  async invokeProjectConversation(
+    targetProjectId: string,
+    roleId: string,
+    input: EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<EmployeeInvocationResult> {
+    requireText(input.message, "message");
+    const targetProject = this.getProject(targetProjectId);
+    if (targetProject.status !== "active") throw new Error(`project ${targetProjectId} is archived`);
+
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    let hostProjectId = session?.assignment?.projectId;
+    if (session) {
+      if (!session.assignment || session.assignment.roleId !== roleId) {
+        throw new Error(`session ${session.id} belongs to another project conversation`);
+      }
+    } else {
+      const bindings = new Map(this.listProjectBindings().map((binding) => [binding.projectId, binding]));
+      const candidates = this.listProjects()
+        .filter((project) => project.status === "active")
+        .filter((project) => project.roles.some((role) => role.id === roleId))
+        .filter((project) => bindings.get(project.id)?.roles.some((role) => role.roleId === roleId))
+        .sort((left, right) => {
+          if (left.id === targetProjectId) return -1;
+          if (right.id === targetProjectId) return 1;
+          return left.id.localeCompare(right.id);
+        });
+      hostProjectId = candidates[0]?.id;
+    }
+    if (!hostProjectId) {
+      throw new Error(`no active project assignment can host conversational role: ${roleId}`);
+    }
+
+    const contextualMessage = [
+      "【本轮对话归属项目】",
+      `项目 ID：${targetProject.id}`,
+      `项目名称：${targetProject.name}`,
+      "请只围绕该项目澄清或整理用户原话，不要创建、推进或修改任何需求记录。",
+      "【用户原话】",
+      input.message.trim()
+    ].join("\n");
+    return this.invokeProjectRole(
+      hostProjectId,
+      roleId,
+      { ...input, message: contextualMessage },
+      { ...source, targetProject: targetProject.id }
+    );
   }
 
   private async invokePinnedProjectRole(
@@ -6262,7 +6917,7 @@ export class WorkbenchService {
     id: string,
     input: JsonObject,
     source: InvocationSource,
-    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot } = {}
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; createLeaderSession?: boolean } = {}
   ): Promise<{
     invocation: InvocationRecord;
     workflow: WorkbenchWorkflowDefinition;
@@ -6283,6 +6938,10 @@ export class WorkbenchService {
       }
       this.getManagementPolicy(workflow.managementPolicy.id, workflow.managementPolicy.version);
     }
+    // Revalidate the exact run-time pins before creating an Invocation. This is especially
+    // important for updatePolicy=latest: a newly worktree-isolated policy must not make an older
+    // workflow executable until its mandatory quality.test and quality.audit Gates are present.
+    await this.validateWorkflow(workflow);
     const employees = this.resolveWorkflowEmployees(workflow);
     for (const employee of employees.values()) {
       if (this.getEmployee(employee.id).status !== "active") throw new Error(`employee ${employee.id} is archived`);
@@ -6299,6 +6958,7 @@ export class WorkbenchService {
       workflow,
       employees,
       input,
+      createLeaderSession: options.createLeaderSession,
       entrance: options.entrance
     });
     return { invocation, workflow, employees };
@@ -6311,7 +6971,11 @@ export class WorkbenchService {
     options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
   ): Promise<InvocationStartResult> {
     const providerCwd = await this.validatedProviderCwd(options.providerCwd);
-    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, options);
+    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, {
+      ...options,
+      createLeaderSession: true
+    });
+    const initialCursor = invocationProgressCursor(await this.getInvocationProgress(prepared.invocation.id));
     const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
     const settled = execution.then(() => undefined, () => undefined);
     this.backgroundInvocations.set(prepared.invocation.id, settled);
@@ -6320,7 +6984,21 @@ export class WorkbenchService {
         this.backgroundInvocations.delete(prepared.invocation.id);
       }
     });
-    return { invocation: prepared.invocation, runId: prepared.invocation.runId };
+    return {
+      invocation: prepared.invocation,
+      runId: prepared.invocation.runId,
+      ...(prepared.workflow.architecture === "supervisor" && prepared.invocation.sessionId
+        ? { leaderSessionId: prepared.invocation.sessionId }
+        : {}),
+      monitor: {
+        mode: "long-poll",
+        tool: "wait_workflow_progress",
+        initialCursor,
+        defaultTimeoutMs: WORKFLOW_PROGRESS_DEFAULT_TIMEOUT_MS,
+        maxTimeoutMs: WORKFLOW_PROGRESS_MAX_TIMEOUT_MS,
+        instructions: "启动后立即用 initialCursor 循环调用 wait_workflow_progress；非终态不要结束当前回合，每次变化或心跳都向用户汇报，终态交付最终摘要。"
+      }
+    };
   }
 
   async archiveWorkflow(id: string): Promise<WorkbenchWorkflowDefinition> {
@@ -6435,7 +7113,13 @@ export class WorkbenchService {
       const message = typeof input.message === "string" ? input.message : JSON.stringify(input);
       return this.invokeEmployee(publication.target.id, {
         message,
-        sessionId: this.sessionForExternalContext(publication.target.id, publicationSource)
+        sessionId: this.sessionForExternalContext(publication.target.id, publicationSource),
+        ...(typeof input.context === "object" && input.context !== null && !Array.isArray(input.context)
+          ? { context: input.context as JsonObject }
+          : {}),
+        ...(input.attachments !== undefined
+          ? { attachments: input.attachments as unknown as EmployeeInvocationInput["attachments"] }
+          : {})
       }, publicationSource, options);
     }
     return this.runWorkbenchWorkflow(publication.target.id, input, publicationSource, options);
@@ -6494,6 +7178,7 @@ export class WorkbenchService {
       ...record,
       category,
       ...(invocation?.source.project ? { project: invocation.source.project } : {}),
+      ...(invocation?.source.taskId ? { taskId: invocation.source.taskId } : {}),
       ...(invocation ? { trigger: invocation.source.kind } : {})
     };
   }
@@ -6519,10 +7204,70 @@ export class WorkbenchService {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      return Object.keys(effectiveProfiles).length > 0 ? { ...run, effectiveProfiles } : run;
+      const invocation = Object.values(this.snapshot().invocations).find((candidate) => candidate.runId === id);
+      const enriched = this.classifyRunSummary(run, invocation);
+      return Object.keys(effectiveProfiles).length > 0 ? { ...enriched, effectiveProfiles } : enriched;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`run not found: ${id}`);
       throw error;
     }
+  }
+
+  private async getRunDeliveryContext(id: string): Promise<{
+    run: WorkflowRunRecord;
+    runDir: string;
+  }> {
+    const run = await this.getRun(id);
+    if (typeof run !== "object" || run === null || Array.isArray(run) || (run as { id?: unknown }).id !== id) {
+      throw new Error(`run record is invalid: ${id}`);
+    }
+    return {
+      run: run as WorkflowRunRecord,
+      // Never trust artifactDir persisted inside run.json for delivery reads or writes. The Run
+      // Store layout plus the validated id is the only authority for resolving delivery assets.
+      runDir: path.join(this.store.dataRoot, "artifacts", "runs", id)
+    };
+  }
+
+  async getRunMergePreview(id: string): Promise<RunMergePreview> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    return previewRunMerge(run, runDir);
+  }
+
+  async mergeRun(
+    id: string,
+    input: { confirmation: string; targetBranch: string }
+  ): Promise<RunMergeResult> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    return mergeAcceptedRun(run, runDir, input);
+  }
+
+  async keepRun(
+    id: string,
+    input: { actor: string; note?: string }
+  ): Promise<RunDeliveryActionResult> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    return keepRunWorktree(run, runDir, input);
+  }
+
+  async discardRun(
+    id: string,
+    input: { confirmation: string; actor: string; note?: string }
+  ): Promise<RunDeliveryActionResult> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    return discardRunWorktree(run, runDir, input);
+  }
+
+  async openRunWorktree(id: string): Promise<{ runId: string; worktreePath: string; repositoryRoot: string }> {
+    const { run } = await this.getRunDeliveryContext(id);
+    return openManagedRunWorktree(run);
+  }
+
+  async getRunEvidenceAsset(id: string, assetId: string): Promise<{
+    filePath: string;
+    asset: RunEvidenceAsset;
+  }> {
+    const { runDir } = await this.getRunDeliveryContext(id);
+    return resolveRunEvidenceAsset(runDir, id, assetId);
   }
 }

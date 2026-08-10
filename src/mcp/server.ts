@@ -46,6 +46,12 @@ const classification = z.enum(["internal", "confidential", "restricted"]);
 const authority = z.enum(["canonical", "reference", "experimental"]);
 const activation = z.enum(["core", "conditional", "on-demand"]);
 const referenceType = z.enum(["related", "supports", "contradicts", "depends-on", "supersedes"]);
+const conversationAttachmentSchema = z.object({
+  name: z.string().min(1).max(255),
+  mediaType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+  base64: z.string().min(1).max(11_184_812)
+}).strict();
+const conversationAttachmentsSchema = z.array(conversationAttachmentSchema).max(5).optional();
 const entranceSourceSchema = z.object({
   kind: z.enum(["workbench", "http", "mcp", "a2a"]),
   label: z.string().min(1).optional(),
@@ -682,7 +688,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("dispatch_entrance_policy", {
     title: "Dispatch through task entrance policy",
-    description: "Evaluate structured routing metadata, then return to the caller, invoke a pinned Employee or project role, or asynchronously start a pinned workflow. Message text is execution-only.",
+    description: "Evaluate structured routing metadata, then return to the caller, invoke a pinned Employee/project role, or asynchronously start a pinned workflow. Message text is execution-only. If the result is invocation-started, the host MUST immediately loop wait_workflow_progress with receipt.monitor.initialCursor, keep the current turn open while terminal=false, relay every changed result or heartbeat, and deliver the final summary at terminal state.",
     inputSchema: {
       entrancePolicyId: resourceId,
       ...entranceEvaluationShape,
@@ -734,14 +740,19 @@ export function createWorkbenchMcpServer(
       employeeId: z.string().min(1),
       message: z.string().min(1),
       sessionId: z.string().min(1).optional(),
+      attachments: conversationAttachmentsSchema,
       project: z.string().min(1).optional(),
       contextId: z.string().min(1).optional(),
       caller: z.string().min(1).optional()
     }
-  }, async ({ employeeId, message, sessionId, project, contextId, caller }) => content(await request(
+  }, async ({ employeeId, message, sessionId, attachments, project, contextId, caller }) => content(await request(
     daemonUrl,
     `/api/employees/${encodeURIComponent(employeeId)}/invoke`,
-    { method: "POST", body: JSON.stringify({ message, sessionId }), headers: invocationHeaders({ project, contextId, caller }) }
+    {
+      method: "POST",
+      body: JSON.stringify({ message, sessionId, attachments }),
+      headers: invocationHeaders({ project, contextId, caller })
+    }
   )));
 
   server.registerTool("list_projects", {
@@ -770,15 +781,16 @@ export function createWorkbenchMcpServer(
       roleId: z.string().min(1),
       message: z.string().min(1),
       sessionId: z.string().min(1).optional(),
+      attachments: conversationAttachmentsSchema,
       contextId: z.string().min(1).optional(),
       caller: z.string().min(1).optional()
     }
-  }, async ({ projectId, roleId, message, sessionId, contextId, caller }) => content(await request(
+  }, async ({ projectId, roleId, message, sessionId, attachments, contextId, caller }) => content(await request(
     daemonUrl,
     `/api/projects/${encodeURIComponent(projectId)}/roles/${encodeURIComponent(roleId)}/invoke`,
     {
       method: "POST",
-      body: JSON.stringify({ message, sessionId }),
+      body: JSON.stringify({ message, sessionId, attachments }),
       headers: invocationHeaders({ project: projectId, contextId, caller })
     }
   )));
@@ -810,7 +822,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("start_workflow", {
     title: "Start multi-agent workflow",
-    description: "Start a registered Graph or Supervisor workflow asynchronously and return an invocation id immediately. Use get_workflow_progress for an aggregated status and the leader's per-round narrative, or get_invocation for the raw work instances and final Run evidence.",
+    description: "Start a registered Graph or Supervisor workflow asynchronously. The host MUST immediately loop wait_workflow_progress using monitor.initialCursor; while terminal=false it MUST NOT end the current turn, and it MUST relay every changed result or heartbeat to the user. At terminal state deliver progressReport as the final summary. Supervisor starts also return leaderSessionId for later continue_workflow_conversation; Graph starts never impersonate a leader session.",
     inputSchema: {
       workflowId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
@@ -833,13 +845,95 @@ export function createWorkbenchMcpServer(
     `/api/invocations/${encodeURIComponent(invocationId)}`
   )));
 
+  server.registerTool("list_human_decision_requests", {
+    title: "List Supervisor human decisions",
+    description: "List durable high-risk human-decision requests, optionally scoped to one invocation. Pending requests mean the proposed assignments have not been scheduled.",
+    inputSchema: {
+      invocationId: z.string().min(1).optional(),
+      status: z.enum(["pending", "approved", "rejected", "voided"]).optional()
+    }
+  }, async ({ invocationId, status }) => {
+    const query = new URLSearchParams();
+    if (invocationId) query.set("invocationId", invocationId);
+    if (status) query.set("status", status);
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    return content(await request(daemonUrl, `/api/human-decision-requests${suffix}`));
+  });
+
+  server.registerTool("get_human_decision_request", {
+    title: "Get Supervisor human decision",
+    description: "Read the exact invocation, Run, workflow version, Supervisor round, risk, proposed action, and decision audit for one request.",
+    inputSchema: { requestId: z.string().min(1) }
+  }, async ({ requestId }) => content(await request(
+    daemonUrl,
+    `/api/human-decision-requests/${encodeURIComponent(requestId)}`
+  )));
+
+  server.registerTool("decide_human_decision_request", {
+    title: "Decide Supervisor high-risk action",
+    description: "Approve or reject one pending high-risk action. Approval resumes the same invocation; rejection returns the comment to the same Supervisor loop for replanning. A request can be decided only once.",
+    inputSchema: {
+      requestId: z.string().min(1),
+      decision: z.enum(["approve", "reject"]),
+      comment: z.string().max(4_000).optional(),
+      decidedBy: z.string().min(1).optional()
+    }
+  }, async ({ requestId, decision, comment, decidedBy }) => content(await request(
+    daemonUrl,
+    `/api/human-decision-requests/${encodeURIComponent(requestId)}/decide`,
+    {
+      method: "POST",
+      body: JSON.stringify({ decision, comment, decidedBy: decidedBy ?? "mcp-local-owner" })
+    }
+  )));
+
   server.registerTool("get_workflow_progress", {
     title: "Get workflow progress",
-    description: "Read an aggregated progress report for one asynchronous invocation: overall status and phase, current supervisor round, a per-status tally and ordered list of work steps, plus the leader's (supervisor's) per-round narrative of what it delegated and why. Poll this to watch a running Supervisor team make progress.",
+    description: "Compatibility snapshot of aggregated workflow progress. Existing callers may keep using it; new asynchronous hosts should use event-driven wait_workflow_progress to avoid busy polling and preserve the current turn until terminal delivery.",
     inputSchema: { invocationId: z.string().min(1) }
   }, async ({ invocationId }) => content(await request(
     daemonUrl,
     `/api/invocations/${encodeURIComponent(invocationId)}/progress`
+  )));
+
+  server.registerTool("wait_workflow_progress", {
+    title: "Wait for workflow progress",
+    description: "Long-poll one asynchronous workflow without busy polling. Call immediately after start_workflow or an invocation-started Entrance dispatch, then call again with nextCursor while terminal=false. The host MUST keep the current turn open and report progressReport on every changed response and heartbeat; when terminal=true, stop waiting and actively deliver the final summary.",
+    inputSchema: {
+      invocationId: z.string().min(1),
+      cursor: z.string().min(1).optional(),
+      timeoutMs: z.number().int().min(1_000).max(55_000).optional()
+    }
+  }, async ({ invocationId, cursor, timeoutMs }) => {
+    const query = new URLSearchParams();
+    if (cursor) query.set("cursor", cursor);
+    if (timeoutMs !== undefined) query.set("timeoutMs", String(timeoutMs));
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    return content(await request(
+      daemonUrl,
+      `/api/invocations/${encodeURIComponent(invocationId)}/progress/wait${suffix}`
+    ));
+  });
+
+  server.registerTool("continue_workflow_conversation", {
+    title: "Continue Supervisor leader conversation",
+    description: "Continue talking in the durable, version-pinned leader Employee Session returned by a Supervisor workflow. The daemon rejects arbitrary Employee Sessions and preserves the original workflow/run context, including an interrupted-run explanation after daemon restart.",
+    inputSchema: {
+      leaderSessionId: z.string().min(1),
+      message: z.string().min(1),
+      attachments: conversationAttachmentsSchema,
+      project: z.string().min(1).optional(),
+      contextId: z.string().min(1).optional(),
+      caller: z.string().min(1).optional()
+    }
+  }, async ({ leaderSessionId, message, attachments, project, contextId, caller }) => content(await request(
+    daemonUrl,
+    "/api/workflow-conversations/continue",
+    {
+      method: "POST",
+      body: JSON.stringify({ leaderSessionId, message, attachments }),
+      headers: invocationHeaders({ project, contextId, caller })
+    }
   )));
 
   server.registerTool("list_publications", {

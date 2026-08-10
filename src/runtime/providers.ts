@@ -5,7 +5,6 @@ import { renderTemplate } from "../core/template.js";
 import type { CodexProviderDefinition, CommandProviderDefinition, JsonValue, ProviderDefinition } from "../core/types.js";
 
 const DEFAULT_PROVIDER_SOFT_TIMEOUT_MS = 600_000;
-const MINIMUM_DEFAULT_HARD_TIMEOUT_MS = 3_600_000;
 const PROGRESS_EVENT_INTERVAL_MS = 5_000;
 
 type ProviderTimeoutDefinition = Pick<CommandProviderDefinition, "timeoutMs" | "idleTimeoutMs" | "hardTimeoutMs">;
@@ -21,7 +20,7 @@ export type ProviderProgress = {
   idleMs: number;
   softTimeoutMs: number;
   idleTimeoutMs: number;
-  hardTimeoutMs: number;
+  hardTimeoutMs: number | null;
   longRunning: boolean;
 };
 
@@ -85,13 +84,13 @@ function validateTimeoutPolicy(prefix: string, definition: Record<string, unknow
 function providerTimeoutPolicy(definition: ProviderTimeoutDefinition): {
   softTimeoutMs: number;
   idleTimeoutMs: number;
-  hardTimeoutMs: number;
+  hardTimeoutMs?: number;
 } {
   const softTimeoutMs = definition.timeoutMs ?? DEFAULT_PROVIDER_SOFT_TIMEOUT_MS;
   return {
     softTimeoutMs,
     idleTimeoutMs: definition.idleTimeoutMs ?? softTimeoutMs,
-    hardTimeoutMs: definition.hardTimeoutMs ?? Math.max(softTimeoutMs * 4, MINIMUM_DEFAULT_HARD_TIMEOUT_MS)
+    ...(definition.hardTimeoutMs === undefined ? {} : { hardTimeoutMs: definition.hardTimeoutMs })
   };
 }
 
@@ -133,7 +132,7 @@ function monitorProviderProcess(
       idleMs: timestamp - lastOutputAt,
       softTimeoutMs: policy.softTimeoutMs,
       idleTimeoutMs: policy.idleTimeoutMs,
-      hardTimeoutMs: policy.hardTimeoutMs,
+      hardTimeoutMs: policy.hardTimeoutMs ?? null,
       longRunning
     };
     progressQueue = progressQueue
@@ -159,13 +158,13 @@ function monitorProviderProcess(
     publish("long-running");
   }, policy.softTimeoutMs);
   softTimer.unref();
-  const hardTimer = setTimeout(() => {
+  const hardTimer = policy.hardTimeoutMs === undefined ? undefined : setTimeout(() => {
     if (timeoutKind) return;
     timeoutKind = "hard-timeout";
     publish("hard-timeout");
     terminate();
   }, policy.hardTimeoutMs);
-  hardTimer.unref();
+  hardTimer?.unref();
 
   return {
     noteOutput(stream, chunk) {
@@ -182,7 +181,7 @@ function monitorProviderProcess(
     stop() {
       clearTimeout(softTimer);
       clearTimeout(idleTimer);
-      clearTimeout(hardTimer);
+      if (hardTimer) clearTimeout(hardTimer);
     },
     flush: () => progressQueue,
     timeoutKind: () => timeoutKind,
@@ -347,9 +346,9 @@ function validateCommandProvider(context: ProviderValidationContext): string[] {
   issues.push(...validateTimeoutPolicy(prefix, definition));
   if (
     definition.outputProtocol !== undefined &&
-    !["json", "claude-json", "raw"].includes(String(definition.outputProtocol))
+    !["json", "claude-json", "claude-stream-json", "codex-stream-json", "raw"].includes(String(definition.outputProtocol))
   ) {
-    issues.push(`${prefix} outputProtocol must be json, claude-json, or raw`);
+    issues.push(`${prefix} outputProtocol must be json, claude-json, claude-stream-json, codex-stream-json, or raw`);
   }
   return issues;
 }
@@ -450,7 +449,7 @@ class CommandProviderAdapter implements ProviderAdapter {
           }
           const timeoutKind = monitor.timeoutKind();
           if (timeoutKind) {
-            const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs;
+            const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs!;
             const reason = timeoutKind === "idle-timeout" ? "was idle" : "reached its hard timeout";
             reject(new ProviderExecutionError(`provider ${invocation.providerId} ${reason} after ${timeoutMs}ms`, stdout, stderr, {
               kind: timeoutKind,
@@ -685,7 +684,7 @@ class CodexProviderAdapter implements ProviderAdapter {
           }));
         } else if (monitor.timeoutKind()) {
           const timeoutKind = monitor.timeoutKind()!;
-          const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs;
+          const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs!;
           const reason = timeoutKind === "idle-timeout" ? "was idle" : "reached its hard timeout";
           reject(new ProviderExecutionError(`provider ${invocation.providerId} ${reason} after ${timeoutMs}ms`, stdout, stderr, {
             kind: timeoutKind,

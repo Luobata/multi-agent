@@ -257,16 +257,20 @@ describe("Office floor live announcements", () => {
 });
 
 describe("OfficePage supervisor studio", () => {
+  const longLeaderSummary = "并行推进 client.fastify.integration.test.ts 与 streamAnswer/answer.ts，确认移动端布局和长标题不会撑破卡片边界。";
+  const longWorkflowId = "team-flow-with-a-super-long-unbreakable-workflow-identifier";
+  const longRequestSummary = "请由交付领队拆解、分工并推进不会撑破工作室卡片的完整 UX 交付标题";
+  const longGateId = "quality.test-with-a-super-long-unbreakable-gate-identifier";
   const supervisorInvocation: InvocationRecord = {
     id: "inv-team-1",
     target: { kind: "workflow", id: "team-flow", version: 1 },
     source: { kind: "workbench" },
     status: "running",
     phase: "provider",
-    requestSummary: "组织团队完成任务",
+    requestSummary: longRequestSummary,
     runId: "run-team-1",
     instanceIds: [],
-    executionSnapshot: { workflow: { id: "team-flow", version: 1, architecture: "supervisor" }, employees: [] },
+    executionSnapshot: { workflow: { id: longWorkflowId, version: 1, architecture: "supervisor" }, employees: [] },
     createdAt: timestamp,
     updatedAt: timestamp,
     transitions: []
@@ -284,7 +288,7 @@ describe("OfficePage supervisor studio", () => {
     status: "running", phase: "provider", terminal: false, updatedAt: timestamp, round: 2,
     tally: { queued: 0, waiting: 0, running: 1, completed: 3, blocked: 0, failed: 0, skipped: 0, cancelled: 0 },
     steps: [],
-    leaderReport: { available: true, rounds: 2, delegations: 2, entries: [{ round: 2, action: "delegate", summary: "继续推进", assignments: [{ roleId: "researcher", task: "调研" }], status: "running" }], gates: [] }
+    leaderReport: { available: true, rounds: 2, delegations: 2, entries: [{ round: 2, action: "delegate", summary: longLeaderSummary, assignments: [{ roleId: "researcher", task: "调研" }], status: "running" }], gates: [{ gateId: longGateId, status: "pending" }] }
   };
 
   let container: HTMLDivElement;
@@ -322,6 +326,16 @@ describe("OfficePage supervisor studio", () => {
     // 3 completed of 4 total => 75%
     expect(bar?.style.width).toBe("75%");
     expect(container.textContent).toContain("Round 2");
+  });
+
+  it("keeps long leader reports inside a dedicated clampable summary region", () => {
+    const summary = container.querySelector<HTMLElement>(".studio-leader-summary");
+    expect(summary?.textContent).toBe(longLeaderSummary);
+    expect(summary?.title).toBe(longLeaderSummary);
+    expect(summary?.parentElement?.classList.contains("studio-leader-note")).toBe(true);
+    expect(container.querySelector<HTMLElement>(".studio-card-title > span")?.title).toBe(longWorkflowId);
+    expect(container.querySelector<HTMLElement>(".studio-card-title > strong")?.title).toBe(longRequestSummary);
+    expect(container.querySelector<HTMLElement>(".studio-gate")?.title).toBe(`${longGateId} · pending`);
   });
 
   it("polls the progress endpoint for the supervisor invocation", async () => {

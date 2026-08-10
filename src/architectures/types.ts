@@ -6,6 +6,8 @@ import type {
   LoadedManifest,
   MultiAgentManifest,
   NodeRunResult,
+  RuntimeHumanDecisionOutcome,
+  RuntimeHumanDecisionRequest,
   WorkflowDefinition,
   WorkflowRunStatus,
   WorkflowRunRecord
@@ -49,6 +51,8 @@ export interface ArchitectureExecutionContext {
   run: WorkflowRunRecord;
   scheduleNode(node: ExecutionPlanNode): Promise<void>;
   executeNode(node: ExecutionPlanNode, options?: ExecuteNodeOptions): Promise<NodeRunResult>;
+  /** Optional Workbench control-plane hook. Architectures must never bypass it for gated work. */
+  requestHumanDecision?(request: RuntimeHumanDecisionRequest): Promise<RuntimeHumanDecisionOutcome>;
   persist(): Promise<void>;
   emit(type: string, nodeId?: string, detail?: JsonValue): Promise<void>;
 }

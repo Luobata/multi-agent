@@ -12,6 +12,26 @@ export type * from "./configuration/types.js";
 export { createDefaultProviderRegistry, registerProviderAdapter } from "./runtime/providers.js";
 export type * from "./runtime/providers.js";
 export { runWorkflow } from "./runtime/runner.js";
+export {
+  discardRunWorktree,
+  discoverRunEvidenceAssets,
+  keepRunWorktree,
+  mergeAcceptedRun,
+  openManagedRunWorktree,
+  previewRunMerge,
+  readRunDelivery,
+  resolveRunEvidenceAsset
+} from "./runtime/worktreeDelivery.js";
+export type {
+  DeliveryStatus,
+  RunDeliveryActionResult,
+  RunDeliveryRecord,
+  RunEvidenceAsset,
+  RunGateEvidence,
+  RunMergePreview,
+  RunMergeResult,
+  RunWorktreeOpenResult
+} from "./runtime/worktreeDelivery.js";
 export { KnowledgeRuntime, formatKnowledgePromptSection } from "./knowledge/runtime.js";
 export { KnowledgeStore, knowledgeQueryTokens, tokenizeKnowledgeText } from "./knowledge/store.js";
 export { knowledgeSelectorMatches, resolveKnowledgeScope } from "./knowledge/resolver.js";
@@ -26,6 +46,13 @@ export type * from "./knowledge/urlFetcher.js";
 export { htmlFragmentToMarkdown, webpageToKnowledgeDocuments } from "./knowledge/urlImport.js";
 export type * from "./knowledge/types.js";
 export { WorkbenchService, type WorkbenchServiceOptions } from "./workbench/service.js";
+export {
+  LarkCliDocumentFetcher,
+  LarkDocumentFetchError,
+  detectLarkDocumentUrls,
+  validateConversationImages
+} from "./workbench/conversationEvidence.js";
+export type { LarkDocumentFetcher, LarkDocumentFetchResult } from "./workbench/conversationEvidence.js";
 export {
   entrancePolicyRuleMatches,
   evaluateEntrancePolicyDefinition,

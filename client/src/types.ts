@@ -118,11 +118,50 @@ export interface EmployeeTemplate {
   updatedAt: string;
 }
 
+export type ConversationImageMediaType = "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+
+/** 发送契约：Base64 图片附件；不接受任意文件或 data URL。 */
+export interface ConversationImageAttachmentInput {
+  name: string;
+  mediaType: ConversationImageMediaType;
+  base64: string;
+}
+
+/** 会话图片元数据；二进制与磁盘路径永不进入会话 JSON。 */
+export interface ConversationImageAttachmentMetadata {
+  id: string;
+  kind: "image";
+  name: string;
+  mediaType: ConversationImageMediaType;
+  sizeBytes: number;
+  sha256: string;
+}
+
+/** 冻结的外部文档（飞书 / Lark）解析元数据；正文保存在服务端证据库。 */
+export interface ConversationDocumentEvidenceMetadata {
+  id: string;
+  kind: "lark-document";
+  url: string;
+  status: "available" | "failed";
+  fetchedAt: string;
+  documentId?: string;
+  revisionId?: string;
+  contentBytes?: number;
+  sha256?: string;
+  error?: {
+    code: string;
+    message: string;
+    action: string;
+  };
+}
+
 export interface SessionMessage {
   id: string;
   role: "user" | "employee" | "system";
   content: string;
   at: string;
+  attachments?: ConversationImageAttachmentMetadata[];
+  documents?: ConversationDocumentEvidenceMetadata[];
   runId?: string;
   runDir?: string;
   output?: JsonValue;
@@ -152,6 +191,7 @@ export interface InvocationSource {
   kind: InvocationSourceKind;
   label?: string;
   project?: string;
+  targetProject?: string;
   projectRole?: string;
   projectBindingVersion?: number;
   caller?: string;
@@ -160,7 +200,7 @@ export interface InvocationSource {
   publicationId?: string;
 }
 
-export type InvocationStatus = "queued" | "running" | "completed" | "blocked" | "failed" | "cancelled";
+export type InvocationStatus = "queued" | "running" | "awaiting-human-decision" | "completed" | "blocked" | "failed" | "cancelled";
 export type WorkInstanceStatus = "queued" | "waiting" | "running" | "completed" | "blocked" | "failed" | "skipped" | "cancelled";
 
 export interface InvocationRecord {
@@ -555,10 +595,130 @@ export interface Run {
   project?: string;
   /** Present on listRuns summaries: the trigger source of the correlated invocation. */
   trigger?: "workbench" | "http" | "mcp" | "a2a";
+  /** Present on listRuns summaries when the correlated invocation carried a requirement task id. */
+  taskId?: string;
   nodes: Record<string, RunNode>;
   /** Present when the run recorded worktree-isolation evidence (WI-T1/T3). */
-  isolation?: { mode: "worktree" | "none"; worktreePath?: string; fallbackReason?: string };
+  isolation?: { mode: "worktree" | "none"; worktreePath?: string; baseCommit?: string; fallbackReason?: string };
   effectiveProfiles?: Record<string, EffectiveExecutionProfile>;
+}
+
+export interface RunEvidenceAsset {
+  id: string;
+  kind: "screenshot" | "recording";
+  name: string;
+  relativePath: string;
+  mediaType: string;
+  sizeBytes: number;
+  url: string;
+}
+
+export interface RunGateEvidence {
+  gateId: string;
+  required: boolean;
+  status: string;
+  reason?: string;
+  /** Server-side capability class, e.g. quality.test / quality.audit. */
+  requiredCapability?: string;
+  mode?: string;
+}
+
+export interface RunDeliveryRecord {
+  runId: string;
+  status: "awaiting-acceptance" | "conflict" | "merged" | "kept" | "discarded";
+  updatedAt: string;
+  baseCommit: string;
+  sourceBranch: string;
+  sourceCommit: string;
+  targetBranch: string;
+  targetCommitBeforeMerge?: string;
+  mergeCommit?: string;
+  message?: string;
+  humanDecision?: {
+    action: "keep" | "discard";
+    actor: string;
+    at: string;
+    note?: string;
+  };
+}
+
+export type HumanDecisionRiskCategory =
+  | "dependency-install"
+  | "data-migration"
+  | "scope-expansion"
+  | "irreversible-other";
+
+export type HumanDecisionRequestStatus = "pending" | "approved" | "rejected" | "voided";
+
+/** Durable high-risk human-decision request pinned to one Invocation/Run (control-plane record). */
+export interface HumanDecisionRequest {
+  id: string;
+  idempotencyKey: string;
+  invocationId: string;
+  runId: string;
+  workflowId: string;
+  workflowVersion: number;
+  supervisorNodeId: string;
+  round: number;
+  riskCategory: HumanDecisionRiskCategory;
+  summary: string;
+  proposedAction: JsonObject;
+  status: HumanDecisionRequestStatus;
+  decidedBy?: string;
+  comment?: string;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt?: string;
+}
+
+export interface RunMergePreview {
+  runId: string;
+  status: "not-ready" | "awaiting-acceptance" | "conflict" | "merged" | "kept" | "discarded";
+  eligible: boolean;
+  reasons: string[];
+  worktreePath?: string;
+  repositoryRoot?: string;
+  sourceBranch?: string;
+  sourceCommit?: string;
+  targetBranch?: string;
+  targetClean: boolean;
+  changes: {
+    files: Array<{ status: string; path: string }>;
+    fileCount: number;
+    summary: string;
+    unifiedDiff: {
+      text: string;
+      truncated: boolean;
+      maxBytes: number;
+    };
+  };
+  /** 只读检查命令；服务端保证不含写操作。 */
+  safeGitCommands: string[];
+  evidence: {
+    assets: RunEvidenceAsset[];
+    structuredE2eCount: number;
+    acceptedVerdict: boolean;
+    gates: RunGateEvidence[];
+  };
+  confirmationToken: string;
+  discardConfirmationToken: string;
+  delivery?: RunDeliveryRecord;
+}
+
+export interface RunMergeResult {
+  status: "merged" | "conflict";
+  delivery: RunDeliveryRecord;
+}
+
+export interface RunDeliveryActionResult {
+  status: "kept" | "discarded";
+  delivery: RunDeliveryRecord;
+}
+
+export interface RunWorktreeOpenResult {
+  runId: string;
+  worktreePath: string;
+  repositoryRoot: string;
 }
 
 export interface Publication {

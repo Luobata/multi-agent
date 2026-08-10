@@ -26,6 +26,25 @@ describe("provider output contracts", () => {
     expect(value).toEqual(structured);
   });
 
+  it("extracts the final structured result from Claude streaming progress", () => {
+    const value = parseProviderOutput("claude-stream-json", [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "system", subtype: "thinking_tokens", estimated_tokens: 42 }),
+      JSON.stringify({ type: "result", subtype: "success", structured_output: { verdict: "pass", summary: "streamed" } })
+    ].join("\n"));
+    expect(value).toEqual({ verdict: "pass", summary: "streamed" });
+  });
+
+  it("extracts the final agent message from Codex JSONL progress", () => {
+    const value = parseProviderOutput("codex-stream-json", [
+      JSON.stringify({ type: "thread.started", thread_id: "thread-1" }),
+      JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "working" } }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "```json\n{\"message\":\"done\"}\n```" } }),
+      JSON.stringify({ type: "turn.completed" })
+    ].join("\n"));
+    expect(value).toEqual({ message: "done" });
+  });
+
   it("keeps domain Block separate from schema failure", () => {
     const output = { verdict: "Block", summary: "Missing runtime evidence" } as const;
     validateStructuredOutput(

@@ -8,6 +8,13 @@
       "updatePolicy": "compatible"
     },
     {
+      "roleId": "requirement-steward",
+      "employeeId": "xiaomiwang-product-manager",
+      "skills": ["humanizer-zh"],
+      "knowledgeProfileIds": ["workbench-product-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
       "roleId": "product-designer",
       "employeeId": "lin-mo-product-designer",
       "skills": ["hallmark", "interaction-state-completeness", "healing-pixel-dossier"],
@@ -56,6 +63,13 @@
       "roleId": "configuration-steward",
       "employeeId": "local-agent-workbench-configuration-steward",
       "skills": ["configuration-control-conversation"],
+      "knowledgeProfileIds": [],
+      "updatePolicy": "locked"
+    },
+    {
+      "roleId": "gate-steward",
+      "employeeId": "local-agent-workbench-gate-steward",
+      "skills": ["gate-control-conversation"],
       "knowledgeProfileIds": [],
       "updatePolicy": "locked"
     }

@@ -10,19 +10,42 @@ import type {
   DashboardSummary,
   FolderNode,
   ManagedProject,
+  McpObservedProject,
   ProjectProfile,
   Requirement,
   RequirementDetail,
   RequirementLane,
+  RunAcceptanceSnapshot,
   SettingsSnapshot,
   SpaceNode
 } from "./types";
 import { REQUIREMENT_LANES, requirementLaneLabel } from "./types";
-import type { Project as ConnectedProject } from "../types";
+import type { PassiveProjectAccess, Project as ConnectedProject } from "../types";
+
+export function mcpCatalogNodeId(accessId: string): string {
+  return `mcp-access:${accessId}`;
+}
+
+/**
+ * fail-closed 验收闸：逐项核对 Run 验收快照的真实字段，返回缺失项清单。
+ * 空数组表示证据完整；任何占位字符串或缺字段都会在这里被点名。
+ */
+export function acceptanceSnapshotGaps(snapshot: RunAcceptanceSnapshot | undefined): string[] {
+  if (!snapshot) return ["Run 验收快照"];
+  const gaps: string[] = [];
+  if (typeof snapshot.runId !== "string" || !snapshot.runId.trim()) gaps.push("Run ID");
+  if (snapshot.eligible !== true) gaps.push("交付门禁 eligible");
+  if (typeof snapshot.worktreePath !== "string" || !snapshot.worktreePath.trim()) gaps.push("候选 worktree 路径");
+  if (!snapshot.testGate || snapshot.testGate.status !== "passed") gaps.push("quality.test 门禁通过");
+  if (!snapshot.reviewGate || snapshot.reviewGate.status !== "passed") gaps.push("quality.audit 门禁通过");
+  if (!(snapshot.mediaCount > 0) && !(snapshot.structuredE2eCount > 0)) gaps.push("截图、录屏或结构化 E2E 证据");
+  if (!Array.isArray(snapshot.diffFiles) || snapshot.diffFiles.length === 0) gaps.push("Diff 文件清单");
+  return gaps;
+}
 
 export interface DashboardService {
-  /** Project 是事实源；Folder / 收藏 / 排序只是按 projectId 关联的 UI 覆盖层。 */
-  syncConnectedProjects(projects: ConnectedProject[]): void;
+  /** Project 是事实源；MCP observed 是接入证据，Folder / 收藏 / 排序只是目录 UI 覆盖层。 */
+  syncConnectedProjects(projects: ConnectedProject[], passiveAccesses?: PassiveProjectAccess[]): void;
   getDashboardSummary(): Promise<DashboardSummary>;
   listSpaces(): Promise<SpaceNode[]>;
   createFolder(input: { parentId: string | null; name: string }): Promise<FolderNode>;
@@ -36,6 +59,8 @@ export interface DashboardService {
   createRequirement(input: { projectId: string; title: string; summary: string; priority: Requirement["priority"]; rawRequirement: string; acceptanceCriteria: string[] }): Promise<Requirement>;
   getRequirement(id: string): Promise<RequirementDetail>;
   updateRequirementLane(id: string, lane: RequirementLane): Promise<Requirement>;
+  /** 原子提交：验证全套 Run 验收证据后，一次性写入 evidence 并迁移到「待验收」。 */
+  submitRequirementForAcceptance(requirementId: string, snapshot: RunAcceptanceSnapshot): Promise<Requirement>;
   archiveRequirement(id: string): Promise<ArchiveRecord>;
   getProjectProfile(id: string): Promise<ProjectProfile>;
   bindRepository(input: { projectId: string; label: string; path: string; defaultBranch?: string }): Promise<ManagedProject>;
@@ -48,6 +73,10 @@ export interface DashboardServiceOptions {
   delayMs?: () => number;
   now?: () => Date;
   idSeed?: (prefix: string) => string;
+  /** 应用单例从空白真实看板开始；单测可继续显式使用 demo fixture。 */
+  initialData?: "empty" | "demo";
+  /** 浏览器端可注入 localStorage；普通 createDashboardService 调用默认不共享状态。 */
+  storage?: Pick<Storage, "getItem" | "setItem"> & Partial<Pick<Storage, "removeItem">>;
 }
 
 interface Store {
@@ -66,7 +95,8 @@ const T = "2026-08-0";
 const at = (day: number, hour: number, minute = 0) =>
   `${T}${day}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00.000Z`;
 
-function seed(): Store {
+function seed(mode: "empty" | "demo" = "demo"): Store {
+  if (mode === "empty") return { nodes: [], requirements: [], activities: [], archive: [] };
   const nodes: SpaceNode[] = [
     { kind: "folder", id: "fld-product", parentId: null, name: "产品线", favorite: true, archivedAt: null, createdAt: at(1, 9), updatedAt: at(3, 10) },
     { kind: "folder", id: "fld-infra", parentId: null, name: "基础设施", favorite: false, archivedAt: null, createdAt: at(1, 9, 30), updatedAt: at(2, 14) },
@@ -110,10 +140,10 @@ function seed(): Store {
   });
   const requirements: RequirementDetail[] = [
     requirement({ id: "req-101", projectId: "prj-workbench", code: "REQ-101", title: "多项目研发后台看板第一阶段", summary: "工作台 / 空间树 / 看板 / 归档 / 设置占位。", lane: "running", exception: null, priority: "high", owner: "米糊糊", createdAt: at(4, 9), updatedAt: at(8, 9) }),
-    requirement({ id: "req-102", projectId: "prj-workbench", code: "REQ-102", title: "看板列迁移交互", summary: "第一阶段无拖拽，经详情页目标列迁移。", lane: "planned", exception: null, priority: "medium", owner: "林墨", createdAt: at(4, 10), updatedAt: at(7, 15) }),
+    requirement({ id: "req-102", projectId: "prj-workbench", code: "REQ-102", title: "看板列迁移交互", summary: "第一阶段无拖拽，经详情页目标列迁移。", lane: "planned", exception: null, priority: "medium", owner: "小狐狐", createdAt: at(4, 10), updatedAt: at(7, 15) }),
     requirement({ id: "req-103", projectId: "prj-workbench", code: "REQ-103", title: "调度器真实接入", summary: "DAG / 时间线 / 资源接入真实运行时。", lane: "inbox", exception: null, priority: "medium", owner: "小米汪", createdAt: at(5, 11), updatedAt: at(6, 9) }),
     requirement({ id: "req-104", projectId: "prj-workbench", code: "REQ-104", title: "归档中心恢复路径验收", summary: "恢复后回到原父节点并保留证据。", lane: "acceptance", exception: null, priority: "high", owner: "小米象", createdAt: at(3, 14), updatedAt: at(8, 8) }),
-    requirement({ id: "req-105", projectId: "prj-workbench", code: "REQ-105", title: "双皮肤视觉回归", summary: "蜡笔 / 像素双主题差异核对。", lane: "done", exception: null, priority: "low", owner: "林墨", createdAt: at(2, 9), updatedAt: at(6, 17) }),
+    requirement({ id: "req-105", projectId: "prj-workbench", code: "REQ-105", title: "双皮肤视觉回归", summary: "蜡笔 / 像素双主题差异核对。", lane: "done", exception: null, priority: "low", owner: "小狐狐", createdAt: at(2, 9), updatedAt: at(6, 17) }),
     requirement({ id: "req-106", projectId: "prj-workbench", code: "REQ-106", title: "移动端底部导航折叠", summary: "≤640 视口收纳进更多面板。", lane: "running", exception: "blocked", priority: "high", owner: "米糊糊", createdAt: at(5, 9), updatedAt: at(8, 10) }),
     requirement({ id: "req-107", projectId: "prj-console", code: "REQ-201", title: "运营指标口径澄清", summary: "与数据侧对齐统计口径。", lane: "clarify", exception: null, priority: "medium", owner: "产品经理", createdAt: at(5, 14), updatedAt: at(7, 9) }),
     requirement({ id: "req-108", projectId: "prj-console", code: "REQ-202", title: "报表导出排队策略", summary: "大报表导出排队与取消。", lane: "queued", exception: null, priority: "low", owner: "姚希", createdAt: at(6, 9), updatedAt: at(7, 12) }),
@@ -124,7 +154,7 @@ function seed(): Store {
   const activities: ActivityItem[] = [
     { id: "act-1", at: at(8, 10), actor: "米糊糊", action: "标记阻塞", target: "REQ-106", detail: "移动端折叠依赖底部导航更多面板验收。" },
     { id: "act-2", at: at(8, 9), actor: "小米象", action: "提交验收", target: "REQ-104", detail: "恢复路径证据已固定，等待复核。" },
-    { id: "act-3", at: at(7, 15), actor: "林墨", action: "更新设计", target: "REQ-102", detail: "列迁移统一走详情页 SelectControl。" },
+    { id: "act-3", at: at(7, 15), actor: "小狐狐", action: "更新设计", target: "REQ-102", detail: "列迁移统一走详情页 SelectControl。" },
     { id: "act-4", at: at(7, 10), actor: "小米汪", action: "归档项目", target: "旧官网", detail: "仅保留配置与证据，磁盘文件不动。" },
     { id: "act-5", at: at(6, 18), actor: "米糊糊", action: "创建需求", target: "REQ-101", detail: "第一阶段范围锁定。" }
   ];
@@ -135,12 +165,48 @@ function seed(): Store {
   return { nodes, requirements, activities, archive };
 }
 
+const LEGACY_DASHBOARD_STORAGE_KEYS = ["local-agent-workbench.requirement-board.v1"] as const;
+export const DASHBOARD_STORAGE_KEY = "local-agent-workbench.requirement-board.v2";
+const DASHBOARD_STORAGE_VERSION = 2;
+
+function persistedStore(storage: DashboardServiceOptions["storage"]): Store | undefined {
+  if (!storage) return undefined;
+  try {
+    const raw = storage.getItem(DASHBOARD_STORAGE_KEY);
+    if (!raw) return undefined;
+    const envelope = JSON.parse(raw) as { version?: unknown; store?: Partial<Store> };
+    if (envelope.version !== DASHBOARD_STORAGE_VERSION || !envelope.store
+      || !Array.isArray(envelope.store.nodes)
+      || !Array.isArray(envelope.store.requirements)
+      || !Array.isArray(envelope.store.activities)
+      || !Array.isArray(envelope.store.archive)) return undefined;
+    return {
+      nodes: envelope.store.nodes,
+      requirements: envelope.store.requirements,
+      activities: envelope.store.activities,
+      archive: envelope.store.archive
+    } as Store;
+  } catch {
+    return undefined;
+  }
+}
+
 export function createDashboardService(options: DashboardServiceOptions = {}): DashboardService {
   const delayMs = options.delayMs ?? (() => 80 + Math.floor(Math.random() * 121));
   const now = options.now ?? (() => new Date());
   let idCounter = 0;
   const nextId = options.idSeed ?? ((prefix: string) => `${prefix}-local-${++idCounter}`);
-  const store = seed();
+  // v1 was the pre-launch test/demo board. The user explicitly requested a clean board before
+  // entering real requirements, so remove it once and never migrate those records into v2.
+  for (const key of LEGACY_DASHBOARD_STORAGE_KEYS) options.storage?.removeItem?.(key);
+  const store = persistedStore(options.storage) ?? seed(options.initialData ?? "demo");
+  const persist = () => {
+    try {
+      options.storage?.setItem(DASHBOARD_STORAGE_KEY, JSON.stringify({ version: DASHBOARD_STORAGE_VERSION, store }));
+    } catch {
+      // localStorage quota / privacy failures degrade to the current in-memory session.
+    }
+  };
   let connectedProjectIds: Set<string> | null = null;
   let connectedCatalogIds = new Set<string>();
   let catalogSeedRemapped = false;
@@ -149,7 +215,9 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
     new Promise<T>((resolve, reject) => {
       globalThis.setTimeout(() => {
         try {
-          resolve(produce());
+          const result = produce();
+          persist();
+          resolve(result);
         } catch (error) {
           reject(error instanceof Error ? error : new Error(String(error)));
         }
@@ -201,9 +269,11 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   const copyNode = (node: SpaceNode): SpaceNode => ({ ...node });
 
   return {
-    syncConnectedProjects(projects) {
+    syncConnectedProjects(projects, passiveAccesses = []) {
       const previousProjects = store.nodes.filter((node): node is ManagedProject => node.kind === "project");
       const previousById = new Map(previousProjects.map((project) => [project.id, project]));
+      const previousMcpProjects = store.nodes.filter((node): node is McpObservedProject => node.kind === "mcp-observed");
+      const previousMcpByAccessId = new Map(previousMcpProjects.map((project) => [project.accessId, project]));
       const folders = store.nodes.filter((node): node is FolderNode => node.kind === "folder");
       const active = projects.filter((project) => project.status === "active");
       connectedProjectIds = new Set(active.map((project) => project.id));
@@ -220,29 +290,63 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       }
 
       const mapped = projects.map((project): ManagedProject => {
-        const overlay = previousById.get(project.id);
-        const defaultBranch = overlay?.defaultBranch ?? "main";
+        const linkedAccesses = passiveAccesses.filter((access) => access.linkedProjectId === project.id);
+        const linkedAccess = linkedAccesses[0];
+        // “MCP 发现 → 正式接入”后沿用用户已经整理好的目录位置和收藏状态。
+        const migratedMcpOverlay = linkedAccess ? previousMcpByAccessId.get(linkedAccess.id) : undefined;
+        const projectOverlay = previousById.get(project.id);
+        const placementOverlay = projectOverlay ?? migratedMcpOverlay;
+        const defaultBranch = projectOverlay?.defaultBranch ?? "main";
         return {
           kind: "project",
           id: project.id,
-          parentId: overlay?.parentId ?? null,
+          parentId: placementOverlay?.parentId ?? null,
           name: project.name,
           repositoryPath: project.rootPath,
           defaultBranch,
-          repositories: overlay?.repositories ?? [{
+          repositories: projectOverlay?.repositories ?? [{
             id: `repo-connected-${project.id}`,
             label: "项目根目录",
             path: project.rootPath,
             defaultBranch,
             primary: true
           }],
-          favorite: overlay?.favorite ?? false,
+          favorite: placementOverlay?.favorite ?? false,
           archivedAt: project.status === "archived" ? project.updatedAt : null,
           createdAt: project.createdAt,
-          updatedAt: project.updatedAt
+          updatedAt: project.updatedAt,
+          mcpAccess: linkedAccess ? {
+            accessId: linkedAccess.id,
+            projectKeys: [...new Set(linkedAccesses.flatMap((access) => access.projectKeys))],
+            requestCount: linkedAccesses.reduce((total, access) => total + access.requestCount, 0),
+            firstSeenAt: linkedAccesses.map((access) => access.firstSeenAt).sort()[0] ?? linkedAccess.firstSeenAt,
+            lastSeenAt: linkedAccesses.map((access) => access.lastSeenAt).sort().at(-1) ?? linkedAccess.lastSeenAt
+          } : undefined
         };
       });
-      store.nodes = [...folders, ...mapped];
+      const observed = passiveAccesses
+        .filter((access) => !access.linkedProjectId)
+        .map((access): McpObservedProject => {
+          const overlay = previousMcpByAccessId.get(access.id);
+          return {
+            kind: "mcp-observed",
+            id: mcpCatalogNodeId(access.id),
+            accessId: access.id,
+            parentId: overlay?.parentId ?? null,
+            name: access.displayName,
+            rootPath: access.rootPath,
+            projectKeys: [...access.projectKeys],
+            requestCount: access.requestCount,
+            firstSeenAt: access.firstSeenAt,
+            lastSeenAt: access.lastSeenAt,
+            historical: !access.rootPath,
+            favorite: overlay?.favorite ?? false,
+            archivedAt: null,
+            createdAt: access.firstSeenAt,
+            updatedAt: access.lastSeenAt
+          };
+        });
+      store.nodes = [...folders, ...mapped, ...observed];
 
       store.archive = store.archive.filter((entry) => entry.kind !== "project");
       for (const project of projects.filter((candidate) => candidate.status === "archived")) {
@@ -257,6 +361,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
           restoreDisabledReason: "当前运行核心尚未提供项目恢复入口；接入历史与运行证据仍完整保留"
         });
       }
+      persist();
     },
     getDashboardSummary() {
       return respond(() => {
@@ -334,6 +439,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
     renameNode(id, name) {
       return respond(() => {
         const node = liveNode(id);
+        if (node.kind === "mcp-observed") throw failure("MCP 发现记录不能重命名", "请先完善接入，再修改正式项目声明中的名称", "MCP 证据与目录位置均未改变");
         if (node.archivedAt) throw failure("已归档节点不能重命名", "请先在归档中心恢复后再改名", "未写入任何配置");
         const trimmed = assertName(name, node.parentId, node.id);
         node.name = trimmed;
@@ -369,6 +475,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
     archiveNode(id) {
       return respond(() => {
         const node = liveNode(id);
+        if (node.kind === "mcp-observed") throw failure("MCP 发现记录不能归档", "请保留接入证据，或先完善为正式项目后再管理生命周期", "MCP 证据与磁盘文件均未改变");
         if (node.archivedAt) throw failure("该节点已经在归档中心", "请刷新归档列表查看最新状态", "未产生重复归档记录");
         const hasLiveChildren = store.nodes.some((candidate) => candidate.parentId === node.id && !candidate.archivedAt);
         if (node.kind === "folder" && hasLiveChildren) {
@@ -464,10 +571,57 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         if (!REQUIREMENT_LANES.some((entry) => entry.id === lane)) throw failure("目标列不存在", "请重新选择目标列", "未写入任何变更");
         if (requirement.exception === "cancelled") throw failure("已取消的需求不能迁移列", "请先在看板恢复其状态或联系领队", "未写入任何变更");
         if (requirement.lane === lane) return { ...requirement };
+        if (lane === "acceptance") {
+          const gaps = acceptanceSnapshotGaps(requirement.evidence.acceptance);
+          if (gaps.length > 0) {
+            throw failure(
+              `缺少验收证据：${gaps.join("、")}`,
+              "请在运行卷宗页对合格交付使用「提交该需求到待验收」，写入真实 Run 证据后再迁移",
+              "未写入任何变更"
+            );
+          }
+        }
         const from = requirementLaneLabel(requirement.lane);
         requirement.lane = lane;
         requirement.updatedAt = touch();
         record("迁移需求列", requirement.code, `${from} → ${requirementLaneLabel(lane)}。`);
+        const { rawRequirement: _raw, acceptanceCriteria: _ac, dag: _dag, timeline: _tl, resourceOverview: _ro, evidence: _ev, ...summary } = requirement;
+        return { ...summary };
+      });
+    },
+    submitRequirementForAcceptance(requirementId, snapshot) {
+      return respond(() => {
+        const requirement = store.requirements.find((candidate) => candidate.id === requirementId);
+        if (!requirement || requirement.archivedAt) throw failure("没有找到这条需求", "请回到需求看板重新选择", "未写入任何变更");
+        if (requirement.exception === "cancelled") throw failure("已取消的需求不能提交验收", "请先在看板恢复其状态或联系领队", "未写入任何变更");
+        const gaps = acceptanceSnapshotGaps(snapshot);
+        if (gaps.length > 0) {
+          throw failure(
+            `缺少验收证据：${gaps.join("、")}`,
+            "请确认该 Run 的交付预览合格（eligible）且包含 test / audit 双门禁后再提交",
+            "未写入任何变更"
+          );
+        }
+        // 到这里快照一定完整；在同一个同步写段内固定证据并迁移列，不会出现半提交状态。
+        const fixed: RunAcceptanceSnapshot = {
+          ...snapshot,
+          runId: snapshot.runId.trim(),
+          worktreePath: snapshot.worktreePath.trim(),
+          diffFiles: snapshot.diffFiles.map((file) => String(file)),
+          capturedAt: snapshot.capturedAt?.trim() || touch()
+        };
+        requirement.evidence = {
+          ...requirement.evidence,
+          diffSummary: `Run ${fixed.runId} · ${fixed.diffFiles.length} 个文件：${fixed.diffFiles.join("、")}`,
+          testReport: `quality.test Gate「${fixed.testGate!.gateId}」passed；结构化 E2E ${fixed.structuredE2eCount} 条。`,
+          reviewNotes: `quality.audit Gate「${fixed.reviewGate!.gateId}」passed；媒体证据 ${fixed.mediaCount} 项；候选 worktree ${fixed.worktreePath}。`,
+          acceptance: fixed
+        };
+        const from = requirementLaneLabel(requirement.lane);
+        const moved = requirement.lane !== "acceptance";
+        requirement.lane = "acceptance";
+        requirement.updatedAt = touch();
+        record("提交验收", requirement.code, moved ? `${from} → 待验收；Run ${fixed.runId} 验收快照已固定。` : `Run ${fixed.runId} 验收快照已更新。`);
         const { rawRequirement: _raw, acceptanceCriteria: _ac, dag: _dag, timeline: _tl, resourceOverview: _ro, evidence: _ev, ...summary } = requirement;
         return { ...summary };
       });
@@ -538,7 +692,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
             title: "空间与项目",
             description: "空间树与 Repository 配置的保存策略。",
             entries: [
-              { label: "空间树存储", value: "本地配置库（内存演示）", hint: "第一阶段为 mock 数据，接口形状即未来服务端契约。" },
+              { label: "空间树存储", value: options.storage ? "浏览器本地配置库 · v1" : "当前内存会话", hint: "正式 Project 仍来自 Workbench；需求与目录 UI 覆盖层使用版本化本地存储。" },
               { label: "Repository path", value: "逐项目保存", hint: "仅保存配置，不会移动磁盘上的文件。" }
             ]
           },
@@ -547,8 +701,8 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
             title: "调度器集成",
             description: "任务 DAG、Agent 时间线与资源占用将在接入调度器后展示真实数据。",
             entries: [
-              { label: "调度器连接", value: "尚未接入调度器 · 演示数据", hint: "接入前所有 DAG / 时间线 / 资源视图以演示徽标标注。" },
-              { label: "数据回写", value: "未开启", hint: "第一阶段所有写操作只落在本地 mock 适配层。" }
+              { label: "调度器连接", value: "Run 证据已接入", hint: "需求执行编排仍需由项目 Workflow 绑定。" },
+              { label: "数据回写", value: options.storage ? "需求看板本地持久化" : "测试隔离内存" }
             ]
           },
           {
@@ -558,8 +712,8 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
             entries: [
               { label: "Provider", value: "未配置 · 占位" },
               { label: "最大并发", value: "4（只读预览）" },
-              { label: "Worktree 隔离", value: "按 Run 创建（未启用）" },
-              { label: "Quality Gates", value: "typecheck → test → review（未启用）" }
+              { label: "Worktree 隔离", value: "有改动保留到人工验收" },
+              { label: "Quality Gates", value: "通过 + 证据充分后才开放合并" }
             ]
           },
           {
@@ -579,4 +733,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
 }
 
 /** 应用级单例：页面默认经此适配层读写，测试可注入独立实例。 */
-export const dashboardService = createDashboardService();
+export const dashboardService = createDashboardService({
+  initialData: "empty",
+  storage: typeof window === "undefined" ? undefined : window.localStorage
+});

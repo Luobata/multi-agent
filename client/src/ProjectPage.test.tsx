@@ -2,11 +2,16 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProjectPage } from "./ProjectPage";
 import type { Bootstrap, WorkInstanceRecord, WorkInstanceStatus } from "./types";
 
 const timestamp = "2026-08-01T00:00:00.000Z";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+});
 
 function workInstance(id: string, status: WorkInstanceStatus, updatedAt = timestamp): WorkInstanceRecord {
   return {
@@ -149,6 +154,10 @@ describe("Project connection page", () => {
     expect(html).toContain("本项目临时追加的知识 Profile");
     expect(html).toContain("Workbench · 质量知识");
     expect(html).toContain("invoke_project_role");
+    expect(html).toContain("主接入方式 · MCP");
+    expect(html).toContain("multi-agent-mcp");
+    expect(html).toContain("--daemon-url");
+    expect(html).toContain("没有 MCP？读取声明");
   });
 
   it("shows MCP-triggered passive access separately and links matching roots to formal projects", () => {
@@ -178,10 +187,11 @@ describe("Project connection page", () => {
 
     const html = renderToStaticMarkup(<ProjectPage data={data} refresh={vi.fn()} notify={vi.fn()} />);
 
-    expect(html).toContain("MCP 被动接入");
+    expect(html).toContain("MCP 自动发现 · 待完善");
     expect(html).toContain("external-project");
     expect(html).toContain("/tmp/external-project");
     expect(html).toContain("3 次 Workbench 请求");
+    expect(html).toContain("完善接入");
     expect(html).toContain("MCP 最近触发");
     expect(html).toContain("5 次请求");
     expect(html.match(/passive-project-card/g)).toHaveLength(1);
@@ -231,6 +241,134 @@ describe("Project connection page", () => {
     expect(html).toContain("未记录工作目录（历史调用）");
     expect(html).toContain("项目标识 vibe-docing");
     expect(html).toContain("2 次 Workbench 请求");
+    expect(html).toContain("补全路径并接入");
+    expect(html).toContain("缺根目录");
+  });
+
+  it("prefills the descriptor modal from an MCP discovery record", () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    HTMLDialogElement.prototype.showModal = vi.fn();
+    HTMLDialogElement.prototype.close = vi.fn();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    act(() => root.render(<ProjectPage
+      data={bootstrap}
+      refresh={vi.fn()}
+      notify={vi.fn()}
+      connectRequest={1}
+      connectSeed={{ accessId: "mcp-external", rootPath: "/tmp/external-project" }}
+      onConnectRequestHandled={vi.fn()}
+    />));
+
+    expect(container.textContent).toContain("完善 MCP 项目接入");
+    expect(container.textContent).toContain("首次 MCP 调用只登记，不写入项目仓库");
+    expect(container.textContent).toContain("声明不存在确认后原子创建");
+    expect(container.textContent).toContain("声明已存在只校验，绝不覆盖");
+    expect((container.querySelector('input[placeholder="/path/to/your-project"]') as HTMLInputElement | null)?.value).toBe("/tmp/external-project");
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("requests safe descriptor scaffolding only for an explicit MCP completion", async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    HTMLDialogElement.prototype.showModal = vi.fn();
+    HTMLDialogElement.prototype.close = vi.fn();
+    const discovered: Bootstrap = {
+      ...bootstrap,
+      passiveProjectAccesses: [{
+        id: "mcp-vibe-docing",
+        rootPath: "/Users/example/vibe-docing",
+        projectKeys: ["vibe-docing"],
+        displayName: "vibe-docing",
+        transport: "mcp",
+        requestCount: 2,
+        firstSeenAt: timestamp,
+        lastSeenAt: timestamp
+      }]
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({ data: { ...bootstrap.projects[0], id: "vibe-docing", name: "vibe-docing" } })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    act(() => root.render(<ProjectPage
+      data={discovered}
+      refresh={vi.fn().mockResolvedValue(undefined)}
+      notify={vi.fn()}
+      connectRequest={1}
+      connectSeed={{ accessId: "mcp-vibe-docing", rootPath: "/Users/example/vibe-docing" }}
+    />));
+    await act(async () => {
+      container.querySelector<HTMLFormElement>("form.modal-body")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({
+      rootPath: "/Users/example/vibe-docing",
+      descriptorPath: "multi-agent.project.yaml",
+      createDescriptorIfMissing: true,
+      projectIdHint: "vibe-docing",
+      projectNameHint: "vibe-docing"
+    });
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("keeps connection errors inside the editable modal with friendly guidance", async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    HTMLDialogElement.prototype.showModal = vi.fn();
+    HTMLDialogElement.prototype.close = vi.fn();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: { message: "ENOENT: no such file or directory, stat '/Users/example/vibe-docing/docs/agents/tester.md'" } })
+    }));
+    const notify = vi.fn();
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    act(() => root.render(<ProjectPage
+      data={bootstrap}
+      refresh={vi.fn()}
+      notify={notify}
+      connectRequest={1}
+      connectSeed={{ accessId: "mcp-vibe-docing", rootPath: "/Users/example/vibe-docing" }}
+    />));
+    await act(async () => {
+      container.querySelector<HTMLFormElement>("form.modal-body")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    });
+
+    const issue = container.querySelector<HTMLElement>(".project-connect-error[role='alert']");
+    const rootInput = container.querySelector<HTMLInputElement>('input[placeholder="/path/to/your-project"]');
+    expect(issue?.closest("dialog")).not.toBeNull();
+    expect(issue?.textContent).toContain("项目声明或它引用的文件不存在");
+    expect(issue?.textContent).toContain("查看技术详情");
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+    expect(rootInput?.value).toBe("/Users/example/vibe-docing");
+    expect(rootInput?.disabled).toBe(false);
+    expect(notify).not.toHaveBeenCalled();
+
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setValue?.call(rootInput, "/Users/example/vibe-docing-fixed");
+      rootInput?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.querySelector(".project-connect-error")).toBeNull();
+
+    act(() => root.unmount());
+    container.remove();
   });
 
   it("shows the bound employee runtime status on the role card", () => {

@@ -281,6 +281,8 @@ describe("task Entrance Policies", () => {
     });
     expect(graphDispatch.dispatch.kind).toBe("invocation-started");
     if (graphDispatch.dispatch.kind !== "invocation-started") throw new Error("expected Graph receipt");
+    expect(graphDispatch.dispatch.receipt.leaderSessionId).toBeUndefined();
+    expect(graphDispatch.dispatch.receipt.monitor.tool).toBe("wait_workflow_progress");
     const graphDetail = await service.waitForInvocation(graphDispatch.dispatch.receipt.invocation.id);
     expect(graphDetail.invocation.executionSnapshot).toMatchObject({
       workflow: { id: graph.id, version: 1, architecture: "graph" },
@@ -293,6 +295,12 @@ describe("task Entrance Policies", () => {
     });
     expect(leaderDispatch.dispatch.kind).toBe("invocation-started");
     if (leaderDispatch.dispatch.kind !== "invocation-started") throw new Error("expected Supervisor receipt");
+    expect(leaderDispatch.dispatch.receipt.leaderSessionId).toBeTruthy();
+    expect(service.getSession(leaderDispatch.dispatch.receipt.leaderSessionId!)).toMatchObject({
+      employeeId: `${leader.id}-manager`,
+      status: "active",
+      supervisor: { workflowId: leader.id, workflowVersion: 1 }
+    });
     const leaderDetail = await service.waitForInvocation(leaderDispatch.dispatch.receipt.invocation.id);
     expect(leaderDetail.invocation.executionSnapshot).toMatchObject({
       workflow: { id: leader.id, version: 1, architecture: "supervisor" },

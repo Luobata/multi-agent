@@ -18,6 +18,39 @@ roles:
     permissions:
       write: none
       tools: [Read, Glob, Grep]
+  requirement-steward:
+    displayName: 需求管家
+    description: 通过对话澄清需求并生成待人工确认的结构化需求草稿，不直接创建或推进需求。
+    requiredSkills: [humanizer-zh]
+    knowledgeProfiles: [workbench-product-knowledge]
+    policyRef: docs/project-roles/requirement-steward.md
+    outputSchema:
+      type: object
+      additionalProperties: false
+      required: [message, nextAction, draft]
+      properties:
+        message:
+          type: string
+          minLength: 1
+        nextAction:
+          enum: [clarify, draft]
+        draft:
+          anyOf:
+            - type: "null"
+            - type: object
+              additionalProperties: false
+              required: [title, summary, priority, rawRequirement, acceptanceCriteria]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 80 }
+                summary: { type: string, maxLength: 160 }
+                priority: { enum: [low, medium, high] }
+                rawRequirement: { type: string, minLength: 1 }
+                acceptanceCriteria:
+                  type: array
+                  items: { type: string, minLength: 1 }
+    permissions:
+      write: none
+      tools: [Read, Glob, Grep]
   product-designer:
     displayName: 产品设计师
     description: 负责信息架构、交互状态、视觉一致性与可访问性设计验收。
@@ -128,3 +161,17 @@ roles:
         - configuration_proposal_list
         - configuration_proposal_get
         - configuration_proposal_create
+  gate-steward:
+    displayName: 工作流门禁管家
+    description: 通过受限 Gate Control MCP 查询门禁并生成待人工审批的变更提案。
+    requiredSkills: [gate-control-conversation]
+    requiredProviderProfiles: [gate-proposal-only]
+    knowledgeProfiles: []
+    policyRef: docs/project-roles/gate-steward.md
+    permissions:
+      write: none
+      tools:
+        - workflow_control_snapshot
+        - workflow_change_list
+        - workflow_change_get
+        - workflow_change_propose

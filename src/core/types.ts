@@ -2,7 +2,29 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-export type OutputProtocol = "json" | "claude-json" | "raw";
+export type HumanDecisionRiskCategory =
+  | "dependency-install"
+  | "data-migration"
+  | "scope-expansion"
+  | "irreversible-other";
+
+/** Architecture-to-runtime request. Workbench adds the durable Invocation/Run/version pins. */
+export interface RuntimeHumanDecisionRequest {
+  nodeId: string;
+  round: number;
+  riskCategory: HumanDecisionRiskCategory;
+  summary: string;
+  proposedAction: JsonObject;
+}
+
+export interface RuntimeHumanDecisionOutcome {
+  requestId: string;
+  decision: "approved" | "rejected";
+  decidedBy?: string;
+  comment?: string;
+}
+
+export type OutputProtocol = "json" | "claude-json" | "claude-stream-json" | "codex-stream-json" | "raw";
 export type WritePolicy = "none" | "artifacts-only" | "project";
 
 export interface ProviderDefinition {
@@ -25,7 +47,7 @@ export interface CommandProviderDefinition extends ProviderDefinition {
   timeoutMs?: number;
   /** Terminates a call only after this long without stdout or stderr activity. */
   idleTimeoutMs?: number;
-  /** Absolute safety limit even when the Provider keeps producing output. */
+  /** Optional absolute safety limit even when the Provider keeps producing output. Omit for progress-driven execution. */
   hardTimeoutMs?: number;
 }
 
@@ -48,7 +70,7 @@ export interface CodexProviderDefinition extends ProviderDefinition {
   timeoutMs?: number;
   /** Terminates a call only after this long without stdout or stderr activity. */
   idleTimeoutMs?: number;
-  /** Absolute safety limit even when the Provider keeps producing output. */
+  /** Optional absolute safety limit even when the Provider keeps producing output. Omit for progress-driven execution. */
   hardTimeoutMs?: number;
   mcpServers?: Record<string, CodexMcpServerDefinition>;
 }
@@ -152,6 +174,7 @@ export interface NodeRunResult {
 export interface WorkflowRunIsolation {
   mode: "worktree" | "none";
   worktreePath?: string;
+  baseCommit?: string;
   fallbackReason?: string;
 }
 

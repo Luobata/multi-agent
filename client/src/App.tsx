@@ -82,13 +82,54 @@ export function assertKnowledgeControlPlane(bootstrap: Bootstrap): void {
   }
 }
 
+export function AppNotice({ notice, onClose, onRetry }: {
+  notice: { message: string; kind: "success" | "error" };
+  onClose: () => void;
+  onRetry?: () => void;
+}) {
+  const noticeRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const element = noticeRef.current;
+    if (!element || typeof element.showPopover !== "function") return;
+    try {
+      // A popover participates in the browser top layer, so feedback remains
+      // visible above a native <dialog>. Unsupported browsers keep the fixed fallback.
+      element.showPopover();
+    } catch {
+      // Rendering the notice is still useful when the Popover API is unavailable.
+    }
+    return () => {
+      if (typeof element.hidePopover !== "function") return;
+      try { element.hidePopover(); } catch { /* already hidden */ }
+    };
+  }, [notice.kind, notice.message]);
+
+  return <div
+    ref={noticeRef}
+    className={`toast toast--${notice.kind}`}
+    popover="manual"
+    role={notice.kind === "error" ? "alert" : "status"}
+    aria-live={notice.kind === "error" ? "assertive" : "polite"}
+    aria-atomic="true"
+  >
+    <div className="toast-copy">
+      <strong>{notice.kind === "error" ? "操作没有完成" : "操作已完成"}</strong>
+      <span>{notice.message}</span>
+    </div>
+    {notice.kind === "error" && <div className="toast-actions">
+      {onRetry && <button type="button" onClick={onRetry}>重新同步</button>}
+      <button type="button" onClick={onClose}>关闭提示</button>
+    </div>}
+  </div>;
+}
+
 export function App() {
   const [route, setRoute] = useState<PageRoute>(pageFromHash);
   const page = route.page;
   const [data, setData] = useState<Bootstrap>(emptyBootstrap);
   const [daemon, setDaemon] = useState<"checking" | "online" | "offline">("checking");
   const [activityStream, setActivityStream] = useState<"connecting" | "live" | "reconnecting" | "offline">("connecting");
-  const [notice, setNotice] = useState<{ message: string; kind: "success" | "error" }>();
+  const [notice, setNotice] = useState<{ message: string; kind: "success" | "error"; retryRefresh?: boolean }>();
   const [commandOpen, setCommandOpen] = useState(false);
   const [pendingRunId, setPendingRunId] = useState("");
   const [syncing, setSyncing] = useState(false);
@@ -111,7 +152,7 @@ export function App() {
       const bootstrap = await api<Bootstrap>("/api/bootstrap");
       if (seq !== bootstrapRequestSeq.current) return; // a newer navigation already superseded this response
       assertKnowledgeControlPlane(bootstrap);
-      dashboardService.syncConnectedProjects(bootstrap.projects);
+      dashboardService.syncConnectedProjects(bootstrap.projects, bootstrap.passiveProjectAccesses ?? []);
       // Live SSE events that arrived while this request was in flight are newer
       // evidence than the snapshot: merge by id + updatedAt so they survive.
       setData((current) => ({ ...bootstrap, activity: mergeActivity(current.activity, bootstrap.activity) }));
@@ -129,8 +170,12 @@ export function App() {
   }, []);
 
   const refreshQuietly = useCallback(() => {
-    refresh().catch((error: unknown) => notify(error instanceof Error ? error.message : String(error), "error"));
-  }, [refresh, notify]);
+    refresh().catch((error: unknown) => setNotice({
+      message: error instanceof Error ? error.message : String(error),
+      kind: "error",
+      retryRefresh: true
+    }));
+  }, [refresh]);
 
   // First load and every page entry (side nav, command palette, browser back/forward)
   // fetch the latest bootstrap. navigate() and the hashchange listener agree on the
@@ -244,7 +289,7 @@ export function App() {
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
-      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} pendingRunId={pendingRunId} onConsumePending={() => setPendingRunId("")} />}
+      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} pendingRunId={pendingRunId} onConsumePending={() => setPendingRunId("")} dashboard={dashboardService} />}
       {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
       {page === "dashboard" && <DashboardPage go={go} />}
@@ -254,13 +299,14 @@ export function App() {
       {page === "archive" && <ArchivePage go={go} notify={notify} />}
       {page === "settings" && <SettingsPage />}
     </div></DaemonGate>
-    {notice && <div className={`toast toast--${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"} aria-live={notice.kind === "error" ? "assertive" : "polite"} aria-atomic="true">
-      <span>{notice.message}</span>
-      {notice.kind === "error" && <div className="toast-actions">
-        <button type="button" onClick={() => void refresh().then(() => setNotice(undefined)).catch((error: unknown) => setNotice({ message: error instanceof Error ? error.message : String(error), kind: "error" }))}>重试连接</button>
-        <button type="button" onClick={() => setNotice(undefined)}>关闭</button>
-      </div>}
-    </div>}
+    {notice && <AppNotice
+      notice={notice}
+      onClose={() => setNotice(undefined)}
+      onRetry={notice.retryRefresh ? () => {
+        setNotice(undefined);
+        refreshQuietly();
+      } : undefined}
+    />}
     {commandOpen && <Modal title="命令面板" eyebrow="TOWN MENU · ⌘K" onClose={() => setCommandOpen(false)}><div className="command-list" onKeyDown={(event) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
       event.preventDefault();

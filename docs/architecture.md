@@ -22,7 +22,7 @@
 - 产品、设计、测试各有一套相似的 runner、parser、report builder 和落盘流程。
 - 运行上下文直接依赖 Review Bundle、session event、dashboard URL 和特定目录布局。
 - 异步 job 与 HTTP 路由绑定，进程重启后运行态不可恢复。
-- `claude-relay`、`claude-kimi` zsh alias 和 Claude Code 参数属于本机 Provider 细节。
+- `claude-relay`、`claude-day1` zsh alias 和 Claude Code 参数属于本机 Provider 细节。
 - 三角色聚合由固定 endpoint 完成，不是可扩展的 DAG。
 
 本项目把这些部分改为 manifest、通用模板上下文、可组合 Role Profile、Architecture Adapter 和显式工作流配置。示例角色只是模板，不进入核心代码。

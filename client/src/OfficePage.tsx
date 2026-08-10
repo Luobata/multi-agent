@@ -25,6 +25,7 @@ const statusLabels: Record<WorkInstanceStatus | InvocationStatus | "idle", strin
   queued: "排队中",
   waiting: "等待中",
   running: "工作中",
+  "awaiting-human-decision": "等待人工决定",
   completed: "已完成",
   blocked: "已阻塞",
   failed: "故障",
@@ -305,14 +306,14 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
             const leader = data.employees.find((employee) => employee.id === leaderEmployeeId);
             return <article key={invocation.id} className={`studio-card studio-card--${tone}`}>
               <header className="studio-card-head">
-                <div><span>{invocation.executionSnapshot?.workflow.id ?? invocation.target.id}</span><strong>{invocation.requestSummary}</strong></div>
+                <div className="studio-card-title"><span title={invocation.executionSnapshot?.workflow.id ?? invocation.target.id}>{invocation.executionSnapshot?.workflow.id ?? invocation.target.id}</span><strong title={invocation.requestSummary}>{invocation.requestSummary}</strong></div>
                 <span className="studio-round">Round {progress?.round ?? invocation.executionSnapshot?.workflow.version ?? 1}</span>
               </header>
               <div className={`studio-progress ${tone === "running" ? "studio-progress--live" : ""}`}>
                 <i className="studio-progress-fill" style={{ width: `${Math.round(ratio * 100)}%` }} aria-hidden="true" />
               </div>
               <div className="studio-progress-legend"><span>{Math.round(ratio * 100)}% 完成</span>{progress && <span>{progress.tally.completed}/{Object.values(progress.tally).reduce((sum, count) => sum + count, 0)} 步</span>}</div>
-              {latestEntry && <p className="studio-leader-note"><code>{latestEntry.action.toUpperCase()}</code>{latestEntry.summary ?? "领队正在决策。"}</p>}
+              {latestEntry && <p className="studio-leader-note"><code>{latestEntry.action.toUpperCase()}</code><span className="studio-leader-summary" title={latestEntry.summary ?? "领队正在决策。"}>{latestEntry.summary ?? "领队正在决策。"}</span></p>}
               <div className="studio-team">
                 <div className="studio-leader"><EmployeeAvatar displayName={leader?.identity.displayName ?? leaderEmployeeId ?? "领队"} presentation={leader?.presentation} /><span>领队</span></div>
                 <div className="studio-members">
@@ -323,7 +324,7 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
                   {(latestEntry?.assignments ?? []).length === 0 && <span className="studio-empty">领队尚未在本轮分派成员。</span>}
                 </div>
               </div>
-              {progress && progress.leaderReport.gates.length > 0 && <div className="studio-gates">{progress.leaderReport.gates.map((gate) => <span key={gate.gateId} className={`studio-gate studio-gate--${gate.status}`}>{gate.gateId} · {gate.status}</span>)}</div>}
+              {progress && progress.leaderReport.gates.length > 0 && <div className="studio-gates">{progress.leaderReport.gates.map((gate) => <span key={gate.gateId} title={`${gate.gateId} · ${gate.status}`} className={`studio-gate studio-gate--${gate.status}`}>{gate.gateId} · {gate.status}</span>)}</div>}
             </article>;
           })}
         </div>

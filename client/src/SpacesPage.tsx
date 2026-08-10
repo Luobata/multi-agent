@@ -1,11 +1,11 @@
-/** 统一项目页的目录分区：Folder 只组织真实接入 Project，不创建第二套逻辑项目。 */
+/** 统一项目目录：正式 Project 与 MCP 发现证据共用一棵虚拟树。 */
 import { useMemo, useState, type CSSProperties, type ReactElement } from "react";
-import { EmptyState, Field, Modal, SelectControl, Stamp, useDaemonAvailable } from "./components";
+import { EmptyState, Field, Modal, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
 import { dashboardService, type DashboardService } from "./dashboard/service";
-import type { FolderNode, SpaceNode } from "./dashboard/types";
+import type { FolderNode, McpObservedProject, SpaceNode } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, UndoToast, useServiceData } from "./dashboard/view";
 
-type SpaceFilter = "all" | "favorite" | "folder" | "project";
+type SpaceFilter = "all" | "favorite" | "folder" | "project" | "mcp";
 
 interface UndoState {
   message: string;
@@ -16,7 +16,8 @@ const FILTER_OPTIONS = [
   { value: "all", label: "全部节点" },
   { value: "favorite", label: "仅收藏" },
   { value: "folder", label: "仅文件夹" },
-  { value: "project", label: "仅项目" }
+  { value: "project", label: "仅正式项目" },
+  { value: "mcp", label: "仅 MCP 发现" }
 ];
 
 function isDescendantOf(nodes: SpaceNode[], ancestorId: string, candidateId: string): boolean {
@@ -28,13 +29,17 @@ function isDescendantOf(nodes: SpaceNode[], ancestorId: string, candidateId: str
   return false;
 }
 
-export function SpacesPage({ go, notify, service = dashboardService, embedded = false, onConnect, onOpenAccess, catalogRevision = "" }: {
+export function SpacesPage({ go, notify, service = dashboardService, embedded = false, onConnect, onReadDescriptor, onOpenAccess, onCompleteMcp, catalogRevision = "" }: {
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
   embedded?: boolean;
+  /** 打开 MCP 主接入说明。 */
   onConnect?: () => void;
+  /** 打开声明文件兜底接入。 */
+  onReadDescriptor?: () => void;
   onOpenAccess?: (projectId: string) => void;
+  onCompleteMcp?: (accessId: string) => void;
   catalogRevision?: string;
 }) {
   const daemonAvailable = useDaemonAvailable();
@@ -64,16 +69,26 @@ export function SpacesPage({ go, notify, service = dashboardService, embedded = 
       if (filter === "favorite" && !node.favorite) return false;
       if (filter === "folder" && node.kind !== "folder") return false;
       if (filter === "project" && node.kind !== "project") return false;
+      if (filter === "mcp" && node.kind !== "mcp-observed") return false;
       if (!term) return true;
-      const path = node.kind === "project" ? node.repositoryPath : "";
-      return node.name.toLowerCase().includes(term) || path.toLowerCase().includes(term);
+      const searchable = node.kind === "project"
+        ? `${node.repositoryPath} ${node.mcpAccess?.projectKeys.join(" ") ?? ""}`
+        : node.kind === "mcp-observed"
+          ? `${node.rootPath ?? ""} ${node.projectKeys.join(" ")}`
+          : "";
+      return node.name.toLowerCase().includes(term) || searchable.toLowerCase().includes(term);
     });
   }, [liveNodes, query, filter]);
 
   const childrenOf = (parentId: string | null): SpaceNode[] =>
     liveNodes
       .filter((node) => (node.parentId ?? null) === parentId)
-      .sort((left, right) => (left.kind === right.kind ? left.name.localeCompare(right.name, "zh-CN") : left.kind === "folder" ? -1 : 1));
+      .sort((left, right) => {
+        const rank = { folder: 0, project: 1, "mcp-observed": 2 } as const;
+        return rank[left.kind] === rank[right.kind]
+          ? left.name.localeCompare(right.name, "zh-CN")
+          : rank[left.kind] - rank[right.kind];
+      });
 
   const replaceNode = (updated: SpaceNode) => setData(nodes.map((node) => (node.id === updated.id ? updated : node)));
   const fail = (error: unknown) => notify(error instanceof Error ? error.message : String(error), "error");
@@ -174,9 +189,11 @@ export function SpacesPage({ go, notify, service = dashboardService, embedded = 
 
   const renderRow = (node: SpaceNode, depth: number): ReactElement => {
     const editing = editingId === node.id;
+    const observed = node.kind === "mcp-observed" ? node : undefined;
+    const kindLabel = node.kind === "folder" ? "夹" : node.kind === "project" ? "项" : "M";
     return <div className="space-row" style={{ "--depth": depth } as CSSProperties}>
-      <span className={`space-kind space-kind--${node.kind}`} aria-hidden="true">{node.kind === "folder" ? "夹" : "项"}</span>
-      {editing
+      <span className={`space-kind space-kind--${node.kind}`} aria-hidden="true">{kindLabel}</span>
+      <span className="space-primary">{editing
         ? <input
             className="space-rename-input"
             aria-label={`重命名 ${node.name}`}
@@ -190,14 +207,21 @@ export function SpacesPage({ go, notify, service = dashboardService, embedded = 
             }}
             onBlur={() => setEditingId("")}
           />
-        : <button type="button" className="space-name" onClick={() => { if (node.kind === "project") go(`projects/${node.id}`); }} title={node.kind === "project" ? "打开项目详情" : node.name}>
-            {node.name}
-            {node.favorite && <span className="space-fav" aria-label="已收藏">★</span>}
-          </button>}
-      {node.kind === "project" && <code className="space-path" title="仅保存配置，不会移动磁盘上的文件">{node.repositoryPath}</code>}
+        : node.kind === "project"
+          ? <button type="button" className="space-name" onClick={() => go(`projects/${node.id}`)} title="打开项目详情">
+              {node.name}{node.favorite && <span className="space-fav" aria-label="已收藏">★</span>}
+            </button>
+          : <span className="space-name space-name--static" title={node.name}>{node.name}{node.favorite && <span className="space-fav" aria-label="已收藏">★</span>}</span>}
+        {node.kind === "project" && node.mcpAccess && <span className="space-access-badge is-linked">MCP 已接通</span>}
+        {observed && <span className="space-access-badge">{observed.historical ? "历史调用 · 缺根目录" : "MCP 已发现 · 待完善"}</span>}
+      </span>
+      {node.kind === "project" && <span className="space-meta"><code className="space-path" title="仅保存配置，不会移动磁盘上的文件">{node.repositoryPath}</code>{node.mcpAccess && <small>最近调用 {formatTime(node.mcpAccess.lastSeenAt)} · {node.mcpAccess.requestCount} 次</small>}</span>}
+      {observed && <span className="space-meta"><code className="space-path">{observed.rootPath ?? "未记录工作目录"}</code><small>{observed.projectKeys.length > 0 ? `项目标识 ${observed.projectKeys.join(" · ")}` : "等待补全项目标识"} · 最近 {formatTime(observed.lastSeenAt)}</small></span>}
+      {node.kind === "folder" && <span className="space-meta"><small>虚拟分类 · 不移动磁盘目录</small></span>}
       <span className="space-actions">
         {node.kind === "project" && <button type="button" className="text-button" onClick={() => go(`projects/${node.id}/board`)}>看板</button>}
         {node.kind === "project" && <button type="button" className="text-button" onClick={() => onOpenAccess?.(node.id)}>接入配置</button>}
+        {observed && <button type="button" className="text-button space-complete-action" disabled={!daemonAvailable} onClick={() => onCompleteMcp?.(observed.accessId)}>{observed.historical ? "补全路径并接入" : "完善接入"}</button>}
         {node.kind === "folder" && <button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => { setEditingId(node.id); setEditingName(node.name); }}>重命名</button>}
         <button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => { setMovingNode(node); setMoveTarget(node.parentId ?? "root"); }}>移动</button>
         <button type="button" className="text-button" disabled={!daemonAvailable} aria-pressed={node.favorite} onClick={() => favorite(node)}>{node.favorite ? "取消收藏" : "收藏"}</button>
@@ -217,13 +241,13 @@ export function SpacesPage({ go, notify, service = dashboardService, embedded = 
   const rootNodes = childrenOf(null);
 
   return <section className={embedded ? "projects-hub-panel" : "dash-page"} aria-label={embedded ? "项目目录" : undefined}>
-    {!embedded && <PageHeader eyebrow="PROJECTS / VIRTUAL FOLDERS" title="项目" description="真实接入项目是唯一项目源；虚拟文件夹只负责分类，不会移动磁盘代码。" actions={<>
+    {!embedded && <PageHeader eyebrow="PROJECTS / MCP CATALOG" title="项目" description="MCP 调用自动发现项目；完善为正式项目后才可承接需求。虚拟文件夹不会移动磁盘代码。" actions={<>
       <button type="button" className="button secondary" disabled={!daemonAvailable} onClick={() => { setCreateKind("folder"); setCreateParentId(null); setFormError(""); }}>新建文件夹</button>
-      <button type="button" className="button primary" disabled={!daemonAvailable} onClick={onConnect}>接入项目</button>
+      <button type="button" className="button primary" onClick={onConnect}>MCP 接入说明</button>
     </>} />}
     <OfflineNotice />
 
-    {embedded && <div className="projects-directory-intro"><div><strong>虚拟目录</strong><span>这里只组织已接入项目；移动和收藏不会改动 Repository path。</span></div><div><button type="button" className="button secondary" disabled={!daemonAvailable} onClick={() => { setCreateKind("folder"); setCreateParentId(null); setFormError(""); }}>新建文件夹</button><button type="button" className="button primary" disabled={!daemonAvailable} onClick={onConnect}>接入项目</button></div></div>}
+    {embedded && <div className="projects-directory-intro"><div><strong>MCP 项目目录</strong><span>其它仓库首次实际调用 MCP tool 后会自动出现；移动和收藏只改虚拟分类，不改 Repository path。</span></div><div><button type="button" className="button secondary" disabled={!daemonAvailable} onClick={() => { setCreateKind("folder"); setCreateParentId(null); setFormError(""); }}>新建文件夹</button><button type="button" className="button secondary" onClick={onReadDescriptor}>读取声明</button><button type="button" className="button primary" onClick={onConnect}>MCP 接入说明</button></div></div>}
 
     <div className="space-toolbar">
       <label className="space-search"><span className="sr-only">搜索节点</span><input placeholder="搜索名称或 Repository path…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
@@ -233,14 +257,14 @@ export function SpacesPage({ go, notify, service = dashboardService, embedded = 
     {state.status === "loading" && <SkeletonBlock rows={5} label="正在加载空间树" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
     {state.status === "ready" && ((browsing ? visibleNodes : rootNodes).length === 0
-      ? <EmptyState title={browsing ? "没有匹配的节点" : "还没有已接入项目"} action={!browsing ? <button type="button" className="button primary" disabled={!daemonAvailable} onClick={onConnect}>接入第一个项目</button> : undefined}>
-        <p>{browsing ? "换个关键词或清除筛选后再试。" : "项目只能通过声明文件正式接入；不能在目录里单独创建逻辑项目。"}</p>
+      ? <EmptyState title={browsing ? "没有匹配的节点" : "还没有发现项目"} action={!browsing ? <button type="button" className="button primary" onClick={onConnect}>查看 MCP 接入</button> : undefined}>
+        <p>{browsing ? "换个关键词或清除筛选后再试。" : "从其它本地仓库实际调用一次 MCP tool，项目会自动进入这里；也可以读取项目声明作为兜底。"}</p>
       </EmptyState>
       : browsing
         ? <ul className="space-tree space-tree--flat" aria-label="匹配节点">{visibleNodes.map((node) => <li key={node.id}>{renderRow(node, 0)}</li>)}</ul>
         : <ul className="space-tree" aria-label="空间树">{rootNodes.map((node) => renderNode(node, 0))}</ul>)}
 
-    {state.status === "ready" && liveNodes.length > 0 && <p className="space-count"><Stamp status="active" label={`${liveNodes.filter((node) => node.kind === "project").length} 个已接入项目`} /></p>}
+    {state.status === "ready" && liveNodes.length > 0 && <p className="space-count"><Stamp status="active" label={`${liveNodes.filter((node) => node.kind === "project").length} 个正式项目 · ${liveNodes.filter((node) => node.kind === "mcp-observed").length} 个 MCP 待完善`} /></p>}
 
     {createKind && <Modal title="新建虚拟文件夹" eyebrow="FOLDER · UI CONFIG ONLY" onClose={() => setCreateKind(null)}>
       <form className="modal-body compact-form" onSubmit={(event) => { event.preventDefault(); void submitCreate(); }}>

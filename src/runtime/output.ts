@@ -35,8 +35,48 @@ function asJsonValue(value: unknown): JsonValue {
   return value as JsonValue;
 }
 
+function parseJsonLines(text: string, label: string): Array<Record<string, unknown>> {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) throw new Error(`${label} output did not contain any events`);
+  return lines.map((line, index) => {
+    const parsed = JSON.parse(line) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`${label} event ${index + 1} must be a JSON object`);
+    }
+    return parsed as Record<string, unknown>;
+  });
+}
+
+function parseClaudeStreamOutput(stdout: string): JsonValue {
+  const events = parseJsonLines(stdout, "claude-stream-json");
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.structured_output !== undefined) return asJsonValue(event.structured_output);
+    if (event.type === "result" && typeof event.result === "string") {
+      return asJsonValue(parseJsonText(event.result));
+    }
+  }
+  throw new Error("claude-stream-json output did not contain structured_output or a JSON result event");
+}
+
+function parseCodexStreamOutput(stdout: string): JsonValue {
+  const events = parseJsonLines(stdout, "codex-stream-json");
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    const item = typeof event.item === "object" && event.item !== null && !Array.isArray(event.item)
+      ? event.item as Record<string, unknown>
+      : undefined;
+    if (event.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
+      return asJsonValue(parseJsonText(item.text));
+    }
+  }
+  throw new Error("codex-stream-json output did not contain a completed agent message");
+}
+
 export function parseProviderOutput(protocol: OutputProtocol, stdout: string): JsonValue {
   if (protocol === "raw") return { text: stdout };
+  if (protocol === "claude-stream-json") return parseClaudeStreamOutput(stdout);
+  if (protocol === "codex-stream-json") return parseCodexStreamOutput(stdout);
   const parsed = parseJsonText(stdout);
   if (protocol === "json") return asJsonValue(parsed);
 

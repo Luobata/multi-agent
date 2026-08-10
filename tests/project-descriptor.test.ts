@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import YAML from "yaml";
-import { loadProjectDescriptor } from "../src/workbench/projectDescriptor.js";
+import { ensureProjectDescriptor, loadProjectDescriptor } from "../src/workbench/projectDescriptor.js";
 
 const directories: string[] = [];
 
@@ -18,6 +18,91 @@ afterEach(() => {
 });
 
 describe("project descriptor", () => {
+  it("scaffolds a valid starter descriptor after explicit MCP onboarding", async () => {
+    const root = temporaryProject();
+
+    const ensured = await ensureProjectDescriptor({
+      rootPath: root,
+      createDescriptorIfMissing: true,
+      projectIdHint: "vibe-docing",
+      projectNameHint: "Vibe Docing"
+    });
+    const project = await loadProjectDescriptor({ rootPath: root });
+    const realRoot = fs.realpathSync(root);
+
+    expect(ensured).toEqual({ descriptorPath: path.join(realRoot, "multi-agent.project.yaml"), created: true });
+    expect(project).toMatchObject({
+      id: "vibe-docing",
+      name: "Vibe Docing",
+      rootPath: realRoot,
+      connector: { kind: "mcp", config: { discovery: "passive" } },
+      roles: [{ id: "project-member", permissions: { write: "project" } }]
+    });
+  });
+
+  it("never overwrites an existing descriptor during MCP onboarding", async () => {
+    const root = temporaryProject();
+    const descriptorPath = path.join(root, "multi-agent.project.yaml");
+    const existing = [
+      "# keep this project-owned declaration",
+      "version: 1",
+      "project:",
+      "  id: existing-project",
+      "roles:",
+      "  reviewer:",
+      "    instructions: Keep the existing policy."
+    ].join("\n");
+    fs.writeFileSync(descriptorPath, existing, "utf8");
+
+    const ensured = await ensureProjectDescriptor({
+      rootPath: root,
+      createDescriptorIfMissing: true,
+      projectIdHint: "replacement"
+    });
+
+    expect(ensured).toEqual({ descriptorPath: path.join(fs.realpathSync(root), "multi-agent.project.yaml"), created: false });
+    expect(fs.readFileSync(descriptorPath, "utf8")).toBe(existing);
+  });
+
+  it("refuses to scaffold a descriptor outside the project root", async () => {
+    const root = temporaryProject();
+    const outside = path.join(path.dirname(root), `outside-${path.basename(root)}.yaml`);
+
+    await expect(ensureProjectDescriptor({
+      rootPath: root,
+      descriptorPath: `../${path.basename(outside)}`,
+      createDescriptorIfMissing: true
+    })).rejects.toThrow(/must stay inside the project root/);
+    expect(fs.existsSync(outside)).toBe(false);
+  });
+
+  it("refuses to scaffold through a symlinked directory outside the project root", async () => {
+    const root = temporaryProject();
+    const outside = temporaryProject();
+    fs.symlinkSync(outside, path.join(root, "external"), "dir");
+
+    await expect(ensureProjectDescriptor({
+      rootPath: root,
+      descriptorPath: "external/multi-agent.project.yaml",
+      createDescriptorIfMissing: true
+    })).rejects.toThrow(/must stay inside the project root/);
+    expect(fs.existsSync(path.join(outside, "multi-agent.project.yaml"))).toBe(false);
+  });
+
+  it("refuses to treat an outside file symlink as an existing project descriptor", async () => {
+    const root = temporaryProject();
+    const outside = temporaryProject();
+    const outsideDescriptor = path.join(outside, "outside.yaml");
+    fs.writeFileSync(outsideDescriptor, "outside project data", "utf8");
+    fs.symlinkSync(outsideDescriptor, path.join(root, "multi-agent.project.yaml"), "file");
+
+    await expect(ensureProjectDescriptor({
+      rootPath: root,
+      createDescriptorIfMissing: true
+    })).rejects.toThrow(/must stay inside the project root/);
+    expect(fs.readFileSync(outsideDescriptor, "utf8")).toBe("outside project data");
+  });
+
   it("resolves project-owned policy and output-schema references without copying them into YAML", async () => {
     const root = temporaryProject();
     fs.mkdirSync(path.join(root, "agent", "policies"), { recursive: true });
@@ -94,18 +179,38 @@ describe("project descriptor", () => {
       .toEqual(["browser", "http-behavior", "automation-run"]);
   });
 
+  it("connects the review project to the conversational requirement steward", async () => {
+    const descriptor = YAML.parse(
+      fs.readFileSync(path.resolve("templates/workbench/cart-fe-workflow-review.project.yaml"), "utf8")
+    ) as { roles: Record<string, { outputSchema?: any; permissions?: { write?: string } }> };
+    const binding = JSON.parse(
+      fs.readFileSync(path.resolve("templates/workbench/cart-fe-workflow-review.binding.json"), "utf8")
+    ) as { roles: Array<{ roleId: string; employeeId: string }> };
+
+    expect(descriptor.roles["requirement-steward"]).toMatchObject({
+      permissions: { write: "none" },
+      outputSchema: expect.objectContaining({ required: ["message", "nextAction", "draft"] })
+    });
+    expect(binding.roles).toContainEqual(expect.objectContaining({
+      roleId: "requirement-steward",
+      employeeId: "xiaomiwang-product-manager"
+    }));
+  });
+
   it("connects every current Employee through a bounded project role", async () => {
     const root = path.resolve(".");
     const project = await loadProjectDescriptor({ rootPath: root, descriptorPath: "multi-agent.project.yaml" });
     const expectedAssignments = [
       ["product-manager", "xiaomiwang-product-manager"],
+      ["requirement-steward", "xiaomiwang-product-manager"],
       ["product-designer", "lin-mo-product-designer"],
       ["frontend-developer", "mihuhu-frontend-engineer"],
       ["backend-developer", "huotuizhu-product-manager"],
       ["fullstack-developer", "yaoxi-programmer"],
       ["test-engineer", "xiaomixiang-tester"],
       ["knowledge-steward", "local-agent-workbench-knowledge-steward"],
-      ["configuration-steward", "local-agent-workbench-configuration-steward"]
+      ["configuration-steward", "local-agent-workbench-configuration-steward"],
+      ["gate-steward", "local-agent-workbench-gate-steward"]
     ];
 
     expect(project).toMatchObject({
@@ -130,6 +235,13 @@ describe("project descriptor", () => {
       requiredSkills: ["hallmark", "interaction-state-completeness"],
       optionalSkills: ["healing-pixel-dossier"],
       permissions: { write: "none" }
+    });
+
+    const requirementSteward = project.roles.find((role) => role.id === "requirement-steward");
+    expect(requirementSteward).toMatchObject({
+      requiredSkills: ["humanizer-zh"],
+      permissions: { write: "none" },
+      outputSchema: expect.objectContaining({ required: ["message", "nextAction", "draft"] })
     });
 
     const knowledgeSteward = project.roles.find((role) => role.id === "knowledge-steward");

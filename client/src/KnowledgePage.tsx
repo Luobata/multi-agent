@@ -1,6 +1,11 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { api, writeBody } from "./api";
 import {
+  ConversationComposer,
+  ConversationMessageEvidence,
+  type ComposerDraft
+} from "./ConversationComposer";
+import {
   DossierSection,
   EmptyState,
   Field,
@@ -657,16 +662,17 @@ export function KnowledgeStewardConsole({ data, refresh, notify }: PageProps) {
     if (!freshSession && sessionId && !sessions.some((session) => session.id === sessionId)) setSessionId("");
   }, [sessions, sessionId, freshSession]);
 
-  const send = async (event: FormEvent) => {
-    event.preventDefault();
-    const text = message.trim();
-    if (!text || !stewardProject) return;
-    setSending(true);
+  const send = async (draft: ComposerDraft): Promise<boolean> => {
+    if (!stewardProject) return false;
     try {
       const result = await api<{ session: Session; runId: string; status: string; message: string }>(
         `/api/projects/${stewardProject.id}/roles/${KNOWLEDGE_STEWARD_ROLE_ID}/invoke`,
         {
-          ...writeBody({ message: text, sessionId: freshSession ? undefined : selectedSession?.id }),
+          ...writeBody({
+            message: draft.message,
+            sessionId: freshSession ? undefined : selectedSession?.id,
+            ...(draft.attachments.length > 0 ? { attachments: draft.attachments } : {})
+          }),
           headers: {
             "x-multi-agent-source": "workbench",
             "x-multi-agent-source-label": "知识控制台 · AI 管理",
@@ -676,13 +682,12 @@ export function KnowledgeStewardConsole({ data, refresh, notify }: PageProps) {
       );
       setSessionId(result.session.id);
       setFreshSession(false);
-      setMessage("");
       notify(result.status === "blocked" ? "知识管家给出了业务阻塞结论" : `知识管家已完成回复 · ${result.runId}`);
       await refresh();
+      return true;
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
-    } finally {
-      setSending(false);
+      return false;
     }
   };
 
@@ -744,18 +749,24 @@ export function KnowledgeStewardConsole({ data, refresh, notify }: PageProps) {
               {selectedSession?.messages.map((item) => <article className={`steward-message steward-message--${item.role}`} key={item.id}>
                 <div className="steward-message-meta"><span>{item.role === "user" ? "我" : item.role === "employee" ? stewardName : "系统"}</span><time>{formatTime(item.at)}</time>{item.runId && <code>{item.runId}</code>}</div>
                 <p className="steward-message-bubble">{item.content}</p>
+                <ConversationMessageEvidence attachments={item.attachments} documents={item.documents} />
               </article>)}
               {sending && <article className="steward-message steward-message--employee steward-message--pending">
                 <div className="steward-message-meta"><span>{stewardName}</span><span>处理中</span></div>
                 <p className="steward-message-bubble">正在通过项目角色调用知识管家；回复、Prompt 与 Run 证据会一起留存…</p>
               </article>}
             </div>
-            <form className="composer steward-composer" onSubmit={send}>
-              <textarea rows={3} required disabled={!daemonAvailable || sending} value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => {
-                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") event.currentTarget.form?.requestSubmit();
-              }} placeholder="询问知识现状、要求试跑或提出变更……" aria-label="发给知识管家的消息" />
-              <div className="composer-footer"><span aria-live="polite">{sending ? "知识管家处理中…" : daemonAvailable ? "⌘ / Ctrl + Enter 发送" : "服务离线，仅可查阅历史"}</span><button className="button primary" disabled={!daemonAvailable || sending || !message.trim()}>{sending ? "发送中…" : "发送"}</button></div>
-            </form>
+            <ConversationComposer
+              className="steward-composer"
+              ariaLabel="发给知识管家的消息"
+              placeholder="询问知识现状、要求试跑或提出变更……"
+              disabled={!daemonAvailable}
+              message={message}
+              onMessageChange={setMessage}
+              onSend={send}
+              onPendingChange={setSending}
+              sendingLabel="知识管家处理中…"
+            />
           </section>
           <section className="steward-changes">
             <header><div><span className="console-kicker">CHANGE PROPOSALS · HUMAN APPROVAL</span><h3>变更提案</h3></div><strong>{pendingChanges.length} 待批</strong></header>

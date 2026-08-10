@@ -17,13 +17,13 @@ describe("supervisorDecisionSchema", () => {
     expect(schema.oneOf).toBeUndefined();
     expect(schema.anyOf).toBeUndefined();
     const properties = schema.properties as { action: { enum?: string[] } };
-    expect(properties.action.enum).toEqual(["delegate", "finish"]);
+    expect(properties.action.enum).toEqual(["delegate", "request-human-decision", "finish"]);
   });
 
   it("includes satisfy-gate in the action enum and a gateId only when gates exist", () => {
     const withGates = supervisorDecisionSchema(roleIds, ["audit"], 3) as Record<string, unknown>;
     const properties = withGates.properties as { action: { enum?: string[] }; gateId: { enum?: string[] } };
-    expect(properties.action.enum).toEqual(["delegate", "satisfy-gate", "finish"]);
+    expect(properties.action.enum).toEqual(["delegate", "request-human-decision", "satisfy-gate", "finish"]);
     expect(properties.gateId.enum).toEqual(["audit"]);
   });
 
@@ -32,6 +32,12 @@ describe("supervisorDecisionSchema", () => {
     const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
 
     expect(validate({ action: "delegate", assignments: [{ roleId: "frontend-developer", task: "build UI" }] })).toBe(true);
+    expect(validate({
+      action: "request-human-decision",
+      riskCategory: "dependency-install",
+      summary: "Install a native dependency",
+      assignments: [{ roleId: "backend-developer", task: "Install it" }]
+    })).toBe(true);
     expect(validate({ action: "satisfy-gate", gateId: "audit", summary: "audited", evidence: {} })).toBe(true);
     expect(validate({ action: "finish", summary: "done", result: { delivered: true } })).toBe(true);
     expect(validate({ action: "wander-off" })).toBe(false);
@@ -54,6 +60,7 @@ describe("supervisorDecisionSchema", () => {
     // finish without summary/result — the exact malformed shape the repair test relies on.
     expect(validate({ action: "finish" })).toBe(false);
     expect(validate({ action: "delegate" })).toBe(false);
+    expect(validate({ action: "request-human-decision", summary: "missing risk and assignments" })).toBe(false);
     expect(validate({ action: "satisfy-gate", gateId: "audit" })).toBe(false);
   });
 });

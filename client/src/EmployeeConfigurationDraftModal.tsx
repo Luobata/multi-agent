@@ -1,5 +1,10 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, writeBody } from "./api";
+import {
+  ConversationComposer,
+  ConversationMessageEvidence,
+  type ComposerDraft
+} from "./ConversationComposer";
 import {
   DossierSection,
   EmptyState,
@@ -90,8 +95,6 @@ export function EmployeeConfigurationDraftModal({
   const selectedSession = sessions.find((session) => session.id === sessionId) ?? sessions[0];
   const [proposalId, setProposalId] = useState("");
   const proposal = proposals.find((candidate) => candidate.id === proposalId) ?? proposals[0];
-  const [message, setMessage] = useState("");
-  const [sending, setSending] = useState(false);
   const [busyItem, setBusyItem] = useState("");
   const [applying, setApplying] = useState(false);
   const decisions = proposal ? latestDecisions(proposal) : new Map();
@@ -103,18 +106,16 @@ export function EmployeeConfigurationDraftModal({
     if (proposalId && !proposals.some((candidate) => candidate.id === proposalId)) setProposalId("");
   }, [proposalId, proposals]);
 
-  const send = async (event: FormEvent) => {
-    event.preventDefault();
-    const text = message.trim();
-    if (!text || !project || !binding) return;
-    setSending(true);
+  const send = async (draft: ComposerDraft): Promise<boolean> => {
+    if (!project || !binding) return false;
     try {
       const result = await api<{ session: Session; runId: string; status: string; message: string }>(
         `/api/projects/${project.id}/roles/${CONFIGURATION_STEWARD_ROLE_ID}/invoke`,
         {
           ...writeBody({
-            message: `[Employee target: ${employee.id} · expected v${employee.version}]\n${text}`,
+            message: `[Employee target: ${employee.id} · expected v${employee.version}]\n${draft.message}`,
             sessionId: selectedSession?.id,
+            ...(draft.attachments.length > 0 ? { attachments: draft.attachments } : {}),
             context: {
               kind: "employee-configuration",
               employeeId: employee.id,
@@ -129,13 +130,12 @@ export function EmployeeConfigurationDraftModal({
         }
       );
       setSessionId(result.session.id);
-      setMessage("");
       notify(`配置管家已完成回复 · ${result.runId}`);
       await refresh();
+      return true;
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
-    } finally {
-      setSending(false);
+      return false;
     }
   };
 
@@ -206,20 +206,22 @@ export function EmployeeConfigurationDraftModal({
             {selectedSession?.messages.map((item) => <article className={`configuration-message configuration-message--${item.role}`} key={item.id}>
               <header><b>{item.role === "user" ? "你" : item.role === "employee" ? "配置管家 · AI" : "系统"}</b><time>{formatTime(item.at)}</time></header>
               <p>{item.content}</p>
+              <ConversationMessageEvidence attachments={item.attachments} documents={item.documents} />
               {item.runId && <code>Run {item.runId}</code>}
             </article>)}
             {!selectedSession && <div className="configuration-chat-empty"><strong>描述你希望调整的内容</strong><p>例如“让职责更聚焦前端测试，并把写权限保持为 none”。不满意时继续对话要求重新提案；已冻结提案不会被直接编辑。</p></div>}
           </div>
-          <form className="configuration-composer" onSubmit={send}>
-            <label htmlFor="configuration-draft-message">给配置管家的消息</label>
-            <textarea id="configuration-draft-message" rows={4} required disabled={!daemonAvailable || sending} value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                event.preventDefault();
-                event.currentTarget.form?.requestSubmit();
-              }
-            }} placeholder="说明目标、不能改变的边界和你希望看到的结果…" />
-            <div><span>{daemonAvailable ? "发送会创建 Session/Run 证据；聊天文本不是授权。⌘/Ctrl + Enter 发送。" : "daemon 离线：历史可读，不能发送或写入。"}</span><button className="button primary" disabled={!daemonAvailable || sending || !message.trim()}>{sending ? "配置管家工作中…" : "发送并起草"}</button></div>
-          </form>
+          <ConversationComposer
+            className="configuration-composer"
+            ariaLabel="给配置管家的消息"
+            placeholder="说明目标、不能改变的边界和你希望看到的结果…"
+            disabled={!daemonAvailable}
+            submitLabel="发送并起草"
+            sendingLabel="配置管家工作中…"
+            hint="发送会创建 Session/Run 证据；聊天文本不是授权。⌘ / Ctrl + Enter 发送"
+            offlineHint="daemon 离线：历史可读，不能发送或写入"
+            onSend={send}
+          />
         </>}
       </section>
 

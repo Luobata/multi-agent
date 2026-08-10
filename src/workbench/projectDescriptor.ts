@@ -1,11 +1,21 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import type { JsonObject, RolePermissionDefinition } from "../core/types.js";
 import type { ProjectConnectInput, ProjectCreateInput, ProjectScope } from "./types.js";
 
 const DEFAULT_DESCRIPTOR = "multi-agent.project.yaml";
 const MAX_REFERENCED_FILE_BYTES = 512 * 1024;
+const MCP_STARTER_DESCRIPTOR = fileURLToPath(
+  new URL("../../templates/workbench/mcp-project-starter.project.yaml", import.meta.url)
+);
+
+export interface EnsuredProjectDescriptor {
+  descriptorPath: string;
+  created: boolean;
+}
 
 function objectValue(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -41,6 +51,109 @@ function resolveProjectFile(rootPath: string, reference: string, label: string):
   return resolved;
 }
 
+function nodeErrorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
+}
+
+async function resolveProjectRoot(input: ProjectConnectInput): Promise<string> {
+  const requestedRoot = path.resolve(textValue(input.rootPath, "project rootPath"));
+  let rootStat;
+  try {
+    rootStat = await fs.stat(requestedRoot);
+  } catch (error) {
+    if (nodeErrorCode(error) === "ENOENT") throw new Error(`project rootPath does not exist: ${requestedRoot}`);
+    throw error;
+  }
+  if (!rootStat.isDirectory()) throw new Error(`project rootPath is not a directory: ${requestedRoot}`);
+  return fs.realpath(requestedRoot);
+}
+
+function requestedDescriptorPath(input: ProjectConnectInput, rootPath: string): string {
+  const requestedDescriptor = input.descriptorPath
+    ? textValue(input.descriptorPath, "project descriptorPath")
+    : DEFAULT_DESCRIPTOR;
+  return path.isAbsolute(requestedDescriptor)
+    ? path.resolve(requestedDescriptor)
+    : path.resolve(rootPath, requestedDescriptor);
+}
+
+function starterProjectId(input: ProjectConnectInput, rootPath: string): string {
+  const hint = input.projectIdHint?.trim() || input.projectNameHint?.trim() || path.basename(rootPath);
+  let id = hint
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!id) id = `local-project-${createHash("sha256").update(rootPath).digest("hex").slice(0, 8)}`;
+  if (/^[0-9]/.test(id)) id = `project-${id}`;
+  return id;
+}
+
+/**
+ * Scaffold the small, project-owned descriptor only after an explicit control-plane action.
+ * Existing files are never rewritten, and both the target and any symlinked parent must stay
+ * inside the real project root.
+ */
+export async function ensureProjectDescriptor(input: ProjectConnectInput): Promise<EnsuredProjectDescriptor> {
+  const rootPath = await resolveProjectRoot(input);
+  const requestedPath = requestedDescriptorPath(input, rootPath);
+  const descriptorPath = resolveProjectFile(rootPath, requestedPath, "project descriptorPath");
+  const parentPath = path.dirname(descriptorPath);
+  let parentStat;
+  try {
+    parentStat = await fs.stat(parentPath);
+  } catch (error) {
+    if (nodeErrorCode(error) === "ENOENT") {
+      throw new Error(`project descriptor directory does not exist: ${parentPath}`);
+    }
+    throw error;
+  }
+  if (!parentStat.isDirectory()) throw new Error(`project descriptor directory is not a directory: ${parentPath}`);
+  const realParent = await fs.realpath(parentPath);
+  const safeDescriptorPath = resolveProjectFile(
+    rootPath,
+    path.join(realParent, path.basename(descriptorPath)),
+    "project descriptorPath"
+  );
+
+  try {
+    const existingStat = await fs.stat(safeDescriptorPath);
+    const realDescriptorPath = resolveProjectFile(
+      rootPath,
+      await fs.realpath(safeDescriptorPath),
+      "project descriptorPath"
+    );
+    if (!existingStat.isFile()) throw new Error(`project descriptor is not a file: ${safeDescriptorPath}`);
+    return { descriptorPath: realDescriptorPath, created: false };
+  } catch (error) {
+    if (nodeErrorCode(error) !== "ENOENT") throw error;
+  }
+
+  const template = objectValue(
+    YAML.parse(await fs.readFile(MCP_STARTER_DESCRIPTOR, "utf8")),
+    "MCP starter project descriptor"
+  );
+  const project = objectValue(template.project, "MCP starter project descriptor.project");
+  project.id = starterProjectId(input, rootPath);
+  project.name = input.projectNameHint?.trim() || path.basename(rootPath) || project.id;
+  project.description = "通过 MCP 发现并在 Workbench 中显式接入的本地项目。";
+  const contents = YAML.stringify(template, { lineWidth: 0 });
+
+  try {
+    await fs.writeFile(safeDescriptorPath, contents, { encoding: "utf8", flag: "wx", mode: 0o644 });
+    return { descriptorPath: safeDescriptorPath, created: true };
+  } catch (error) {
+    // Another explicit onboarding request may have won the race. Treat that file
+    // exactly like any pre-existing descriptor and leave its contents untouched.
+    if (nodeErrorCode(error) !== "EEXIST") throw error;
+    const existingStat = await fs.stat(safeDescriptorPath);
+    if (!existingStat.isFile()) throw new Error(`project descriptor is not a file: ${safeDescriptorPath}`);
+    return { descriptorPath: safeDescriptorPath, created: false };
+  }
+}
+
 async function readReferencedText(rootPath: string, reference: string, label: string): Promise<string> {
   const filePath = resolveProjectFile(rootPath, reference, label);
   const stat = await fs.stat(filePath);
@@ -63,17 +176,15 @@ function permissionsValue(value: unknown, label: string): RolePermissionDefiniti
 }
 
 export async function loadProjectDescriptor(input: ProjectConnectInput): Promise<ProjectCreateInput> {
-  const requestedRoot = path.resolve(textValue(input.rootPath, "project rootPath"));
-  const rootStat = await fs.stat(requestedRoot);
-  if (!rootStat.isDirectory()) throw new Error(`project rootPath is not a directory: ${requestedRoot}`);
-  const rootPath = await fs.realpath(requestedRoot);
-  const requestedDescriptor = input.descriptorPath
-    ? textValue(input.descriptorPath, "project descriptorPath")
-    : DEFAULT_DESCRIPTOR;
-  const descriptorPath = path.isAbsolute(requestedDescriptor)
-    ? path.resolve(requestedDescriptor)
-    : path.resolve(rootPath, requestedDescriptor);
-  const descriptorStat = await fs.stat(descriptorPath);
+  const rootPath = await resolveProjectRoot(input);
+  const descriptorPath = requestedDescriptorPath(input, rootPath);
+  let descriptorStat;
+  try {
+    descriptorStat = await fs.stat(descriptorPath);
+  } catch (error) {
+    if (nodeErrorCode(error) === "ENOENT") throw new Error(`project descriptor does not exist: ${descriptorPath}`);
+    throw error;
+  }
   if (!descriptorStat.isFile()) throw new Error(`project descriptor is not a file: ${descriptorPath}`);
   if (descriptorStat.size > MAX_REFERENCED_FILE_BYTES) throw new Error(`project descriptor exceeds 512 KiB: ${descriptorPath}`);
 

@@ -229,6 +229,29 @@ describe("provider adapters", () => {
     expect(failure).toMatchObject({ kind: "hard-timeout", retryable: false });
   });
 
+  it("does not impose an absolute hard timeout when progress-driven execution omits it", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const progress: Array<{ hardTimeoutMs: number | null }> = [];
+    const response = await adapter.invoke({
+      providerId: "progress-driven-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", "process.stderr.write('start'); let ticks=0; const timer=setInterval(() => { process.stderr.write('tick'); if (++ticks === 5) { clearInterval(timer); process.stdout.write('{}'); } }, 25)"],
+        timeoutMs: 20,
+        idleTimeoutMs: 2_000
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {},
+      onProgress: (event) => { progress.push({ hardTimeoutMs: event.hardTimeoutMs }); }
+    });
+
+    expect(response.stdout).toBe("{}");
+    expect(progress.length).toBeGreaterThan(0);
+    expect(progress.every((event) => event.hardTimeoutMs === null)).toBe(true);
+  });
+
   it("accepts non-empty model metadata and rejects empty declarations", () => {
     const registry = createDefaultProviderRegistry();
     const command = registry.get("command")!;

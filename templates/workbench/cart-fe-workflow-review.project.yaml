@@ -9,6 +9,39 @@ connector:
   config:
     roleSource: src/core/reviewRoleAgents.ts
 roles:
+  requirement-steward:
+    displayName: 需求管家
+    description: 通过对话澄清目标项目的需求并生成待人工确认的结构化草稿，不直接创建或推进需求。
+    requiredSkills: [humanizer-zh]
+    knowledgeProfiles: [workbench-product-knowledge]
+    policyRef: docs/project-roles/requirement-steward.md
+    outputSchema:
+      type: object
+      additionalProperties: false
+      required: [message, nextAction, draft]
+      properties:
+        message:
+          type: string
+          minLength: 1
+        nextAction:
+          enum: [clarify, draft]
+        draft:
+          anyOf:
+            - type: "null"
+            - type: object
+              additionalProperties: false
+              required: [title, summary, priority, rawRequirement, acceptanceCriteria]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 80 }
+                summary: { type: string, maxLength: 160 }
+                priority: { enum: [low, medium, high] }
+                rawRequirement: { type: string, minLength: 1 }
+                acceptanceCriteria:
+                  type: array
+                  items: { type: string, minLength: 1 }
+    permissions:
+      write: none
+      tools: [Read, Glob, Grep]
   product-manager:
     displayName: 产品验收
     description: 还原需求、评估产品合理性并定义可追溯的验收标准。

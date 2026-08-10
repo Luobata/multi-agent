@@ -1,0 +1,182 @@
+/* 共享对话 Composer：附件列表、校验错误、飞书链接提示与历史消息证据。 */
+/* 基座 .composer 布局沿用 styles.css；这里只覆盖 Composer 独有的部件。 */
+
+.conversation-composer textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.composer-attachment {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: var(--rule) solid var(--line-strong);
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-paper-small);
+  max-width: 100%;
+}
+
+.composer-attachment img {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border: var(--rule) solid var(--line);
+  background: var(--paper-sunken);
+  image-rendering: pixelated;
+}
+
+.composer-attachment-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.composer-attachment-meta strong {
+  font-size: var(--text-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.composer-attachment-meta small {
+  font-family: var(--font-machine);
+  font-size: var(--text-xs);
+  color: var(--ink-3);
+}
+
+.composer-attachment-remove {
+  min-width: 32px;
+  min-height: 32px;
+  border: var(--rule) solid var(--stamp-red-ink);
+  background: var(--paper);
+  color: var(--stamp-red-ink);
+  font-size: 14px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.composer-attachment-remove:hover:not([disabled]) {
+  background: var(--danger-bg);
+}
+
+.composer-attachment-remove[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.composer-error {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: var(--rule) solid var(--stamp-red-ink);
+  background: var(--danger-bg);
+  color: var(--stamp-red-ink);
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.composer-error::before {
+  content: "!";
+  display: inline-block;
+  margin-right: var(--space-2);
+  font-family: var(--font-machine);
+  font-weight: 900;
+}
+
+.composer-lark-hint {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: var(--rule) dashed var(--seal-blue);
+  background: var(--seal-blue-bg);
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* 历史消息证据：图片走服务端预览 URL，文档只呈现 URL 与解析状态。 */
+.message-evidence {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.message-evidence-image {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  align-self: flex-start;
+  padding: var(--space-2);
+  border: var(--rule) solid var(--line-strong);
+  background: var(--paper-raised);
+  box-shadow: var(--shadow-paper-small);
+  color: var(--ink-2);
+  font-family: var(--font-machine);
+  font-size: var(--text-xs);
+  text-decoration: none;
+  max-width: 100%;
+}
+
+.message-evidence-image:hover {
+  background: var(--paper-hover);
+}
+
+.message-evidence-image img {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border: var(--rule) solid var(--line);
+  background: var(--paper-sunken);
+}
+
+.message-evidence-image span {
+  overflow-wrap: anywhere;
+}
+
+.message-evidence-doc {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: var(--rule) solid var(--line-strong);
+  background: var(--paper-raised);
+  font-size: var(--text-xs);
+}
+
+.message-evidence-doc--failed {
+  border-style: dashed;
+  background: var(--paper-sunken);
+}
+
+.message-evidence-doc-url {
+  font-family: var(--font-machine);
+  overflow-wrap: anywhere;
+}
+
+.message-evidence-doc-meta {
+  color: var(--ink-3);
+  font-family: var(--font-machine);
+}
+
+.message-evidence-doc-error {
+  flex-basis: 100%;
+  color: var(--stamp-red-ink);
+  font-weight: 700;
+}

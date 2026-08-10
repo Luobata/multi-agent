@@ -21,7 +21,7 @@ export const manifestSchema = {
         required: ["adapter"],
         properties: {
           adapter: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
-          outputProtocol: { enum: ["json", "claude-json", "raw"] }
+          outputProtocol: { enum: ["json", "claude-json", "claude-stream-json", "codex-stream-json", "raw"] }
         }
       }
     },

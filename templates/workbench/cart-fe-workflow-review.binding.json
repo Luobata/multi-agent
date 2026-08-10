@@ -1,6 +1,13 @@
 {
   "roles": [
     {
+      "roleId": "requirement-steward",
+      "employeeId": "xiaomiwang-product-manager",
+      "skills": ["humanizer-zh"],
+      "knowledgeProfileIds": ["workbench-product-knowledge"],
+      "updatePolicy": "compatible"
+    },
+    {
       "roleId": "product-manager",
       "employeeId": "xiaomiwang-product-manager",
       "skills": ["humanizer-zh"],

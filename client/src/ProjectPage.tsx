@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { api, writeBody } from "./api";
+import { ConversationComposer, type ComposerDraft } from "./ConversationComposer";
 import {
   DossierSection,
   EmployeeAvatar,
@@ -34,6 +35,8 @@ interface PageProps {
   initialProjectId?: string;
   /** 父级每次递增时直接打开接入声明 Modal。 */
   connectRequest?: number;
+  /** 从目录中的 MCP 发现记录发起完善接入时预填工作目录。 */
+  connectSeed?: { accessId: string; rootPath?: string };
   onConnectRequestHandled?: () => void;
 }
 
@@ -42,6 +45,63 @@ interface RoleDraft {
   skillIds: string[];
   knowledgeProfileIds: string[];
   updatePolicy: ProjectBindingUpdatePolicy;
+}
+
+interface ProjectConnectIssue {
+  title: string;
+  guidance: string;
+  detail: string;
+}
+
+function projectConnectIssue(error: unknown): ProjectConnectIssue {
+  const detail = error instanceof Error ? error.message : String(error);
+  if (/rootPath does not exist|rootPath is not a directory/i.test(detail)) {
+    return {
+      title: "项目根目录不可用",
+      guidance: "请核对绝对路径，确认目录仍在本机且当前用户可以读取，然后直接修改下方路径重试。",
+      detail
+    };
+  }
+  if (/descriptorPath must stay inside|descriptor.*stay inside/i.test(detail)) {
+    return {
+      title: "声明文件必须留在项目目录内",
+      guidance: "请填写项目根目录内的相对路径，例如 multi-agent.project.yaml。",
+      detail
+    };
+  }
+  if (/descriptor directory does not exist/i.test(detail)) {
+    return {
+      title: "声明文件所在目录不存在",
+      guidance: "请改用项目根目录下的 multi-agent.project.yaml，或先创建你填写的子目录。",
+      detail
+    };
+  }
+  if (/descriptor does not exist|ENOENT|no such file/i.test(detail)) {
+    return {
+      title: "项目声明或它引用的文件不存在",
+      guidance: "MCP 完善接入会补建缺失的最小声明；若已有声明引用了策略文件，请检查引用路径。",
+      detail
+    };
+  }
+  if (/version must be 1|roles must|YAML|must be an object|must not be empty/i.test(detail)) {
+    return {
+      title: "项目声明内容还不能使用",
+      guidance: "请按技术详情修正声明格式；已有文件只会被读取和校验，不会被 Workbench 覆盖。",
+      detail
+    };
+  }
+  if (/EACCES|EPERM|permission/i.test(detail)) {
+    return {
+      title: "没有权限读取或创建项目声明",
+      guidance: "请确认当前用户对项目目录有读写权限，再回来重试。",
+      detail
+    };
+  }
+  return {
+    title: "项目接入没有完成",
+    guidance: "输入内容仍然保留，可以修改后再次提交；展开技术详情可查看原始原因。",
+    detail
+  };
 }
 
 function bindingId(binding: SkillBinding): string {
@@ -105,14 +165,18 @@ function policyLabel(policy: ProjectBindingUpdatePolicy): string {
   return "兼容更新";
 }
 
-export function ProjectPage({ data, refresh, notify, initialProjectId, connectRequest = 0, onConnectRequestHandled }: PageProps) {
+export function ProjectPage({ data, refresh, notify, initialProjectId, connectRequest = 0, connectSeed, onConnectRequestHandled }: PageProps) {
   const daemonAvailable = useDaemonAvailable();
   // Lightweight page clock so a short-lived "completed" chip actually fades
   // after its dwell while someone stays on this page. Cleaned up on unmount.
   const [clock, setClock] = useState(() => Date.now());
+  const mcpConfigResetTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      if (mcpConfigResetTimer.current !== undefined) window.clearTimeout(mcpConfigResetTimer.current);
+    };
   }, []);
   const activeProjects = data.projects.filter((project) => project.status === "active");
   const passiveProjectAccesses = data.passiveProjectAccesses ?? [];
@@ -127,15 +191,17 @@ export function ProjectPage({ data, refresh, notify, initialProjectId, connectRe
   const selected = data.projects.find((project) => project.id === selectedId) ?? data.projects[0];
   const binding = data.projectBindings.find((candidate) => candidate.projectId === selected?.id);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [connectContext, setConnectContext] = useState("");
+  const [mcpConfigCopied, setMcpConfigCopied] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [invokeRoleId, setInvokeRoleId] = useState<string>();
   const [connectDraft, setConnectDraft] = useState({ rootPath: "", descriptorPath: "multi-agent.project.yaml" });
+  const [connectIssue, setConnectIssue] = useState<ProjectConnectIssue>();
+  const connectIssueRef = useRef<HTMLElement>(null);
   const [roleDrafts, setRoleDrafts] = useState<Record<string, RoleDraft>>({});
   const [saving, setSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const [invokeMessage, setInvokeMessage] = useState("请按项目验收契约检查当前改动，并给出可追溯的结论。");
   const [invokeResult, setInvokeResult] = useState("");
-  const [invoking, setInvoking] = useState(false);
   const origin = typeof window === "undefined" ? "http://127.0.0.1:4318" : window.location.origin;
   const activeKnowledgeProfileIds = useMemo(
     () => new Set((data.knowledgeProfiles ?? []).filter((profile) => profile.status === "active").map((profile) => profile.id)),
@@ -150,12 +216,44 @@ export function ProjectPage({ data, refresh, notify, initialProjectId, connectRe
     if (initialProjectId) setSelectedId(initialProjectId);
   }, [initialProjectId]);
   useEffect(() => {
+    if (!connectIssue) return;
+    const issue = connectIssueRef.current;
+    if (typeof issue?.scrollIntoView === "function") issue.scrollIntoView({ block: "nearest" });
+    issue?.focus();
+  }, [connectIssue]);
+  useEffect(() => {
     if (connectRequest > 0) {
-      setConnectDraft({ rootPath: "", descriptorPath: "multi-agent.project.yaml" });
+      setConnectDraft({ rootPath: connectSeed?.rootPath ?? "", descriptorPath: "multi-agent.project.yaml" });
+      setConnectContext(connectSeed?.accessId ?? "");
+      setConnectIssue(undefined);
       setConnectOpen(true);
       onConnectRequestHandled?.();
     }
-  }, [connectRequest, onConnectRequestHandled]);
+  }, [connectRequest, connectSeed?.accessId, connectSeed?.rootPath, onConnectRequestHandled]);
+
+  const openDescriptorConnect = (access?: PassiveProjectAccess) => {
+    setConnectDraft({ rootPath: access?.rootPath ?? "", descriptorPath: "multi-agent.project.yaml" });
+    setConnectContext(access?.id ?? "");
+    setConnectIssue(undefined);
+    setConnectOpen(true);
+  };
+
+  const mcpClientConfig = JSON.stringify({
+    command: "multi-agent-mcp",
+    args: ["--daemon-url", origin]
+  }, null, 2);
+
+  const copyMcpConfig = async () => {
+    try {
+      await navigator.clipboard.writeText(mcpClientConfig);
+      setMcpConfigCopied(true);
+      if (mcpConfigResetTimer.current !== undefined) window.clearTimeout(mcpConfigResetTimer.current);
+      mcpConfigResetTimer.current = window.setTimeout(() => setMcpConfigCopied(false), 2200);
+      notify("MCP 客户端配置已复制");
+    } catch {
+      notify("复制失败；请手动复制 MCP 配置", "error");
+    }
+  };
 
   const readiness = useMemo(() => selected?.roles.map((role) => {
     const draft = roleDrafts[role.id];
@@ -170,18 +268,25 @@ export function ProjectPage({ data, refresh, notify, initialProjectId, connectRe
 
   const connect = async (event: FormEvent) => {
     event.preventDefault();
+    setConnectIssue(undefined);
     setSaving(true);
     try {
+      const passiveAccess = connectContext
+        ? passiveProjectAccesses.find((access) => access.id === connectContext)
+        : undefined;
       const project = await api<Project>("/api/projects/connect", writeBody({
         rootPath: connectDraft.rootPath.trim(),
-        descriptorPath: connectDraft.descriptorPath.trim() || undefined
+        descriptorPath: connectDraft.descriptorPath.trim() || undefined,
+        createDescriptorIfMissing: Boolean(connectContext),
+        projectIdHint: passiveAccess?.projectKeys[0] || passiveAccess?.displayName,
+        projectNameHint: passiveAccess?.displayName
       }));
       setSelectedId(project.id);
       setConnectOpen(false);
       notify(`项目 ${project.name} 已接入；接下来分派角色即可`);
       await refresh();
     } catch (error) {
-      notify(error instanceof Error ? error.message : String(error), "error");
+      setConnectIssue(projectConnectIssue(error));
     } finally {
       setSaving(false);
     }
@@ -241,16 +346,17 @@ export function ProjectPage({ data, refresh, notify, initialProjectId, connectRe
     }
   };
 
-  const invoke = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!selected || !invokeRoleId) return;
-    setInvoking(true);
+  const invoke = async (draft: ComposerDraft): Promise<boolean> => {
+    if (!selected || !invokeRoleId) return false;
     setInvokeResult("");
     try {
       const result = await api<{ message: string; runId: string }>(
         `/api/projects/${selected.id}/roles/${invokeRoleId}/invoke`,
         {
-          ...writeBody({ message: invokeMessage }),
+          ...writeBody({
+            message: draft.message,
+            ...(draft.attachments.length > 0 ? { attachments: draft.attachments } : {})
+          }),
           headers: {
             "x-multi-agent-source": "workbench",
             "x-multi-agent-source-label": "项目接入调试台",
@@ -260,20 +366,33 @@ export function ProjectPage({ data, refresh, notify, initialProjectId, connectRe
       );
       setInvokeResult(`${result.message}\n\nRun: ${result.runId}`);
       notify(`${selected.roles.find((role) => role.id === invokeRoleId)?.displayName ?? invokeRoleId} 已完成交办`);
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setInvokeResult(message);
       notify(message, "error");
-    } finally {
-      setInvoking(false);
+      return false;
     }
   };
 
   return <div className="page-grid page-grid--projects">
+    <section className="mcp-onboarding-banner" aria-label="MCP 主接入方式">
+      <span className="mcp-onboarding-mark" aria-hidden="true">M</span>
+      <div className="mcp-onboarding-copy"><span>主接入方式 · MCP</span><strong>从其它本地仓库实际调用一次 MCP tool，项目就会自动出现在项目目录页</strong><p>仅配置客户端不会产生记录。Workbench 会保存调用证据；能获取工作目录时一并记录，历史缺目录条目可在这里补全。</p></div>
+      <pre role="group" aria-label="MCP 客户端配置">{mcpClientConfig}</pre>
+      <div className="mcp-onboarding-actions"><button type="button" className="button primary" onClick={() => void copyMcpConfig()}>{mcpConfigCopied ? "已复制" : "复制 MCP 配置"}</button><button type="button" className="text-button" disabled={!daemonAvailable} onClick={() => openDescriptorConnect()}>没有 MCP？读取声明</button></div>
+    </section>
     <aside className="record-list">
-      <header className="list-header"><h1>已接入项目</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => setConnectOpen(true)} aria-label="接入项目"><UtilityIcon name="add" /></button></header>
-      <div className="list-tools"><span className="project-list-note">声明需求，再分派员工</span><button className="text-button" disabled={!daemonAvailable} onClick={() => setConnectOpen(true)}>读取项目声明</button></div>
+      <header className="list-header"><h1>项目接入</h1><button className="square-action" disabled={!daemonAvailable} onClick={() => openDescriptorConnect()} aria-label="读取项目声明"><UtilityIcon name="add" /></button></header>
+      <div className="list-tools"><span className="project-list-note">MCP 自动发现为主</span><button className="text-button" disabled={!daemonAvailable} onClick={() => openDescriptorConnect()}>读取声明</button></div>
       <div className="record-scroll project-list">
+        {unlinkedPassiveAccesses.length > 0 && <div className="passive-project-heading is-primary"><strong>MCP 自动发现 · 待完善</strong><small>已经显示在同一项目目录页；完善后才可承接需求与配置角色。</small></div>}
+        {unlinkedPassiveAccesses.map((access) => <article className="project-card passive-project-card" key={access.id}>
+          <span className="project-card-mark passive-project-mark" aria-hidden="true">M</span>
+          <div><strong>{access.displayName}</strong><code>{access.rootPath ?? "未记录工作目录（历史调用）"}</code>{access.projectKeys.length > 0 && <small>项目标识 {access.projectKeys.join(" · ")}</small>}<small>首次 {formatTime(access.firstSeenAt)} · 最近 {formatTime(access.lastSeenAt)}</small><small>{access.requestCount} 次 Workbench 请求</small><button type="button" className="text-button passive-complete-button" disabled={!daemonAvailable} onClick={() => openDescriptorConnect(access)}>{access.rootPath ? "完善接入" : "补全路径并接入"}</button></div>
+          <span className="space-access-badge">{access.rootPath ? "待完善" : "缺根目录"}</span>
+        </article>)}
+        <div className="passive-project-heading formal-project-heading"><strong>正式项目</strong><small>已具备项目声明；active 项目可进入需求看板。</small></div>
         {data.projects.map((project) => {
           const projectBinding = data.projectBindings.find((candidate) => candidate.projectId === project.id);
           const passiveAccess = passiveAccessByProjectId.get(project.id);
@@ -289,24 +408,18 @@ export function ProjectPage({ data, refresh, notify, initialProjectId, connectRe
           </button>;
         })}
         {data.projects.length === 0 && <div className="mini-empty">尚未正式接入项目。项目只需一份很短的声明文件，不需要复制员工 Prompt。</div>}
-        {unlinkedPassiveAccesses.length > 0 && <div className="passive-project-heading"><strong>MCP 被动接入</strong><small>工具请求触发后自动留档；尚未建立角色任用关系。</small></div>}
-        {unlinkedPassiveAccesses.map((access) => <article className="project-card passive-project-card" key={access.id}>
-          <span className="project-card-mark passive-project-mark" aria-hidden="true">MCP</span>
-          <div><strong>{access.displayName}</strong><code>{access.rootPath ?? "未记录工作目录（历史调用）"}</code>{access.projectKeys.length > 0 && <small>项目标识 {access.projectKeys.join(" · ")}</small>}<small>首次 {formatTime(access.firstSeenAt)} · 最近 {formatTime(access.lastSeenAt)}</small><small>{access.requestCount} 次 Workbench 请求</small></div>
-          <Stamp status="active" label="被动" />
-        </article>)}
       </div>
-      <footer className="list-footer"><span>{activeProjects.length} 个正式接入 · {unlinkedPassiveAccesses.length} 个被动记录</span><span>DESCRIPTOR → BINDING</span></footer>
+      <footer className="list-footer"><span>{activeProjects.length} 个正式项目 · {unlinkedPassiveAccesses.length} 个 MCP 待完善</span><span>MCP → DESCRIPTOR</span></footer>
     </aside>
 
     <main className="detail-pane">
-      {!selected ? <EmptyState title="把第一个项目接入员工小镇" action={<button className="button primary" disabled={!daemonAvailable} onClick={() => setConnectOpen(true)}>读取项目声明</button>}>
-        {unlinkedPassiveAccesses.length > 0 && <>Workbench 已记录上方 MCP 被动接入；它只证明工具曾被触发，不会自动获得项目角色或权限。</>} 在项目根目录放一份 <code>multi-agent.project.yaml</code>，即可把被动记录升级为正式项目接入。
+      {!selected ? <EmptyState title="先从 MCP 发现项目" action={<button className="button primary" disabled={!daemonAvailable || unlinkedPassiveAccesses.length === 0} onClick={() => openDescriptorConnect(unlinkedPassiveAccesses[0])}>{unlinkedPassiveAccesses.length > 0 ? "完善第一个项目" : "等待 MCP 调用"}</button>}>
+        MCP 调用发现的项目会先进入目录供分类管理；在需要录入需求前，再用 <code>multi-agent.project.yaml</code> 完善为正式项目。
       </EmptyState> : <div className="dossier project-dossier">
         <header className="dossier-cover">
           <div className="file-index"><span>PROJECT CONNECTION RECORD</span><code>No. {selected.id.toUpperCase()}</code></div>
           <div className="dossier-title-row"><div className="workflow-mark project-mark" aria-hidden="true">接</div><div><h2>{selected.name}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div>
-          <div className="dossier-actions"><button className="button secondary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => { setConnectDraft({ rootPath: selected.rootPath, descriptorPath: selected.descriptorPath }); setConnectOpen(true); }}>重新读取声明</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档项目</button></div>
+          <div className="dossier-actions"><button className="button secondary" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => { setConnectContext(""); setConnectDraft({ rootPath: selected.rootPath, descriptorPath: selected.descriptorPath }); setConnectOpen(true); }}>重新读取声明</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档项目</button></div>
         </header>
 
         <DossierSection number="01" title="项目声明"><dl className="ledger project-ledger"><dt>项目范围</dt><dd>{selected.scope === "repository" ? "代码仓库" : "当前工作区"}</dd><dt>项目根目录</dt><dd><code>{selected.rootPath}</code></dd><dt>声明文件</dt><dd><code>{selected.descriptorPath}</code></dd><dt>接入器</dt><dd><code>{selected.connector.kind}</code></dd><dt>声明版本</dt><dd>v{selected.version} · {formatTime(selected.updatedAt)}</dd></dl></DossierSection>
@@ -400,8 +513,66 @@ export function ProjectPage({ data, refresh, notify, initialProjectId, connectRe
       </div>}
     </main>
 
-    {connectOpen && <Modal title={selected && connectDraft.rootPath ? "重新读取项目声明" : "接入项目"} eyebrow="DESCRIPTOR · NO PROMPT COPY" onClose={() => setConnectOpen(false)}><form className="modal-body compact-form" onSubmit={connect}><div className="project-connect-note"><strong>项目只提交一张“需求卡”。</strong><p>员工档案、完整 Skill 和 Provider 都留在 Workbench；声明文件只写项目 ID、角色槽位以及策略文件引用。</p></div><Field label="项目根目录"><input required disabled={!daemonAvailable} placeholder="/path/to/your-project" value={connectDraft.rootPath} onChange={(event) => setConnectDraft({ ...connectDraft, rootPath: event.target.value })} /></Field><Field label="项目声明文件" hint="相对路径会从项目根目录解析。"><input required disabled={!daemonAvailable} value={connectDraft.descriptorPath} onChange={(event) => setConnectDraft({ ...connectDraft, descriptorPath: event.target.value })} /></Field><div className="descriptor-mini-example"><span>声明文件只需类似：</span><pre>{`version: 1\nproject:\n  id: your-project\n  name: 项目名称\nroles:\n  tester:\n    requiredSkills: [browser-e2e-validation]\n    policyRef: docs/agents/tester.md`}</pre></div><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setConnectOpen(false)}>取消</button><button className="button primary" disabled={!daemonAvailable || saving}>{saving ? "读取中…" : "读取并接入"}</button></div></form></Modal>}
+    {connectOpen && <Modal
+      title={connectContext ? "完善 MCP 项目接入" : selected && connectDraft.rootPath ? "重新读取项目声明" : "读取项目声明"}
+      eyebrow={connectContext ? "MCP DISCOVERY → FORMAL PROJECT" : "DESCRIPTOR · FALLBACK"}
+      onClose={() => setConnectOpen(false)}
+    >
+      <form className="modal-body compact-form" onSubmit={connect}>
+        <div className="project-connect-note">
+          <strong>{connectContext ? "首次 MCP 调用只登记，不写入项目仓库。" : "声明文件是 MCP 之外的兜底方式。"}</strong>
+          <p>{connectContext ? "只有你在这里确认后，缺失的最小声明才会创建；已有声明只读取校验、绝不覆盖。接入成功后会沿用目录位置与收藏状态。" : "员工档案、完整 Skill 和 Provider 都留在 Workbench；这里仅读取项目身份、角色槽位和策略引用。"}</p>
+        </div>
+        {connectIssue && <section ref={connectIssueRef} className="project-connect-error" role="alert" aria-live="assertive" tabIndex={-1}>
+          <header><span>接入未完成</span><strong>{connectIssue.title}</strong></header>
+          <p>{connectIssue.guidance}</p>
+          <details><summary>查看技术详情</summary><code>{connectIssue.detail}</code></details>
+        </section>}
+        <Field
+          label="项目根目录"
+          hint={connectContext && !connectDraft.rootPath
+            ? "历史 MCP 调用没有目录证据，请手动补全真实的绝对路径。"
+            : connectContext
+              ? "确认后只可能新增声明文件；不会移动代码，也不会改写已有文件。"
+              : "只读取配置，不会移动或修改磁盘代码。"}
+        >
+          <input
+            required
+            disabled={!daemonAvailable || saving}
+            placeholder="/path/to/your-project"
+            value={connectDraft.rootPath}
+            onChange={(event) => { setConnectDraft({ ...connectDraft, rootPath: event.target.value }); setConnectIssue(undefined); }}
+          />
+        </Field>
+        <Field label="项目声明文件" hint={connectContext ? "相对项目根目录解析；缺失则创建最小声明，存在则只读取和校验。" : "相对项目根目录解析；文件必须已经存在。"}>
+          <input
+            required
+            disabled={!daemonAvailable || saving}
+            value={connectDraft.descriptorPath}
+            onChange={(event) => { setConnectDraft({ ...connectDraft, descriptorPath: event.target.value }); setConnectIssue(undefined); }}
+          />
+        </Field>
+        {connectContext && <dl className="project-connect-behavior" aria-label="MCP 接入写入规则">
+          <div><dt>MCP 首次调用</dt><dd>只登记发现证据</dd></div>
+          <div><dt>声明不存在</dt><dd>确认后原子创建</dd></div>
+          <div><dt>声明已存在</dt><dd>只校验，绝不覆盖</dd></div>
+        </dl>}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={() => setConnectOpen(false)}>取消</button>
+          <button className="button primary" disabled={!daemonAvailable || saving}>{saving ? (connectContext ? "正在生成 / 读取…" : "正在读取…") : connectContext ? "完善并接入" : "读取并接入"}</button>
+        </div>
+      </form>
+    </Modal>}
     {archiveOpen && selected && <Modal title="归档项目接入" eyebrow={`${selected.id} · 保留历史`} onClose={() => setArchiveOpen(false)}><div className="modal-body"><div className="danger-notice"><b>归档后停止新的项目角色调用。</b><p>项目声明版本、任用关系、员工档案和已有 Run 证据都会保留。</p></div><div className="modal-actions"><button className="button secondary" onClick={() => setArchiveOpen(false)}>取消</button><button className="button danger-filled" disabled={!daemonAvailable} onClick={() => void archive()}>确认归档</button></div></div></Modal>}
-    {invokeRoleId && selected && <Modal title={`交办给 ${selected.roles.find((role) => role.id === invokeRoleId)?.displayName ?? invokeRoleId}`} eyebrow={`${selected.id} · ${invokeRoleId}`} onClose={() => setInvokeRoleId(undefined)}><form className="modal-body compact-form" onSubmit={invoke}><Field label="任务"><textarea required rows={6} disabled={!daemonAvailable || invoking} value={invokeMessage} onChange={(event) => setInvokeMessage(event.target.value)} /></Field>{invokeResult && <ReadonlyEvidence label="本次返回" value={invokeResult} mono />}<div className="modal-actions"><button type="button" className="button secondary" onClick={() => setInvokeRoleId(undefined)}>关闭</button><button className="button primary" disabled={!daemonAvailable || invoking}>{invoking ? "执行中…" : "通过项目关系交办"}</button></div></form></Modal>}
+    {invokeRoleId && selected && <Modal title={`交办给 ${selected.roles.find((role) => role.id === invokeRoleId)?.displayName ?? invokeRoleId}`} eyebrow={`${selected.id} · ${invokeRoleId}`} onClose={() => setInvokeRoleId(undefined)}><div className="modal-body compact-form"><ConversationComposer
+      key={invokeRoleId}
+      ariaLabel="交办任务"
+      initialMessage="请按项目验收契约检查当前改动，并给出可追溯的结论。"
+      placeholder="写下要交办给这个项目角色的任务……"
+      disabled={!daemonAvailable}
+      submitLabel="通过项目关系交办"
+      sendingLabel="执行中…"
+      onSend={invoke}
+    />{invokeResult && <ReadonlyEvidence label="本次返回" value={invokeResult} mono />}<div className="modal-actions"><button type="button" className="button secondary" onClick={() => setInvokeRoleId(undefined)}>关闭</button></div></div></Modal>}
   </div>;
 }

@@ -1,0 +1,23 @@
+# Generated only after the user explicitly confirms "完善并接入".
+# Existing descriptors are never overwritten. Extend these project-owned role slots as needed.
+version: 1
+project:
+  id: starter-project
+  name: Starter Project
+  scope: repository
+  description: Project explicitly connected from MCP discovery.
+connector:
+  kind: mcp
+  config:
+    discovery: passive
+roles:
+  project-member:
+    displayName: 项目协作
+    description: 在当前项目范围内完成已经确认的研发工作。
+    instructions: |
+      Work only within this project's repository and the confirmed task scope.
+      Keep changes reviewable, preserve unrelated work, and report validation evidence.
+    requiredSkills: []
+    optionalSkills: []
+    permissions:
+      write: project

@@ -27,7 +27,7 @@
       "specialty": "react-typescript-workbench-ui",
       "seniority": "senior",
       "language": "zh-CN",
-      "providerPersona": "claude-kimi",
+      "providerPersona": "claude-day1",
       "avatarCharacter": "LinaBell wearing a dusty-rose skirt"
     }
   },
@@ -36,7 +36,7 @@
   "requestPrompt": "完成当前前端开发任务。先基于代码与设计证据确认改动范围，再实施组件、样式、状态、数据接入或测试变更；最后实际运行相关检查。message 汇总结果与关键取舍，changedFiles 列出实际修改文件，validation 只记录真实执行的验证，risks 记录剩余风险；最终响应必须严格符合输出 JSON Schema。",
   "skills": [],
   "knowledgeProfileIds": ["workbench-engineering-knowledge"],
-  "providerId": "claude-kimi",
+  "providerId": "claude-day1",
   "outputSchema": {
     "type": "object",
     "additionalProperties": false,

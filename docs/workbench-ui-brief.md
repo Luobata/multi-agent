@@ -1,6 +1,6 @@
 # Workbench UI Functional Brief
 
-This brief intentionally contains product constraints only. Visual direction, layout, component composition, typography, color, motion, and interaction details must be designed by the configured `claude-kimi` designer.
+This brief intentionally contains product constraints only. Visual direction, layout, component composition, typography, color, motion, and interaction details must be designed by the configured `claude-day1` designer.
 
 ## Product
 

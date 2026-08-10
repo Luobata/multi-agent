@@ -19,6 +19,27 @@ afterEach(() => {
 });
 
 describe("Local Agent Workbench", () => {
+  it("keeps passive MCP discovery read-only and scaffolds only after explicit connection", async () => {
+    const dataRoot = temporaryRoot();
+    const externalRoot = temporaryRoot();
+    const descriptorPath = path.join(externalRoot, "multi-agent.project.yaml");
+    const service = await WorkbenchService.open({ dataRoot });
+
+    await service.recordPassiveProjectAccess({ rootPath: externalRoot, projectKey: "vibe-docing" });
+    expect(fs.existsSync(descriptorPath)).toBe(false);
+
+    const project = await service.connectProject({
+      rootPath: externalRoot,
+      createDescriptorIfMissing: true,
+      projectIdHint: "vibe-docing",
+      projectNameHint: "Vibe Docing"
+    });
+
+    expect(fs.existsSync(descriptorPath)).toBe(true);
+    expect(project).toMatchObject({ id: "vibe-docing", name: "Vibe Docing", connector: { kind: "mcp" } });
+    expect(service.listPassiveProjectAccesses()[0]).toMatchObject({ linkedProjectId: "vibe-docing" });
+  });
+
   it("persists and merges MCP project keys with their observed root", async () => {
     const dataRoot = temporaryRoot();
     const externalRoot = temporaryRoot();
@@ -399,7 +420,7 @@ describe("Local Agent Workbench", () => {
     await service.invokeEmployee(
       employee.id,
       { message: "single task" },
-      { kind: "mcp", project: "demo-project" }
+      { kind: "mcp", project: "demo-project", taskId: "req-102" }
     );
 
     await service.createWorkflow({
@@ -409,13 +430,16 @@ describe("Local Agent Workbench", () => {
     });
     await service.runWorkbenchWorkflow("graph-flow", {}, { kind: "workbench" });
 
-    const runs = await service.listRuns() as Array<{ category: string; project?: string; trigger?: string; workflow: string }>;
+    const runs = await service.listRuns() as Array<{ id: string; category: string; project?: string; taskId?: string; trigger?: string; workflow: string }>;
     const single = runs.find((run) => run.workflow.startsWith("direct-"));
     const graph = runs.find((run) => run.workflow === "graph-flow");
 
     expect(single?.category).toBe("single");
     expect(single?.project).toBe("demo-project");
+    expect(single?.taskId).toBe("req-102");
     expect(single?.trigger).toBe("mcp");
+    const singleDetail = await service.getRun(single!.id) as { taskId?: string; project?: string };
+    expect(singleDetail).toMatchObject({ taskId: "req-102", project: "demo-project" });
     expect(graph?.category).toBe("graph");
     expect(graph?.trigger).toBe("workbench");
   });

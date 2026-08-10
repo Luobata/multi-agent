@@ -1,4 +1,5 @@
 import type {
+  HumanDecisionRiskCategory,
   JsonObject,
   JsonValue,
   ProviderDefinition,
@@ -362,9 +363,23 @@ export interface EmployeeSessionMessage {
   role: "user" | "employee" | "system";
   content: string;
   at: string;
+  /** Stable image metadata only. Binary/base64 payloads and filesystem paths are never persisted in state.json. */
+  attachments?: ConversationImageAttachmentMetadata[];
+  /** Frozen external-document metadata. Document bodies and filesystem paths live in the conversation evidence store. */
+  documents?: ConversationDocumentEvidenceMetadata[];
+  /** Stable key used by deterministic background writers to avoid duplicate progress/delivery messages. */
+  dedupeKey?: string;
   runId?: string;
   runDir?: string;
   output?: JsonValue;
+}
+
+export interface SupervisorSessionContext {
+  architecture: "supervisor";
+  invocationId: string;
+  runId: string;
+  workflowId: string;
+  workflowVersion: number;
 }
 
 export interface EmployeeSession {
@@ -380,6 +395,8 @@ export interface EmployeeSession {
   title: string;
   status: "active" | "closed";
   context?: JsonObject;
+  /** Present only for the durable leader conversation created by an asynchronous Supervisor run. */
+  supervisor?: SupervisorSessionContext;
   messages: EmployeeSessionMessage[];
   createdAt: string;
   updatedAt: string;
@@ -391,6 +408,8 @@ export interface InvocationSource {
   kind: InvocationSourceKind;
   label?: string;
   project?: string;
+  /** The project the conversation is about when a compatible host role is reused. */
+  targetProject?: string;
   projectRole?: string;
   projectBindingVersion?: number;
   caller?: string;
@@ -555,7 +574,14 @@ export type EntrancePolicyDispatchResult =
       dispatch: { kind: "invocation-started"; receipt: InvocationStartResult };
     };
 
-export type InvocationStatus = "queued" | "running" | "completed" | "blocked" | "failed" | "cancelled";
+export type InvocationStatus =
+  | "queued"
+  | "running"
+  | "awaiting-human-decision"
+  | "completed"
+  | "blocked"
+  | "failed"
+  | "cancelled";
 export type WorkInstanceStatus =
   | "queued"
   | "waiting"
@@ -571,6 +597,47 @@ export interface ActivityTransition<TStatus extends string> {
   status: TStatus;
   phase: string;
   message?: string;
+}
+
+export type HumanDecisionRequestStatus = "pending" | "approved" | "rejected" | "voided";
+
+/** Durable control-plane record pinned to the exact Supervisor decision that created it. */
+export interface HumanDecisionRequest {
+  id: string;
+  idempotencyKey: string;
+  invocationId: string;
+  runId: string;
+  workflowId: string;
+  workflowVersion: number;
+  supervisorNodeId: string;
+  round: number;
+  riskCategory: HumanDecisionRiskCategory;
+  summary: string;
+  proposedAction: JsonObject;
+  status: HumanDecisionRequestStatus;
+  decidedBy?: string;
+  comment?: string;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt?: string;
+}
+
+export interface HumanDecisionRequestCreateInput {
+  invocationId: string;
+  runId: string;
+  workflowId: string;
+  workflowVersion: number;
+  supervisorNodeId: string;
+  round: number;
+  riskCategory: HumanDecisionRiskCategory;
+  summary: string;
+  proposedAction: JsonObject;
+}
+
+export interface HumanDecisionRequestDecisionInput {
+  decision: "approve" | "reject";
+  decidedBy: string;
+  comment?: string;
 }
 
 /** One addressable request entering the workbench through HTTP, MCP, A2A, or its local debug desk. */
@@ -640,11 +707,24 @@ export interface ActivitySnapshot {
 export interface InvocationStartResult {
   invocation: InvocationRecord;
   runId: string;
+  /** Only Supervisor workflows create a durable leader conversation. Graph workflows never set this. */
+  leaderSessionId?: string;
+  monitor: WorkflowMonitorContract;
+}
+
+export interface WorkflowMonitorContract {
+  mode: "long-poll";
+  tool: "wait_workflow_progress";
+  initialCursor: string;
+  defaultTimeoutMs: number;
+  maxTimeoutMs: number;
+  instructions: string;
 }
 
 export interface InvocationDetail {
   invocation: InvocationRecord;
   instances: WorkInstanceRecord[];
+  humanDecisionRequests?: HumanDecisionRequest[];
   run?: unknown;
 }
 
@@ -774,6 +854,7 @@ export interface WorkbenchState {
   passiveProjectAccesses: Record<string, PassiveProjectAccessRecord>;
   invocations: Record<string, InvocationRecord>;
   workInstances: Record<string, WorkInstanceRecord>;
+  humanDecisionRequests: Record<string, HumanDecisionRequest>;
 }
 
 export interface ProjectCreateInput {
@@ -790,6 +871,11 @@ export interface ProjectCreateInput {
 export interface ProjectConnectInput {
   rootPath: string;
   descriptorPath?: string;
+  /** Explicit control-plane consent to scaffold a missing descriptor. Passive MCP discovery never sets this. */
+  createDescriptorIfMissing?: boolean;
+  /** Passive MCP evidence used only to seed a valid starter descriptor. */
+  projectIdHint?: string;
+  projectNameHint?: string;
 }
 
 export interface ProjectRoleBindingInput {
@@ -970,6 +1056,42 @@ export interface EmployeeInvocationInput {
   message: string;
   sessionId?: string;
   context?: JsonObject;
+  /** Base64-encoded image attachments. Arbitrary files and data URLs are not accepted. */
+  attachments?: ConversationImageAttachmentInput[];
+}
+
+export type ConversationImageMediaType = "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+
+export interface ConversationImageAttachmentInput {
+  name: string;
+  mediaType: ConversationImageMediaType;
+  base64: string;
+}
+
+export interface ConversationImageAttachmentMetadata {
+  id: string;
+  kind: "image";
+  name: string;
+  mediaType: ConversationImageMediaType;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface ConversationDocumentEvidenceMetadata {
+  id: string;
+  kind: "lark-document";
+  url: string;
+  status: "available" | "failed";
+  fetchedAt: string;
+  documentId?: string;
+  revisionId?: string;
+  contentBytes?: number;
+  sha256?: string;
+  error?: {
+    code: string;
+    message: string;
+    action: string;
+  };
 }
 
 export interface EmployeeInvocationResult {

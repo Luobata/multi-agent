@@ -268,7 +268,7 @@ describe("App navigation freshness", () => {
     expect(FakeEventSource.urls).toEqual(["/api/activity/stream"]);
     const alert = container.querySelector("[role='alert']");
     expect(alert?.textContent).toContain("连接中断，请检查本地核心");
-    const retry = Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "重试连接");
+    const retry = Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "重新同步");
     expect(retry).toBeDefined();
 
     click(retry as HTMLButtonElement);

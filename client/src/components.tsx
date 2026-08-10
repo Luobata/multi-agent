@@ -418,6 +418,9 @@ export function Modal({ title, eyebrow, children, onClose, wide = false }: Props
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (!dialog.open) dialog.showModal();
     const frame = window.requestAnimationFrame(() => {
+      // An async validation state may already have focused its in-dialog alert.
+      // Never steal that focus just because the modal's initial frame ran later.
+      if (document.activeElement instanceof HTMLElement && dialog.contains(document.activeElement)) return;
       const first = dialog.querySelector<HTMLElement>("input:not([disabled]), textarea:not([disabled]), [role='combobox']:not([disabled]), select:not([disabled]), .command-list button:not([disabled]), button:not(.icon-button):not([disabled])");
       (first ?? dialog.querySelector<HTMLElement>(".icon-button"))?.focus();
     });

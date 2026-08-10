@@ -94,3 +94,5 @@ npm run cli -- workbench entrance-policy dispatch default-task-entrance-policy d
 ```
 
 HTTP 与 MCP 共用相同的 TypeScript 评估和分发实现；协议层只负责传输，不复制路由逻辑。
+
+当 `dispatch` 返回 `kind=invocation-started` 时，Graph 与 Supervisor 都带有同一套 `monitor` 长轮询契约；宿主应立即循环 `wait_workflow_progress`，而不是在一次进度快照后结束当前回合。只有 `leader` 的 Supervisor 路径额外返回 `leaderSessionId`，并允许终态后通过 `continue_workflow_conversation` 继续领队对话；Graph specialist 路径不会创建领队 Session。

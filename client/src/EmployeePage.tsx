@@ -42,6 +42,11 @@ import { EmployeeKnowledgeGrantModal } from "./employeeKnowledgeGrant";
 import { isProjectEmployee, isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
 import { EmployeeConfigurationDraftModal } from "./EmployeeConfigurationDraftModal";
 import { EffectiveProfileView } from "./EffectiveProfileView";
+import {
+  ConversationComposer,
+  ConversationMessageEvidence,
+  type ComposerDraft
+} from "./ConversationComposer";
 
 interface PageProps {
   data: Bootstrap;
@@ -482,8 +487,6 @@ function DirectDesk({ employee, sessions, refresh, notify, onContext }: {
   onContext: (sessionId?: string) => void;
 }) {
   const [sessionId, setSessionId] = useState(sessions[0]?.id ?? "");
-  const [message, setMessage] = useState("");
-  const [running, setRunning] = useState(false);
   const daemonAvailable = useDaemonAvailable();
   useEffect(() => {
     setSessionId(sessions[0]?.id ?? "");
@@ -493,23 +496,23 @@ function DirectDesk({ employee, sessions, refresh, notify, onContext }: {
   }, [sessions, sessionId]);
   const session = sessions.find((candidate) => candidate.id === sessionId);
 
-  const invoke = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!message.trim()) return;
-    setRunning(true);
+  const send = async (draft: ComposerDraft): Promise<boolean> => {
     try {
       const result = await api<{ session: Session; runId: string; status: string }>(`/api/employees/${employee.id}/invoke`, {
-        ...writeBody({ message, sessionId: sessionId || undefined }),
+        ...writeBody({
+          message: draft.message,
+          sessionId: sessionId || undefined,
+          ...(draft.attachments.length > 0 ? { attachments: draft.attachments } : {})
+        }),
         headers: { "x-multi-agent-source": "workbench", "x-multi-agent-source-label": "直接交办调试台" }
       });
       setSessionId(result.session.id);
-      setMessage("");
       notify(result.status === "blocked" ? "请求完成，员工给出业务阻塞结论" : `工单已完成 · ${result.runId}`);
       await refresh();
+      return true;
     } catch (error) {
       notify(error instanceof Error ? error.message : String(error), "error");
-    } finally {
-      setRunning(false);
+      return false;
     }
   };
 
@@ -519,14 +522,19 @@ function DirectDesk({ employee, sessions, refresh, notify, onContext }: {
       {!session?.messages.length ? <div className="transcript-empty"><span>工单尚未填写</span><p>提交第一项请求后，原始请求、处理结果与 Run 编号会留存在这里。</p></div> : session.messages.map((item) => <article className={`transcript-row transcript-row--${item.role}`} key={item.id}>
         <div className="transcript-meta"><span>{item.role === "user" ? "请求" : item.role === "employee" ? "处理结果" : "系统记录"}</span><time>{formatTime(item.at)}</time>{item.runId && <code>{item.runId}</code>}</div>
         <p>{item.content}</p>
+        <ConversationMessageEvidence attachments={item.attachments} documents={item.documents} />
       </article>)}
     </div>
-    <form className="composer" onSubmit={invoke}>
-      <textarea rows={3} disabled={!daemonAvailable} value={message} onChange={(e) => setMessage(e.target.value)} onKeyDown={(event) => {
-        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") event.currentTarget.form?.requestSubmit();
-      }} placeholder="写下要交办的事项……" aria-label="交办事项" />
-      <div className="composer-footer"><span>{daemonAvailable ? "⌘ / Ctrl + Enter" : "服务离线，仅可查阅历史"}</span><button className="button primary" disabled={!daemonAvailable || running || !message.trim()}>{running ? "执行中…" : "提交请求"}</button></div>
-    </form>
+    <ConversationComposer
+      key={employee.id}
+      ariaLabel="交办事项"
+      placeholder="写下要交办的事项……"
+      disabled={!daemonAvailable}
+      submitLabel="提交请求"
+      sendingLabel="执行中…"
+      hint="⌘ / Ctrl + Enter"
+      onSend={send}
+    />
   </div>;
 }
 

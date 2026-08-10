@@ -27,7 +27,7 @@ export function supervisorDecisionSchema(
   dagNodeIds?: string[]
 ): JsonObject {
   const dagMode = dagNodeIds !== undefined;
-  const actions = ["delegate", ...(gateIds.length > 0 ? ["satisfy-gate"] : []), "finish"];
+  const actions = ["delegate", "request-human-decision", ...(gateIds.length > 0 ? ["satisfy-gate"] : []), "finish"];
   // A single root object with an `action` discriminator. Structured-output APIs reject a
   // root-level `oneOf`/`anyOf` with 400 before processing, so the union is flattened here and
   // per-action required fields are enforced downstream in supervisor.ts `decision()`.
@@ -38,6 +38,9 @@ export function supervisorDecisionSchema(
     properties: {
       action: { enum: actions },
       summary: { type: "string" },
+      riskCategory: {
+        enum: ["dependency-install", "data-migration", "scope-expansion", "irreversible-other"]
+      },
       assignments: {
         type: "array",
         minItems: 1,
@@ -69,6 +72,13 @@ export function supervisorDecisionSchema(
     // (and triggers the runtime repair attempt) instead of silently passing the flat object.
     allOf: [
       { if: { properties: { action: { const: "delegate" } } }, then: { required: ["assignments"] } },
+      {
+        if: { properties: { action: { const: "request-human-decision" } } },
+        then: {
+          required: ["riskCategory", "summary", "assignments"],
+          properties: { summary: { type: "string", maxLength: 4000 } }
+        }
+      },
       ...(gateIds.length > 0
         ? [{ if: { properties: { action: { const: "satisfy-gate" } } }, then: { required: ["gateId", "summary", "evidence"] } }]
         : []),
@@ -164,7 +174,7 @@ function requestTemplateFor(
     const decisionContract = workflow.flow.dag
       ? "In DAG mode every delegate assignment must name its declared nodeId and matching roleId; delegate only ready nodes whose dependencies passed."
       : "";
-    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself. ${sequencingRules}\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\n${dagSection}Management policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nMember role slots with their profiles (responsibilities, skill summaries, capability hints) — pick the best-fit member per task:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, and Gate ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-decision validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nReturn exactly one JSON decision matching the supplied output schema. ${decisionContract} Use action \"delegate\" with one or more assignments, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
+    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself. ${sequencingRules}\n\nBefore delegating dependency installation, data migration, scope expansion, or another irreversible action, use action \"request-human-decision\" with the exact proposed assignments, a riskCategory, and a concise summary. The runtime will pause before scheduling those assignments. After rejection, use the human comment in the prior ledger to replan; never repeat the rejected action unchanged.\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\n${dagSection}Management policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nMember role slots with their profiles (responsibilities, skill summaries, capability hints) — pick the best-fit member per task:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, Gate, and human-decision ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-decision validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nReturn exactly one JSON decision matching the supplied output schema. ${decisionContract} Use action \"delegate\" with one or more assignments, \"request-human-decision\" before any high-risk assignment, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
   }
   return `${employee.requestPrompt.trim()}\n\n## Delegation from the workflow supervisor\n\nYour workflow-local role slot:\n{{node.with.__delegatedRoleId}}\n\nDelegated task:\n{{node.with.__delegatedTask}}\n\nRequired capabilities:\n{{node.with.__requiredCapabilities}}\n\nWork kind and change set:\n{{node.with.__workKind}} / {{node.with.__changeSet}}\n\nGate execution request, when present:\n{{node.with.__gateExecution}}\n\nDelegated context:\n{{node.with.__delegatedContext}}\n\nSupervisor summary:\n{{node.with.__supervisorSummary}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nReturn the requested specialist result using your normal output contract.\n`;
 }
@@ -323,7 +333,8 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
           allowedRoleIds: [...supervisorPolicy!.allowedRoleIds],
           limits: { ...supervisorPolicy!.limits },
           failure: { ...supervisorPolicy!.failure },
-          completion: { ...supervisorPolicy!.completion }
+          completion: { ...supervisorPolicy!.completion },
+          ...(supervisorPolicy!.execution ? { execution: { ...supervisorPolicy!.execution } } : {})
         },
         members: supervisorWorkflow!.members.map((member) => {
           const memberEmployee = options.employees.get(supervisorMemberRuntimeRoleId(member.roleId))!;

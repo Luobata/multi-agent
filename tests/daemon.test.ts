@@ -80,6 +80,38 @@ async function fixture(options: { knowledgeUrlFetcher?: { fetch: (url: string) =
 }
 
 describe("workbench daemon", () => {
+  it("hosts a target project's conversation through another compatible assigned project role", async () => {
+    const { base, service } = await fixture();
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-conversation-target-"));
+    directories.push(targetRoot);
+    await service.createProject({
+      id: "target-without-intake-role",
+      name: "Target Without Intake Role",
+      rootPath: targetRoot,
+      descriptorPath: path.join(targetRoot, "multi-agent.project.yaml"),
+      roles: [{ id: "developer", displayName: "Developer" }]
+    });
+
+    const response = await fetch(`${base}/api/projects/target-without-intake-role/conversations/reviewer/invoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Please clarify this vague request" })
+    });
+    expect(response.status).toBe(200);
+    const payload = await response.json() as { data: { session: { assignment?: { projectId: string; roleId: string } } } };
+    expect(payload.data.session.assignment).toMatchObject({ projectId: "desk-project", roleId: "reviewer" });
+
+    const [invocation] = service.getActivitySnapshot().invocations;
+    expect(invocation?.source).toMatchObject({
+      project: "desk-project",
+      targetProject: "target-without-intake-role",
+      projectRole: "reviewer"
+    });
+    const detail = await service.getInvocationDetail(invocation!.id);
+    expect(JSON.stringify(detail.run)).toContain("Target Without Intake Role");
+    expect(JSON.stringify(detail.run)).toContain("Please clarify this vague request");
+  });
+
   it("preserves Unicode invocation metadata from encoded and legacy HTTP headers", async () => {
     const { base } = await fixture();
     const invoke = (label: string) => fetch(`${base}/api/employees/desk-agent/invoke`, {
@@ -155,7 +187,18 @@ describe("workbench daemon", () => {
       body: JSON.stringify({ message: "Coordinate the desk" })
     });
     expect(start.status).toBe(202);
-    const receipt = await start.json() as { data: { invocation: { id: string } } };
+    const receipt = await start.json() as {
+      data: {
+        invocation: { id: string };
+        leaderSessionId: string;
+        monitor: { initialCursor: string; waitUrl: string; maxTimeoutMs: number };
+      };
+    };
+    expect(receipt.data.leaderSessionId).toBeTruthy();
+    expect(receipt.data.monitor).toMatchObject({
+      waitUrl: `/api/invocations/${receipt.data.invocation.id}/progress/wait`,
+      maxTimeoutMs: 55_000
+    });
     const completed = await service.waitForInvocation(receipt.data.invocation.id);
     expect(completed.invocation.status).toBe("completed");
     expect(completed.instances).toEqual([expect.objectContaining({ kind: "supervisor", nodeId: "supervisor-r1" })]);
@@ -163,6 +206,26 @@ describe("workbench daemon", () => {
       architecture: "supervisor",
       status: "passed",
       output: { rounds: 1, delegations: 0 }
+    });
+    const waited = await fetch(
+      `${base}${receipt.data.monitor.waitUrl}?cursor=${encodeURIComponent(receipt.data.monitor.initialCursor)}&timeoutMs=1000`
+    ).then((response) => response.json()) as {
+      data: { terminal: boolean; changed: boolean; leaderSessionId: string; progressReport: string };
+    };
+    expect(waited.data).toMatchObject({
+      terminal: true,
+      changed: true,
+      leaderSessionId: receipt.data.leaderSessionId
+    });
+    expect(waited.data.progressReport).toContain("工作流已完成");
+    const continued = await fetch(`${base}/api/workflow-conversations/continue`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ leaderSessionId: receipt.data.leaderSessionId, message: "继续说明交付" })
+    });
+    expect(continued.status).toBe(200);
+    expect(await continued.json()).toMatchObject({
+      data: { session: { id: receipt.data.leaderSessionId, status: "active" } }
     });
 
     const bootstrap = await fetch(`${base}/api/bootstrap`).then((response) => response.json()) as {
@@ -735,10 +798,19 @@ describe("workbench daemon", () => {
     });
     expect(response.status).toBe(202);
     const receipt = await response.json() as {
-      data: { invocation: { id: string; runId: string }; runId: string; statusUrl: string; streamUrl: string };
+      data: {
+        invocation: { id: string; runId: string };
+        runId: string;
+        leaderSessionId?: string;
+        monitor: { waitUrl: string };
+        statusUrl: string;
+        streamUrl: string;
+      };
     };
     expect(receipt.data.runId).toBe(receipt.data.invocation.runId);
     expect(receipt.data.statusUrl).toBe(`/api/invocations/${receipt.data.invocation.id}`);
+    expect(receipt.data.leaderSessionId).toBeUndefined();
+    expect(receipt.data.monitor.waitUrl).toBe(`/api/invocations/${receipt.data.invocation.id}/progress/wait`);
     expect(receipt.data.streamUrl).toBe("/api/activity/stream");
 
     await service.waitForInvocation(receipt.data.invocation.id);

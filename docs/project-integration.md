@@ -19,6 +19,8 @@ Workbench 启动时也会从持久化的历史 MCP Invocation 安全回填 `sour
 
 被动记录只证明某个本地目录或项目标识通过 MCP 接触过 Workbench，不会自动创建 `Project Descriptor`、`ProjectBinding`，也不会授予项目角色、Skill 或写权限。正式项目接入后，控制面会按相同根目录或相同项目标识动态关联被动记录；历史触发证据仍然保留。仅配置但从未触发 MCP tool 时不会产生记录。
 
+用户在控制面明确点击“完善并接入”时，Workbench 才会检查项目根目录：若声明缺失，会在项目内原子创建一份最小 `multi-agent.project.yaml`；若文件已经存在，则只读取和校验，绝不覆盖。这个显式写入动作与首次 MCP 工具调用的被动发现严格分开。历史调用没有 `rootPath` 时，必须先人工补全真实目录，才允许创建声明。
+
 当该 MCP 客户端实际调用 Employee、Workflow、Entrance Policy 或 Publication 时，daemon 会先校验这个绝对路径真实存在且为目录，再把它作为 Provider 的工作目录传入；materialized manifest 与 Run Store 仍留在 Workbench 数据目录。目录上下文不等于授权，最终可用工具、写入范围和沙箱能力仍由 Employee 与 Provider 配置控制。无效目录会在创建长时间 Run 前直接失败，避免员工落到生成目录或只读快照中反复阻塞。
 
 ## 最小项目声明
@@ -102,7 +104,7 @@ MCP 对话使用：
 - `templates/workbench/interaction-state-completeness.skill.json`
 - `templates/workbench/xiaomixiang-tester.employee.json`
 
-示例把产品、设计和测试三个项目角色分别关联到小米汪、小狐和小米象。设计角色启用 `hallmark` 与 `interaction-state-completeness`，后者负责展开态、浮层边界和键盘路径等容易被静态稿遗漏的细节；其他项目风格 Skill 仍不会被自动带入。测试角色启用 `browser-e2e-validation`。三个角色分别追加产品、设计和质量 Knowledge Profile；可执行种子见 [`templates/workbench/knowledge/`](../templates/workbench/knowledge/README.md)。
+示例把产品、设计和测试三个项目角色分别关联到小米汪、小狐狐和小米象。设计角色启用 `hallmark` 与 `interaction-state-completeness`，后者负责展开态、浮层边界和键盘路径等容易被静态稿遗漏的细节；其他项目风格 Skill 仍不会被自动带入。测试角色启用 `browser-e2e-validation`。三个角色分别追加产品、设计和质量 Knowledge Profile；可执行种子见 [`templates/workbench/knowledge/`](../templates/workbench/knowledge/README.md)。
 
 ## 当前仓库的全部员工接入
 
@@ -111,6 +113,7 @@ MCP 对话使用：
 | 项目角色 | 当前员工 |
 | --- | --- |
 | `product-manager` | `xiaomiwang-product-manager` |
+| `requirement-steward` | `xiaomiwang-product-manager` |
 | `product-designer` | `lin-mo-product-designer` |
 | `frontend-developer` | `mihuhu-frontend-engineer` |
 | `backend-developer` | `huotuizhu-product-manager` |
@@ -118,6 +121,7 @@ MCP 对话使用：
 | `test-engineer` | `xiaomixiang-tester` |
 | `knowledge-steward` | `local-agent-workbench-knowledge-steward`（项目内部） |
 | `configuration-steward` | `local-agent-workbench-configuration-steward`（项目内部） |
+| `gate-steward` | `local-agent-workbench-gate-steward`（项目内部） |
 
 ```bash
 npm run cli -- workbench employee create templates/workbench/mihuhu-frontend-engineer.employee.json

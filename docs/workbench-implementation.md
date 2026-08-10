@@ -107,7 +107,7 @@ Provider Adapter 由可信 TypeScript 代码注册；Provider 实例由 state/AP
 }
 ```
 
-`timeoutMs` 是软时限：越过后 Work Instance 显示为长任务，但有 stdout/stderr 进展时继续执行。`idleTimeoutMs` 才表示持续无输出多久后按疑似卡死终止；`hardTimeoutMs` 是防止无限循环的绝对安全上限。省略后两项时，空闲时限沿用 `timeoutMs`，硬上限取软时限的四倍且至少一小时。
+`timeoutMs` 是软时限：越过后 Work Instance 显示为长任务，但有 stdout/stderr 进展时继续执行。`idleTimeoutMs` 才表示持续无输出多久后按疑似卡死终止；省略时沿用 `timeoutMs`。`hardTimeoutMs` 是可选的绝对安全上限，只有显式配置才生效；默认不限制总时长。静默型 CLI 应切换为流式事件输出，以真实思考/工具进度续租 idle timeout。
 
 Employee identity 是结构化字段，不是一段不可拆 prompt：
 

@@ -1,6 +1,14 @@
 import { Ajv, type ErrorObject } from "ajv";
 import { ManifestValidationError } from "../core/errors.js";
-import type { ExecutionPlan, ExecutionPlanNode, JsonObject, JsonValue, LoadedManifest, NodeRunResult } from "../core/types.js";
+import type {
+  ExecutionPlan,
+  ExecutionPlanNode,
+  HumanDecisionRiskCategory,
+  JsonObject,
+  JsonValue,
+  LoadedManifest,
+  NodeRunResult
+} from "../core/types.js";
 import type {
   ArchitectureAdapter,
   ArchitectureExecutionContext,
@@ -35,6 +43,9 @@ interface SupervisorPolicyConfig {
   completion: {
     requireDelegation: boolean;
     requireAllDelegationsSuccessful: boolean;
+  };
+  execution?: {
+    isolation?: "worktree" | "none";
   };
 }
 
@@ -103,6 +114,12 @@ type SupervisorDecision =
       gateId: string;
       summary: string;
       evidence: JsonValue;
+    }
+  | {
+      action: "request-human-decision";
+      riskCategory: HumanDecisionRiskCategory;
+      summary: string;
+      assignments: SupervisorAssignment[];
     }
   | {
       action: "finish";
@@ -252,6 +269,13 @@ const supervisorConfigSchema = {
           properties: {
             requireDelegation: { type: "boolean" },
             requireAllDelegationsSuccessful: { type: "boolean" }
+          }
+        },
+        execution: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            isolation: { enum: ["worktree", "none"] }
           }
         }
       }
@@ -417,6 +441,34 @@ function flowIssues(workflowId: string, flow: SupervisorFlowConfig): string[] {
   return issues;
 }
 
+function strictWorktreeFlowIssues(workflowId: string, value: SupervisorWorkflowConfig): string[] {
+  if (value.policy.execution?.isolation !== "worktree") return [];
+  const issues: string[] = [];
+  const qualityTest = value.flow.gates.find((gate) => (
+    gate.requiredCapability === "quality.test"
+    && gate.mode === "before-completion"
+    && gate.required
+    && gate.validatorId !== "none"
+  ));
+  if (!qualityTest) {
+    issues.push(
+      `workflow ${workflowId} uses worktree isolation and requires a before-completion required quality.test gate with real e2e validation`
+    );
+  }
+  const qualityAudit = value.flow.gates.find((gate) => (
+    gate.requiredCapability === "quality.audit"
+    && gate.mode === "before-completion"
+    && gate.required
+    && gate.fallback === "block"
+  ));
+  if (!qualityAudit) {
+    issues.push(
+      `workflow ${workflowId} uses worktree isolation and requires a before-completion required quality.audit gate with fallback=block`
+    );
+  }
+  return issues;
+}
+
 function validateSupervisor(context: ArchitectureValidationContext): string[] {
   const issues = shapeIssues(context.workflow.config);
   if (issues.length > 0) return issues;
@@ -443,6 +495,7 @@ function validateSupervisor(context: ArchitectureValidationContext): string[] {
     issues.push(`workflow ${context.workflowId} maxParallelDelegations cannot exceed maxDelegations`);
   }
   issues.push(...flowIssues(context.workflowId, value.flow));
+  issues.push(...strictWorktreeFlowIssues(context.workflowId, value));
   issues.push(...supervisorDagIssues(context.workflowId, value.flow.dag, roleIds));
   return issues;
 }
@@ -593,6 +646,14 @@ function decision(value: JsonValue | undefined): SupervisorDecision | undefined 
   const candidate = value as Record<string, JsonValue>;
   if (candidate.action === "delegate" && Array.isArray(candidate.assignments)) return candidate as unknown as SupervisorDecision;
   if (
+    candidate.action === "request-human-decision"
+    && typeof candidate.riskCategory === "string"
+    && typeof candidate.summary === "string"
+    && Array.isArray(candidate.assignments)
+  ) {
+    return candidate as unknown as SupervisorDecision;
+  }
+  if (
     candidate.action === "satisfy-gate"
     && typeof candidate.gateId === "string"
     && typeof candidate.summary === "string"
@@ -673,8 +734,18 @@ function trackerStatus(tracker: GateTracker): void {
 
 function resolveGateExecutor(
   value: SupervisorWorkflowConfig,
-  gate: SupervisorGateConfig
+  gate: SupervisorGateConfig,
+  excludedRuntimeRoles: ReadonlySet<string> = new Set()
 ): { roleId: string; role: string } | undefined {
+  if (value.policy.execution?.isolation === "worktree" && gate.requiredCapability === "quality.audit") {
+    const independentAuditor = value.members.find((candidate) => (
+      candidate.capabilities.includes("quality.audit")
+      && !excludedRuntimeRoles.has(candidate.role)
+    ));
+    return independentAuditor
+      ? { roleId: independentAuditor.roleId, role: independentAuditor.role }
+      : undefined;
+  }
   // Capability tags are hints, not a hard gate. Prefer a member whose tags mention the required
   // capability; otherwise honor the gate's explicit fallback: "supervisor" lets the supervisor cover
   // (no tag check — that string-match was the anti-pattern), while "block" is softened to let any
@@ -709,10 +780,37 @@ async function executeGateActivation(
 ): Promise<string | undefined> {
   tracker.activations.set(activation.key, activation);
   if (tracker.passed.has(activation.key)) return undefined;
-  const executor = resolveGateExecutor(value, tracker.gate);
+  const sourceRuntimeRoles = new Set(
+    activation.sourceNodeIds.flatMap((sourceNodeId) => {
+      const source = context.plan.nodes.find((candidate) => candidate.id === sourceNodeId);
+      return source ? [source.role] : [];
+    })
+  );
+  const strictAudit = value.policy.execution?.isolation === "worktree"
+    && tracker.gate.requiredCapability === "quality.audit";
+  const executor = strictAudit && activation.sourceNodeIds.length === 0
+    ? undefined
+    : resolveGateExecutor(value, tracker.gate, sourceRuntimeRoles);
   if (!executor) {
     tracker.noExecutor = true;
-    tracker.reason = `gate ${tracker.gate.id} requires capability ${tracker.gate.requiredCapability}, but no eligible member or supervisor fallback has it`;
+    tracker.reason = strictAudit
+      ? activation.sourceNodeIds.length === 0
+        ? `gate ${tracker.gate.id} requires an independent quality.audit executor, but no code or integration source node is available to audit`
+        : `gate ${tracker.gate.id} requires an independent quality.audit member whose runtime role differs from every reviewed code or integration source; no eligible auditor is available`
+      : `gate ${tracker.gate.id} requires capability ${tracker.gate.requiredCapability}, but no eligible member or supervisor fallback has it`;
+    tracker.executions.push({
+      nodeId: `gate-${tracker.gate.id}-blocked-r${round}-${sequence}`,
+      executorRoleId: "none",
+      executorRuntimeRole: "none",
+      activation: activation.key,
+      sourceNodeIds: activation.sourceNodeIds,
+      status: "blocked",
+      evidence: {
+        reason: tracker.reason,
+        excludedRuntimeRoles: [...sourceRuntimeRoles]
+      },
+      error: tracker.reason
+    });
     trackerStatus(tracker);
     await context.emit("gate.blocked", undefined, {
       gateId: tracker.gate.id,
@@ -892,9 +990,13 @@ async function runCompletionGates(
       const capabilityHasWorkCondition = tracker.gate.requiredCapability === "quality.test"
         || tracker.gate.requiredCapability === "quality.audit"
         || tracker.gate.requiredCapability.startsWith("code.");
-      if (matching.length > 0 || !capabilityHasWorkCondition) {
+      const strictQualityGate = value.policy.execution?.isolation === "worktree"
+        && (tracker.gate.requiredCapability === "quality.test" || tracker.gate.requiredCapability === "quality.audit");
+      if (matching.length > 0 || !capabilityHasWorkCondition || strictQualityGate) {
         activation = {
-          key: matching.length > 0 ? `completion:${matching.map((record) => record.worker.id).join(",")}` : "completion",
+          key: matching.length > 0
+            ? `completion:${matching.map((record) => record.worker.id).join(",")}`
+            : strictQualityGate ? "completion:no-code-source" : "completion",
           sourceNodeIds: matching.map((record) => record.worker.id)
         };
       }
@@ -943,7 +1045,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
   // Absolute wall-clock ceiling is optional. When the policy omits maxDurationMs the run has no
   // fixed deadline: it keeps going while nodes make progress and is bounded only by per-node idle
   // timeouts and the round/delegation limits. A value still acts as a hard safety ceiling.
-  const deadlineAt = value.policy.limits.maxDurationMs === undefined
+  let deadlineAt = value.policy.limits.maxDurationMs === undefined
     ? undefined
     : startedAt + value.policy.limits.maxDurationMs;
   const durationExceeded = () => deadlineAt !== undefined && Date.now() >= deadlineAt;
@@ -974,11 +1076,73 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         output: output(supervisorResult.error ?? "supervisor decision failed", round, delegationCount, trackers, undefined, dagTrackers)
       };
     }
-    const next = decision(supervisorResult.output);
+    let next = decision(supervisorResult.output);
     if (!next) {
       return {
         status: "failed",
         output: output("supervisor returned an invalid decision", round, delegationCount, trackers, undefined, dagTrackers)
+      };
+    }
+
+    if (next.action === "request-human-decision") {
+      if (!context.requestHumanDecision) {
+        return {
+          status: "failed",
+          output: output(
+            "supervisor requested a human decision, but no human-decision control plane is available",
+            round,
+            delegationCount,
+            trackers,
+            undefined,
+            dagTrackers
+          )
+        };
+      }
+      const requested = next;
+      const waitingStartedAt = Date.now();
+      const humanDecision = await context.requestHumanDecision({
+        nodeId: node.id,
+        round,
+        riskCategory: requested.riskCategory,
+        summary: requested.summary,
+        proposedAction: {
+          action: "delegate",
+          summary: requested.summary,
+          assignments: requested.assignments as unknown as JsonValue
+        }
+      });
+      // A human pause is control-plane latency, not active execution time. Preserve the configured
+      // runtime budget by moving its deadline forward by the exact wait duration.
+      if (deadlineAt !== undefined) deadlineAt += Date.now() - waitingStartedAt;
+      history.push({
+        round,
+        supervisorNodeId: node.id,
+        decision: requested as unknown as JsonValue,
+        humanDecision: {
+          requestId: humanDecision.requestId,
+          decision: humanDecision.decision,
+          decidedBy: humanDecision.decidedBy ?? null,
+          comment: humanDecision.comment ?? null
+        }
+      });
+      if (humanDecision.decision === "rejected") {
+        if (round >= value.policy.limits.maxRounds) {
+          return blocked(
+            "human rejected the proposed high-risk action at the management policy round limit",
+            round,
+            delegationCount,
+            trackers,
+            dagTrackers
+          );
+        }
+        latestNodeIds = [node.id];
+        round += 1;
+        continue;
+      }
+      next = {
+        action: "delegate",
+        summary: requested.summary,
+        assignments: requested.assignments
       };
     }
 
