@@ -68,6 +68,93 @@ describe("empty production board and versioned persistence", () => {
     expect((await restored.listSpaces()).filter((node) => node.kind === "project")).toHaveLength(1);
   });
 
+  it("does not reuse a persisted requirement id after the browser service is recreated", async () => {
+    const storage = memoryStorage();
+    const first = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    first.syncConnectedProjects([connectedProject("connected-a")]);
+    const original = await first.createRequirement({
+      projectId: "connected-a",
+      title: "首条需求",
+      summary: "保留 id",
+      priority: "medium",
+      rawRequirement: "首条",
+      acceptanceCriteria: ["可验收"]
+    });
+
+    const restored = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    restored.syncConnectedProjects([connectedProject("connected-a")]);
+    const next = await restored.createRequirement({
+      projectId: "connected-a",
+      title: "重载后创建",
+      summary: "必须获得新 id",
+      priority: "medium",
+      rawRequirement: "第二条",
+      acceptanceCriteria: ["可并发"]
+    });
+    expect(next.id).not.toBe(original.id);
+    expect(new Set((await restored.listBoard()).map((requirement) => requirement.id)).size).toBe(2);
+  });
+
+  it("repairs legacy duplicate requirement ids without attaching one Run to two cards", async () => {
+    const storage = memoryStorage();
+    let id = 0;
+    let minute = 0;
+    const first = createDashboardService({
+      delayMs: () => 0,
+      initialData: "empty",
+      storage,
+      idSeed: (prefix) => `${prefix}-legacy-${++id}`,
+      now: () => new Date(`2026-08-10T01:${String(minute++).padStart(2, "0")}:00.000Z`)
+    });
+    first.syncConnectedProjects([connectedProject("connected-a")]);
+    const older = await first.createRequirement({
+      projectId: "connected-a",
+      title: "已经推进的旧需求",
+      summary: "应保留 Run",
+      priority: "medium",
+      rawRequirement: "旧需求",
+      acceptanceCriteria: ["可验收"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await first.reserveRequirementAdvancement(older.id, config, "human");
+    await first.syncRequirementAdvancement(older.id, reserved.idempotencyKey, {
+      invocationId: "inv-old",
+      runId: "run-old",
+      status: "running",
+      observedAt: "2026-08-10T01:10:00.000Z"
+    }, config.pollIntervalMs);
+    const newer = await first.createRequirement({
+      projectId: "connected-a",
+      title: "误用旧 id 的新需求",
+      summary: "不应继承 Run",
+      priority: "medium",
+      rawRequirement: "新需求",
+      acceptanceCriteria: ["可并发"]
+    });
+
+    const envelope = JSON.parse(storage.values.get(DASHBOARD_STORAGE_KEY)!) as {
+      store: { requirements: Array<{ id: string; title: string; lane: string; advancement?: unknown }> };
+    };
+    const persistedNewer = envelope.store.requirements.find((requirement) => requirement.title === newer.title)!;
+    persistedNewer.id = older.id;
+    persistedNewer.lane = "running";
+    persistedNewer.advancement = envelope.store.requirements.find((requirement) => requirement.title === older.title)!.advancement;
+    storage.values.set(DASHBOARD_STORAGE_KEY, JSON.stringify({ version: 2, store: envelope.store }));
+
+    const repaired = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    repaired.syncConnectedProjects([connectedProject("connected-a")]);
+    const board = await repaired.listBoard();
+    expect(new Set(board.map((requirement) => requirement.id)).size).toBe(2);
+    expect(board.find((requirement) => requirement.title === older.title)).toMatchObject({
+      id: older.id,
+      lane: "running",
+      advancement: { invocationId: "inv-old", runId: "run-old" }
+    });
+    const repairedNewer = board.find((requirement) => requirement.title === newer.title)!;
+    expect(repairedNewer.lane).toBe("inbox");
+    expect(repairedNewer.advancement).toBeUndefined();
+  });
+
   it("ignores corrupt or unsupported persisted data and safely falls back to empty", async () => {
     const storage = memoryStorage(new Map([[DASHBOARD_STORAGE_KEY, JSON.stringify({ version: 99, store: { nodes: [{ id: "bad" }] } })]]));
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
@@ -78,6 +165,14 @@ describe("empty production board and versioned persistence", () => {
 
 describe("requirement advancement persistence", () => {
   const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+
+  it("keeps queued and running lanes runtime-controlled", async () => {
+    const service = makeService();
+    expect(await expectFailure(service.updateRequirementLane("req-103", "queued"))).toContain("只能由真实 Run 更新");
+    const reserved = await service.reserveRequirementAdvancement("req-103", config, "human");
+    expect(await expectFailure(service.updateRequirementLane("req-103", "planned"))).toContain("仍有进行中的真实 Run");
+    expect(reserved.idempotencyKey).toBe("requirement:req-103:advance:1");
+  });
 
   it("reserves, attaches and tracks one Run while moving queued/running lanes automatically", async () => {
     const service = makeService();
@@ -452,13 +547,13 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
 
   it("迁移列成功并写入活动，目标列相同则原样返回", async () => {
     const service = makeService();
-    const moved = await service.updateRequirementLane("req-102", "queued");
-    expect(moved.lane).toBe("queued");
+    const moved = await service.updateRequirementLane("req-102", "clarify");
+    expect(moved.lane).toBe("clarify");
     expect(moved).not.toHaveProperty("dag");
     const summary = await service.getDashboardSummary();
     expect(summary.activities[0]?.action).toBe("迁移需求列");
-    const same = await service.updateRequirementLane("req-102", "queued");
-    expect(same.lane).toBe("queued");
+    const same = await service.updateRequirementLane("req-102", "clarify");
+    expect(same.lane).toBe("clarify");
   });
 
   it("fail-closed：普通列迁移不能绕过 Run 验收快照", async () => {

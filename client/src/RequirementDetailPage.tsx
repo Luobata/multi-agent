@@ -2,7 +2,7 @@
  *  DAG / 时间线 / 资源概览的演示徽标完全由数据 demo 标记驱动。列迁移走目标列 SelectControl。 */
 import { useEffect, useState } from "react";
 import { DemoBadge, DossierSection, EmptyState, Modal, ReadonlyEvidence, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
-import { isActiveRequirementAdvancement, requirementAdvancementConfig } from "./dashboard/advancement";
+import { isActiveRequirementAdvancement, requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { DagTaskNode, RequirementDetail, RequirementLane } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_LANES, requirementLaneLabel } from "./dashboard/types";
@@ -227,7 +227,7 @@ export function RequirementDetailPage({
         </div>
         <p>{detail.summary}</p>
         <dl className="dash-facts">
-          <dt>负责人</dt><dd>{detail.owner}</dd>
+          <dt>负责人</dt><dd>{requirementOwnerLabel(detail)}</dd>
           <dt>创建</dt><dd>{formatTime(detail.createdAt)}</dd>
           <dt>最近更新</dt><dd>{formatTime(detail.updatedAt)}</dd>
         </dl>
@@ -259,15 +259,24 @@ export function RequirementDetailPage({
             ariaLabel="目标列"
             placeholder="选择目标列…"
             value={targetLane}
-            disabled={!daemonAvailable || migrating || detail.exception === "cancelled"}
+            disabled={!daemonAvailable || migrating || detail.exception === "cancelled" || isActiveRequirementAdvancement(detail.advancement)}
             invalid={Boolean(migrateError)}
             errorMessage={migrateError || undefined}
-            options={REQUIREMENT_LANES.map((lane) => ({ value: lane.id, label: lane.label, disabled: lane.id === detail.lane, description: lane.id === detail.lane ? "当前所在列" : undefined }))}
+            options={REQUIREMENT_LANES.map((lane) => {
+              const runtimeControlled = lane.id === "queued" || lane.id === "running";
+              return {
+                value: lane.id,
+                label: lane.label,
+                disabled: lane.id === detail.lane || runtimeControlled,
+                description: lane.id === detail.lane ? "当前所在列" : runtimeControlled ? "由真实 Run 自动更新" : undefined
+              };
+            })}
             onChange={(value) => { setTargetLane(value as RequirementLane); setMigrateError(""); }}
           />
-          <button type="button" className="button primary" disabled={!daemonAvailable || migrating || !targetLane} onClick={() => void migrate()}>{migrating ? "迁移中…" : "迁移到目标列"}</button>
+          <button type="button" className="button primary" disabled={!daemonAvailable || migrating || !targetLane || isActiveRequirementAdvancement(detail.advancement)} onClick={() => void migrate()}>{migrating ? "迁移中…" : "迁移到目标列"}</button>
           <button type="button" className="button danger" disabled={!daemonAvailable} onClick={() => setArchiveOpen(true)}>归档需求</button>
         </div>
+        {isActiveRequirementAdvancement(detail.advancement) && <p className="dash-hint-line">真实 Run 进行中，排队中 / 执行中由系统同步；处理或取消 Run 后才能人工迁移其它列。</p>}
         {detail.exception === "cancelled" && <p className="dash-hint-line">已取消的需求不能迁移列；如需恢复请联系领队。</p>}
       </div>
 

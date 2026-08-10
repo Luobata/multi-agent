@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import { api, writeBody } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
 import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
+import { requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { ManagedProject, Requirement, RequirementException, RequirementPriority, SpaceNode } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_LANES, REQUIREMENT_PRIORITY_LABELS } from "./dashboard/types";
@@ -231,7 +232,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     <PageHeader
       eyebrow="BOARD / SEVEN LANES"
       title={project ? `${project.name} · 需求看板` : "需求看板"}
-      description="七列流转；阻塞 / 失败 / 取消与列正交叠加。第一阶段不支持拖拽，列迁移请在需求详情页选择目标列。"
+      description="七列流转；排队中 / 执行中只由真实 Run 自动更新，阻塞 / 失败 / 取消与列正交叠加。其它列请在需求详情页迁移。"
       actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
     />
     <OfflineNotice />
@@ -260,7 +261,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
                   <p>{requirement.summary}</p>
                   <footer>
                     <span className={`board-priority board-priority--${requirement.priority}`}>{REQUIREMENT_PRIORITY_LABELS[requirement.priority]}</span>
-                    <span>{requirement.owner}</span>
+                    <span>{requirementOwnerLabel(requirement)}</span>
                     <time>{formatTime(requirement.updatedAt)}</time>
                     {exceptionChip(requirement.exception)}
                   </footer>

@@ -61,6 +61,15 @@ export function isActiveRequirementAdvancement(advancement: RequirementAdvanceme
   return Boolean(advancement && ACTIVE_STATUSES.has(advancement.status));
 }
 
+/**
+ * `owner` is the human/product ownership placeholder. Once a real advancement
+ * cycle has been reserved, showing "待分配" is misleading because the work is
+ * already owned by the governed Agent workflow even before a member node runs.
+ */
+export function requirementOwnerLabel(requirement: Pick<Requirement, "owner" | "advancement">): string {
+  return requirement.advancement ? "Agent 团队" : requirement.owner;
+}
+
 export function advancementLane(status: RequirementAdvancementStatus, current: RequirementLane): RequirementLane {
   if (status === "queued" || status === "dispatching") return "queued";
   if (status === "running" || status === "awaiting-human-decision" || status === "completed") return "running";

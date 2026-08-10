@@ -24,6 +24,7 @@ import { REQUIREMENT_LANES, requirementLaneLabel } from "./types";
 import type { PassiveProjectAccess, Project as ConnectedProject } from "../types";
 import {
   advancementLane,
+  isActiveRequirementAdvancement,
   observeAdvancement,
   reserveAdvancement,
   type RequirementAdvancementConfig,
@@ -211,12 +212,75 @@ function persistedStore(storage: DashboardServiceOptions["storage"]): Store | un
 export function createDashboardService(options: DashboardServiceOptions = {}): DashboardService {
   const delayMs = options.delayMs ?? (() => 80 + Math.floor(Math.random() * 121));
   const now = options.now ?? (() => new Date());
-  let idCounter = 0;
-  const nextId = options.idSeed ?? ((prefix: string) => `${prefix}-local-${++idCounter}`);
   // v1 was the pre-launch test/demo board. The user explicitly requested a clean board before
   // entering real requirements, so remove it once and never migrate those records into v2.
   for (const key of LEGACY_DASHBOARD_STORAGE_KEYS) options.storage?.removeItem?.(key);
   const store = persistedStore(options.storage) ?? seed(options.initialData ?? "demo");
+  const occupiedIds = new Set<string>([
+    ...store.nodes.map((node) => node.id),
+    ...store.nodes.flatMap((node) => node.kind === "project" ? node.repositories.map((repository) => repository.id) : []),
+    ...store.requirements.map((requirement) => requirement.id),
+    ...store.activities.map((activity) => activity.id),
+    ...store.archive.map((entry) => entry.id)
+  ]);
+  let idCounter = [...occupiedIds].reduce((largest, id) => {
+    const match = id.match(/-local-(\d+)(?:-|$)/);
+    return match ? Math.max(largest, Number(match[1])) : largest;
+  }, 0);
+  const idSeed = options.idSeed ?? ((prefix: string) => `${prefix}-local-${++idCounter}`);
+  const nextId = (prefix: string): string => {
+    const candidate = idSeed(prefix);
+    if (!occupiedIds.has(candidate)) {
+      occupiedIds.add(candidate);
+      return candidate;
+    }
+    let suffix = 2;
+    while (occupiedIds.has(`${candidate}-${suffix}`)) suffix += 1;
+    const unique = `${candidate}-${suffix}`;
+    occupiedIds.add(unique);
+    return unique;
+  };
+
+  // Early v2 builds restarted their in-memory counter at 1 after every reload.
+  // A newly created requirement could therefore reuse a persisted id, making
+  // two cards share one idempotency key and one Run. Repair that legacy shape
+  // fail-closed: the oldest requirement keeps the correlated Run, while newer
+  // duplicates receive fresh ids and return to the inbox for an explicit start.
+  let repairedDuplicateIds = false;
+  const requirementsById = new Map<string, RequirementDetail[]>();
+  for (const requirement of store.requirements) {
+    const group = requirementsById.get(requirement.id) ?? [];
+    group.push(requirement);
+    requirementsById.set(requirement.id, group);
+  }
+  for (const duplicates of requirementsById.values()) {
+    if (duplicates.length < 2) continue;
+    repairedDuplicateIds = true;
+    const canonical = [...duplicates].sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]!;
+    const latestAdvancement = duplicates
+      .flatMap((requirement) => requirement.advancement ? [requirement.advancement] : [])
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    if (latestAdvancement) {
+      canonical.advancement = { ...latestAdvancement };
+      canonical.lane = advancementLane(latestAdvancement.status, canonical.lane);
+      canonical.updatedAt = [canonical.updatedAt, latestAdvancement.updatedAt].sort().at(-1)!;
+      canonical.exception = latestAdvancement.status === "blocked"
+        ? "blocked"
+        : latestAdvancement.status === "failed"
+          ? "failed"
+          : latestAdvancement.status === "cancelled"
+            ? "cancelled"
+            : null;
+    }
+    for (const duplicate of duplicates) {
+      if (duplicate === canonical) continue;
+      duplicate.id = nextId("req");
+      delete duplicate.advancement;
+      if (duplicate.lane === "queued" || duplicate.lane === "running") duplicate.lane = "inbox";
+      if (duplicate.exception === "blocked" || duplicate.exception === "failed") duplicate.exception = null;
+      if (duplicate.updatedAt < duplicate.createdAt) duplicate.updatedAt = duplicate.createdAt;
+    }
+  }
   const persist = () => {
     try {
       options.storage?.setItem(DASHBOARD_STORAGE_KEY, JSON.stringify({ version: DASHBOARD_STORAGE_VERSION, store }));
@@ -224,6 +288,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       // localStorage quota / privacy failures degrade to the current in-memory session.
     }
   };
+  if (repairedDuplicateIds) persist();
   let connectedProjectIds: Set<string> | null = null;
   let connectedCatalogIds = new Set<string>();
   let catalogSeedRemapped = false;
@@ -592,6 +657,20 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         if (!REQUIREMENT_LANES.some((entry) => entry.id === lane)) throw failure("目标列不存在", "请重新选择目标列", "未写入任何变更");
         if (requirement.exception === "cancelled") throw failure("已取消的需求不能迁移列", "请先在看板恢复其状态或联系领队", "未写入任何变更");
         if (requirement.lane === lane) return { ...requirement };
+        if (lane === "queued" || lane === "running") {
+          throw failure(
+            `「${requirementLaneLabel(lane)}」只能由真实 Run 更新`,
+            "请在需求详情点击「开始推进」，系统会按 Invocation 状态自动迁移",
+            "未创建 Run，也未改变需求所在列"
+          );
+        }
+        if (isActiveRequirementAdvancement(requirement.advancement)) {
+          throw failure(
+            "当前需求仍有进行中的真实 Run",
+            "请先在运行卷宗处理或取消该 Run，再人工调整需求列",
+            "Run、推进记录与需求所在列均未改变"
+          );
+        }
         if (lane === "acceptance") {
           const gaps = acceptanceSnapshotGaps(requirement.evidence.acceptance);
           if (gaps.length > 0) {

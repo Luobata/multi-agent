@@ -4,6 +4,7 @@ import {
   dueRequirementAdvancements,
   planRequirementAdvancementPoll,
   requirementAdvancementConfig,
+  requirementOwnerLabel,
   reserveAdvancement
 } from "./advancement";
 import type { Requirement, RequirementDetail } from "./types";
@@ -67,6 +68,15 @@ describe("requirement advancement control state", () => {
     expect(retried.idempotencyKey).toBe(first.idempotencyKey);
     expect(retried.cycle).toBe(1);
     expect(retried.trigger).toBe("automatic");
+  });
+
+  it("keeps concurrent requirements isolated and replaces the pending owner once a cycle exists", () => {
+    const first = reserveAdvancement(detail({ id: "req-1" }), config, "human", "2026-08-10T01:00:00.000Z");
+    const second = reserveAdvancement(detail({ id: "req-2" }), config, "human", "2026-08-10T01:00:00.000Z");
+    expect(first.idempotencyKey).toBe("requirement:req-1:advance:1");
+    expect(second.idempotencyKey).toBe("requirement:req-2:advance:1");
+    expect(requirementOwnerLabel(detail())).toBe("待分配");
+    expect(requirementOwnerLabel(detail({ advancement: first }))).toBe("Agent 团队");
   });
 
   it("opens a new cycle after a recorded Run fails, while completed delivery stays protected", () => {
