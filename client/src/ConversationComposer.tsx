@@ -5,7 +5,7 @@
  * 发送失败（onSend 返回 false）时正文与附件全部保留，由用户决定重试或修改。
  */
 import { useEffect, useId, useRef, useState, type ClipboardEvent, type FormEvent, type KeyboardEvent } from "react";
-import { Stamp } from "./components";
+import { Modal, Stamp } from "./components";
 import "./conversation-composer.css";
 import type {
   ConversationDocumentEvidenceMetadata,
@@ -298,22 +298,51 @@ export function ConversationComposer({
 }
 
 /** 历史消息证据：图片走服务端按附件 id 的预览 URL，文档只展示 URL 与 available/failed 状态；绝不展示本地磁盘路径。 */
+function ConversationEvidenceImage({ attachment }: { attachment: ConversationImageAttachmentMetadata }) {
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const url = conversationAttachmentUrl(attachment.id);
+
+  return <>
+    <button
+      type="button"
+      className="message-evidence-image"
+      onClick={() => setPreviewOpen(true)}
+      aria-haspopup="dialog"
+      aria-label={`放大预览 ${attachment.name}`}
+    >
+      {thumbnailFailed
+        ? <span className="message-evidence-image-error" role="status">图片暂时无法加载</span>
+        : <img src={url} alt="" loading="lazy" decoding="async" onError={() => setThumbnailFailed(true)} />}
+      <span><strong>{attachment.name}</strong><small>{formatAttachmentSize(attachment.sizeBytes)} · 点击放大</small></span>
+    </button>
+    {previewOpen && <Modal
+      title={attachment.name}
+      eyebrow="IMAGE EVIDENCE · PREVIEW"
+      onClose={() => setPreviewOpen(false)}
+      wide
+      className="message-evidence-preview-modal"
+    >
+      <div className="message-evidence-preview-body">
+        <div className="message-evidence-preview-viewport">
+          <img src={url} alt={attachment.name} />
+        </div>
+        <footer>
+          <span>{attachment.mediaType.split("/")[1]?.toUpperCase()} · {formatAttachmentSize(attachment.sizeBytes)}</span>
+          <a className="button secondary" href={url} target="_blank" rel="noreferrer">在新窗口打开原图</a>
+        </footer>
+      </div>
+    </Modal>}
+  </>;
+}
+
 export function ConversationMessageEvidence({ attachments, documents }: {
   attachments?: ConversationImageAttachmentMetadata[];
   documents?: ConversationDocumentEvidenceMetadata[];
 }) {
   if (!attachments?.length && !documents?.length) return null;
   return <div className="message-evidence">
-    {attachments?.map((attachment) => <a
-      key={attachment.id}
-      className="message-evidence-image"
-      href={conversationAttachmentUrl(attachment.id)}
-      target="_blank"
-      rel="noreferrer"
-    >
-      <img src={conversationAttachmentUrl(attachment.id)} alt={attachment.name} loading="lazy" decoding="async" />
-      <span>{attachment.name} · {formatAttachmentSize(attachment.sizeBytes)}</span>
-    </a>)}
+    {attachments?.map((attachment) => <ConversationEvidenceImage key={attachment.id} attachment={attachment} />)}
     {documents?.map((document) => <div key={document.id} className={`message-evidence-doc message-evidence-doc--${document.status}`}>
       <Stamp status={document.status === "available" ? "passed" : "failed"} label={document.status === "available" ? "文档已解析" : "文档解析失败"} />
       <span className="message-evidence-doc-url">{document.url}</span>

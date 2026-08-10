@@ -40,6 +40,14 @@ describe("ConversationComposer", () => {
 
   beforeEach(() => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute("open", ""); }
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, "close", {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute("open"); }
+    });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -49,6 +57,8 @@ describe("ConversationComposer", () => {
     act(() => root.unmount());
     container.remove();
     document.body.replaceChildren();
+    Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+    Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
   });
 
   function render(onSend: (draft: ComposerDraft) => Promise<boolean>) {
@@ -199,6 +209,26 @@ describe("ConversationComposer", () => {
     expect(container.textContent).toContain("服务离线，仅可查阅历史");
     expect(container.querySelector<HTMLButtonElement>("button[type='submit']")?.disabled).toBe(true);
   });
+
+  it("opens the persisted image in a dismissible in-app preview", () => {
+    act(() => root.render(<ConversationMessageEvidence attachments={[{
+      id: "att-1",
+      kind: "image",
+      name: "screen.png",
+      mediaType: "image/png",
+      sizeBytes: 2048,
+      sha256: "x"
+    }]} />));
+
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="放大预览 screen.png"]')?.click());
+    const preview = document.querySelector<HTMLDialogElement>("dialog.message-evidence-preview-modal");
+    expect(preview?.open).toBe(true);
+    expect(preview?.querySelector<HTMLImageElement>('.message-evidence-preview-viewport img')?.alt).toBe("screen.png");
+    expect(preview?.querySelector<HTMLAnchorElement>('a[href="/api/conversation-attachments/att-1"]')?.textContent).toContain("打开原图");
+
+    act(() => preview?.querySelector<HTMLButtonElement>('[aria-label="关闭弹窗"]')?.click());
+    expect(document.querySelector("dialog.message-evidence-preview-modal")).toBeNull();
+  });
 });
 
 describe("detectLarkDocumentLinks", () => {
@@ -220,7 +250,7 @@ describe("detectLarkDocumentLinks", () => {
 });
 
 describe("ConversationMessageEvidence", () => {
-  it("links image attachments to the server preview URL without local paths", () => {
+  it("renders image attachments as an accessible preview trigger without local paths", () => {
     const html = renderToStaticMarkup(<ConversationMessageEvidence
       attachments={[{ id: "att-1", kind: "image", name: "screen.png", mediaType: "image/png", sizeBytes: 2048, sha256: "x" }]}
       documents={[{
@@ -234,6 +264,9 @@ describe("ConversationMessageEvidence", () => {
     />);
 
     expect(html).toContain("/api/conversation-attachments/att-1");
+    expect(html).toContain("aria-haspopup=\"dialog\"");
+    expect(html).toContain("放大预览 screen.png");
+    expect(html).toContain("点击放大");
     expect(html).toContain("screen.png");
     expect(html).toContain("https://acme.feishu.cn/docx/Token123");
     expect(html).toContain("文档解析失败");

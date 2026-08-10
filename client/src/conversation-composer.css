@@ -130,10 +130,13 @@
   font-family: var(--font-machine);
   font-size: var(--text-xs);
   text-decoration: none;
+  text-align: left;
+  cursor: zoom-in;
   max-width: 100%;
 }
 
-.message-evidence-image:hover {
+.message-evidence-image:hover,
+.message-evidence-image:focus-visible {
   background: var(--paper-hover);
 }
 
@@ -145,8 +148,80 @@
   background: var(--paper-sunken);
 }
 
-.message-evidence-image span {
+.message-evidence-image > span:last-child {
+  display: grid;
+  gap: var(--space-1);
   overflow-wrap: anywhere;
+}
+
+.message-evidence-image strong,
+.message-evidence-image small {
+  font: inherit;
+}
+
+.message-evidence-image small {
+  color: var(--ink-3);
+}
+
+.message-evidence-image-error {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  padding: var(--space-2);
+  border: var(--rule) dashed var(--stamp-red-ink);
+  background: var(--danger-bg);
+  color: var(--stamp-red-ink);
+  text-align: center;
+}
+
+.message-evidence-preview-modal .modal-frame {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.message-evidence-preview-body {
+  min-height: 0;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+}
+
+.message-evidence-preview-viewport {
+  min-height: 220px;
+  display: grid;
+  flex: 1 1 auto;
+  place-items: center;
+  overflow: auto;
+  border: var(--rule) solid var(--line-strong);
+  background:
+    linear-gradient(45deg, var(--surface-muted) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--surface-muted) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--surface-muted) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--surface-muted) 75%);
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-size: 16px 16px;
+}
+
+.message-evidence-preview-viewport img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100dvh - 230px);
+  object-fit: contain;
+}
+
+.message-evidence-preview-body footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  color: var(--ink-3);
+  font-family: var(--font-machine);
+  font-size: var(--text-xs);
 }
 
 .message-evidence-doc {

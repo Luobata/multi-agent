@@ -285,7 +285,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
         <div className="modal-actions"><button type="button" className="button secondary" onClick={() => setCreateOpen(false)}>取消</button><button type="submit" className="button primary" disabled={saving || !createProjectId}>{saving ? "创建中…" : "创建并进入收件箱"}</button></div>
       </form>
     </Modal>}
-    {agentOpen && <Modal title="和 AI 说需求" eyebrow="REQUIREMENT STEWARD · DRAFT ONLY" onClose={() => setAgentOpen(false)} wide>
+    {agentOpen && <Modal title="和 AI 说需求" eyebrow="REQUIREMENT STEWARD · DRAFT ONLY" onClose={() => setAgentOpen(false)} wide className="board-ai-modal">
       <div className="board-ai-layout">
         <section className="board-ai-conversation" aria-label="需求管家对话">
           <header><div><span className="ai-content-badge">AI 生成内容</span><h3>先描述，再决定怎么推进</h3></div><p>文字、粘贴图片和飞书文档都会进入同一份会话证据；Agent 只整理草稿，不会替你创建需求。</p></header>

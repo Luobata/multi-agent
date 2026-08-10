@@ -79,7 +79,13 @@ async function invokeRoute(
         result.headers[name.toLowerCase()] = value;
         return response;
       },
-      sendFile(filePath: string, callback: (error?: Error) => void) {
+      sendFile(
+        filePath: string,
+        optionsOrCallback: { dotfiles?: string } | ((error?: Error) => void),
+        maybeCallback?: (error?: Error) => void
+      ) {
+        const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+        if (!callback) throw new Error("sendFile callback is required");
         fs.readFile(filePath, (error, body) => {
           if (error) {
             callback(error);

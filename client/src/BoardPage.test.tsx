@@ -124,6 +124,11 @@ describe("BoardPage AI requirement creation", () => {
       button("和 AI 说需求").click();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
+    const agentDialog = document.querySelector("dialog.board-ai-modal");
+    expect(agentDialog).toBeInstanceOf(HTMLDialogElement);
+    expect(agentDialog?.querySelector(".board-ai-layout")).toBeTruthy();
+    expect(agentDialog?.querySelector(".board-ai-draft-fields")).toBeNull();
+    expect(agentDialog?.querySelector(".board-ai-confirm")).toBeTruthy();
     const textarea = document.querySelector('textarea[aria-label="描述需求"]');
     expect(textarea).toBeInstanceOf(HTMLTextAreaElement);
     act(() => setText(textarea as HTMLTextAreaElement, "购物车空态增加优惠推荐"));
@@ -139,6 +144,8 @@ describe("BoardPage AI requirement creation", () => {
     });
     expect(await service.listBoard()).toEqual([]);
     expect((document.querySelector('input[value="购物车空态优惠推荐"]') as HTMLInputElement | null)?.value).toBe("购物车空态优惠推荐");
+    expect(agentDialog?.querySelector(".board-ai-draft-fields")).toBeTruthy();
+    expect(agentDialog?.querySelector(".board-ai-confirm button")?.textContent).toContain("确认创建");
     const raw = [...document.querySelectorAll("textarea")].find((candidate) => candidate.value === "购物车空态增加优惠推荐");
     expect(raw).toBeTruthy();
 

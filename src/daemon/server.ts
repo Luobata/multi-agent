@@ -127,7 +127,10 @@ export async function sendConversationAttachment(
   response.set("X-Content-Type-Options", "nosniff");
   response.set("Content-Disposition", `inline; filename*=UTF-8''${contentDispositionFileName(attachment.name)}`);
   await new Promise<void>((resolve, reject) => {
-    response.sendFile(attachment.filePath, (error) => error ? reject(error) : resolve());
+    // The default data root is ~/.multi-agent/workbench. Express ignores any
+    // path containing a dot-directory unless dotfiles are explicitly allowed,
+    // even when sendFile receives a validated absolute path.
+    response.sendFile(attachment.filePath, { dotfiles: "allow" }, (error) => error ? reject(error) : resolve());
   });
 }
 
@@ -143,7 +146,7 @@ export async function sendRunEvidenceAsset(
   response.set("X-Content-Type-Options", "nosniff");
   response.set("Content-Disposition", `inline; filename*=UTF-8''${contentDispositionFileName(evidence.asset.name)}`);
   await new Promise<void>((resolve, reject) => {
-    response.sendFile(evidence.filePath, (error) => error ? reject(error) : resolve());
+    response.sendFile(evidence.filePath, { dotfiles: "allow" }, (error) => error ? reject(error) : resolve());
   });
 }
 

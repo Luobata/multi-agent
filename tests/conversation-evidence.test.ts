@@ -7,7 +7,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JsonObject } from "../src/core/types.js";
 import type { ProviderRegistry } from "../src/runtime/providers.js";
-import { sendConversationAttachment } from "../src/daemon/server.js";
+import { createDaemonApp, sendConversationAttachment } from "../src/daemon/server.js";
 import { createWorkbenchMcpServer } from "../src/mcp/server.js";
 import {
   LarkCliDocumentFetcher,
@@ -265,7 +265,7 @@ describe("conversation evidence persistence", () => {
       status: vi.fn(),
       type: vi.fn(),
       set: vi.fn(),
-      sendFile: vi.fn((filePath: string, callback: (error?: Error) => void) => {
+      sendFile: vi.fn((filePath: string, _options: { dotfiles: string }, callback: (error?: Error) => void) => {
         sentPath = filePath;
         callback();
       })
@@ -274,6 +274,7 @@ describe("conversation evidence persistence", () => {
     expect(response.status).toHaveBeenCalledWith(200);
     expect(response.type).toHaveBeenCalledWith("image/png");
     expect(response.set).toHaveBeenCalledWith("X-Content-Type-Options", "nosniff");
+    expect(response.sendFile).toHaveBeenCalledWith(sentPath, { dotfiles: "allow" }, expect.any(Function));
     expect(fs.readFileSync(sentPath)).toEqual(imageBytes());
 
     await expect(service.getConversationImageAttachment("../state.json")).rejects.toThrow(/id is invalid/);
@@ -282,6 +283,31 @@ describe("conversation evidence persistence", () => {
     fs.unlinkSync(stored.filePath);
     fs.symlinkSync(path.join(root, "state.json"), stored.filePath);
     await expect(service.getConversationImageAttachment(attachmentId)).rejects.toThrow(/outside the evidence root/);
+  });
+
+  it("serves attachments through HTTP when the validated data root contains a dot-directory", async () => {
+    const root = temporaryRoot();
+    const dataRoot = path.join(root, ".multi-agent", "workbench");
+    const { service } = await evidenceService({ dataRoot });
+    const invoked = await service.invokeEmployee("evidence-agent", {
+      message: "Preview this image over HTTP",
+      attachments: [pngAttachment("hidden-root.png")]
+    });
+    const attachmentId = invoked.session.messages.find((message) => message.role === "user")!.attachments![0]!.id;
+    const app = createDaemonApp(service, { staticDir: path.join(root, "missing-client") });
+    const server = app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve) => server.once("listening", () => resolve()));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("expected TCP address");
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/conversation-attachments/${attachmentId}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("image/png");
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(imageBytes());
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });
 

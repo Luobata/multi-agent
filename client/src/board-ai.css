@@ -1,8 +1,19 @@
+.board-ai-modal .modal-frame {
+  display: flex;
+  flex-direction: column;
+  height: calc(100dvh - 64px);
+  overflow: hidden;
+}
+
+.board-ai-modal .modal-header {
+  flex: 0 0 auto;
+}
+
 .board-ai-layout {
+  flex: 1 1 auto;
+  min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.08fr) minmax(360px, 0.92fr);
-  min-height: min(720px, calc(100vh - 120px));
-  max-height: min(780px, calc(100vh - 96px));
   overflow: hidden;
 }
 
@@ -49,6 +60,8 @@
   flex: 1 1 auto;
   min-height: 180px;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   display: grid;
   align-content: start;
   gap: 10px;
@@ -112,6 +125,8 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   display: grid;
   align-content: start;
   gap: 12px;
@@ -134,10 +149,15 @@
 }
 
 @media (max-width: 900px) {
-  .board-ai-layout {
-    grid-template-columns: 1fr;
-    max-height: min(820px, calc(100vh - 48px));
+  .board-ai-modal .modal-frame {
+    height: calc(100dvh - 48px);
     overflow-y: auto;
+  }
+
+  .board-ai-layout {
+    flex: 0 0 auto;
+    grid-template-columns: 1fr;
+    overflow: visible;
   }
 
   .board-ai-conversation {

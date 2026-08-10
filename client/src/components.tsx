@@ -401,11 +401,12 @@ export function EmptyState({ title, children, action }: PropsWithChildren<{
   </section>;
 }
 
-export function Modal({ title, eyebrow, children, onClose, wide = false }: PropsWithChildren<{
+export function Modal({ title, eyebrow, children, onClose, wide = false, className = "" }: PropsWithChildren<{
   title: string;
   eyebrow?: string;
   onClose: () => void;
   wide?: boolean;
+  className?: string;
 }>) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const closeRef = useRef(onClose);
@@ -433,7 +434,7 @@ export function Modal({ title, eyebrow, children, onClose, wide = false }: Props
 
   return <dialog
     ref={dialogRef}
-    className={`modal-sheet ${wide ? "modal-sheet--wide" : ""}`}
+    className={`modal-sheet ${wide ? "modal-sheet--wide" : ""} ${className}`.trim()}
     aria-labelledby={titleId}
     onCancel={(event) => { event.preventDefault(); closeRef.current(); }}
     onClick={(event) => {
