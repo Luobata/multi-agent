@@ -22,7 +22,7 @@
     }
   ],
   "knowledgeProfileIds": ["workbench-quality-knowledge"],
-  "providerId": "mock",
+  "providerId": "claude-relay-execution",
   "outputSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -51,7 +51,7 @@
   "maxAttempts": 2,
   "permissions": {
     "write": "none",
-    "tools": ["Read", "Glob", "Grep", "WebFetch", "browser"]
+    "tools": ["Read", "Glob", "Grep", "WebFetch", "Bash"]
   },
   "contextPolicy": { "historyLimit": 20 },
   "presentation": {

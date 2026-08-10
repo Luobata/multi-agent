@@ -1,0 +1,32 @@
+{
+  "adapter": "command",
+  "model": "model_hub/es1_orange_o48[1m]",
+  "command": "zsh",
+  "args": [
+    "-ic",
+    "claude-relay \"$@\"",
+    "claude-relay",
+    "--print",
+    "--bare",
+    "--effort",
+    "medium",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--permission-mode",
+    "dontAsk",
+    "--tools",
+    "{{role.toolsCsv}}",
+    "--allowedTools",
+    "{{role.toolsCsv}}",
+    "--no-session-persistence",
+    "--max-budget-usd",
+    "3",
+    "--json-schema",
+    "{{role.outputSchemaJson}}"
+  ],
+  "inputTemplate": "{{prompt}}",
+  "timeoutMs": 900000,
+  "idleTimeoutMs": 600000,
+  "outputProtocol": "claude-stream-json"
+}

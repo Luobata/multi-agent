@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProviderExecutionError } from "../src/core/errors.js";
-import type { ProviderRegistry } from "../src/runtime/providers.js";
+import { createDefaultProviderRegistry, type ProviderRegistry } from "../src/runtime/providers.js";
 import type { JsonObject, RoleVerdictDefinition } from "../src/core/types.js";
 import { WorkbenchService } from "../src/workbench/service.js";
 
@@ -1620,6 +1620,8 @@ describe("Local Agent Workbench", () => {
     identity: { constraints?: string[] };
     systemPrompt: string;
     requestPrompt: string;
+    providerId: string;
+    permissions: { write: string; tools: string[] };
     outputSchema: JsonObject;
     verdict?: RoleVerdictDefinition;
   }
@@ -1635,6 +1637,11 @@ describe("Local Agent Workbench", () => {
       "任何验收必须包含真实 e2e/行为验证，禁止仅凭静态检查（读源码/类型/lint）判定通过"
     );
     expect(template.systemPrompt).toContain("严禁仅凭静态检查判定通过；每条结论必须有真实 e2e/行为证据。");
+    expect(template.providerId).toBe("claude-relay-execution");
+    expect(template.permissions).toEqual({
+      write: "none",
+      tools: ["Read", "Glob", "Grep", "WebFetch", "Bash"]
+    });
     expect(template.verdict).toEqual({ path: "/verdict", pass: ["pass"], block: ["block"] });
     expect(template.outputSchema).toMatchObject({
       type: "object",
@@ -1664,6 +1671,24 @@ describe("Local Agent Workbench", () => {
     for (const field of ["verdict", "summary", "e2eEvidence", "risks"]) {
       expect(template.requestPrompt).toContain(field);
     }
+  });
+
+  it("configures the executable relay Provider from the effective Role tools", () => {
+    const definition = JSON.parse(fs.readFileSync(
+      path.resolve("templates", "workbench", "claude-relay-execution.provider.json"),
+      "utf8"
+    )) as { adapter: string; args?: string[]; hardTimeoutMs?: number };
+    expect(createDefaultProviderRegistry().get("command")?.validate({
+      providerId: "claude-relay-execution",
+      definition,
+      projectRoot: process.cwd()
+    })).toEqual([]);
+    expect(definition.args).toEqual(expect.arrayContaining([
+      "--tools",
+      "{{role.toolsCsv}}",
+      "--allowedTools"
+    ]));
+    expect(definition.hardTimeoutMs).toBeUndefined();
   });
 
   async function openScriptedTester(): Promise<{
