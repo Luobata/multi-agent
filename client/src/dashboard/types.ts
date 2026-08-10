@@ -11,6 +11,37 @@ export type RequirementException = "blocked" | "failed" | "cancelled" | null;
 
 export type RequirementPriority = "low" | "medium" | "high";
 
+export type RequirementAdvancementStatus =
+  | "dispatching"
+  | "queued"
+  | "running"
+  | "awaiting-human-decision"
+  | "completed"
+  | "blocked"
+  | "failed"
+  | "cancelled";
+
+/**
+ * Durable cursor shared by the human-triggered button and a future polling worker.
+ * One cycle owns one idempotency key, so a retry after a lost response cannot create a duplicate Run.
+ */
+export interface RequirementAdvancement {
+  schemaVersion: 1;
+  cycle: number;
+  trigger: "human" | "automatic";
+  status: RequirementAdvancementStatus;
+  entrancePolicyId: string;
+  idempotencyKey: string;
+  invocationId?: string;
+  runId?: string;
+  leaderSessionId?: string;
+  startedAt: string;
+  updatedAt: string;
+  /** Non-terminal records are eligible for the future scanner after this time. */
+  nextCheckAt?: string;
+  error?: string;
+}
+
 export const REQUIREMENT_LANES: ReadonlyArray<{ id: RequirementLane; label: string }> = [
   { id: "inbox", label: "收件箱" },
   { id: "clarify", label: "待澄清" },
@@ -95,6 +126,7 @@ export interface Requirement {
   exception: RequirementException;
   priority: RequirementPriority;
   owner: string;
+  advancement?: RequirementAdvancement;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string | null;

@@ -1,0 +1,169 @@
+import type { InvocationStatus, Project } from "../types";
+import type {
+  Requirement,
+  RequirementAdvancement,
+  RequirementAdvancementStatus,
+  RequirementDetail,
+  RequirementLane
+} from "./types";
+
+export interface RequirementAdvancementConfig {
+  entrancePolicyId: string;
+  autoPollEnabled: boolean;
+  pollIntervalMs: number;
+}
+
+export interface RequirementInvocationObservation {
+  invocationId: string;
+  runId: string;
+  status: InvocationStatus;
+  observedAt: string;
+  error?: string;
+}
+
+export type RequirementAdvancementPollAction =
+  | { kind: "launch"; requirementId: string; config: RequirementAdvancementConfig }
+  | { kind: "observe"; requirementId: string; invocationId: string; config: RequirementAdvancementConfig };
+
+const ACTIVE_STATUSES = new Set<RequirementAdvancementStatus>([
+  "dispatching",
+  "queued",
+  "running",
+  "awaiting-human-decision"
+]);
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function positivePollInterval(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 5_000 && value <= 300_000
+    ? value
+    : 15_000;
+}
+
+/** Project descriptor config is the only binding between a project and its advancement policy. */
+export function requirementAdvancementConfig(project: Project | undefined): RequirementAdvancementConfig | undefined {
+  const config = record(project?.connector.config.requirementAdvancement);
+  const entrancePolicyId = typeof config?.entrancePolicyId === "string" ? config.entrancePolicyId.trim() : "";
+  if (!entrancePolicyId) return undefined;
+  const polling = record(config!.polling);
+  return {
+    entrancePolicyId,
+    autoPollEnabled: polling?.enabled === true,
+    pollIntervalMs: positivePollInterval(polling?.intervalMs)
+  };
+}
+
+export function isActiveRequirementAdvancement(advancement: RequirementAdvancement | undefined): boolean {
+  return Boolean(advancement && ACTIVE_STATUSES.has(advancement.status));
+}
+
+export function advancementLane(status: RequirementAdvancementStatus, current: RequirementLane): RequirementLane {
+  if (status === "queued" || status === "dispatching") return "queued";
+  if (status === "running" || status === "awaiting-human-decision" || status === "completed") return "running";
+  return current;
+}
+
+export function reserveAdvancement(
+  requirement: RequirementDetail,
+  config: RequirementAdvancementConfig,
+  trigger: RequirementAdvancement["trigger"],
+  at: string
+): RequirementAdvancement {
+  const current = requirement.advancement;
+  // A lost HTTP response must retry the same cycle/key. This is the critical
+  // bridge between today's button and a future polling scanner.
+  if ((current?.status === "dispatching" || current?.status === "failed") && !current.invocationId) {
+    return { ...current, trigger, updatedAt: at, nextCheckAt: at, error: undefined };
+  }
+  if (isActiveRequirementAdvancement(current)) {
+    throw new Error(`需求已有进行中的推进任务：${current?.invocationId ?? current?.idempotencyKey}`);
+  }
+  if (current?.invocationId) {
+    throw new Error("这轮推进已经产生 Run；请先在运行卷宗处理结果，再决定是否重新推进");
+  }
+  if (requirement.lane === "clarify") throw new Error("需求仍在待澄清；请先补齐关键信息并迁移回收件箱或已规划");
+  if (requirement.lane === "acceptance" || requirement.lane === "done") {
+    throw new Error(`需求已经位于「${requirement.lane === "acceptance" ? "待验收" : "已完成"}」，不能重新开始推进`);
+  }
+  if (requirement.exception === "cancelled") throw new Error("已取消的需求不能开始推进");
+  if (requirement.acceptanceCriteria.length === 0) throw new Error("缺少验收标准；请先补齐可观察的验收标准");
+  const cycle = (current?.cycle ?? 0) + 1;
+  return {
+    schemaVersion: 1,
+    cycle,
+    trigger,
+    status: "dispatching",
+    entrancePolicyId: config.entrancePolicyId,
+    idempotencyKey: `requirement:${requirement.id}:advance:${cycle}`,
+    startedAt: at,
+    updatedAt: at,
+    nextCheckAt: at
+  };
+}
+
+export function observeAdvancement(
+  advancement: RequirementAdvancement,
+  observation: RequirementInvocationObservation,
+  pollIntervalMs: number
+): RequirementAdvancement {
+  if (advancement.invocationId && advancement.invocationId !== observation.invocationId) {
+    throw new Error("推进观察结果不属于当前需求的 Invocation");
+  }
+  const status = observation.status;
+  const terminal = status === "completed" || status === "blocked" || status === "failed" || status === "cancelled";
+  return {
+    ...advancement,
+    status,
+    invocationId: observation.invocationId,
+    runId: observation.runId,
+    updatedAt: observation.observedAt,
+    ...(terminal ? { nextCheckAt: undefined } : {
+      nextCheckAt: new Date(new Date(observation.observedAt).getTime() + pollIntervalMs).toISOString()
+    }),
+    ...(observation.error ? { error: observation.error } : { error: undefined })
+  };
+}
+
+/** Pure selection function for the future interval worker; it performs no dispatch or writes. */
+export function dueRequirementAdvancements(requirements: Requirement[], now: string): Requirement[] {
+  const timestamp = new Date(now).getTime();
+  return requirements.filter((requirement) => {
+    const advancement = requirement.advancement;
+    if (!advancement || !isActiveRequirementAdvancement(advancement) || !advancement.nextCheckAt) return false;
+    return new Date(advancement.nextCheckAt).getTime() <= timestamp;
+  });
+}
+
+/**
+ * Side-effect-free polling plan. A future timer/queue may execute these actions, but it must call
+ * the same reserve/dispatch/sync methods as the human button so automatic and manual starts cannot diverge.
+ */
+export function planRequirementAdvancementPoll(
+  requirements: RequirementDetail[],
+  configForProject: (projectId: string) => RequirementAdvancementConfig | undefined,
+  now: string
+): RequirementAdvancementPollAction[] {
+  const timestamp = new Date(now).getTime();
+  const actions: RequirementAdvancementPollAction[] = [];
+  for (const requirement of requirements) {
+    const config = configForProject(requirement.projectId);
+    if (!config?.autoPollEnabled || requirement.archivedAt || requirement.exception === "cancelled") continue;
+    const advancement = requirement.advancement;
+    const due = !advancement?.nextCheckAt || new Date(advancement.nextCheckAt).getTime() <= timestamp;
+    if (advancement?.invocationId && isActiveRequirementAdvancement(advancement) && due) {
+      actions.push({ kind: "observe", requirementId: requirement.id, invocationId: advancement.invocationId, config });
+      continue;
+    }
+    const retryable = !advancement || (!advancement.invocationId && advancement.status === "failed")
+      || (!advancement.invocationId && advancement.status === "dispatching" && due);
+    const eligibleLane = requirement.lane === "inbox" || requirement.lane === "planned" || requirement.lane === "queued";
+    if (retryable && eligibleLane && requirement.acceptanceCriteria.length > 0) {
+      actions.push({ kind: "launch", requirementId: requirement.id, config });
+    }
+  }
+  return actions;
+}

@@ -1,11 +1,19 @@
 /** 需求详情：原始需求 / 验收标准 / 任务 DAG / Agent 时间线 / Diff·测试·Review·交付物。
  *  DAG / 时间线 / 资源概览的演示徽标完全由数据 demo 标记驱动。列迁移走目标列 SelectControl。 */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { DemoBadge, DossierSection, EmptyState, Modal, ReadonlyEvidence, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
+import { isActiveRequirementAdvancement, requirementAdvancementConfig } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { DagTaskNode, RequirementDetail, RequirementLane } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_LANES, requirementLaneLabel } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
+import {
+  buildRequirementAdvancementInput,
+  requirementAdvancementGateway,
+  requirementAdvancementSafetyGaps,
+  type RequirementAdvancementGateway
+} from "./requirementAdvancement";
+import type { EntrancePolicy, EntrancePolicyDecision, InvocationRecord, ManagementPolicy, Project, Workflow } from "./types";
 
 function dagStamp(status: DagTaskNode["status"]) {
   if (status === "completed") return <Stamp status="completed" />;
@@ -16,11 +24,52 @@ function dagStamp(status: DagTaskNode["status"]) {
   return <Stamp status="pending" />;
 }
 
-export function RequirementDetailPage({ requirementId, go, notify, service = dashboardService }: {
+const ADVANCEMENT_LABELS = {
+  dispatching: "正在创建 Run",
+  queued: "已排队",
+  running: "Agent 正在推进",
+  "awaiting-human-decision": "等待你的决定",
+  completed: "执行完成，等待核对交付",
+  blocked: "推进已阻塞",
+  failed: "推进失败",
+  cancelled: "推进已取消"
+} as const;
+
+function startBlockedReason(detail: RequirementDetail, configured: boolean, policyAvailable: boolean): string | undefined {
+  if (!configured) return "项目尚未配置需求推进入口";
+  if (!policyAvailable) return "项目配置的入口策略不存在或已归档";
+  if (detail.lane === "clarify") return "需求仍在待澄清，请先补齐关键信息";
+  if (detail.lane === "acceptance" || detail.lane === "done") return "该需求已经进入验收或完成阶段";
+  if (detail.exception === "cancelled") return "已取消的需求不能开始推进";
+  if (detail.acceptanceCriteria.length === 0) return "请先补齐至少一条可观察的验收标准";
+  if (detail.advancement?.invocationId) return "当前推进轮次已经产生 Run，请先处理该 Run";
+  return undefined;
+}
+
+export function RequirementDetailPage({
+  requirementId,
+  go,
+  notify,
+  service = dashboardService,
+  projects = [],
+  entrancePolicies = [],
+  workflows = [],
+  managementPolicies = [],
+  invocations = [],
+  gateway = requirementAdvancementGateway,
+  onOpenRun
+}: {
   requirementId: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
+  projects?: Project[];
+  entrancePolicies?: EntrancePolicy[];
+  workflows?: Workflow[];
+  managementPolicies?: ManagementPolicy[];
+  invocations?: InvocationRecord[];
+  gateway?: RequirementAdvancementGateway;
+  onOpenRun?: (runId: string) => void;
 }) {
   const daemonAvailable = useDaemonAvailable();
   const { state, reload, setData } = useServiceData<RequirementDetail>(() => service.getRequirement(requirementId), [service, requirementId]);
@@ -28,8 +77,102 @@ export function RequirementDetailPage({ requirementId, go, notify, service = das
   const [migrating, setMigrating] = useState(false);
   const [migrateError, setMigrateError] = useState("");
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [launchDecision, setLaunchDecision] = useState<EntrancePolicyDecision>();
+  const [evaluatingLaunch, setEvaluatingLaunch] = useState(false);
+  const [launching, setLaunching] = useState(false);
+  const [launchError, setLaunchError] = useState("");
 
   const detail = state.status === "ready" ? state.data : undefined;
+  const project = detail ? projects.find((candidate) => candidate.id === detail.projectId) : undefined;
+  const advancementConfig = requirementAdvancementConfig(project);
+  const activePolicy = advancementConfig
+    ? entrancePolicies.find((policy) => policy.id === advancementConfig.entrancePolicyId && policy.status === "active")
+    : undefined;
+  const activeInvocation = detail?.advancement?.invocationId
+    ? invocations.find((invocation) => invocation.id === detail.advancement?.invocationId)
+    : undefined;
+  const launchGaps = launchDecision ? requirementAdvancementSafetyGaps(launchDecision, workflows, managementPolicies) : [];
+  const blockedStart = detail ? startBlockedReason(detail, Boolean(advancementConfig), Boolean(activePolicy)) : undefined;
+
+  useEffect(() => {
+    if (!detail?.advancement || !activeInvocation || detail.advancement.status === activeInvocation.status) return;
+    let cancelled = false;
+    void service.syncRequirementAdvancement(detail.id, detail.advancement.idempotencyKey, {
+      invocationId: activeInvocation.id,
+      runId: activeInvocation.runId,
+      leaderSessionId: activeInvocation.sessionId,
+      status: activeInvocation.status,
+      observedAt: activeInvocation.updatedAt,
+      error: activeInvocation.error
+    }, advancementConfig?.pollIntervalMs ?? 15_000).then((updated) => {
+      if (!cancelled) setData({ ...detail, ...updated });
+    }).catch((error: unknown) => {
+      if (!cancelled) setLaunchError(error instanceof Error ? error.message : String(error));
+    });
+    return () => { cancelled = true; };
+  }, [activeInvocation?.id, activeInvocation?.status, activeInvocation?.updatedAt, advancementConfig?.pollIntervalMs, detail?.advancement?.idempotencyKey, detail?.advancement?.status, detail?.id, service, setData]);
+
+  const evaluateLaunch = async () => {
+    if (!detail || !advancementConfig || blockedStart) return;
+    setEvaluatingLaunch(true);
+    setLaunchError("");
+    try {
+      const input = buildRequirementAdvancementInput(detail);
+      const decision = await gateway.evaluate(advancementConfig.entrancePolicyId, {
+        route: input.route,
+        tags: input.tags,
+        signals: input.signals,
+        source: input.source
+      });
+      setLaunchDecision(decision);
+    } catch (error) {
+      setLaunchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setEvaluatingLaunch(false);
+    }
+  };
+
+  const launch = async () => {
+    if (!detail || !advancementConfig || !launchDecision || launchGaps.length > 0) return;
+    setLaunching(true);
+    setLaunchError("");
+    // Only a successfully reserved cycle may be marked failed. A stale click must never
+    // overwrite an already-active Invocation merely because its reservation was rejected.
+    let key: string | undefined;
+    try {
+      const advancement = await service.reserveRequirementAdvancement(detail.id, advancementConfig, "human");
+      key = advancement.idempotencyKey;
+      setData({ ...detail, advancement, exception: null, updatedAt: advancement.updatedAt });
+      const receipt = await gateway.dispatch(
+        advancementConfig.entrancePolicyId,
+        buildRequirementAdvancementInput(detail, advancement)
+      );
+      const updated = await service.syncRequirementAdvancement(detail.id, advancement.idempotencyKey, {
+        invocationId: receipt.invocation.id,
+        runId: receipt.runId,
+        leaderSessionId: receipt.leaderSessionId,
+        status: receipt.invocation.status,
+        observedAt: receipt.invocation.updatedAt,
+        error: receipt.invocation.error
+      }, advancementConfig.pollIntervalMs);
+      setData({ ...detail, ...updated });
+      setLaunchDecision(undefined);
+      notify(`${detail.code} 已开始推进；Run ${receipt.runId} 已进入「${requirementLaneLabel(updated.lane)}」`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLaunchError(message);
+      if (key) {
+        try {
+          const failed = await service.failRequirementAdvancement(detail.id, key, message);
+          setData({ ...detail, ...failed });
+        } catch {
+          // Keep the original dispatch error visible; the persisted key remains fail-closed.
+        }
+      }
+    } finally {
+      setLaunching(false);
+    }
+  };
 
   const migrate = async () => {
     if (!detail || !targetLane) return;
@@ -83,6 +226,30 @@ export function RequirementDetailPage({ requirementId, go, notify, service = das
           <dt>创建</dt><dd>{formatTime(detail.createdAt)}</dd>
           <dt>最近更新</dt><dd>{formatTime(detail.updatedAt)}</dd>
         </dl>
+        <section className="dash-advance-panel" aria-labelledby="requirement-advance-title">
+          <div className="dash-advance-ticket">
+            <span>REAL RUN · CYCLE {detail.advancement?.cycle ?? 1}</span>
+            <strong id="requirement-advance-title">{detail.advancement ? ADVANCEMENT_LABELS[detail.advancement.status] : "尚未启动真实推进"}</strong>
+            <small>{detail.advancement?.runId
+              ? `Run ${detail.advancement.runId}`
+              : activePolicy
+                ? `入口策略 ${activePolicy.id} · v${activePolicy.version}`
+                : blockedStart ?? "先核对入口，再创建受监控的领队 Run"}</small>
+          </div>
+          <div className="dash-advance-actions">
+            {detail.advancement?.runId
+              ? <button type="button" className="button primary" onClick={() => onOpenRun?.(detail.advancement!.runId!)} disabled={!onOpenRun}>查看 Run 与证据</button>
+              : <button
+                  type="button"
+                  className="button primary dash-start-button"
+                  disabled={!daemonAvailable || evaluatingLaunch || launching || isActiveRequirementAdvancement(detail.advancement) || Boolean(blockedStart)}
+                  title={blockedStart}
+                  onClick={() => void evaluateLaunch()}
+                >{evaluatingLaunch ? "正在核对入口…" : detail.advancement?.status === "failed" ? "安全重试启动" : "开始推进"}</button>}
+            <span>{advancementConfig?.autoPollEnabled ? "自动轮询已启用" : "自动轮询协议已预留 · 当前人工启动"}</span>
+          </div>
+          {(launchError || blockedStart) && <p className={launchError ? "dash-advance-error" : "dash-hint-line"} role={launchError ? "alert" : undefined}>{launchError || blockedStart}</p>}
+        </section>
         <div className="dash-migrate" role="group" aria-label="迁移目标列">
           <SelectControl
             ariaLabel="目标列"
@@ -144,6 +311,24 @@ export function RequirementDetailPage({ requirementId, go, notify, service = das
           : <ul className="dash-deliverable-list">{detail.evidence.deliverables.map((item) => <li key={item}><code>{item}</code></li>)}</ul>}
       </DossierSection>
     </div>}
+    {launchDecision && detail && <Modal title={`开始推进 ${detail.code}`} eyebrow="REAL RUN · HUMAN CONFIRMATION" onClose={() => { if (!launching) setLaunchDecision(undefined); }}>
+      <div className="modal-body dash-launch-confirm">
+        <div className="dash-launch-route">
+          <span>入口决策</span>
+          <strong>{launchDecision.target.kind === "supervisor-workflow" ? `${launchDecision.target.workflowId} · v${launchDecision.target.workflowVersion}` : launchDecision.target.kind}</strong>
+          <small>策略 {launchDecision.policyId} · v{launchDecision.policyVersion} · {launchDecision.decidedBy}</small>
+        </div>
+        <p>确认后会创建真实异步 Run，并自动把需求推进到排队中 / 执行中。代码改动必须位于独立 Worktree，测试与独立 Review 通过后才会进入交付；不会自动合并或推送。</p>
+        {launchGaps.length > 0
+          ? <div className="danger-notice" role="alert"><b>安全门禁未通过，暂不能启动</b><ul>{launchGaps.map((gap) => <li key={gap}>{gap}</li>)}</ul></div>
+          : <div className="dash-launch-safe"><Stamp status="passed" label="启动门禁通过" /><span>Worktree、quality.test、quality.audit 与人工高风险决策约束已核对。</span></div>}
+        {launchError && <p className="dash-advance-error" role="alert">{launchError}</p>}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" disabled={launching} onClick={() => setLaunchDecision(undefined)}>先不启动</button>
+          <button type="button" className="button primary" disabled={launching || launchGaps.length > 0} onClick={() => void launch()}>{launching ? "正在创建 Run…" : "确认并开始推进"}</button>
+        </div>
+      </div>
+    </Modal>}
     {archiveOpen && detail && <Modal title={`归档 ${detail.code}`} eyebrow="ARCHIVE · RECOVERABLE" onClose={() => setArchiveOpen(false)}><div className="modal-body"><div className="danger-notice"><b>需求将从看板隐藏。</b><p>原始需求、DAG、时间线与交付证据会完整保留，可在归档中心恢复。</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setArchiveOpen(false)}>取消</button><button type="button" className="button danger-filled" onClick={() => void archive()}>确认归档</button></div></div></Modal>}
   </main>;
 }

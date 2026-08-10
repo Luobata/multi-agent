@@ -102,7 +102,9 @@ function invocationSource(request: Request, fallback: InvocationSourceKind): Inv
     label: headerText(request, "x-multi-agent-source-label"),
     project: headerText(request, "x-multi-agent-project"),
     caller: headerText(request, "x-multi-agent-caller"),
-    contextId: headerText(request, "x-multi-agent-context")
+    contextId: headerText(request, "x-multi-agent-context"),
+    taskId: headerText(request, "x-multi-agent-task-id"),
+    idempotencyKey: headerText(request, "x-multi-agent-idempotency-key")
   };
 }
 

@@ -13,6 +13,7 @@ import type {
   McpObservedProject,
   ProjectProfile,
   Requirement,
+  RequirementAdvancement,
   RequirementDetail,
   RequirementLane,
   RunAcceptanceSnapshot,
@@ -21,6 +22,13 @@ import type {
 } from "./types";
 import { REQUIREMENT_LANES, requirementLaneLabel } from "./types";
 import type { PassiveProjectAccess, Project as ConnectedProject } from "../types";
+import {
+  advancementLane,
+  observeAdvancement,
+  reserveAdvancement,
+  type RequirementAdvancementConfig,
+  type RequirementInvocationObservation
+} from "./advancement";
 
 export function mcpCatalogNodeId(accessId: string): string {
   return `mcp-access:${accessId}`;
@@ -59,6 +67,15 @@ export interface DashboardService {
   createRequirement(input: { projectId: string; title: string; summary: string; priority: Requirement["priority"]; rawRequirement: string; acceptanceCriteria: string[] }): Promise<Requirement>;
   getRequirement(id: string): Promise<RequirementDetail>;
   updateRequirementLane(id: string, lane: RequirementLane): Promise<Requirement>;
+  /** Reserve one durable cycle before dispatch. Button and future scanner must both call this first. */
+  reserveRequirementAdvancement(id: string, config: RequirementAdvancementConfig, trigger: RequirementAdvancement["trigger"]): Promise<RequirementAdvancement>;
+  syncRequirementAdvancement(
+    id: string,
+    idempotencyKey: string,
+    observation: RequirementInvocationObservation & { leaderSessionId?: string },
+    pollIntervalMs: number
+  ): Promise<Requirement>;
+  failRequirementAdvancement(id: string, idempotencyKey: string, message: string): Promise<Requirement>;
   /** 原子提交：验证全套 Run 验收证据后，一次性写入 evidence 并迁移到「待验收」。 */
   submitRequirementForAcceptance(requirementId: string, snapshot: RunAcceptanceSnapshot): Promise<Requirement>;
   archiveRequirement(id: string): Promise<ArchiveRecord>;
@@ -267,6 +284,10 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
     if (parent.archivedAt) throw failure("目标文件夹已归档", "请先在归档中心恢复，或改选其它文件夹", "未写入任何配置");
   };
   const copyNode = (node: SpaceNode): SpaceNode => ({ ...node });
+  const requirementSummary = (requirement: RequirementDetail): Requirement => {
+    const { rawRequirement: _raw, acceptanceCriteria: _ac, dag: _dag, timeline: _tl, resourceOverview: _ro, evidence: _ev, ...summary } = requirement;
+    return { ...summary };
+  };
 
   return {
     syncConnectedProjects(projects, passiveAccesses = []) {
@@ -587,6 +608,80 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         record("迁移需求列", requirement.code, `${from} → ${requirementLaneLabel(lane)}。`);
         const { rawRequirement: _raw, acceptanceCriteria: _ac, dag: _dag, timeline: _tl, resourceOverview: _ro, evidence: _ev, ...summary } = requirement;
         return { ...summary };
+      });
+    },
+    reserveRequirementAdvancement(id, config, trigger) {
+      return respond(() => {
+        const requirement = store.requirements.find((candidate) => candidate.id === id);
+        if (!requirement || requirement.archivedAt) {
+          throw failure("没有找到这条需求", "请回到需求看板重新选择", "未启动任何执行任务");
+        }
+        const advancement = reserveAdvancement(requirement, config, trigger, touch());
+        requirement.advancement = advancement;
+        requirement.exception = null;
+        requirement.updatedAt = advancement.updatedAt;
+        record(
+          advancement.cycle === 1 ? "准备推进" : "重试推进",
+          requirement.code,
+          `推进轮次 ${advancement.cycle} 已预留；入口策略 ${advancement.entrancePolicyId}；尚未重复创建 Run。`
+        );
+        return { ...advancement };
+      });
+    },
+    syncRequirementAdvancement(id, idempotencyKey, observation, pollIntervalMs) {
+      return respond(() => {
+        const requirement = store.requirements.find((candidate) => candidate.id === id);
+        if (!requirement || requirement.archivedAt) {
+          throw failure("没有找到这条需求", "请回到需求看板重新选择", "Workbench 中的 Run 不会被删除");
+        }
+        if (!requirement.advancement || requirement.advancement.idempotencyKey !== idempotencyKey) {
+          throw failure("推进回写不属于当前需求轮次", "请刷新需求详情后重试", "现有推进记录与 Run 均未被覆盖");
+        }
+        const previousStatus = requirement.advancement.status;
+        requirement.advancement = {
+          ...observeAdvancement(requirement.advancement, observation, pollIntervalMs),
+          ...(observation.leaderSessionId ? { leaderSessionId: observation.leaderSessionId } : {})
+        };
+        requirement.lane = advancementLane(requirement.advancement.status, requirement.lane);
+        requirement.exception = requirement.advancement.status === "blocked"
+          ? "blocked"
+          : requirement.advancement.status === "failed"
+            ? "failed"
+            : requirement.advancement.status === "cancelled"
+              ? "cancelled"
+              : null;
+        requirement.updatedAt = requirement.advancement.updatedAt;
+        if (previousStatus !== requirement.advancement.status || !requirement.advancement.runId) {
+          record(
+            "同步推进状态",
+            requirement.code,
+            `${previousStatus} → ${requirement.advancement.status}；Run ${requirement.advancement.runId ?? observation.runId}。`
+          );
+        }
+        return requirementSummary(requirement);
+      });
+    },
+    failRequirementAdvancement(id, idempotencyKey, message) {
+      return respond(() => {
+        const requirement = store.requirements.find((candidate) => candidate.id === id);
+        if (!requirement || requirement.archivedAt) {
+          throw failure("没有找到这条需求", "请回到需求看板重新选择", "Workbench 中可能已创建的 Run 不会被删除");
+        }
+        if (!requirement.advancement || requirement.advancement.idempotencyKey !== idempotencyKey) {
+          throw failure("推进失败信息不属于当前需求轮次", "请刷新需求详情后重试", "现有推进记录未被覆盖");
+        }
+        const stamp = touch();
+        requirement.advancement = {
+          ...requirement.advancement,
+          status: "failed",
+          updatedAt: stamp,
+          nextCheckAt: requirement.advancement.invocationId ? undefined : stamp,
+          error: message.trim() || "启动推进失败"
+        };
+        requirement.exception = "failed";
+        requirement.updatedAt = stamp;
+        record("推进启动失败", requirement.code, `${requirement.advancement.error}；保留幂等键，可安全重试。`);
+        return requirementSummary(requirement);
       });
     },
     submitRequirementForAcceptance(requirementId, snapshot) {

@@ -197,6 +197,8 @@ export interface InvocationSource {
   caller?: string;
   contextId?: string;
   taskId?: string;
+  /** Caller-chosen durable key used to make an asynchronous dispatch exactly-once from its perspective. */
+  idempotencyKey?: string;
   publicationId?: string;
 }
 
@@ -412,10 +414,11 @@ export interface ManagementPolicy {
     maxRounds: number;
     maxDelegations: number;
     maxParallelDelegations: number;
-    maxDurationMs: number;
+    maxDurationMs?: number;
   };
   failure: { workerFailure: "observe-and-replan" | "fail-fast" };
   completion: { requireDelegation: boolean; requireAllDelegationsSuccessful: boolean };
+  execution?: { isolation?: "worktree" | "none" };
   createdAt: string;
   updatedAt: string;
 }

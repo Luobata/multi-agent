@@ -1691,6 +1691,11 @@ export class WorkbenchService {
   private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly backgroundInvocations = new Map<string, Promise<void>>();
+  /**
+   * Closes the small race between two callers that dispatch the same durable task cycle at once.
+   * The persisted Invocation source remains the source of truth across daemon restarts.
+   */
+  private readonly idempotentWorkflowStarts = new Map<string, Promise<InvocationStartResult>>();
   private readonly humanDecisionWaiters = new Map<string, {
     promise: Promise<RuntimeHumanDecisionOutcome>;
     resolve: (outcome: RuntimeHumanDecisionOutcome) => void;
@@ -6964,31 +6969,13 @@ export class WorkbenchService {
     return { invocation, workflow, employees };
   }
 
-  async startWorkbenchWorkflow(
-    id: string,
-    input: JsonObject = {},
-    source: InvocationSource = { kind: "workbench" },
-    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
-  ): Promise<InvocationStartResult> {
-    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
-    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, {
-      ...options,
-      createLeaderSession: true
-    });
-    const initialCursor = invocationProgressCursor(await this.getInvocationProgress(prepared.invocation.id));
-    const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
-    const settled = execution.then(() => undefined, () => undefined);
-    this.backgroundInvocations.set(prepared.invocation.id, settled);
-    void settled.finally(() => {
-      if (this.backgroundInvocations.get(prepared.invocation.id) === settled) {
-        this.backgroundInvocations.delete(prepared.invocation.id);
-      }
-    });
+  private async workflowInvocationReceipt(invocation: InvocationRecord): Promise<InvocationStartResult> {
+    const initialCursor = invocationProgressCursor(await this.getInvocationProgress(invocation.id));
     return {
-      invocation: prepared.invocation,
-      runId: prepared.invocation.runId,
-      ...(prepared.workflow.architecture === "supervisor" && prepared.invocation.sessionId
-        ? { leaderSessionId: prepared.invocation.sessionId }
+      invocation,
+      runId: invocation.runId,
+      ...(invocation.executionSnapshot?.workflow.architecture === "supervisor" && invocation.sessionId
+        ? { leaderSessionId: invocation.sessionId }
         : {}),
       monitor: {
         mode: "long-poll",
@@ -6999,6 +6986,62 @@ export class WorkbenchService {
         instructions: "启动后立即用 initialCursor 循环调用 wait_workflow_progress；非终态不要结束当前回合，每次变化或心跳都向用户汇报，终态交付最终摘要。"
       }
     };
+  }
+
+  private async startWorkbenchWorkflowOnce(
+    id: string,
+    input: JsonObject = {},
+    source: InvocationSource = { kind: "workbench" },
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
+  ): Promise<InvocationStartResult> {
+    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
+    const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, {
+      ...options,
+      createLeaderSession: true
+    });
+    const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
+    const settled = execution.then(() => undefined, () => undefined);
+    this.backgroundInvocations.set(prepared.invocation.id, settled);
+    void settled.finally(() => {
+      if (this.backgroundInvocations.get(prepared.invocation.id) === settled) {
+        this.backgroundInvocations.delete(prepared.invocation.id);
+      }
+    });
+    return this.workflowInvocationReceipt(prepared.invocation);
+  }
+
+  async startWorkbenchWorkflow(
+    id: string,
+    input: JsonObject = {},
+    source: InvocationSource = { kind: "workbench" },
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
+  ): Promise<InvocationStartResult> {
+    const idempotencyKey = source.idempotencyKey?.trim();
+    if (!idempotencyKey) return this.startWorkbenchWorkflowOnce(id, input, source, options);
+
+    const existing = Object.values(this.snapshot().invocations)
+      .find((candidate) => candidate.source.idempotencyKey === idempotencyKey);
+    if (existing) {
+      if (existing.target.kind !== "workflow" || existing.target.id !== id
+        || (options.workflowVersion !== undefined && existing.target.version !== options.workflowVersion)
+        || existing.source.taskId !== source.taskId
+        || existing.source.project !== source.project) {
+        throw new Error(`idempotency key ${idempotencyKey} is already bound to another workflow Invocation`);
+      }
+      return this.workflowInvocationReceipt(existing);
+    }
+
+    const pending = this.idempotentWorkflowStarts.get(idempotencyKey);
+    if (pending) return pending;
+    const started = this.startWorkbenchWorkflowOnce(id, input, { ...source, idempotencyKey }, options);
+    this.idempotentWorkflowStarts.set(idempotencyKey, started);
+    try {
+      return await started;
+    } finally {
+      if (this.idempotentWorkflowStarts.get(idempotencyKey) === started) {
+        this.idempotentWorkflowStarts.delete(idempotencyKey);
+      }
+    }
   }
 
   async archiveWorkflow(id: string): Promise<WorkbenchWorkflowDefinition> {

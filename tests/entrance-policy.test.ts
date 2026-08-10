@@ -312,6 +312,46 @@ describe("task Entrance Policies", () => {
     });
   });
 
+  it("reuses one workflow Invocation for the same durable dispatch key, including after reopen", async () => {
+    const root = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot: root });
+    const leader = await createSupervisorWorkflow(service, "idempotent-leader");
+    await service.createEntrancePolicy({
+      id: "idempotent-routing",
+      leader: { workflowId: leader.id },
+      default: { route: "leader" }
+    });
+    const request = {
+      ...evaluation({
+        source: {
+          kind: "http" as const,
+          taskId: "req-101",
+          idempotencyKey: "requirement:req-101:advance:1"
+        }
+      }),
+      message: "Start this requirement exactly once."
+    };
+
+    const first = await service.dispatchEntrancePolicy("idempotent-routing", request);
+    const second = await service.dispatchEntrancePolicy("idempotent-routing", request);
+    expect(first.dispatch.kind).toBe("invocation-started");
+    expect(second.dispatch.kind).toBe("invocation-started");
+    if (first.dispatch.kind !== "invocation-started" || second.dispatch.kind !== "invocation-started") {
+      throw new Error("expected workflow receipts");
+    }
+    expect(second.dispatch.receipt.invocation.id).toBe(first.dispatch.receipt.invocation.id);
+    expect(second.dispatch.receipt.runId).toBe(first.dispatch.receipt.runId);
+    expect(service.getActivitySnapshot().invocations).toHaveLength(1);
+    await service.waitForInvocation(first.dispatch.receipt.invocation.id);
+
+    const reopened = await WorkbenchService.open({ dataRoot: root });
+    const retried = await reopened.dispatchEntrancePolicy("idempotent-routing", request);
+    expect(retried.dispatch.kind).toBe("invocation-started");
+    if (retried.dispatch.kind !== "invocation-started") throw new Error("expected reopened workflow receipt");
+    expect(retried.dispatch.receipt.invocation.id).toBe(first.dispatch.receipt.invocation.id);
+    expect(reopened.getActivitySnapshot().invocations).toHaveLength(1);
+  });
+
   it("rejects a non-Supervisor workflow configured as leader", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     await createEmployee(service, "not-a-leader");

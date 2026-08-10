@@ -28,6 +28,7 @@ const SOURCE_FIELDS = [
   "caller",
   "contextId",
   "taskId",
+  "idempotencyKey",
   "publicationId"
 ] as const;
 

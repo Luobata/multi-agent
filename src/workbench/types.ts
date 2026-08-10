@@ -415,6 +415,8 @@ export interface InvocationSource {
   caller?: string;
   contextId?: string;
   taskId?: string;
+  /** Caller-chosen durable key used to deduplicate asynchronous dispatch retries. */
+  idempotencyKey?: string;
   publicationId?: string;
 }
 
@@ -476,6 +478,7 @@ export interface EntrancePolicySourceCondition {
   caller?: string;
   contextId?: string;
   taskId?: string;
+  idempotencyKey?: string;
   publicationId?: string;
 }
 

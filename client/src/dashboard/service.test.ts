@@ -76,6 +76,44 @@ describe("empty production board and versioned persistence", () => {
   });
 });
 
+describe("requirement advancement persistence", () => {
+  const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+
+  it("reserves, attaches and tracks one Run while moving queued/running lanes automatically", async () => {
+    const service = makeService();
+    const reserved = await service.reserveRequirementAdvancement("req-103", config, "human");
+    expect(reserved).toMatchObject({ cycle: 1, status: "dispatching", idempotencyKey: "requirement:req-103:advance:1" });
+
+    const queued = await service.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
+      invocationId: "inv-1",
+      runId: "run-1",
+      leaderSessionId: "session-1",
+      status: "queued",
+      observedAt: "2026-08-09T06:00:01.000Z"
+    }, config.pollIntervalMs);
+    expect(queued).toMatchObject({ lane: "queued", advancement: { invocationId: "inv-1", runId: "run-1", nextCheckAt: "2026-08-09T06:00:16.000Z" } });
+
+    const running = await service.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
+      invocationId: "inv-1",
+      runId: "run-1",
+      status: "running",
+      observedAt: "2026-08-09T06:00:16.000Z"
+    }, config.pollIntervalMs);
+    expect(running).toMatchObject({ lane: "running", exception: null, advancement: { status: "running" } });
+  });
+
+  it("keeps the same cycle available for a safe retry when dispatch has no receipt", async () => {
+    const service = makeService();
+    const first = await service.reserveRequirementAdvancement("req-103", config, "human");
+    const failed = await service.failRequirementAdvancement("req-103", first.idempotencyKey, "响应中断");
+    expect(failed).toMatchObject({ exception: "failed", advancement: { status: "failed" } });
+    expect(failed.advancement?.invocationId).toBeUndefined();
+    const retried = await service.reserveRequirementAdvancement("req-103", config, "human");
+    expect(retried.idempotencyKey).toBe(first.idempotencyKey);
+    expect(retried.cycle).toBe(1);
+  });
+});
+
 function connectedProject(id: string, status: Project["status"] = "active"): Project {
   return {
     id,

@@ -8,6 +8,12 @@ connector:
   kind: repository-development
   config:
     sourceRoots: [src, client]
+    requirementAdvancement:
+      entrancePolicyId: default-task-entrance-policy
+      polling:
+        # 人工按钮与未来轮询器复用同一幂等推进协议；首期只开放人工启动。
+        enabled: false
+        intervalMs: 15000
 roles:
   product-manager:
     displayName: 产品经理

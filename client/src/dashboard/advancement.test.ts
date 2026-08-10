@@ -1,0 +1,96 @@
+import { describe, expect, it } from "vitest";
+import {
+  advancementLane,
+  dueRequirementAdvancements,
+  planRequirementAdvancementPoll,
+  requirementAdvancementConfig,
+  reserveAdvancement
+} from "./advancement";
+import type { Requirement, RequirementDetail } from "./types";
+import type { Project } from "../types";
+
+function detail(overrides: Partial<RequirementDetail> = {}): RequirementDetail {
+  return {
+    id: "req-1",
+    projectId: "project-1",
+    code: "REQ-1",
+    title: "推进需求",
+    summary: "需要真实执行",
+    lane: "inbox",
+    exception: null,
+    priority: "medium",
+    owner: "待分配",
+    createdAt: "2026-08-10T00:00:00.000Z",
+    updatedAt: "2026-08-10T00:00:00.000Z",
+    archivedAt: null,
+    rawRequirement: "推进需求",
+    acceptanceCriteria: ["可验收"],
+    dag: { demo: true, nodes: [] },
+    timeline: { demo: true, entries: [] },
+    resourceOverview: { demo: true, agents: 0, elapsedMinutes: 0, tokensUsed: 0 },
+    evidence: { diffSummary: "", testReport: "", reviewNotes: "", deliverables: [] },
+    ...overrides
+  };
+}
+
+const config = { entrancePolicyId: "requirement-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+
+describe("requirement advancement control state", () => {
+  it("reads the project-owned policy and polling schedule without hard-coding a workflow", () => {
+    const project = {
+      connector: {
+        kind: "repository-development",
+        config: {
+          requirementAdvancement: {
+            entrancePolicyId: "requirement-policy",
+            polling: { enabled: true, intervalMs: 30_000 }
+          }
+        }
+      }
+    } as unknown as Project;
+    expect(requirementAdvancementConfig(project)).toEqual({
+      entrancePolicyId: "requirement-policy",
+      autoPollEnabled: true,
+      pollIntervalMs: 30_000
+    });
+  });
+
+  it("reserves a stable key and reuses it after a response-less failure", () => {
+    const first = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
+    expect(first).toMatchObject({ cycle: 1, status: "dispatching", idempotencyKey: "requirement:req-1:advance:1" });
+    const retried = reserveAdvancement(
+      detail({ advancement: { ...first, status: "failed", error: "network lost" } }),
+      config,
+      "automatic",
+      "2026-08-10T01:01:00.000Z"
+    );
+    expect(retried.idempotencyKey).toBe(first.idempotencyKey);
+    expect(retried.cycle).toBe(1);
+    expect(retried.trigger).toBe("automatic");
+  });
+
+  it("selects only due active cursors for a future poller and maps execution states to lanes", () => {
+    const reserved = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
+    const due = detail({ advancement: { ...reserved, status: "running", nextCheckAt: "2026-08-10T01:00:15.000Z" } });
+    const later = detail({ id: "req-2", advancement: { ...reserved, idempotencyKey: "requirement:req-2:advance:1", nextCheckAt: "2026-08-10T01:05:00.000Z" } });
+    const terminal = detail({ id: "req-3", advancement: { ...reserved, status: "completed", nextCheckAt: undefined } });
+    expect(dueRequirementAdvancements([due, later, terminal] as Requirement[], "2026-08-10T01:00:20.000Z").map((item) => item.id)).toEqual(["req-1"]);
+    expect(advancementLane("queued", "inbox")).toBe("queued");
+    expect(advancementLane("awaiting-human-decision", "queued")).toBe("running");
+    expect(advancementLane("failed", "running")).toBe("running");
+  });
+
+  it("plans automatic launch and observation actions without performing side effects", () => {
+    const automatic = { ...config, autoPollEnabled: true };
+    const reserved = reserveAdvancement(detail(), automatic, "automatic", "2026-08-10T01:00:00.000Z");
+    const actions = planRequirementAdvancementPoll([
+      detail(),
+      detail({ id: "req-2", advancement: { ...reserved, idempotencyKey: "requirement:req-2:advance:1", invocationId: "inv-2", status: "running", nextCheckAt: "2026-08-10T01:00:10.000Z" } }),
+      detail({ id: "req-3", lane: "clarify" })
+    ], () => automatic, "2026-08-10T01:00:20.000Z");
+    expect(actions).toEqual([
+      { kind: "launch", requirementId: "req-1", config: automatic },
+      { kind: "observe", requirementId: "req-2", invocationId: "inv-2", config: automatic }
+    ]);
+  });
+});
