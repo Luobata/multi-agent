@@ -9,6 +9,23 @@ const PROGRESS_EVENT_INTERVAL_MS = 5_000;
 
 type ProviderTimeoutDefinition = Pick<CommandProviderDefinition, "timeoutMs" | "idleTimeoutMs" | "hardTimeoutMs">;
 
+/**
+ * A daemon launched by Finder/launchd often inherits a minimal PATH even though it is itself
+ * running under Node. Codex CLI uses `#!/usr/bin/env node`, so always expose the directory of the
+ * current executable to child Providers instead of relying on an interactive shell profile.
+ */
+export function providerSpawnEnvironment(
+  inherited: NodeJS.ProcessEnv = process.env,
+  executable = process.execPath
+): NodeJS.ProcessEnv {
+  const executableDirectory = path.dirname(executable);
+  const entries = (inherited.PATH ?? "").split(path.delimiter).filter(Boolean);
+  return {
+    ...inherited,
+    PATH: [executableDirectory, ...entries.filter((entry) => entry !== executableDirectory)].join(path.delimiter)
+  };
+}
+
 export type ProviderProgress = {
   [key: string]: JsonValue;
   kind: "output" | "long-running" | "idle-timeout" | "hard-timeout";
@@ -686,7 +703,7 @@ class CodexProviderAdapter implements ProviderAdapter {
     return new Promise((resolve, reject) => {
       const child = spawn(definition.command?.trim() || "codex", args, {
         cwd: workingDirectory,
-        env: process.env,
+        env: providerSpawnEnvironment(),
         stdio: ["pipe", "pipe", "pipe"]
       });
       let stdout = "";

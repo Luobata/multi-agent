@@ -59,7 +59,8 @@ describe("requirement advancement control state", () => {
 
   it("reserves a stable key and reuses it after a response-less failure", () => {
     const first = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
-    expect(first).toMatchObject({ cycle: 1, status: "dispatching", idempotencyKey: "requirement:req-1:advance:1" });
+    expect(first).toMatchObject({ cycle: 1, status: "dispatching" });
+    expect(first.idempotencyKey).toMatch(/^requirement:project-1:req-1:advance:1:/);
     const retried = reserveAdvancement(
       detail({ advancement: { ...first, status: "failed", error: "network lost" } }),
       config,
@@ -71,11 +72,24 @@ describe("requirement advancement control state", () => {
     expect(retried.trigger).toBe("automatic");
   });
 
+  it("rotates only a key proven to belong to another browser-local board", () => {
+    const first = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
+    const retried = reserveAdvancement(detail({ advancement: {
+      ...first,
+      status: "failed",
+      error: `idempotency key ${first.idempotencyKey} is already bound to another workflow Invocation`
+    } }), config, "human", "2026-08-10T01:01:00.000Z");
+    expect(retried.cycle).toBe(1);
+    expect(retried.idempotencyKey).not.toBe(first.idempotencyKey);
+    expect(retried.idempotencyKey).toMatch(/^requirement:project-1:req-1:advance:1:/);
+  });
+
   it("keeps concurrent requirements isolated and replaces the pending owner once a cycle exists", () => {
     const first = reserveAdvancement(detail({ id: "req-1" }), config, "human", "2026-08-10T01:00:00.000Z");
     const second = reserveAdvancement(detail({ id: "req-2" }), config, "human", "2026-08-10T01:00:00.000Z");
-    expect(first.idempotencyKey).toBe("requirement:req-1:advance:1");
-    expect(second.idempotencyKey).toBe("requirement:req-2:advance:1");
+    expect(first.idempotencyKey).toMatch(/^requirement:project-1:req-1:advance:1:/);
+    expect(second.idempotencyKey).toMatch(/^requirement:project-1:req-2:advance:1:/);
+    expect(second.idempotencyKey).not.toBe(first.idempotencyKey);
     expect(requirementOwnerLabel(detail())).toBe("待分配");
     expect(requirementOwnerLabel(detail({ advancement: first }))).toBe("Agent 团队");
   });
@@ -94,7 +108,8 @@ describe("requirement advancement control state", () => {
       "human",
       "2026-08-10T01:05:00.000Z"
     );
-    expect(next).toMatchObject({ cycle: 2, status: "dispatching", idempotencyKey: "requirement:req-1:advance:2" });
+    expect(next).toMatchObject({ cycle: 2, status: "dispatching" });
+    expect(next.idempotencyKey).toMatch(/^requirement:project-1:req-1:advance:2:/);
     expect(() => reserveAdvancement(
       detail({ advancement: { ...failed, status: "completed" }, exception: null }),
       config,

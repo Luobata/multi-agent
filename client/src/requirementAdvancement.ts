@@ -83,7 +83,12 @@ function sourceFor(requirement: RequirementDetail, advancement?: RequirementAdva
     label: `需求看板推进 · ${requirement.code}`,
     project: requirement.projectId,
     caller: "requirement-advancement",
-    contextId: `requirement:${requirement.id}`,
+    // The daemon is shared by multiple browser-local boards. Once a cycle is reserved, its
+    // globally unique idempotency key also scopes the provider Session and prevents two local
+    // `req-local-1` records from serializing into the same conversation.
+    contextId: advancement
+      ? `requirement-run:${advancement.idempotencyKey}`
+      : `requirement:${requirement.projectId}:${requirement.id}`,
     taskId: requirement.id,
     ...(advancement ? { idempotencyKey: advancement.idempotencyKey } : {})
   };

@@ -178,9 +178,14 @@ describe("RequirementDetailPage advancement launch", () => {
     await act(async () => { button("确认并开始推进").click(); await new Promise((resolve) => setTimeout(resolve, 20)); });
     expect(dispatch).toHaveBeenCalledOnce();
     expect(dispatch.mock.calls[0]![1].source).toMatchObject({
-      taskId: requirement.id,
-      idempotencyKey: `requirement:${requirement.id}:advance:1`
+      taskId: requirement.id
     });
+    expect(dispatch.mock.calls[0]![1].source.idempotencyKey).toMatch(
+      new RegExp(`^requirement:${project.id}:${requirement.id}:advance:1:`)
+    );
+    expect(dispatch.mock.calls[0]![1].source.contextId).toBe(
+      `requirement-run:${dispatch.mock.calls[0]![1].source.idempotencyKey}`
+    );
     expect(await service.getRequirement(requirement.id)).toMatchObject({
       lane: "queued",
       advancement: { invocationId: "inv-1", runId: "run-1", status: "queued" }

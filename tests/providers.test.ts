@@ -1,8 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { ProviderExecutionError } from "../src/core/errors.js";
-import { buildCodexInvocationArgs, createDefaultProviderRegistry, providerExitDiagnostic, registerProviderAdapter } from "../src/runtime/providers.js";
+import { buildCodexInvocationArgs, createDefaultProviderRegistry, providerExitDiagnostic, providerSpawnEnvironment, registerProviderAdapter } from "../src/runtime/providers.js";
 
 describe("provider adapters", () => {
+  it("prepends the daemon Node directory so env-based Codex launchers work without a shell profile", () => {
+    const inherited = { PATH: ["/usr/bin", "/bin"].join(":"), KEEP: "yes" };
+    expect(providerSpawnEnvironment(inherited, "/opt/homebrew/bin/node")).toMatchObject({
+      PATH: ["/opt/homebrew/bin", "/usr/bin", "/bin"].join(":"),
+      KEEP: "yes"
+    });
+    expect(providerSpawnEnvironment({ PATH: "/opt/homebrew/bin:/usr/bin" }, "/opt/homebrew/bin/node").PATH)
+      .toBe("/opt/homebrew/bin:/usr/bin");
+  });
+
   it("includes a deterministic local mock adapter", async () => {
     const adapter = createDefaultProviderRegistry().get("mock");
     const response = await adapter!.invoke({

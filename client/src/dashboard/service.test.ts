@@ -210,13 +210,14 @@ describe("requirement advancement persistence", () => {
     expect(await expectFailure(service.updateRequirementLane("req-103", "confirmation"))).toContain("只能由真实 Run 更新");
     const reserved = await service.reserveRequirementAdvancement("req-103", config, "human");
     expect(await expectFailure(service.updateRequirementLane("req-103", "planned"))).toContain("仍有进行中的真实 Run");
-    expect(reserved.idempotencyKey).toBe("requirement:req-103:advance:1");
+    expect(reserved.idempotencyKey).toMatch(/^requirement:prj-workbench:req-103:advance:1:/);
   });
 
   it("moves one Run from execution to confirmation and back after the human decides", async () => {
     const service = makeService();
     const reserved = await service.reserveRequirementAdvancement("req-103", config, "human");
-    expect(reserved).toMatchObject({ cycle: 1, status: "dispatching", idempotencyKey: "requirement:req-103:advance:1" });
+    expect(reserved).toMatchObject({ cycle: 1, status: "dispatching" });
+    expect(reserved.idempotencyKey).toMatch(/^requirement:prj-workbench:req-103:advance:1:/);
 
     const queued = await service.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
       invocationId: "inv-1",
