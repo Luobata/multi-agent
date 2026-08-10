@@ -188,6 +188,46 @@ describe("RequirementDetailPage advancement launch", () => {
     expect(button("查看 Run 与证据")).toBeTruthy();
   });
 
+  it("explains the pending decision and opens the exact Run as the primary action", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T02:00:00.000Z"), idSeed: () => "req-confirm" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "高风险修改确认",
+      summary: "等待人工批准",
+      priority: "high",
+      rawRequirement: "需要安装依赖",
+      acceptanceCriteria: ["批准后继续原 Run"]
+    });
+    const config = { entrancePolicyId: entrancePolicy.id, autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-confirm",
+      runId: "run-confirm",
+      status: "awaiting-human-decision",
+      observedAt: "2026-08-10T02:00:01.000Z"
+    }, config.pollIntervalMs);
+    const onOpenRun = vi.fn();
+
+    act(() => root.render(<RequirementDetailPage
+      requirementId={requirement.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+      entrancePolicies={[entrancePolicy]}
+      workflows={[workflow]}
+      managementPolicies={[managementPolicy]}
+      onOpenRun={onOpenRun}
+    />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(container.querySelector(".dash-confirmation-guide")?.textContent).toContain("这个 Run 已暂停，正在等你");
+    expect(container.querySelector(".dash-confirmation-guide")?.textContent).toContain("批准或拒绝");
+    await act(async () => { button("查看问题并作决定").click(); });
+    expect(onOpenRun).toHaveBeenCalledWith("run-confirm");
+  });
+
   it("offers a new governed cycle after the previous Run failed", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T01:00:00.000Z"), idSeed: () => "req-retry" });
     service.syncConnectedProjects([project]);

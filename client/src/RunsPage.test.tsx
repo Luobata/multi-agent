@@ -618,6 +618,8 @@ describe("RunsPage human-in-the-loop decisions", () => {
   it("renders the pending request as a prominent awaiting banner with risk evidence", () => {
     const card = container.querySelector(".human-decision-card--pending");
     expect(card).toBeTruthy();
+    const sectionTitles = [...container.querySelectorAll(".dossier-section h3")].map((element) => element.textContent);
+    expect(sectionTitles[0]).toBe("需要你的决定");
     expect(card?.querySelector('[role="alert"]')?.textContent).toContain("等待你的决定");
     const text = card?.textContent ?? "";
     expect(text).toContain("依赖安装");

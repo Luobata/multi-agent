@@ -250,4 +250,40 @@ describe("BoardPage AI requirement creation", () => {
     expect(raw).toBeTruthy();
     expect(await service.listBoard()).toEqual([]);
   });
+
+  it("turns a waiting confirmation card into a direct human-decision action", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T03:00:00.000Z") });
+    service.syncConnectedProjects([connectedProject()]);
+    const requirement = await service.createRequirement({
+      projectId: "connected-a",
+      title: "安装浏览器依赖前确认",
+      summary: "Agent 需要人工批准高风险操作",
+      priority: "high",
+      rawRequirement: "运行端到端测试",
+      acceptanceCriteria: ["人工决定后继续同一个 Run"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-confirmation",
+      runId: "run-confirmation",
+      status: "awaiting-human-decision",
+      observedAt: "2026-08-10T03:00:01.000Z"
+    }, config.pollIntervalMs);
+    const go = vi.fn();
+    const onOpenRun = vi.fn();
+
+    act(() => root.render(<BoardPage spaceId="connected-a" go={go} notify={vi.fn()} service={service} onOpenRun={onOpenRun} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(container.textContent).toContain("Run 已暂停，不会自行继续");
+    await act(async () => { button("处理待确认").click(); });
+    expect(onOpenRun).toHaveBeenCalledWith("run-confirmation");
+    expect(go).not.toHaveBeenCalled();
+
+    const detailAction = container.querySelector<HTMLButtonElement>(`[aria-label="查看需求详情：${requirement.code} ${requirement.title}"]`);
+    expect(detailAction).toBeTruthy();
+    await act(async () => { detailAction?.click(); });
+    expect(go).toHaveBeenCalledWith(`requirements/${requirement.id}`);
+  });
 });

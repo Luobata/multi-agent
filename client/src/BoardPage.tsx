@@ -62,12 +62,13 @@ function exceptionChip(exception: Requirement["exception"]) {
   return null;
 }
 
-export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "" }: {
+export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", onOpenRun }: {
   spaceId?: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
   catalogRevision?: string;
+  onOpenRun?: (runId: string) => void;
 }) {
   const daemonAvailable = useDaemonAvailable();
   const { state, reload, setData } = useServiceData<{ requirements: Requirement[]; nodes: SpaceNode[] }>(
@@ -253,19 +254,33 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
             return <section className="board-lane" key={lane.id} aria-label={`${lane.label}（${cards.length} 条）`}>
               <header className="board-lane-head"><h2>{lane.label}</h2><span className="board-lane-count">{cards.length}</span></header>
               <div className="board-lane-body">
-                {cards.map((requirement) => <button type="button" key={requirement.id}
-                  className={`board-card${requirement.exception ? ` board-card--${requirement.exception}` : ""}`}
-                  onClick={() => go(`requirements/${requirement.id}`)}>
-                  <div className="board-card-top"><code>{requirement.code}</code>{!spaceId && <span className="board-card-project" title={projectName(requirement.projectId)}>{projectName(requirement.projectId)}</span>}</div>
-                  <strong>{requirement.title}</strong>
-                  <p>{requirement.summary}</p>
-                  <footer>
-                    <span className={`board-priority board-priority--${requirement.priority}`}>{REQUIREMENT_PRIORITY_LABELS[requirement.priority]}</span>
-                    <span>{requirementOwnerLabel(requirement)}</span>
-                    <time>{formatTime(requirement.updatedAt)}</time>
-                    {exceptionChip(requirement.exception)}
-                  </footer>
-                </button>)}
+                {cards.map((requirement) => {
+                  const awaitingDecision = requirement.advancement?.status === "awaiting-human-decision";
+                  const runId = requirement.advancement?.runId;
+                  const openRequirement = () => go(`requirements/${requirement.id}`);
+                  const openDecision = () => {
+                    if (runId && onOpenRun) onOpenRun(runId);
+                    else openRequirement();
+                  };
+                  return <article key={requirement.id}
+                    className={`board-card${awaitingDecision ? " board-card--confirmation" : ""}${requirement.exception ? ` board-card--${requirement.exception}` : ""}`}>
+                    <button type="button" className="board-card-main" onClick={openRequirement} aria-label={`查看需求详情：${requirement.code} ${requirement.title}`}>
+                      <div className="board-card-top"><code>{requirement.code}</code>{!spaceId && <span className="board-card-project" title={projectName(requirement.projectId)}>{projectName(requirement.projectId)}</span>}</div>
+                      <strong>{requirement.title}</strong>
+                      <p>{requirement.summary}</p>
+                      <footer>
+                        <span className={`board-priority board-priority--${requirement.priority}`}>{REQUIREMENT_PRIORITY_LABELS[requirement.priority]}</span>
+                        <span>{requirementOwnerLabel(requirement)}</span>
+                        <time>{formatTime(requirement.updatedAt)}</time>
+                        {exceptionChip(requirement.exception)}
+                      </footer>
+                    </button>
+                    {awaitingDecision && <div className="board-card-confirmation" role="status">
+                      <span><strong>等待你的决定</strong><small>Run 已暂停，不会自行继续</small></span>
+                      <button type="button" className="button primary" onClick={openDecision}>{runId && onOpenRun ? "处理待确认 →" : "查看待确认详情 →"}</button>
+                    </div>}
+                  </article>;
+                })}
                 {cards.length === 0 && <div className="board-lane-empty">暂无需求</div>}
               </div>
             </section>;

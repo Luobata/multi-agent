@@ -98,6 +98,7 @@ export function RequirementDetailPage({
   const launchGaps = launchDecision ? requirementAdvancementSafetyGaps(launchDecision, workflows, managementPolicies) : [];
   const blockedStart = detail ? startBlockedReason(detail, Boolean(advancementConfig), Boolean(activePolicy)) : undefined;
   const canRestart = detail?.advancement?.status === "failed" || detail?.advancement?.status === "blocked";
+  const awaitingDecision = detail?.advancement?.status === "awaiting-human-decision";
 
   useEffect(() => {
     if (!detail?.advancement || !activeInvocation || detail.advancement.status === activeInvocation.status) return;
@@ -231,7 +232,7 @@ export function RequirementDetailPage({
           <dt>创建</dt><dd>{formatTime(detail.createdAt)}</dd>
           <dt>最近更新</dt><dd>{formatTime(detail.updatedAt)}</dd>
         </dl>
-        <section className="dash-advance-panel" aria-labelledby="requirement-advance-title">
+        <section className={`dash-advance-panel${awaitingDecision ? " dash-advance-panel--confirmation" : ""}`} aria-labelledby="requirement-advance-title">
           <div className="dash-advance-ticket">
             <span>REAL RUN · CYCLE {detail.advancement?.cycle ?? 1}</span>
             <strong id="requirement-advance-title">{detail.advancement ? ADVANCEMENT_LABELS[detail.advancement.status] : "尚未启动真实推进"}</strong>
@@ -242,7 +243,7 @@ export function RequirementDetailPage({
                 : blockedStart ?? "先核对入口，再创建受监控的领队 Run"}</small>
           </div>
           <div className="dash-advance-actions">
-            {detail.advancement?.runId && <button type="button" className="button secondary" onClick={() => onOpenRun?.(detail.advancement!.runId!)} disabled={!onOpenRun}>{canRestart ? "查看上次 Run" : "查看 Run 与证据"}</button>}
+            {detail.advancement?.runId && <button type="button" className={`button ${awaitingDecision ? "primary" : "secondary"}`} onClick={() => onOpenRun?.(detail.advancement!.runId!)} disabled={!onOpenRun}>{awaitingDecision ? "查看问题并作决定 →" : canRestart ? "查看上次 Run" : "查看 Run 与证据"}</button>}
             {(!detail.advancement?.runId || canRestart) && <button
                   type="button"
                   className="button primary dash-start-button"
@@ -252,6 +253,11 @@ export function RequirementDetailPage({
                 >{evaluatingLaunch ? "正在核对入口…" : canRestart ? "重新推进" : detail.advancement?.status === "failed" ? "安全重试启动" : "开始推进"}</button>}
             <span>{advancementConfig?.autoPollEnabled ? "自动轮询已启用" : "自动轮询协议已预留 · 当前人工启动"}</span>
           </div>
+          {awaitingDecision && <div className="dash-confirmation-guide" role="alert">
+            <strong>这个 Run 已暂停，正在等你</strong>
+            <span>打开运行卷宗查看 Agent 想执行的动作与风险；你可以补充反馈，然后批准继续，或拒绝并要求领队重新规划。</span>
+            <ol><li>查看拟执行动作</li><li>填写反馈（可选）</li><li>批准或拒绝</li></ol>
+          </div>}
           {(launchError || blockedStart) && <p className={launchError ? "dash-advance-error" : "dash-hint-line"} role={launchError ? "alert" : undefined}>{launchError || blockedStart}</p>}
         </section>
         <div className="dash-migrate" role="group" aria-label="迁移目标列">

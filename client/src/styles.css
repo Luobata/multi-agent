@@ -2123,21 +2123,28 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
 .board-lane-count { min-width: 25px; height: 25px; display: grid; place-items: center; border: 2px solid var(--line-strong); border-radius: var(--radius-1); background: var(--paper); box-shadow: 1px 1px 0 var(--line); font-family: var(--font-machine); font-size: var(--text-xs); }
 .board-lane-body { display: grid; align-content: start; gap: var(--space-2); padding: var(--space-2); }
 /* B8 · 契约：需求卡 2px 硬边 / 6px 左条 / radius-2 / 云面 / pixel 错位阴影；hover 浮起、active 按压、focus 即时环 */
-.board-card { min-width: 0; display: grid; gap: var(--space-2); padding: var(--space-3); border: 2px solid var(--line-strong); border-left: 6px solid var(--seal-blue); border-radius: var(--radius-2); background: var(--cloud); color: var(--ink); text-align: left; box-shadow: 2px 2px 0 var(--pixel-shadow); }
+.board-card { min-width: 0; display: grid; overflow: hidden; border: 2px solid var(--line-strong); border-left: 6px solid var(--seal-blue); border-radius: var(--radius-2); background: var(--cloud); color: var(--ink); text-align: left; box-shadow: 2px 2px 0 var(--pixel-shadow); }
 .board-card:hover { border-color: var(--ink); transform: translate(-1px, -1px); box-shadow: 3px 3px 0 var(--pixel-shadow); }
 .board-card:active { transform: translate(2px, 2px); box-shadow: none; }
-.board-card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.board-card-main { min-width: 0; width: 100%; display: grid; gap: var(--space-2); padding: var(--space-3); border: 0; background: transparent; color: inherit; text-align: left; }
+.board-card-main:focus-visible { outline: 2px solid var(--focus); outline-offset: -3px; }
 .board-card--blocked { border-left-color: var(--seal-amber); }
 .board-card--failed { border-left-color: var(--stamp-red-ink); }
 .board-card--cancelled { border-left-color: var(--seal-gray); opacity: .72; }
+.board-card--confirmation { border-left-color: var(--seal-amber); background: color-mix(in srgb, var(--season-summer-soft) 68%, var(--cloud)); }
 .board-card-top, .board-card footer { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
 .board-card-top { justify-content: space-between; }
 .board-card code, .board-card-project { color: var(--ink-3); font-family: var(--font-machine); font-size: var(--text-xs); }
 .board-card-project { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.board-card > strong { line-height: 1.45; overflow-wrap: anywhere; }
+.board-card-main > strong { line-height: 1.45; overflow-wrap: anywhere; }
 .board-card p { min-height: 38px; margin: 0; color: var(--ink-2); font-size: var(--text-xs); line-height: 1.5; }
 .board-card footer { color: var(--ink-3); font-size: var(--text-xs); }
 .board-card footer time { margin-left: auto; }
+.board-card-confirmation { display: grid; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); border-top: 2px dashed var(--seal-amber); background: color-mix(in srgb, var(--season-summer) 24%, var(--paper-raised)); }
+.board-card-confirmation > span { display: grid; gap: 2px; }
+.board-card-confirmation strong { color: var(--seal-amber); font-family: var(--font-display); font-size: var(--text-xs); }
+.board-card-confirmation small { color: var(--ink-2); font-size: 11px; }
+.board-card-confirmation .button { width: 100%; min-height: 36px; }
 /* B9 · 契约：优先级徽标升 2px 硬边 + 软底；补登缺失的 --low 变体 */
 .board-priority { padding: 1px var(--space-2); border: 2px solid var(--line); border-radius: var(--radius-1); font-weight: 700; }
 .board-priority--high { border-color: var(--stamp-red-ink); background: var(--danger-bg); color: var(--stamp-red-ink); }
@@ -2229,6 +2236,15 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
 .dash-advance-ticket > small { min-width: 0; overflow: hidden; color: var(--ink-3); font-family: var(--font-machine); text-overflow: ellipsis; white-space: nowrap; }
 .dash-advance-actions { min-width: 190px; display: grid; align-content: center; justify-items: stretch; gap: var(--space-1); }
 .dash-advance-actions > span { color: var(--ink-3); font-size: 11px; text-align: center; }
+.dash-advance-panel--confirmation { border-color: var(--seal-amber); background: color-mix(in srgb, var(--season-summer-soft) 82%, var(--paper-raised)); box-shadow: 5px 5px 0 color-mix(in srgb, var(--seal-amber) 22%, transparent); }
+.dash-advance-panel--confirmation .dash-advance-ticket { border-left-color: var(--seal-amber); }
+.dash-advance-panel--confirmation .dash-advance-ticket > span { color: var(--seal-amber); }
+.dash-confirmation-guide { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(180px, .7fr) minmax(240px, 1.3fr); gap: var(--space-2) var(--space-4); padding: var(--space-3); border-top: 2px dashed var(--seal-amber); background: color-mix(in srgb, var(--paper-raised) 78%, transparent); }
+.dash-confirmation-guide > strong { color: var(--seal-amber); font-family: var(--font-display); }
+.dash-confirmation-guide > span { color: var(--ink-2); font-size: var(--text-xs); line-height: 1.6; }
+.dash-confirmation-guide ol { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2); margin: 0; padding: 0; list-style: none; counter-reset: confirmation-step; }
+.dash-confirmation-guide li { display: flex; align-items: center; gap: var(--space-2); color: var(--ink-2); font-size: var(--text-xs); counter-increment: confirmation-step; }
+.dash-confirmation-guide li::before { content: counter(confirmation-step); width: 22px; height: 22px; display: grid; flex: 0 0 auto; place-items: center; border: 2px solid var(--seal-amber); border-radius: 50%; color: var(--seal-amber); font-family: var(--font-machine); font-weight: 800; }
 .dash-start-button { min-height: 48px; padding-inline: var(--space-5); font-family: var(--font-display); letter-spacing: .05em; }
 .dash-advance-panel > .dash-hint-line, .dash-advance-error { grid-column: 1 / -1; margin: 0; }
 .dash-advance-error { padding: var(--space-2) var(--space-3); border-left: 4px solid var(--stamp-red-ink); background: var(--danger-bg); color: var(--stamp-red-ink); font-size: var(--text-xs); }
@@ -2276,6 +2292,8 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
   .dash-facts { grid-template-columns: auto 1fr; }
   .dash-advance-panel { grid-template-columns: minmax(0, 1fr); }
   .dash-advance-actions { min-width: 0; justify-items: stretch; }
+  .dash-confirmation-guide { grid-template-columns: minmax(0, 1fr); }
+  .dash-confirmation-guide ol { grid-column: 1; grid-template-columns: minmax(0, 1fr); }
   .dash-migrate { grid-template-columns: minmax(0, 1fr); }
   .board-create-form { grid-template-columns: minmax(0, 1fr); }
   .board-create-form > * { grid-column: 1 !important; }

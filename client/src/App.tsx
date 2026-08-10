@@ -294,7 +294,7 @@ export function App() {
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
       {page === "dashboard" && <DashboardPage go={go} />}
       {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} />}
-      {page === "board" && <BoardPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} />}
+      {page === "board" && <BoardPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "requirement" && route.requirementId && <RequirementDetailPage
         requirementId={route.requirementId}
         go={go}
