@@ -237,6 +237,40 @@ function codexMemorySummarizerProvider(): ProviderDefinition {
   };
 }
 
+/**
+ * Older Workbench installations registered the shared `codex` Provider as a
+ * generic shell command. That path can parse Codex JSONL, but it cannot attach
+ * the materialized Role output schema to `codex exec`; useful work is therefore
+ * reported as failed whenever the final message is Markdown or has extra keys.
+ *
+ * Migrate only the exact legacy shape we shipped. User-authored command
+ * Providers (including commands that merely happen to mention Codex) remain
+ * untouched. Invocation snapshots already in flight are immutable and continue
+ * to use their pinned definition; new Invocations receive the native adapter.
+ */
+function migrateLegacyCodexProvider(state: WorkbenchState): void {
+  const current = state.providers.codex;
+  if (current?.adapter !== "command") return;
+  const command = typeof current.command === "string" ? current.command : "";
+  const args = Array.isArray(current.args) && current.args.every((argument) => typeof argument === "string")
+    ? current.args as string[]
+    : [];
+  const legacyInvocation = [command, ...args].join(" ");
+  if (!/\bcodex\s+exec\b/.test(legacyInvocation) || !args.some((argument) => argument.includes("--json"))) return;
+
+  state.providers.codex = {
+    adapter: "codex",
+    command: resolveCodexCommand(),
+    ...(typeof current.model === "string" ? { model: current.model } : {}),
+    sandbox: "workspace-write",
+    approvalPolicy: "never",
+    ...(typeof current.timeoutMs === "number" ? { timeoutMs: current.timeoutMs } : {}),
+    ...(typeof current.idleTimeoutMs === "number" ? { idleTimeoutMs: current.idleTimeoutMs } : {}),
+    ...(typeof current.hardTimeoutMs === "number" ? { hardTimeoutMs: current.hardTimeoutMs } : {}),
+    outputProtocol: "json"
+  };
+}
+
 function initialState(): WorkbenchState {
   return {
     schemaVersion: 1,
@@ -298,6 +332,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   if (state.providers.mock?.adapter === "mock" && state.providers.mock.model === undefined) {
     state.providers.mock.model = "deterministic-mock";
   }
+  migrateLegacyCodexProvider(state);
   const currentKnowledgeControl = state.providers["codex-knowledge-control"];
   state.providers["codex-knowledge-control"] = {
     ...codexKnowledgeControlProvider(),

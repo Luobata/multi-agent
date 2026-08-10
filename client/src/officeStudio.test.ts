@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSupervisorInvocations, completionRatio, progressTone, studioSupervisorInvocations } from "./officeStudio";
+import { activeSupervisorInvocations, completionRatio, historicalExceptionCount, progressTone, studioSupervisorInvocations } from "./officeStudio";
 import type { InvocationRecord, WorkInstanceStatus } from "./types";
 
 function tally(overrides: Partial<Record<WorkInstanceStatus, number>>): Record<WorkInstanceStatus, number> {
@@ -22,10 +22,18 @@ const base: InvocationRecord = {
 };
 
 describe("completionRatio", () => {
-  it("returns completed over total, 0 when empty", () => {
+  it("measures actionable delivery progress without counting retained failure history", () => {
     expect(completionRatio(tally({ completed: 2, running: 2 }))).toBe(0.5);
+    expect(completionRatio(tally({ completed: 2, failed: 3, blocked: 1 }))).toBe(1);
+    expect(completionRatio(tally({ failed: 2 }))).toBe(0);
     expect(completionRatio(tally({}))).toBe(0);
     expect(completionRatio(tally({ completed: 3 }))).toBe(1);
+  });
+});
+
+describe("historicalExceptionCount", () => {
+  it("keeps failed attempts visible outside the progress denominator", () => {
+    expect(historicalExceptionCount(tally({ failed: 2, blocked: 1, skipped: 1, cancelled: 1 }))).toBe(5);
   });
 });
 
@@ -33,6 +41,7 @@ describe("progressTone", () => {
   it("maps status to a tone", () => {
     expect(progressTone("running")).toBe("running");
     expect(progressTone("queued")).toBe("running");
+    expect(progressTone("awaiting-human-decision")).toBe("confirmation");
     expect(progressTone("completed")).toBe("completed");
     expect(progressTone("blocked")).toBe("blocked");
     expect(progressTone("failed")).toBe("failed");

@@ -75,6 +75,24 @@ roles:
     permissions:
       write: project
       tools: [Read, Glob, Grep, Edit, Write, Bash]
+    outputSchema:
+      type: object
+      additionalProperties: false
+      required: [message, changedFiles, validation, risks]
+      properties:
+        message: { type: string, minLength: 1, description: "交付摘要与关键取舍" }
+        changedFiles:
+          type: array
+          description: "实际修改的仓库相对路径"
+          items: { type: string, minLength: 1 }
+        validation:
+          type: array
+          description: "实际执行且有结果的验证命令或行为检查"
+          items: { type: string, minLength: 1 }
+        risks:
+          type: array
+          description: "仍未消除的风险；没有风险时返回空数组"
+          items: { type: string, minLength: 1 }
   backend-developer:
     displayName: 服务端开发工程师
     description: 负责 TypeScript 服务端、API、Provider、运行时、持久化与服务端测试。
@@ -83,6 +101,24 @@ roles:
     permissions:
       write: project
       tools: [Read, Edit, Shell, Test]
+    outputSchema:
+      type: object
+      additionalProperties: false
+      required: [message, changedFiles, validation, risks]
+      properties:
+        message: { type: string, minLength: 1, description: "交付摘要与关键取舍" }
+        changedFiles:
+          type: array
+          description: "实际修改的仓库相对路径"
+          items: { type: string, minLength: 1 }
+        validation:
+          type: array
+          description: "实际执行且有结果的验证命令或行为检查"
+          items: { type: string, minLength: 1 }
+        risks:
+          type: array
+          description: "仍未消除的风险；没有风险时返回空数组"
+          items: { type: string, minLength: 1 }
   fullstack-developer:
     displayName: 全栈开发工程师
     description: 负责明确分派的跨前后端实现、契约联调、迁移与集成验证。
@@ -91,6 +127,24 @@ roles:
     permissions:
       write: project
       tools: [Read, Edit, Shell, Test]
+    outputSchema:
+      type: object
+      additionalProperties: false
+      required: [message, changedFiles, validation, risks]
+      properties:
+        message: { type: string, minLength: 1, description: "交付摘要与关键取舍" }
+        changedFiles:
+          type: array
+          description: "实际修改的仓库相对路径"
+          items: { type: string, minLength: 1 }
+        validation:
+          type: array
+          description: "实际执行且有结果的验证命令或行为检查"
+          items: { type: string, minLength: 1 }
+        risks:
+          type: array
+          description: "仍未消除的风险；没有风险时返回空数组"
+          items: { type: string, minLength: 1 }
   test-engineer:
     displayName: 测试工程师
     description: 负责真实行为、服务响应、持久化结果与自动化覆盖的独立验收。

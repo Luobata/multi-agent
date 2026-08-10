@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { api } from "./api";
 import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeHealth, employeeRuntimeStatus, formatTime } from "./components";
 import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
-import { activeSupervisorInvocations, completionRatio, progressTone, studioSupervisorInvocations } from "./officeStudio";
+import { activeSupervisorInvocations, completionRatio, historicalExceptionCount, progressTone, studioSupervisorInvocations } from "./officeStudio";
 import type {
   Bootstrap,
   Employee,
@@ -319,6 +319,17 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
             const progress = progressById[invocation.id];
             const ratio = progress ? completionRatio(progress.tally) : 0;
             const tone = progressTone(invocation.status);
+            const exceptions = progress ? historicalExceptionCount(progress.tally) : 0;
+            const actionable = progress
+              ? progress.tally.completed + progress.tally.queued + progress.tally.waiting + progress.tally.running
+              : 0;
+            const exceptionParts = progress ? [
+              progress.tally.failed > 0 ? `${progress.tally.failed} 次失败` : undefined,
+              progress.tally.blocked > 0 ? `${progress.tally.blocked} 个阻塞` : undefined,
+              (progress.tally.skipped + progress.tally.cancelled) > 0
+                ? `${progress.tally.skipped + progress.tally.cancelled} 个跳过/取消`
+                : undefined
+            ].filter((part): part is string => Boolean(part)) : [];
             const latestEntry = progress?.leaderReport.entries.at(-1);
             const leaderEmployeeId = invocation.executionSnapshot?.employees[0]?.employeeId;
             const leader = data.employees.find((employee) => employee.id === leaderEmployeeId);
@@ -330,7 +341,11 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
               <div className={`studio-progress ${tone === "running" ? "studio-progress--live" : ""}`}>
                 <i className="studio-progress-fill" style={{ width: `${Math.round(ratio * 100)}%` }} aria-hidden="true" />
               </div>
-              <div className="studio-progress-legend"><span>{Math.round(ratio * 100)}% 完成</span>{progress && <span>{progress.tally.completed}/{Object.values(progress.tally).reduce((sum, count) => sum + count, 0)} 步</span>}</div>
+              <div className="studio-progress-legend">
+                <span>{invocation.status === "awaiting-human-decision" ? "待确认" : `${Math.round(ratio * 100)}% 执行进度`}</span>
+                {progress && <span>{progress.tally.completed}/{actionable} 个有效步骤</span>}
+              </div>
+              {progress && exceptions > 0 && <p className="studio-attempt-history">历史尝试：{exceptionParts.join(" · ")}</p>}
               {latestEntry && <p className="studio-leader-note"><code>{latestEntry.action.toUpperCase()}</code><span className="studio-leader-summary" title={latestEntry.summary ?? "领队正在决策。"}>{latestEntry.summary ?? "领队正在决策。"}</span></p>}
               <div className="studio-team">
                 <div className="studio-leader"><EmployeeAvatar displayName={leader?.identity.displayName ?? leaderEmployeeId ?? "领队"} presentation={leader?.presentation} /><span>领队</span></div>

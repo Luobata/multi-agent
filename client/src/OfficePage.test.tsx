@@ -364,6 +364,37 @@ describe("OfficePage supervisor studio", () => {
     expect(container.textContent).toContain("Round 2");
   });
 
+  it("shows human confirmation separately and keeps recovered attempts out of delivery progress", async () => {
+    const awaitingInvocation: InvocationRecord = {
+      ...supervisorInvocation,
+      id: "inv-team-confirm",
+      runId: "run-team-confirm",
+      status: "awaiting-human-decision",
+      phase: "awaiting-human-decision"
+    };
+    const awaitingProgress = {
+      ...progress,
+      invocationId: "inv-team-confirm",
+      runId: "run-team-confirm",
+      status: "awaiting-human-decision" as const,
+      phase: "awaiting-human-decision",
+      tally: { queued: 0, waiting: 0, running: 0, completed: 3, blocked: 1, failed: 2, skipped: 0, cancelled: 0 }
+    };
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.includes("/progress")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: awaitingProgress }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+    });
+    act(() => root.render(<OfficePage data={{ ...bootstrap, activity: { invocations: [awaitingInvocation], instances: [] } }} streamStatus="live" />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    expect(container.querySelector(".studio-card--confirmation")).toBeTruthy();
+    expect(container.querySelector<HTMLElement>(".studio-progress-fill")?.style.width).toBe("100%");
+    expect(container.textContent).toContain("待确认");
+    expect(container.textContent).toContain("3/3 个有效步骤");
+    expect(container.textContent).toContain("历史尝试：2 次失败 · 1 个阻塞");
+  });
+
   it("keeps long leader reports inside a dedicated clampable summary region", () => {
     const summary = container.querySelector<HTMLElement>(".studio-leader-summary");
     expect(summary?.textContent).toBe(longLeaderSummary);

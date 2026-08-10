@@ -232,12 +232,17 @@ describe("project descriptor", () => {
     const frontend = project.roles.find((role) => role.id === "frontend-developer");
     expect(frontend).toMatchObject({
       knowledgeProfileIds: ["workbench-engineering-knowledge", "workbench-design-knowledge"],
+      outputSchema: expect.objectContaining({ required: ["message", "changedFiles", "validation", "risks"] }),
       permissions: {
         write: "project",
         tools: ["Read", "Glob", "Grep", "Edit", "Write", "Bash"]
       }
     });
     expect(frontend?.instructions).toContain("所有前端实现任务");
+    for (const roleId of ["backend-developer", "fullstack-developer"]) {
+      expect(project.roles.find((role) => role.id === roleId)?.outputSchema?.required)
+        .toEqual(["message", "changedFiles", "validation", "risks"]);
+    }
 
     const designer = project.roles.find((role) => role.id === "product-designer");
     expect(designer).toMatchObject({

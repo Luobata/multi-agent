@@ -204,3 +204,50 @@ describe("system employee normalization", () => {
     expect(persisted.employees["memory-summarizer"]?.versions.length).toBe(1);
   });
 });
+
+describe("legacy Codex Provider normalization", () => {
+  it("migrates the shipped command wrapper to the schema-aware native adapter", async () => {
+    await writeState(emptyState({
+      providers: {
+        codex: {
+          adapter: "command",
+          model: "gpt-5.6-sol",
+          command: "zsh",
+          args: ["-ic", "codex exec --json --model gpt-5.6-sol --sandbox workspace-write -"],
+          inputTemplate: "{{prompt}}",
+          timeoutMs: 900_000,
+          idleTimeoutMs: 600_000,
+          outputProtocol: "codex-stream-json"
+        }
+      }
+    }) as unknown as Record<string, unknown>);
+
+    const provider = (await WorkbenchStore.open(dataRoot)).snapshot().providers.codex;
+
+    expect(provider).toMatchObject({
+      adapter: "codex",
+      model: "gpt-5.6-sol",
+      sandbox: "workspace-write",
+      approvalPolicy: "never",
+      timeoutMs: 900_000,
+      idleTimeoutMs: 600_000,
+      outputProtocol: "json"
+    });
+    expect(provider?.hardTimeoutMs).toBeUndefined();
+    expect(typeof provider?.command).toBe("string");
+  });
+
+  it("does not rewrite user-authored command Providers", async () => {
+    const custom = {
+      adapter: "command",
+      command: "zsh",
+      args: ["-ic", "my-codex-wrapper --json"],
+      outputProtocol: "json" as const
+    };
+    await writeState(emptyState({ providers: { codex: custom } }) as unknown as Record<string, unknown>);
+
+    const provider = (await WorkbenchStore.open(dataRoot)).snapshot().providers.codex;
+
+    expect(provider).toEqual(custom);
+  });
+});
