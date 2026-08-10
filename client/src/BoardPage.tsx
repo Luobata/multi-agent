@@ -1,4 +1,4 @@
-/** 需求看板：七列 + 阻塞/失败/取消三异常态（与列正交）。第一阶段无拖拽，列迁移走详情页。 */
+/** 需求看板：八列 + 阻塞/失败/取消三异常态（与列正交）。第一阶段无拖拽，列迁移走详情页。 */
 import { useMemo, useState } from "react";
 import { api, writeBody } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
@@ -230,9 +230,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
 
   return <main className="dash-page">
     <PageHeader
-      eyebrow="BOARD / SEVEN LANES"
+      eyebrow="BOARD / EIGHT LANES"
       title={project ? `${project.name} · 需求看板` : "需求看板"}
-      description="七列流转；排队中 / 执行中只由真实 Run 自动更新，阻塞 / 失败 / 取消与列正交叠加。其它列请在需求详情页迁移。"
+      description="八列流转；排队中 / 执行中 / 待确认只由真实 Run 自动更新，等待人工决定时会离开执行中。阻塞 / 失败 / 取消与列正交叠加。"
       actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
     />
     <OfflineNotice />

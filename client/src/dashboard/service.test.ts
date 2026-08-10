@@ -95,6 +95,44 @@ describe("empty production board and versioned persistence", () => {
     expect(new Set((await restored.listBoard()).map((requirement) => requirement.id)).size).toBe(2);
   });
 
+  it("reconciles a persisted waiting Run from the legacy running lane into confirmation", async () => {
+    const storage = memoryStorage();
+    const first = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    first.syncConnectedProjects([connectedProject("connected-a")]);
+    const created = await first.createRequirement({
+      projectId: "connected-a",
+      title: "等待高风险决定",
+      summary: "旧版仍显示在执行中",
+      priority: "high",
+      rawRequirement: "执行到高风险修改前暂停",
+      acceptanceCriteria: ["人工决定后继续原 Run"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await first.reserveRequirementAdvancement(created.id, config, "human");
+    await first.syncRequirementAdvancement(created.id, reserved.idempotencyKey, {
+      invocationId: "inv-confirmation",
+      runId: "run-confirmation",
+      status: "awaiting-human-decision",
+      observedAt: "2026-08-10T02:00:00.000Z"
+    }, config.pollIntervalMs);
+
+    const envelope = JSON.parse(storage.values.get(DASHBOARD_STORAGE_KEY)!) as {
+      version: number;
+      store: { requirements: Array<{ id: string; lane: string }> };
+    };
+    envelope.store.requirements.find((requirement) => requirement.id === created.id)!.lane = "running";
+    storage.values.set(DASHBOARD_STORAGE_KEY, JSON.stringify(envelope));
+
+    const restored = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    restored.syncConnectedProjects([connectedProject("connected-a")]);
+    expect(await restored.getRequirement(created.id)).toMatchObject({
+      lane: "confirmation",
+      advancement: { status: "awaiting-human-decision", invocationId: "inv-confirmation" }
+    });
+    const repairedEnvelope = JSON.parse(storage.values.get(DASHBOARD_STORAGE_KEY)!) as typeof envelope;
+    expect(repairedEnvelope.store.requirements.find((requirement) => requirement.id === created.id)?.lane).toBe("confirmation");
+  });
+
   it("repairs legacy duplicate requirement ids without attaching one Run to two cards", async () => {
     const storage = memoryStorage();
     let id = 0;
@@ -166,15 +204,16 @@ describe("empty production board and versioned persistence", () => {
 describe("requirement advancement persistence", () => {
   const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
 
-  it("keeps queued and running lanes runtime-controlled", async () => {
+  it("keeps queued, running and confirmation lanes runtime-controlled", async () => {
     const service = makeService();
     expect(await expectFailure(service.updateRequirementLane("req-103", "queued"))).toContain("只能由真实 Run 更新");
+    expect(await expectFailure(service.updateRequirementLane("req-103", "confirmation"))).toContain("只能由真实 Run 更新");
     const reserved = await service.reserveRequirementAdvancement("req-103", config, "human");
     expect(await expectFailure(service.updateRequirementLane("req-103", "planned"))).toContain("仍有进行中的真实 Run");
     expect(reserved.idempotencyKey).toBe("requirement:req-103:advance:1");
   });
 
-  it("reserves, attaches and tracks one Run while moving queued/running lanes automatically", async () => {
+  it("moves one Run from execution to confirmation and back after the human decides", async () => {
     const service = makeService();
     const reserved = await service.reserveRequirementAdvancement("req-103", config, "human");
     expect(reserved).toMatchObject({ cycle: 1, status: "dispatching", idempotencyKey: "requirement:req-103:advance:1" });
@@ -195,6 +234,22 @@ describe("requirement advancement persistence", () => {
       observedAt: "2026-08-09T06:00:16.000Z"
     }, config.pollIntervalMs);
     expect(running).toMatchObject({ lane: "running", exception: null, advancement: { status: "running" } });
+
+    const awaitingDecision = await service.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
+      invocationId: "inv-1",
+      runId: "run-1",
+      status: "awaiting-human-decision",
+      observedAt: "2026-08-09T06:00:31.000Z"
+    }, config.pollIntervalMs);
+    expect(awaitingDecision).toMatchObject({ lane: "confirmation", exception: null, advancement: { status: "awaiting-human-decision" } });
+
+    const resumed = await service.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
+      invocationId: "inv-1",
+      runId: "run-1",
+      status: "running",
+      observedAt: "2026-08-09T06:00:46.000Z"
+    }, config.pollIntervalMs);
+    expect(resumed).toMatchObject({ lane: "running", advancement: { status: "running" } });
   });
 
   it("keeps the same cycle available for a safe retry when dispatch has no receipt", async () => {
@@ -513,8 +568,11 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
     expect(await expectFailure(service.createRequirement({ ...input, projectId: "missing" }))).toContain("尚未正式接入或已归档");
   });
 
-  it("看板七列契约完整，按项目过滤且去掉详情字段", async () => {
+  it("看板八列契约完整，按项目过滤且去掉详情字段", async () => {
     const service = makeService();
+    expect(REQUIREMENT_LANES.map((lane) => lane.id)).toEqual([
+      "inbox", "clarify", "planned", "queued", "running", "confirmation", "acceptance", "done"
+    ]);
     const all = await service.listBoard();
     expect(all.length).toBeGreaterThan(0);
     expect(all.every((requirement) => REQUIREMENT_LANES.some((lane) => lane.id === requirement.lane))).toBe(true);

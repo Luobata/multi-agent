@@ -246,7 +246,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   // two cards share one idempotency key and one Run. Repair that legacy shape
   // fail-closed: the oldest requirement keeps the correlated Run, while newer
   // duplicates receive fresh ids and return to the inbox for an explicit start.
-  let repairedDuplicateIds = false;
+  let repairedPersistedData = false;
   const requirementsById = new Map<string, RequirementDetail[]>();
   for (const requirement of store.requirements) {
     const group = requirementsById.get(requirement.id) ?? [];
@@ -255,7 +255,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   }
   for (const duplicates of requirementsById.values()) {
     if (duplicates.length < 2) continue;
-    repairedDuplicateIds = true;
+    repairedPersistedData = true;
     const canonical = [...duplicates].sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0]!;
     const latestAdvancement = duplicates
       .flatMap((requirement) => requirement.advancement ? [requirement.advancement] : [])
@@ -276,10 +276,20 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       if (duplicate === canonical) continue;
       duplicate.id = nextId("req");
       delete duplicate.advancement;
-      if (duplicate.lane === "queued" || duplicate.lane === "running") duplicate.lane = "inbox";
+      if (duplicate.lane === "queued" || duplicate.lane === "running" || duplicate.lane === "confirmation") duplicate.lane = "inbox";
       if (duplicate.exception === "blocked" || duplicate.exception === "failed") duplicate.exception = null;
       if (duplicate.updatedAt < duplicate.createdAt) duplicate.updatedAt = duplicate.createdAt;
     }
+  }
+  // `confirmation` was introduced after v2 had already persisted real requirements.
+  // Reconcile every correlated record from the durable Invocation status so an
+  // already-waiting Run leaves the execution lane immediately after reload.
+  for (const requirement of store.requirements) {
+    if (!requirement.advancement) continue;
+    const reconciledLane = advancementLane(requirement.advancement.status, requirement.lane);
+    if (reconciledLane === requirement.lane) continue;
+    requirement.lane = reconciledLane;
+    repairedPersistedData = true;
   }
   const persist = () => {
     try {
@@ -288,7 +298,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       // localStorage quota / privacy failures degrade to the current in-memory session.
     }
   };
-  if (repairedDuplicateIds) persist();
+  if (repairedPersistedData) persist();
   let connectedProjectIds: Set<string> | null = null;
   let connectedCatalogIds = new Set<string>();
   let catalogSeedRemapped = false;
@@ -470,7 +480,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
             exceptions: activeRequirements.filter((requirement) => requirement.exception !== null).length,
             byLane
           },
-          tasks: { queued: byLane.queued, running: byLane.running, acceptance: byLane.acceptance },
+          tasks: { queued: byLane.queued, running: byLane.running, confirmation: byLane.confirmation, acceptance: byLane.acceptance },
           activities: store.activities.slice(0, 12).map((item) => ({ ...item })),
           resourceOverview: {
             demo: true,
@@ -657,7 +667,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         if (!REQUIREMENT_LANES.some((entry) => entry.id === lane)) throw failure("目标列不存在", "请重新选择目标列", "未写入任何变更");
         if (requirement.exception === "cancelled") throw failure("已取消的需求不能迁移列", "请先在看板恢复其状态或联系领队", "未写入任何变更");
         if (requirement.lane === lane) return { ...requirement };
-        if (lane === "queued" || lane === "running") {
+        if (lane === "queued" || lane === "running" || lane === "confirmation") {
           throw failure(
             `「${requirementLaneLabel(lane)}」只能由真实 Run 更新`,
             "请在需求详情点击「开始推进」，系统会按 Invocation 状态自动迁移",

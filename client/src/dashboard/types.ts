@@ -3,8 +3,8 @@
  * 状态词严格复用 components.tsx 的 Stamp / RuntimeStatusChip 语义，不新增状态词。
  */
 
-/** 看板七列（与异常态正交）。 */
-export type RequirementLane = "inbox" | "clarify" | "planned" | "queued" | "running" | "acceptance" | "done";
+/** 看板八列（与异常态正交）；confirmation 专门承接等待人工决定的真实 Run。 */
+export type RequirementLane = "inbox" | "clarify" | "planned" | "queued" | "running" | "confirmation" | "acceptance" | "done";
 
 /** 阻塞 / 失败 / 取消三种异常态，与所在列正交叠加。 */
 export type RequirementException = "blocked" | "failed" | "cancelled" | null;
@@ -48,6 +48,7 @@ export const REQUIREMENT_LANES: ReadonlyArray<{ id: RequirementLane; label: stri
   { id: "planned", label: "已规划" },
   { id: "queued", label: "排队中" },
   { id: "running", label: "执行中" },
+  { id: "confirmation", label: "待确认" },
   { id: "acceptance", label: "待验收" },
   { id: "done", label: "已完成" }
 ];
@@ -227,7 +228,7 @@ export interface DashboardSummary {
   generatedAt: string;
   projects: { total: number; active: number; favorites: number; archived: number };
   requirements: { total: number; active: number; exceptions: number; byLane: Record<RequirementLane, number> };
-  tasks: { queued: number; running: number; acceptance: number };
+  tasks: { queued: number; running: number; confirmation: number; acceptance: number };
   activities: ActivityItem[];
   resourceOverview: { demo: true; agents: ResourceAgentLoad[] };
 }

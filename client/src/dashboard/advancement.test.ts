@@ -109,7 +109,8 @@ describe("requirement advancement control state", () => {
     const terminal = detail({ id: "req-3", advancement: { ...reserved, status: "completed", nextCheckAt: undefined } });
     expect(dueRequirementAdvancements([due, later, terminal] as Requirement[], "2026-08-10T01:00:20.000Z").map((item) => item.id)).toEqual(["req-1"]);
     expect(advancementLane("queued", "inbox")).toBe("queued");
-    expect(advancementLane("awaiting-human-decision", "queued")).toBe("running");
+    expect(advancementLane("awaiting-human-decision", "running")).toBe("confirmation");
+    expect(advancementLane("running", "confirmation")).toBe("running");
     expect(advancementLane("failed", "running")).toBe("running");
   });
 

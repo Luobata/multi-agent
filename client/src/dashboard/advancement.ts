@@ -72,7 +72,8 @@ export function requirementOwnerLabel(requirement: Pick<Requirement, "owner" | "
 
 export function advancementLane(status: RequirementAdvancementStatus, current: RequirementLane): RequirementLane {
   if (status === "queued" || status === "dispatching") return "queued";
-  if (status === "running" || status === "awaiting-human-decision" || status === "completed") return "running";
+  if (status === "awaiting-human-decision") return "confirmation";
+  if (status === "running" || status === "completed") return "running";
   return current;
 }
 

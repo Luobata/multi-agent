@@ -24,7 +24,7 @@ export function DashboardPage({ go, service = dashboardService }: {
             <div className="dash-stat"><span>活跃项目</span><strong>{summary.projects.active}</strong><small>归档 {summary.projects.archived} · 收藏 {summary.projects.favorites}</small></div>
             <div className="dash-stat"><span>进行中需求</span><strong>{summary.requirements.active}</strong><small>总计 {summary.requirements.total}</small></div>
             <div className="dash-stat"><span>异常态需求</span><strong>{summary.requirements.exceptions}</strong><small>阻塞 / 失败 / 取消</small></div>
-            <div className="dash-stat"><span>待验收</span><strong>{summary.tasks.acceptance}</strong><small>排队 {summary.tasks.queued} · 执行 {summary.tasks.running}</small></div>
+            <div className="dash-stat"><span>待验收</span><strong>{summary.tasks.acceptance}</strong><small>排队 {summary.tasks.queued} · 执行 {summary.tasks.running} · 待确认 {summary.tasks.confirmation}</small></div>
           </div>
         </SectionShell>
 

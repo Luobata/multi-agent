@@ -263,7 +263,7 @@ export function RequirementDetailPage({
             invalid={Boolean(migrateError)}
             errorMessage={migrateError || undefined}
             options={REQUIREMENT_LANES.map((lane) => {
-              const runtimeControlled = lane.id === "queued" || lane.id === "running";
+              const runtimeControlled = lane.id === "queued" || lane.id === "running" || lane.id === "confirmation";
               return {
                 value: lane.id,
                 label: lane.label,
@@ -276,7 +276,7 @@ export function RequirementDetailPage({
           <button type="button" className="button primary" disabled={!daemonAvailable || migrating || !targetLane || isActiveRequirementAdvancement(detail.advancement)} onClick={() => void migrate()}>{migrating ? "迁移中…" : "迁移到目标列"}</button>
           <button type="button" className="button danger" disabled={!daemonAvailable} onClick={() => setArchiveOpen(true)}>归档需求</button>
         </div>
-        {isActiveRequirementAdvancement(detail.advancement) && <p className="dash-hint-line">真实 Run 进行中，排队中 / 执行中由系统同步；处理或取消 Run 后才能人工迁移其它列。</p>}
+        {isActiveRequirementAdvancement(detail.advancement) && <p className="dash-hint-line">真实 Run 进行中，排队中 / 执行中 / 待确认由系统同步；完成人工决定或处理 Run 后，系统会继续更新所在列。</p>}
         {detail.exception === "cancelled" && <p className="dash-hint-line">已取消的需求不能迁移列；如需恢复请联系领队。</p>}
       </div>
 
@@ -331,7 +331,7 @@ export function RequirementDetailPage({
           <strong>{launchDecision.target.kind === "supervisor-workflow" ? `${launchDecision.target.workflowId} · v${launchDecision.target.workflowVersion}` : launchDecision.target.kind}</strong>
           <small>策略 {launchDecision.policyId} · v{launchDecision.policyVersion} · {launchDecision.decidedBy}</small>
         </div>
-        <p>确认后会创建真实异步 Run，并自动把需求推进到排队中 / 执行中。代码改动必须位于独立 Worktree，测试与独立 Review 通过后才会进入交付；不会自动合并或推送。</p>
+        <p>确认后会创建真实异步 Run，并自动把需求推进到排队中 / 执行中；需要你决定时会进入待确认，决定后可回到执行中继续原 Run。代码改动必须位于独立 Worktree，测试与独立 Review 通过后才会进入交付；不会自动合并或推送。</p>
         {launchGaps.length > 0
           ? <div className="danger-notice" role="alert"><b>安全门禁未通过，暂不能启动</b><ul>{launchGaps.map((gap) => <li key={gap}>{gap}</li>)}</ul></div>
           : <div className="dash-launch-safe"><Stamp status="passed" label="启动门禁通过" /><span>Worktree、quality.test、quality.audit 与人工高风险决策约束已核对。</span></div>}
