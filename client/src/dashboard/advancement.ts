@@ -82,7 +82,7 @@ export function reserveAdvancement(
   if (isActiveRequirementAdvancement(current)) {
     throw new Error(`需求已有进行中的推进任务：${current?.invocationId ?? current?.idempotencyKey}`);
   }
-  if (current?.invocationId) {
+  if (current?.invocationId && current.status !== "failed" && current.status !== "blocked") {
     throw new Error("这轮推进已经产生 Run；请先在运行卷宗处理结果，再决定是否重新推进");
   }
   if (requirement.lane === "clarify") throw new Error("需求仍在待澄清；请先补齐关键信息并迁移回收件箱或已规划");

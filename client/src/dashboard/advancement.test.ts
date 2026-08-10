@@ -69,6 +69,29 @@ describe("requirement advancement control state", () => {
     expect(retried.trigger).toBe("automatic");
   });
 
+  it("opens a new cycle after a recorded Run fails, while completed delivery stays protected", () => {
+    const first = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
+    const failed = {
+      ...first,
+      status: "failed" as const,
+      invocationId: "inv-1",
+      runId: "run-1"
+    };
+    const next = reserveAdvancement(
+      detail({ advancement: failed, exception: "failed" }),
+      config,
+      "human",
+      "2026-08-10T01:05:00.000Z"
+    );
+    expect(next).toMatchObject({ cycle: 2, status: "dispatching", idempotencyKey: "requirement:req-1:advance:2" });
+    expect(() => reserveAdvancement(
+      detail({ advancement: { ...failed, status: "completed" }, exception: null }),
+      config,
+      "human",
+      "2026-08-10T01:05:00.000Z"
+    )).toThrow(/已经产生 Run/);
+  });
+
   it("selects only due active cursors for a future poller and maps execution states to lanes", () => {
     const reserved = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
     const due = detail({ advancement: { ...reserved, status: "running", nextCheckAt: "2026-08-10T01:00:15.000Z" } });

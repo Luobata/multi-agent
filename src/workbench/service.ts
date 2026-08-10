@@ -2810,6 +2810,23 @@ export class WorkbenchService {
     return resolved;
   }
 
+  /**
+   * `source.project` is an identity, never a caller-supplied filesystem path. Resolve it through
+   * the versioned Project control plane so HTTP/workbench starts receive the same trusted
+   * repository root as direct project-role invocations. An explicit MCP execution root keeps
+   * precedence because the daemon has already restricted it to MCP transport metadata.
+   */
+  private async workflowExecutionRoot(
+    source: InvocationSource,
+    explicitRoot?: string
+  ): Promise<string | undefined> {
+    if (explicitRoot?.trim()) return this.validatedProviderCwd(explicitRoot);
+    const projectId = source.project?.trim();
+    const project = projectId ? this.snapshot().projects[projectId]?.current : undefined;
+    if (!project || project.status !== "active") return undefined;
+    return this.validatedProviderCwd(project.rootPath);
+  }
+
   private async inSessionQueue<T>(
     sessionId: string,
     onWaiting: () => void | Promise<void>,
@@ -6875,7 +6892,7 @@ export class WorkbenchService {
     source: InvocationSource = { kind: "workbench" },
     options: { providerCwd?: string } = {}
   ): Promise<RunWorkflowResult> {
-    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
+    const providerCwd = await this.workflowExecutionRoot(source, options.providerCwd);
     const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source);
     return this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
   }
@@ -6994,7 +7011,7 @@ export class WorkbenchService {
     source: InvocationSource = { kind: "workbench" },
     options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
   ): Promise<InvocationStartResult> {
-    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
+    const providerCwd = await this.workflowExecutionRoot(source, options.providerCwd);
     const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, {
       ...options,
       createLeaderSession: true

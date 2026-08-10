@@ -187,4 +187,50 @@ describe("RequirementDetailPage advancement launch", () => {
     });
     expect(button("查看 Run 与证据")).toBeTruthy();
   });
+
+  it("offers a new governed cycle after the previous Run failed", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T01:00:00.000Z"), idSeed: () => "req-retry" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "失败后重试",
+      summary: "保留上次 Run",
+      priority: "high",
+      rawRequirement: "修复执行根后重试",
+      acceptanceCriteria: ["产生新的推进轮次"]
+    });
+    const config = { entrancePolicyId: entrancePolicy.id, autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-failed",
+      runId: "run-failed",
+      status: "failed",
+      observedAt: "2026-08-10T01:00:01.000Z",
+      error: "worktree setup failed"
+    }, config.pollIntervalMs);
+    const gateway: RequirementAdvancementGateway = {
+      evaluate: vi.fn().mockResolvedValue(decision),
+      dispatch: vi.fn()
+    };
+
+    act(() => root.render(<RequirementDetailPage
+      requirementId={requirement.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+      entrancePolicies={[entrancePolicy]}
+      workflows={[workflow]}
+      managementPolicies={[managementPolicy]}
+      gateway={gateway}
+      onOpenRun={vi.fn()}
+    />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(button("查看上次 Run")).toBeTruthy();
+    expect(button("重新推进").disabled).toBe(false);
+    await act(async () => { button("重新推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(gateway.evaluate).toHaveBeenCalledOnce();
+    expect(document.body.textContent).toContain("启动门禁通过");
+  });
 });

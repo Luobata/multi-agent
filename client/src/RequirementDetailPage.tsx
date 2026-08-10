@@ -42,7 +42,11 @@ function startBlockedReason(detail: RequirementDetail, configured: boolean, poli
   if (detail.lane === "acceptance" || detail.lane === "done") return "该需求已经进入验收或完成阶段";
   if (detail.exception === "cancelled") return "已取消的需求不能开始推进";
   if (detail.acceptanceCriteria.length === 0) return "请先补齐至少一条可观察的验收标准";
-  if (detail.advancement?.invocationId) return "当前推进轮次已经产生 Run，请先处理该 Run";
+  if (detail.advancement?.invocationId
+    && detail.advancement.status !== "failed"
+    && detail.advancement.status !== "blocked") {
+    return "当前推进轮次已经产生 Run，请先处理该 Run";
+  }
   return undefined;
 }
 
@@ -93,6 +97,7 @@ export function RequirementDetailPage({
     : undefined;
   const launchGaps = launchDecision ? requirementAdvancementSafetyGaps(launchDecision, workflows, managementPolicies) : [];
   const blockedStart = detail ? startBlockedReason(detail, Boolean(advancementConfig), Boolean(activePolicy)) : undefined;
+  const canRestart = detail?.advancement?.status === "failed" || detail?.advancement?.status === "blocked";
 
   useEffect(() => {
     if (!detail?.advancement || !activeInvocation || detail.advancement.status === activeInvocation.status) return;
@@ -237,15 +242,14 @@ export function RequirementDetailPage({
                 : blockedStart ?? "先核对入口，再创建受监控的领队 Run"}</small>
           </div>
           <div className="dash-advance-actions">
-            {detail.advancement?.runId
-              ? <button type="button" className="button primary" onClick={() => onOpenRun?.(detail.advancement!.runId!)} disabled={!onOpenRun}>查看 Run 与证据</button>
-              : <button
+            {detail.advancement?.runId && <button type="button" className="button secondary" onClick={() => onOpenRun?.(detail.advancement!.runId!)} disabled={!onOpenRun}>{canRestart ? "查看上次 Run" : "查看 Run 与证据"}</button>}
+            {(!detail.advancement?.runId || canRestart) && <button
                   type="button"
                   className="button primary dash-start-button"
                   disabled={!daemonAvailable || evaluatingLaunch || launching || isActiveRequirementAdvancement(detail.advancement) || Boolean(blockedStart)}
                   title={blockedStart}
                   onClick={() => void evaluateLaunch()}
-                >{evaluatingLaunch ? "正在核对入口…" : detail.advancement?.status === "failed" ? "安全重试启动" : "开始推进"}</button>}
+                >{evaluatingLaunch ? "正在核对入口…" : canRestart ? "重新推进" : detail.advancement?.status === "failed" ? "安全重试启动" : "开始推进"}</button>}
             <span>{advancementConfig?.autoPollEnabled ? "自动轮询已启用" : "自动轮询协议已预留 · 当前人工启动"}</span>
           </div>
           {(launchError || blockedStart) && <p className={launchError ? "dash-advance-error" : "dash-hint-line"} role={launchError ? "alert" : undefined}>{launchError || blockedStart}</p>}

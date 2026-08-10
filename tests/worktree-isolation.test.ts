@@ -199,6 +199,41 @@ describe("management policy execution.isolation", () => {
 });
 
 describe("runTrackedWorkflow worktree isolation", () => {
+  it("resolves a trusted connected Project root for an Entrance Policy workflow start", async () => {
+    const { service, workflow, providerCwd, calls } = await isolationFixture("git");
+    await service.createProject({
+      id: "requirement-source-project",
+      name: "Requirement Source Project",
+      description: "Supplies the trusted repository root for board-triggered work.",
+      scope: "repository",
+      rootPath: providerCwd,
+      descriptorPath: path.join(providerCwd, "multi-agent.project.yaml"),
+      roles: [{ id: "developer" }]
+    });
+    await service.createEntrancePolicy({
+      id: "requirement-source-entrance",
+      leader: { workflowId: workflow.id },
+      default: { route: "leader" }
+    });
+
+    const dispatched = await service.dispatchEntrancePolicy("requirement-source-entrance", {
+      route: "auto",
+      tags: ["requirement-advancement"],
+      signals: { requiresDynamicReplanning: true },
+      message: "Advance this project requirement.",
+      source: { kind: "workbench", project: "requirement-source-project", taskId: "req-1" }
+    });
+    expect(dispatched.dispatch.kind).toBe("invocation-started");
+    if (dispatched.dispatch.kind !== "invocation-started") throw new Error("expected workflow receipt");
+    const detail = await service.waitForInvocation(dispatched.dispatch.receipt.invocation.id);
+    expect(detail.invocation.status).toBe("completed");
+    expect(await service.getRun(dispatched.dispatch.receipt.runId)).toMatchObject({
+      status: "passed",
+      isolation: { mode: "worktree", worktreePath: expect.stringContaining(".multi-agent/worktrees") }
+    });
+    expect(calls.count).toBeGreaterThan(0);
+  });
+
   it("runs a worktree-isolation supervisor workflow in a worktree and tears it down afterward", async () => {
     const { result, service, workflow } = await isolationWorkflow("git");
     expect(result.run.status).toBe("passed");
