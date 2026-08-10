@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BoardPage, requirementStewardOutput } from "./BoardPage";
 import { createDashboardService } from "./dashboard/service";
-import type { Project, Session } from "./types";
+import type { InvocationRecord, Project, Session } from "./types";
 
 function connectedProject(): Project {
   return {
@@ -285,5 +285,57 @@ describe("BoardPage AI requirement creation", () => {
     expect(detailAction).toBeTruthy();
     await act(async () => { detailAction?.click(); });
     expect(go).toHaveBeenCalledWith(`requirements/${requirement.id}`);
+  });
+
+  it("moves a confirmed requirement back to execution from durable Invocation activity", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T03:00:00.000Z") });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "人工确认后恢复执行",
+      summary: "批准后应离开待确认列",
+      priority: "high",
+      rawRequirement: "继续原 Run",
+      acceptanceCriteria: ["批准事件到达后自动回到执行中"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-confirmation",
+      runId: "run-confirmation",
+      status: "awaiting-human-decision",
+      observedAt: "2026-08-10T03:00:01.000Z"
+    }, config.pollIntervalMs);
+    const resumed: InvocationRecord = {
+      id: "inv-confirmation",
+      target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench" },
+      status: "running",
+      phase: "resuming-after-human-approval",
+      requestSummary: "人工确认后恢复执行",
+      runId: "run-confirmation",
+      instanceIds: [],
+      createdAt: "2026-08-10T03:00:00.000Z",
+      updatedAt: "2026-08-10T03:00:02.000Z",
+      transitions: []
+    };
+
+    act(() => root.render(<BoardPage
+      spaceId={project.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+      invocations={[resumed]}
+    />));
+    for (let attempt = 0; attempt < 10 && !container.querySelector<HTMLElement>('section[aria-label^="执行中"]')?.textContent?.includes(requirement.title); attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }
+
+    const runningLane = container.querySelector<HTMLElement>('section[aria-label^="执行中"]');
+    expect(runningLane?.textContent).toContain(requirement.title);
+    expect(container.textContent).not.toContain("Run 已暂停，不会自行继续");
+    expect((await service.getRequirement(requirement.id)).advancement?.status).toBe("running");
   });
 });

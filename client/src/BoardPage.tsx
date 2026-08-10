@@ -1,14 +1,14 @@
 /** 需求看板：八列 + 阻塞/失败/取消三异常态（与列正交）。第一阶段无拖拽，列迁移走详情页。 */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, writeBody } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
 import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
-import { requirementOwnerLabel } from "./dashboard/advancement";
+import { requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { ManagedProject, Requirement, RequirementException, RequirementPriority, SpaceNode } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_LANES, REQUIREMENT_PRIORITY_LABELS } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
-import type { JsonValue, Session } from "./types";
+import type { InvocationRecord, JsonValue, Project, Session } from "./types";
 import "./board-ai.css";
 
 const REQUIREMENT_STEWARD_ROLE_ID = "requirement-steward";
@@ -62,12 +62,14 @@ function exceptionChip(exception: Requirement["exception"]) {
   return null;
 }
 
-export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", onOpenRun }: {
+export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", projects: connectedProjects = [], invocations = [], onOpenRun }: {
   spaceId?: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
   catalogRevision?: string;
+  projects?: Project[];
+  invocations?: InvocationRecord[];
   onOpenRun?: (runId: string) => void;
 }) {
   const daemonAvailable = useDaemonAvailable();
@@ -115,6 +117,54 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     for (const requirement of filtered) map.get(requirement.lane)?.push(requirement);
     return map;
   }, [filtered]);
+
+  // The requirement board is a local projection; Invocation activity is the
+  // durable source of truth. Reconcile whenever the app receives an SSE/bootstrap
+  // update so approving or rejecting a human decision immediately moves the card
+  // out of confirmation without requiring a detail-page visit or manual refresh.
+  useEffect(() => {
+    if (!data || invocations.length === 0) return;
+    const invocationById = new Map(invocations.map((invocation) => [invocation.id, invocation]));
+    const pending = data.requirements.flatMap((requirement) => {
+      const advancement = requirement.advancement;
+      if (!advancement?.invocationId) return [];
+      const invocation = invocationById.get(advancement.invocationId);
+      if (!invocation || invocation.status === advancement.status) return [];
+      return [{ requirement, advancement, invocation }];
+    });
+    if (pending.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      const updatedById = new Map<string, Requirement>();
+      const results = await Promise.allSettled(pending.map(async ({ requirement, advancement, invocation }) => {
+        const config = requirementAdvancementConfig(
+          connectedProjects.find((project) => project.id === requirement.projectId)
+        );
+        return service.syncRequirementAdvancement(requirement.id, advancement.idempotencyKey, {
+          invocationId: invocation.id,
+          runId: invocation.runId,
+          leaderSessionId: invocation.sessionId,
+          status: invocation.status,
+          observedAt: invocation.updatedAt,
+          error: invocation.error
+        }, config?.pollIntervalMs ?? 15_000);
+      }));
+      for (const result of results) {
+        if (result.status === "fulfilled") updatedById.set(result.value.id, result.value);
+      }
+      if (!cancelled && updatedById.size > 0) {
+        setData({
+          ...data,
+          requirements: data.requirements.map((requirement) => updatedById.get(requirement.id) ?? requirement)
+        });
+      }
+      const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (!cancelled && rejected) {
+        notify(`需求推进状态同步失败：${rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason)}`, "error");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [connectedProjects, data, invocations, notify, service, setData]);
 
   const openCreate = () => {
     setCreateProjectId(spaceId ?? projects[0]?.id ?? "");

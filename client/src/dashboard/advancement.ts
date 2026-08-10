@@ -123,6 +123,13 @@ export function observeAdvancement(
   if (advancement.invocationId && advancement.invocationId !== observation.invocationId) {
     throw new Error("推进观察结果不属于当前需求的 Invocation");
   }
+  // SSE reconnects and overlapping polls may deliver an older snapshot after a
+  // newer one. The local board projection must never regress from running back to
+  // awaiting-human-decision (or from terminal to active) because of that race.
+  if (advancement.invocationId
+    && new Date(observation.observedAt).getTime() < new Date(advancement.updatedAt).getTime()) {
+    return advancement;
+  }
   const status = observation.status;
   const terminal = status === "completed" || status === "blocked" || status === "failed" || status === "cancelled";
   return {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   advancementLane,
   dueRequirementAdvancements,
+  observeAdvancement,
   planRequirementAdvancementPoll,
   requirementAdvancementConfig,
   requirementOwnerLabel,
@@ -112,6 +113,17 @@ describe("requirement advancement control state", () => {
     expect(advancementLane("awaiting-human-decision", "running")).toBe("confirmation");
     expect(advancementLane("running", "confirmation")).toBe("running");
     expect(advancementLane("failed", "running")).toBe("running");
+  });
+
+  it("ignores an older Invocation observation so the board cannot regress after approval", () => {
+    const reserved = reserveAdvancement(detail(), config, "human", "2026-08-10T03:00:00.000Z");
+    const current = { ...reserved, invocationId: "inv-1", runId: "run-1", status: "running" as const, updatedAt: "2026-08-10T03:00:02.000Z" };
+    expect(observeAdvancement(current, {
+      invocationId: "inv-1",
+      runId: "run-1",
+      status: "awaiting-human-decision",
+      observedAt: "2026-08-10T03:00:01.000Z"
+    }, 15_000)).toEqual(current);
   });
 
   it("plans automatic launch and observation actions without performing side effects", () => {
