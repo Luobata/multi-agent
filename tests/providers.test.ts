@@ -228,6 +228,35 @@ describe("provider adapters", () => {
     expect(progress).toContain("idle-timeout");
   });
 
+  it("settles an idle timeout when a dead CLI leaves an inherited output pipe open", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const script = [
+      "const { spawn } = require('node:child_process')",
+      `const grandchild = spawn(${JSON.stringify(process.execPath)}, ['-e', 'setTimeout(() => process.exit(0), 4000)'], { detached: true, stdio: ['ignore', 1, 2] })`,
+      "grandchild.unref()"
+    ].join("; ");
+    const started = Date.now();
+    const failure = await adapter.invoke({
+      providerId: "inherited-pipe-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", script],
+        timeoutMs: 20,
+        idleTimeoutMs: 50
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {}
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "idle-timeout", retryable: false });
+    // The inherited pipe remains open for four seconds, but the Provider must fail closed after
+    // its termination grace instead of waiting for that unrelated descendant.
+    expect(Date.now() - started).toBeLessThan(3_000);
+  });
+
   it("retains an absolute hard timeout for a noisy infinite Provider", async () => {
     const adapter = createDefaultProviderRegistry().get("command")!;
     const failure = await adapter.invoke({

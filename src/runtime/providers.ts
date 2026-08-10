@@ -79,6 +79,12 @@ export type ProviderRegistry = Map<string, ProviderAdapter>;
  */
 const TRANSIENT_FAILURE_PATTERN = /rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up|\b5\d{2}\b|internalservererror|internalserverexception|internal server error|service unavailable|bad gateway|gateway timeout|upstream|厂商资源|资源问题|断连/;
 
+// A Provider CLI can exit while one of its descendants keeps stdout/stderr inherited. In that
+// state Node emits `exit` for the direct child but never emits `close`, so merely signalling the
+// already-dead child cannot settle the invocation. Give normal SIGTERM/SIGKILL cleanup a short
+// grace period, then fail closed from the monitor's durable timeout classification.
+const PROVIDER_TERMINATION_SETTLE_GRACE_MS = 1_250;
+
 function safeProviderDiagnostic(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const compact = value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
@@ -456,6 +462,7 @@ class CommandProviderAdapter implements ProviderAdapter {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      let terminationSettlementTimer: ReturnType<typeof setTimeout> | undefined;
 
       const failureOptions = (status: number | null) => {
         const detail = `${stdout}\n${stderr}`.toLowerCase();
@@ -471,6 +478,7 @@ class CommandProviderAdapter implements ProviderAdapter {
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
+        if (terminationSettlementTimer) clearTimeout(terminationSettlementTimer);
         monitor.stop();
         invocation.signal?.removeEventListener("abort", abort);
         void monitor.flush().then(callback);
@@ -478,6 +486,27 @@ class CommandProviderAdapter implements ProviderAdapter {
       const abort = () => {
         child.kill("SIGTERM");
         setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
+        if (terminationSettlementTimer) return;
+        terminationSettlementTimer = setTimeout(() => {
+          if (invocation.signal?.aborted) {
+            finish(() => reject(new ProviderExecutionError(`provider ${invocation.providerId} was aborted`, stdout, stderr, {
+              kind: "aborted",
+              retryable: false,
+              durationMs: Date.now() - started
+            })));
+            return;
+          }
+          const timeoutKind = monitor.timeoutKind();
+          if (!timeoutKind) return;
+          const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs!;
+          const reason = timeoutKind === "idle-timeout" ? "was idle" : "reached its hard timeout";
+          finish(() => reject(new ProviderExecutionError(`provider ${invocation.providerId} ${reason} after ${timeoutMs}ms`, stdout, stderr, {
+            kind: timeoutKind,
+            retryable: false,
+            durationMs: Date.now() - started
+          })));
+        }, PROVIDER_TERMINATION_SETTLE_GRACE_MS);
+        terminationSettlementTimer.unref();
       };
       const monitor = monitorProviderProcess(invocation, definition, started, abort);
       invocation.signal?.addEventListener("abort", abort, { once: true });
@@ -709,9 +738,11 @@ class CodexProviderAdapter implements ProviderAdapter {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      let terminationSettlementTimer: ReturnType<typeof setTimeout> | undefined;
       const finish = (callback: () => void) => {
         if (settled) return;
         settled = true;
+        if (terminationSettlementTimer) clearTimeout(terminationSettlementTimer);
         monitor.stop();
         invocation.signal?.removeEventListener("abort", abort);
         void monitor.flush().then(callback);
@@ -719,6 +750,27 @@ class CodexProviderAdapter implements ProviderAdapter {
       const abort = () => {
         child.kill("SIGTERM");
         setTimeout(() => child.kill("SIGKILL"), 1_000).unref();
+        if (terminationSettlementTimer) return;
+        terminationSettlementTimer = setTimeout(() => {
+          if (invocation.signal?.aborted) {
+            finish(() => reject(new ProviderExecutionError(`provider ${invocation.providerId} was aborted`, stdout, stderr, {
+              kind: "aborted",
+              retryable: false,
+              durationMs: Date.now() - started
+            })));
+            return;
+          }
+          const timeoutKind = monitor.timeoutKind();
+          if (!timeoutKind) return;
+          const timeoutMs = timeoutKind === "idle-timeout" ? monitor.policy.idleTimeoutMs : monitor.policy.hardTimeoutMs!;
+          const reason = timeoutKind === "idle-timeout" ? "was idle" : "reached its hard timeout";
+          finish(() => reject(new ProviderExecutionError(`provider ${invocation.providerId} ${reason} after ${timeoutMs}ms`, stdout, stderr, {
+            kind: timeoutKind,
+            retryable: false,
+            durationMs: Date.now() - started
+          })));
+        }, PROVIDER_TERMINATION_SETTLE_GRACE_MS);
+        terminationSettlementTimer.unref();
       };
       const monitor = monitorProviderProcess(invocation, definition, started, abort);
       invocation.signal?.addEventListener("abort", abort, { once: true });
