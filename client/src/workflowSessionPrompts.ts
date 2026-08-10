@@ -4,7 +4,7 @@ export type WorkflowInvocationMode = "publication" | "workflow";
 
 export interface WorkflowSessionPrompts {
   mode: WorkflowInvocationMode;
-  tool: "invoke_publication" | "run_workflow";
+  tool: "start_publication" | "start_workflow";
   targetId: string;
   input: JsonObject;
   agentsMarkdown: string;
@@ -116,7 +116,7 @@ export function buildWorkflowSessionPrompts(
     ? publication
     : undefined;
   const mode: WorkflowInvocationMode = activePublication ? "publication" : "workflow";
-  const tool = activePublication ? "invoke_publication" : "run_workflow";
+  const tool = activePublication ? "start_publication" : "start_workflow";
   const targetId = activePublication?.id ?? workflow.id;
   const targetArgument = activePublication
     ? { publicationId: activePublication.id }
@@ -131,11 +131,18 @@ export function buildWorkflowSessionPrompts(
     }
   };
   const routeDescription = activePublication
-    ? `通过调用包「${activePublication.name}」调用 Publication ID \`${activePublication.id}\``
-    : `当前没有活动调用包，使用 \`run_workflow\` 直接调试 Workflow ID \`${workflow.id}\``;
+    ? `通过调用包「${activePublication.name}」异步启动 Publication ID \`${activePublication.id}\``
+    : `当前没有活动调用包，使用 \`start_workflow\` 异步启动 Workflow ID \`${workflow.id}\``;
   const agentsRouteRule = activePublication
-    ? `默认通过 \`invoke_publication\` 调用 Publication \`${activePublication.id}\`（${activePublication.name}），不要自行拆解其内部 Workflow、节点或 Prompt。`
-    : `默认通过 \`run_workflow\` 调用 Workflow \`${workflow.id}\`。`;
+    ? `默认通过 \`start_publication\` 启动 Publication \`${activePublication.id}\`（${activePublication.name}），不要自行拆解其内部 Workflow、节点或 Prompt。`
+    : `默认通过 \`start_workflow\` 启动 Workflow \`${workflow.id}\`。`;
+  const monitorRules = [
+    "启动回执返回后，立即保存 `invocation.id`、`runId` 和 `monitor.initialCursor`。",
+    "随后循环调用 `wait_workflow_progress`：传入 `invocationId`、上一次的 `nextCursor`，并使用不超过 55 秒的 `timeoutMs`（推荐 30000）。",
+    "每次状态变化或 heartbeat 都向用户转述 `progressReport`，然后把 cursor 更新为 `nextCursor`。",
+    "只要 `terminal=false`，就不得结束当前回合或给出最终答复；继续等待。只有 `terminal=true` 才交付最终摘要。",
+    "等待发生临时传输错误时，使用同一 `invocationId` 和 cursor 重试，不得重新启动 Workflow。若原回合或连接已经结束，使用 `resume_workflow_monitor(runId)` 取得新回执后继续同一循环。"
+  ];
 
   return {
     mode,
@@ -149,7 +156,8 @@ export function buildWorkflowSessionPrompts(
       "- 仅讨论需求、方案或设计时，不要自动启动协作编排。",
       `- ${agentsRouteRule}`,
       "- `project` 使用当前项目名称。新任务不传 `contextId`；只有继续同一次协作编排时，才复用稳定的 `contextId`。",
-      "- 调用完成后汇总运行状态和 `runId`；结果为 `blocked` 或 `failed` 时，明确说明阻塞或故障原因。",
+      ...monitorRules.map((rule) => `- ${rule}`),
+      "- 终态时汇总运行状态和 `runId`；结果为 `blocked` 或 `failed` 时，明确说明阻塞或故障原因。",
       "- 如果 MCP 或目标入口不可用，应报告配置问题，不要在本地伪造协作结果。"
     ].join("\n"),
     invocationPrompt: [
@@ -163,7 +171,9 @@ export function buildWorkflowSessionPrompts(
       "```",
       "- 将 project 替换为当前项目名；只有需要关联连续调用时才填写稳定的 contextId。",
       "",
-      `请调用 \`${tool}\`。完成后返回运行状态和 runId，汇总最终结论；如结果为 blocked 或 failed，请说明阻塞或故障原因。`
+      `请先调用 \`${tool}\`，然后严格执行以下监听协议：`,
+      ...monitorRules.map((rule, index) => `${index + 1}. ${rule}`),
+      "终态后返回运行状态和 runId，汇总最终结论；如结果为 blocked 或 failed，请说明阻塞或故障原因。"
     ].join("\n"),
     mcpJson: JSON.stringify(invocation, null, 2)
   };

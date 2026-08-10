@@ -118,6 +118,9 @@ GET /api/invocations/:id
 MCP 同步新增：
 
 - `start_workflow`：立即开始并返回调用编号。
+- `start_publication`：通过稳定的 Workflow Publication 异步开始并返回调用编号。
+- `wait_workflow_progress`：基于 cursor 长轮询，变化或默认 30 秒心跳时返回；非终态由宿主继续同一回合。
+- `resume_workflow_monitor`：已知 `runId` 时恢复 Invocation 与监听回执。
 - `get_invocation`：查询运行状态和最终证据。
 
 原 `/api/workflows/:id/run` 与 `run_workflow` 暂时保留为兼容入口，但新的长任务调用应默认使用异步入口。
@@ -134,9 +137,9 @@ Workflow 页面改为向异步入口提交。界面中的“运行中”只覆�
 
 对 Web 或 MCP 客户端，统一采用“启动—观察—取证”三步：
 
-1. 调用 `start_workflow` 或 `POST /start`，保存 `invocationId` 与 `runId`。
-2. 通过 SSE 观察整体活动，或按需调用 `get_invocation` 查询单次状态；不要高频轮询。
-3. Invocation 进入终态后读取 Run 证据，使用规范化结果，不把 HTTP 连接存活视为任务存活。
+1. 调用 `start_workflow`、`start_publication` 或对应的 `POST /start`，保存 `invocationId`、`runId` 与 `monitor.initialCursor`。
+2. MCP 会话立即循环 `wait_workflow_progress`，每次传入上次的 `nextCursor`；变化或心跳都转述 `progressReport`，`terminal=false` 时不得结束当前回合。Web 界面也可通过 SSE 观察整体活动。
+3. Invocation 进入终态后读取 Run 证据并交付规范化结果。连接中断时使用 `resume_workflow_monitor(runId)` 重挂，不能把 HTTP 连接存活视为任务存活。
 
 调用方超时只应表示“本次查询没有及时返回”，不能直接推断后台 Workflow 失败。后续增加取消能力时，也必须显式调用取消命令，不能依靠浏览器断开连接隐式取消。
 
@@ -150,6 +153,7 @@ Workflow 页面改为向异步入口提交。界面中的“运行中”只覆�
 - 明确标记的瞬态错误仍会按配置重试。
 - 异步 HTTP 返回 202，随后可由 Invocation 查询得到运行中与最终状态。
 - MCP 暴露并可调用 `start_workflow`、`get_invocation`。
+- Workflow Publication 可通过 `start_publication` 异步启动，并能通过 `runId` 恢复监听。
 - 旧同步入口继续兼容。
 - 前端提交后立即恢复可操作状态，并显示可追踪的 Run 编号。
 - 仓库最终通过 `npm run check`。

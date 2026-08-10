@@ -12,21 +12,21 @@
 - 日期：2026-07-30
 - 优先级：P1
 - 状态：已完成
-- 置信度：92%；现有 MCP 工具与 Publication 数据已能覆盖，无需后端变更。
+- 后续可靠性修订：长任务必须异步启动并持续监听，因此增加 `start_publication` 与按 `runId` 恢复能力。
 
 ## Key Insights
 
 - 当前详情在 `04 / 版本` 后直接进入本地运行工单，缺少“交给其他会话”的出口。
 - `ReadonlyEvidence` 已提供可复制代码块和“已复制”反馈，应直接复用。
-- Publication 是稳定入口；`run_workflow` 仅作为未打包时的可用调试入口。
+- Publication 是稳定入口；Workflow 包使用 `start_publication`，未打包 Workflow 使用 `start_workflow`。
 
 ## Requirements
 
 - 在 `04 / 版本` 与 `run-workflow` 之间加入 `05 / 其他会话使用`。
 - 首屏说明行显示文字状态章、入口类型和说明；多 Publication 时复用产品化 `SelectControl`，同时覆盖展开态、键盘路径和视口边界。
 - 纵向展示两个证据块：`给 Codex 会话的提示词 · 推荐`、`MCP 参数示例`。
-- 有 Publication：生成 `invoke_publication`；无 Publication：生成 `run_workflow`，并显示“未打包”及前往 `#publications`。
-- 自然语言示例须包含工具名、目标 ID、任务占位、project、可选 contextId，并要求返回 Run ID。
+- 有 Publication：生成 `start_publication`；无 Publication：生成 `start_workflow`，并显示“未打包”及前往 `#publications`。
+- 自然语言示例须包含工具名、目标 ID、任务占位、project、可选 contextId，并要求保存 Run ID、循环 `wait_workflow_progress` 到终态。
 
 ## Architecture
 
@@ -59,7 +59,7 @@
 ## Success Criteria
 
 - 复制出的自然语言可直接粘贴到新 Codex 会话。
-- MCP JSON 与现有 `invoke_publication` / `run_workflow` schema 一致。
+- MCP JSON 与 `start_publication` / `start_workflow` schema 一致，配套说明 initialCursor、nextCursor、heartbeat、terminal 和恢复协议。
 - 900px 以下页面堆叠；640px 以下选择器和动作满宽；代码仅在自身块内换行/滚动。
 - 按钮、选择器保持 DOM 阅读顺序、可见焦点及粗指针最小 44px 命中区。
 

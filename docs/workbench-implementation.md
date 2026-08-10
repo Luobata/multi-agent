@@ -132,7 +132,7 @@ MCP server 只把 stdio tool call 转成 daemon HTTP 请求，不持有 Employee
 multi-agent-mcp --daemon-url http://127.0.0.1:4318
 ```
 
-调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包，再用 `invoke_publication` 调用，不必感知包内是单 Employee 还是 Workflow。需要先决定是否启用领队时，使用 `evaluate_entrance_policy` 做无副作用试算，或用 `dispatch_entrance_policy` 执行固定目标；消息正文不参与路由。直接运行长 Workflow 时优先使用 `start_workflow`，再用 `get_invocation` 读取状态；`run_workflow` 仅作为同步兼容入口。
+调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包：Employee Publication 使用 `invoke_publication`，Workflow Publication 使用 `start_publication`，后者既保留稳定 Publication 边界，也避免同步请求占住整个 Run。需要先决定是否启用领队时，使用 `evaluate_entrance_policy` 做无副作用试算，或用 `dispatch_entrance_policy` 执行固定目标；消息正文不参与路由。直接运行长 Workflow 使用 `start_workflow`。两种异步启动都必须立即用回执的 `monitor.initialCursor` 循环 `wait_workflow_progress`；`terminal=false` 时保持当前回合，变化和心跳都转述 `progressReport`，终态才交付。断线后可用 `resume_workflow_monitor(runId)` 重挂。`run_workflow` 与 Workflow 目标的 `invoke_publication` 仅作为同步兼容入口，不适合长任务。
 
 运行时调度、有限重试和异步入口的设计与后续边界见 [Multi-Agent 运行性能与可靠性优化](multi-agent-runtime-performance.md)。
 

@@ -7066,6 +7066,42 @@ export class WorkbenchService {
     }
   }
 
+  /**
+   * Start a Workflow through its stable Publication boundary without falling back to the
+   * synchronous compatibility path. Employee Publications remain conversational and must use
+   * invokePublication instead.
+   */
+  async startPublication(
+    id: string,
+    input: JsonObject = {},
+    source: InvocationSource = { kind: "http" },
+    options: { providerCwd?: string } = {}
+  ): Promise<InvocationStartResult> {
+    const publication = this.getPublication(id);
+    if (publication.status !== "active") throw new Error(`publication ${id} is archived`);
+    if (publication.target.kind !== "workflow") {
+      throw new Error(`publication ${id} targets an Employee; use invoke_publication instead`);
+    }
+    return this.startWorkbenchWorkflow(
+      publication.target.id,
+      input,
+      { ...source, publicationId: id },
+      options
+    );
+  }
+
+  /** Return a fresh long-poll receipt for a durable Workflow Invocation identified by Run id. */
+  async resumeWorkflowMonitor(runId: string): Promise<InvocationStartResult> {
+    if (!/^run-[A-Za-z0-9-]+$/.test(runId)) throw new Error("run id is invalid");
+    const invocation = Object.values(this.snapshot().invocations)
+      .find((candidate) => candidate.runId === runId);
+    if (!invocation) throw new Error(`workflow Invocation not found for Run: ${runId}`);
+    if (invocation.target.kind !== "workflow") {
+      throw new Error(`Run ${runId} belongs to an Employee Invocation and has no Workflow monitor`);
+    }
+    return this.workflowInvocationReceipt(invocation);
+  }
+
   async archiveWorkflow(id: string): Promise<WorkbenchWorkflowDefinition> {
     return this.store.mutate((state) => {
       const record = state.workflows[id];

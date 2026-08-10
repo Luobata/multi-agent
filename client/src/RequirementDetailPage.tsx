@@ -5,7 +5,7 @@ import { DemoBadge, DossierSection, EmptyState, Modal, ReadonlyEvidence, Runtime
 import { isActiveRequirementAdvancement, requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { DagTaskNode, RequirementDetail, RequirementLane } from "./dashboard/types";
-import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_LANES, requirementLaneLabel } from "./dashboard/types";
+import { REQUIREMENT_EXCEPTION_LABELS, VISIBLE_REQUIREMENT_LANES, requirementLaneLabel } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
 import {
   buildRequirementAdvancementInput,
@@ -268,7 +268,7 @@ export function RequirementDetailPage({
             disabled={!daemonAvailable || migrating || detail.exception === "cancelled" || isActiveRequirementAdvancement(detail.advancement)}
             invalid={Boolean(migrateError)}
             errorMessage={migrateError || undefined}
-            options={REQUIREMENT_LANES.map((lane) => {
+            options={VISIBLE_REQUIREMENT_LANES.map((lane) => {
               const runtimeControlled = lane.id === "queued" || lane.id === "running" || lane.id === "confirmation";
               return {
                 value: lane.id,

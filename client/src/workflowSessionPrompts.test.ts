@@ -81,7 +81,7 @@ describe("workflow session prompts", () => {
     expect(matches.map((item) => item.id)).toEqual(["a-package", "z-package"]);
   });
 
-  it("prefers a publication and emits the exact invoke_publication contract", () => {
+  it("prefers an asynchronous publication and emits the mandatory monitor contract", () => {
     const result = buildWorkflowSessionPrompts(
       workflow(),
       publication("review-agent", { name: "联合评审 Agent" }),
@@ -89,9 +89,9 @@ describe("workflow session prompts", () => {
     );
     const invocation = JSON.parse(result.mcpJson) as { tool: string; arguments: Record<string, unknown> };
 
-    expect(result).toMatchObject({ mode: "publication", tool: "invoke_publication", targetId: "review-agent" });
+    expect(result).toMatchObject({ mode: "publication", tool: "start_publication", targetId: "review-agent" });
     expect(invocation).toMatchObject({
-      tool: "invoke_publication",
+      tool: "start_publication",
       arguments: {
         publicationId: "review-agent",
         input: { message: "检查当前改动" },
@@ -100,22 +100,26 @@ describe("workflow session prompts", () => {
       }
     });
     expect(result.invocationPrompt).toContain("Publication ID `review-agent`");
-    expect(result.invocationPrompt).toContain("运行状态和 runId");
+    expect(result.invocationPrompt).toContain("循环调用 `wait_workflow_progress`");
+    expect(result.invocationPrompt).toContain("`terminal=false`");
+    expect(result.invocationPrompt).toContain("`resume_workflow_monitor(runId)`");
     expect(result.agentsMarkdown).toContain("## 协作编排");
     expect(result.agentsMarkdown).toContain("仅讨论需求、方案或设计时，不要自动启动协作编排");
-    expect(result.agentsMarkdown).toContain("`invoke_publication` 调用 Publication `review-agent`");
+    expect(result.agentsMarkdown).toContain("`start_publication` 启动 Publication `review-agent`");
+    expect(result.agentsMarkdown).toContain("不得结束当前回合");
   });
 
-  it("falls back to run_workflow without exposing internal nodes or prompts", () => {
+  it("falls back to asynchronous start_workflow without exposing internal nodes or prompts", () => {
     const result = buildWorkflowSessionPrompts(workflow());
     const invocation = JSON.parse(result.mcpJson) as { tool: string; arguments: Record<string, unknown> };
 
-    expect(result).toMatchObject({ mode: "workflow", tool: "run_workflow", targetId: "review-team" });
+    expect(result).toMatchObject({ mode: "workflow", tool: "start_workflow", targetId: "review-team" });
     expect(invocation).toMatchObject({
-      tool: "run_workflow",
+      tool: "start_workflow",
       arguments: { workflowId: "review-team" }
     });
-    expect(result.agentsMarkdown).toContain("`run_workflow` 调用 Workflow `review-team`");
+    expect(result.agentsMarkdown).toContain("`start_workflow` 启动 Workflow `review-team`");
+    expect(result.invocationPrompt).toContain("heartbeat");
     expect(`${result.agentsMarkdown}\n${result.invocationPrompt}\n${result.mcpJson}`).not.toContain("internal-review");
     expect(`${result.agentsMarkdown}\n${result.invocationPrompt}\n${result.mcpJson}`).not.toContain("private-reviewer");
     expect(`${result.agentsMarkdown}\n${result.invocationPrompt}\n${result.mcpJson}`).not.toContain("systemPrompt");

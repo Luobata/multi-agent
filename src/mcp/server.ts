@@ -806,7 +806,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("run_workflow", {
     title: "Run multi-agent workflow",
-    description: "Compatibility entry point that waits for a registered Graph or Supervisor workflow to finish. Prefer start_workflow for long-running work.",
+    description: "Synchronous compatibility entry point for short workflows only. DO NOT use it for Supervisor or other long-running work: use start_workflow and immediately loop wait_workflow_progress so the current turn stays open.",
     inputSchema: {
       workflowId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
@@ -947,7 +947,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("invoke_publication", {
     title: "Invoke agent package",
-    description: "Invoke a published single-Agent or multi-Agent package through one stable MCP tool.",
+    description: "Synchronous compatibility entry point for Employee Publications and short packages. For any Workflow Publication, use start_publication and immediately loop wait_workflow_progress.",
     inputSchema: {
       publicationId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
@@ -959,6 +959,31 @@ export function createWorkbenchMcpServer(
     daemonUrl,
     `/api/publications/${encodeURIComponent(publicationId)}/invoke`,
     { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
+  )));
+
+  server.registerTool("start_publication", {
+    title: "Start workflow package",
+    description: "Asynchronously start a published Workflow through its stable Publication boundary. The host MUST immediately loop wait_workflow_progress using monitor.initialCursor, MUST NOT end the current turn while terminal=false, and must relay every changed result or heartbeat before terminal delivery. Employee Publications must use invoke_publication.",
+    inputSchema: {
+      publicationId: z.string().min(1),
+      input: z.record(z.string(), z.unknown()).optional(),
+      project: z.string().min(1).optional(),
+      contextId: z.string().min(1).optional(),
+      caller: z.string().min(1).optional()
+    }
+  }, async ({ publicationId, input, project, contextId, caller }) => content(await request(
+    daemonUrl,
+    `/api/publications/${encodeURIComponent(publicationId)}/start`,
+    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
+  )));
+
+  server.registerTool("resume_workflow_monitor", {
+    title: "Resume workflow monitoring",
+    description: "Recover the durable Invocation and a fresh monitor receipt from a known runId after a host turn or connection ended. The host MUST immediately loop wait_workflow_progress with monitor.initialCursor and MUST NOT end the current turn while terminal=false.",
+    inputSchema: { runId: z.string().regex(/^run-[A-Za-z0-9-]+$/) }
+  }, async ({ runId }) => content(await request(
+    daemonUrl,
+    `/api/runs/${encodeURIComponent(runId)}/monitor`
   )));
 
   server.registerTool("list_runs", {

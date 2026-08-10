@@ -6,9 +6,10 @@ import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, form
 import { requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { ManagedProject, Requirement, RequirementException, RequirementPriority, SpaceNode } from "./dashboard/types";
-import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_LANES, REQUIREMENT_PRIORITY_LABELS } from "./dashboard/types";
+import { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
+import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_PRIORITY_LABELS, VISIBLE_REQUIREMENT_LANES, visibleRequirementLane } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
-import type { HumanDecisionRequest, InvocationRecord, JsonValue, Project, Session } from "./types";
+import type { HumanDecisionRequest, InvocationRecord, JsonValue, Project, RunMergePreview, Session } from "./types";
 import "./board-ai.css";
 
 const REQUIREMENT_STEWARD_ROLE_ID = "requirement-steward";
@@ -114,8 +115,8 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     });
   }, [data?.requirements, exception, priority, projectFilter, query, spaceId]);
   const grouped = useMemo(() => {
-    const map = new Map<string, Requirement[]>(REQUIREMENT_LANES.map((lane) => [lane.id, []]));
-    for (const requirement of filtered) map.get(requirement.lane)?.push(requirement);
+    const map = new Map<string, Requirement[]>(VISIBLE_REQUIREMENT_LANES.map((lane) => [lane.id, []]));
+    for (const requirement of filtered) map.get(visibleRequirementLane(requirement.lane))?.push(requirement);
     return map;
   }, [filtered]);
 
@@ -130,25 +131,50 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       const advancement = requirement.advancement;
       if (!advancement?.invocationId) return [];
       const invocation = invocationById.get(advancement.invocationId);
-      if (!invocation || invocation.status === advancement.status) return [];
+      if (!invocation) return [];
+      const needsStatusSync = invocation.status !== advancement.status;
+      const needsAcceptance = invocation.status === "completed"
+        && requirement.lane !== "acceptance"
+        && requirement.lane !== "done";
+      if (!needsStatusSync && !needsAcceptance) return [];
       return [{ requirement, advancement, invocation }];
     });
     if (pending.length === 0) return;
     let cancelled = false;
     void (async () => {
       const updatedById = new Map<string, Requirement>();
+      const warnings: string[] = [];
       const results = await Promise.allSettled(pending.map(async ({ requirement, advancement, invocation }) => {
         const config = requirementAdvancementConfig(
           connectedProjects.find((project) => project.id === requirement.projectId)
         );
-        return service.syncRequirementAdvancement(requirement.id, advancement.idempotencyKey, {
-          invocationId: invocation.id,
-          runId: invocation.runId,
-          leaderSessionId: invocation.sessionId,
-          status: invocation.status,
-          observedAt: invocation.updatedAt,
-          error: invocation.error
-        }, config?.pollIntervalMs ?? 15_000);
+        let updated = requirement;
+        if (invocation.status !== advancement.status) {
+          updated = await service.syncRequirementAdvancement(requirement.id, advancement.idempotencyKey, {
+            invocationId: invocation.id,
+            runId: invocation.runId,
+            leaderSessionId: invocation.sessionId,
+            status: invocation.status,
+            observedAt: invocation.updatedAt,
+            error: invocation.error
+          }, config?.pollIntervalMs ?? 15_000);
+        }
+        if (invocation.status !== "completed" || !invocation.runId
+          || updated.lane === "acceptance" || updated.lane === "done") return updated;
+        try {
+          const preview = await api<RunMergePreview>(`/api/runs/${encodeURIComponent(invocation.runId)}/merge-preview`);
+          if (!preview.eligible) {
+            warnings.push(`${requirement.code} 已完成，但交付证据尚未满足自动待验收门禁：${preview.reasons.join("；") || "交付预览未就绪"}`);
+            return updated;
+          }
+          return service.submitRequirementForAcceptance(
+            requirement.id,
+            acceptanceSnapshotFromPreview(preview, new Date().toISOString())
+          );
+        } catch (error) {
+          warnings.push(`${requirement.code} 自动提交待验收失败：${error instanceof Error ? error.message : String(error)}`);
+          return updated;
+        }
       }));
       for (const result of results) {
         if (result.status === "fulfilled") updatedById.set(result.value.id, result.value);
@@ -159,6 +185,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
           requirements: data.requirements.map((requirement) => updatedById.get(requirement.id) ?? requirement)
         });
       }
+      if (!cancelled && warnings.length > 0) notify(warnings[0]!, "error");
       const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
       if (!cancelled && rejected) {
         notify(`需求推进状态同步失败：${rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason)}`, "error");
@@ -282,9 +309,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
 
   return <main className="dash-page">
     <PageHeader
-      eyebrow="BOARD / EIGHT LANES"
+      eyebrow="BOARD / SIX LANES"
       title={project ? `${project.name} · 需求看板` : "需求看板"}
-      description="八列流转；排队中 / 执行中 / 待确认只由真实 Run 自动更新，等待人工决定时会离开执行中。阻塞 / 失败 / 取消与列正交叠加。"
+      description="六列流转；排队中 / 执行中 / 待确认只由真实 Run 自动更新，门禁与交付证据通过后自动进入待验收。阻塞 / 失败 / 取消与列正交叠加。"
       actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
     />
     <OfflineNotice />
@@ -300,7 +327,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       ? <EmptyState title={projects.length === 0 ? "还没有可承接需求的项目" : "看板还没有需求"} action={projects.length === 0 ? <button type="button" className="button primary" onClick={() => go("projects")}>前往项目</button> : undefined}><p>{projects.length === 0 ? "只有正式接入且 active 的项目可以创建需求；被动 MCP 记录需要先升级。" : "需求会按列出现在这里；先由产品经理登记第一批需求。"}</p></EmptyState>
       : <div className="board-scroll" role="region" aria-label="需求看板（可横向滚动）" tabIndex={0}>
         <div className="board-grid">
-          {REQUIREMENT_LANES.map((lane) => {
+          {VISIBLE_REQUIREMENT_LANES.map((lane) => {
             const cards = grouped.get(lane.id) ?? [];
             return <section className="board-lane" key={lane.id} aria-label={`${lane.label}（${cards.length} 条）`}>
               <header className="board-lane-head"><h2>{lane.label}</h2><span className="board-lane-count">{cards.length}</span></header>

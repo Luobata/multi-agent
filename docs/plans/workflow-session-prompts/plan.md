@@ -2,7 +2,7 @@
 
 ## 目标
 
-让“协作编排”详情直接产出可复制到另一 Codex 会话的自然语言提示词与 MCP 参数示例；已有调用包时优先 `invoke_publication`，否则提供明确标注为调试入口的 `run_workflow` 示例。
+让“协作编排”详情直接产出可复制到另一 Codex 会话的自然语言提示词与 MCP 参数示例；已有 Workflow 调用包时优先 `start_publication`，否则使用 `start_workflow`，并要求原回合持续循环 `wait_workflow_progress` 到终态。
 
 ## 设计结论
 
@@ -14,7 +14,7 @@
 ## 范围
 
 - React + plain CSS 客户端；无需新增后端 API 或修改持久化模型。
-- 保留现有本地“运行编排”为调试台，不改变 MCP、A2A、Workflow 和 Publication 边界。
+- 保留现有本地“运行编排”为调试台；Workflow Publication 通过异步 `start_publication` 保持稳定边界，Employee Publication 继续使用 `invoke_publication`。
 - 视觉沿用暖灰纸张、编号章节、朱红索引与等宽证据块。
 
 ## 阶段

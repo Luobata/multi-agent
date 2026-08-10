@@ -3,9 +3,11 @@ import { api, writeBody } from "./api";
 import { DossierSection, EmptyState, Modal, SelectControl, Stamp, formatTime, scrollRecordIntoView } from "./components";
 import { SupervisorRunTopology } from "./SupervisorRunTopology";
 import { EffectiveProfileView } from "./EffectiveProfileView";
+import { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
 import type { DashboardService } from "./dashboard/service";
-import type { RunAcceptanceSnapshot } from "./dashboard/types";
 import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunMergePreview, RunMergeResult, RunNode, RunWorktreeOpenResult } from "./types";
+
+export { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
 
 const CATEGORY_LABELS: Record<"single" | "graph" | "supervisor", string> = {
   single: "单任务",
@@ -312,24 +314,6 @@ function CopyButton({ value, label, className = "button ghost" }: { value: strin
     </button>
     {status === "failed" && <span className="copy-error" role="alert">剪贴板不可用，请手动选择文本复制。</span>}
   </span>;
-}
-
-/** 从合格交付预览提取看板验收快照；门禁按服务端 requiredCapability 精确定位，不做猜测。 */
-export function acceptanceSnapshotFromPreview(preview: RunMergePreview, capturedAt: string): RunAcceptanceSnapshot {
-  const pickGate = (capability: string) => preview.evidence.gates.find((gate) => gate.requiredCapability === capability);
-  const testGate = pickGate("quality.test");
-  const reviewGate = pickGate("quality.audit");
-  return {
-    runId: preview.runId,
-    eligible: preview.eligible,
-    worktreePath: preview.worktreePath ?? "",
-    ...(testGate ? { testGate: { gateId: testGate.gateId, status: testGate.status } } : {}),
-    ...(reviewGate ? { reviewGate: { gateId: reviewGate.gateId, status: reviewGate.status } } : {}),
-    mediaCount: preview.evidence.assets.length,
-    structuredE2eCount: preview.evidence.structuredE2eCount,
-    diffFiles: preview.changes.files.map((file) => file.path),
-    capturedAt
-  };
 }
 
 function RunDeliveryPanel({

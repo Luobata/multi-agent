@@ -786,6 +786,15 @@ describe("workbench daemon", () => {
 
   it("accepts a workflow asynchronously and exposes status without holding the request open", async () => {
     const { base, service } = await fixture();
+    const rejectedEmployeePackage = await fetch(`${base}/api/publications/desk-public/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Employee packages stay conversational" })
+    });
+    expect(rejectedEmployeePackage.status).toBe(400);
+    expect(await rejectedEmployeePackage.json()).toMatchObject({
+      error: { message: expect.stringContaining("use invoke_publication instead") }
+    });
     await service.createWorkflow({
       id: "desk-flow",
       nodes: [{ id: "respond", employeeId: "desk-agent" }]
@@ -820,6 +829,38 @@ describe("workbench daemon", () => {
     expect(detail.data.invocation.status).toBe("completed");
     expect(detail.data.instances[0]?.status).toBe("completed");
     expect(detail.data.run.status).toBe("passed");
+
+    await service.createPublication({
+      id: "desk-flow-package",
+      name: "Desk Flow Package",
+      description: "A stable asynchronous package for the desk flow.",
+      target: { kind: "workflow", id: "desk-flow" }
+    });
+    const packagedResponse = await fetch(`${base}/api/publications/desk-flow-package/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-multi-agent-project": "outside-project" },
+      body: JSON.stringify({ message: "Run the stable package asynchronously" })
+    });
+    expect(packagedResponse.status).toBe(202);
+    const packaged = await packagedResponse.json() as {
+      data: { invocation: { id: string; source: { publicationId?: string } }; runId: string; monitor: { waitUrl: string } };
+    };
+    expect(packaged.data.invocation.source.publicationId).toBe("desk-flow-package");
+    expect(packaged.data.monitor.waitUrl).toBe(`/api/invocations/${packaged.data.invocation.id}/progress/wait`);
+
+    const recovered = await fetch(`${base}/api/runs/${packaged.data.runId}/monitor`);
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toMatchObject({
+      data: {
+        invocation: { id: packaged.data.invocation.id },
+        runId: packaged.data.runId,
+        monitor: {
+          tool: "wait_workflow_progress",
+          waitUrl: `/api/invocations/${packaged.data.invocation.id}/progress/wait`
+        }
+      }
+    });
+    await service.waitForInvocation(packaged.data.invocation.id);
   });
 
   it("exposes the shared daemon registry through MCP tools", async () => {
@@ -827,6 +868,12 @@ describe("workbench daemon", () => {
     await service.createWorkflow({
       id: "mcp-flow",
       nodes: [{ id: "respond", employeeId: "desk-agent" }]
+    });
+    await service.createPublication({
+      id: "mcp-flow-package",
+      name: "MCP Flow Package",
+      description: "Stable asynchronous workflow package.",
+      target: { kind: "workflow", id: "mcp-flow" }
     });
     await service.createEntrancePolicy({
       id: "mcp-entrance",
@@ -842,6 +889,8 @@ describe("workbench daemon", () => {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_employee");
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_publication");
+      expect(tools.tools.map((tool) => tool.name)).toContain("start_publication");
+      expect(tools.tools.map((tool) => tool.name)).toContain("resume_workflow_monitor");
       expect(tools.tools.map((tool) => tool.name)).toContain("invoke_project_role");
       expect(tools.tools.map((tool) => tool.name)).toContain("start_workflow");
       expect(tools.tools.map((tool) => tool.name)).toContain("get_invocation");
@@ -881,6 +930,25 @@ describe("workbench daemon", () => {
       });
       const statusText = (status.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text")?.text ?? "";
       expect(statusText).toContain('"status": "completed"');
+      const packagedWorkflow = await client.callTool({
+        name: "start_publication",
+        arguments: { publicationId: "mcp-flow-package", input: { message: "Start package through MCP" } }
+      });
+      const packagedWorkflowText = (packagedWorkflow.content as Array<{ type: string; text?: string }>)
+        .find((item) => item.type === "text")?.text ?? "{}";
+      const packagedReceipt = JSON.parse(packagedWorkflowText) as { invocation: { id: string }; runId: string };
+      await service.waitForInvocation(packagedReceipt.invocation.id);
+      const resumed = await client.callTool({
+        name: "resume_workflow_monitor",
+        arguments: { runId: packagedReceipt.runId }
+      });
+      const resumedText = (resumed.content as Array<{ type: string; text?: string }>)
+        .find((item) => item.type === "text")?.text ?? "{}";
+      expect(JSON.parse(resumedText)).toMatchObject({
+        invocation: { id: packagedReceipt.invocation.id },
+        runId: packagedReceipt.runId,
+        monitor: { tool: "wait_workflow_progress" }
+      });
       const entranceList = await client.callTool({
         name: "list_entrance_policies",
         arguments: {}

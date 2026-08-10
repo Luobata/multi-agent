@@ -53,6 +53,20 @@ export const REQUIREMENT_LANES: ReadonlyArray<{ id: RequirementLane; label: stri
   { id: "done", label: "已完成" }
 ];
 
+/**
+ * The data contract keeps the two early product-state lanes for backward
+ * compatibility, but the current board intentionally hides them. Legacy cards
+ * stored in either lane are projected into inbox so hiding a column never makes
+ * a requirement disappear.
+ */
+export const VISIBLE_REQUIREMENT_LANES = REQUIREMENT_LANES.filter(
+  (lane) => lane.id !== "clarify" && lane.id !== "planned"
+);
+
+export function visibleRequirementLane(lane: RequirementLane): RequirementLane {
+  return lane === "clarify" || lane === "planned" ? "inbox" : lane;
+}
+
 export const REQUIREMENT_EXCEPTION_LABELS: Record<Exclude<RequirementException, null>, string> = {
   blocked: "阻塞",
   failed: "失败",

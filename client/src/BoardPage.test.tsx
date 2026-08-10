@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BoardPage, requirementStewardOutput } from "./BoardPage";
 import { createDashboardService } from "./dashboard/service";
-import type { HumanDecisionRequest, InvocationRecord, Project, Session } from "./types";
+import type { HumanDecisionRequest, InvocationRecord, Project, RunMergePreview, Session } from "./types";
 
 function connectedProject(): Project {
   return {
@@ -376,5 +376,133 @@ describe("BoardPage AI requirement creation", () => {
     expect(runningLane?.textContent).toContain(requirement.title);
     expect(container.textContent).not.toContain("Run 已暂停，不会自行继续");
     expect((await service.getRequirement(requirement.id)).advancement?.status).toBe("running");
+  });
+
+  it("hides clarify and planned columns while keeping legacy cards visible in inbox", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const clarify = await service.createRequirement({
+      projectId: project.id,
+      title: "旧待澄清需求",
+      summary: "兼容旧数据",
+      priority: "medium",
+      rawRequirement: "旧数据不能消失",
+      acceptanceCriteria: ["在收件箱可见"]
+    });
+    const planned = await service.createRequirement({
+      projectId: project.id,
+      title: "旧已规划需求",
+      summary: "兼容旧数据",
+      priority: "medium",
+      rawRequirement: "旧数据不能消失",
+      acceptanceCriteria: ["在收件箱可见"]
+    });
+    await service.updateRequirementLane(clarify.id, "clarify");
+    await service.updateRequirementLane(planned.id, "planned");
+
+    act(() => root.render(<BoardPage spaceId={project.id} go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(container.querySelector('section[aria-label^="待澄清"]')).toBeNull();
+    expect(container.querySelector('section[aria-label^="已规划"]')).toBeNull();
+    const inbox = container.querySelector<HTMLElement>('section[aria-label^="收件箱"]');
+    expect(inbox?.textContent).toContain("旧待澄清需求");
+    expect(inbox?.textContent).toContain("旧已规划需求");
+  });
+
+  it("automatically submits a completed eligible Run to acceptance", async () => {
+    const service = createDashboardService({
+      delayMs: () => 0,
+      initialData: "empty",
+      now: () => new Date("2026-08-10T04:00:00.000Z")
+    });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "自动进入待验收",
+      summary: "Run 完成后自动固定交付证据",
+      priority: "high",
+      rawRequirement: "测试和 Review 通过后无需再次手动提交",
+      acceptanceCriteria: ["卡片自动进入待验收"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-completed",
+      runId: "run-completed",
+      status: "running",
+      observedAt: "2026-08-10T04:00:01.000Z"
+    }, config.pollIntervalMs);
+    const preview: RunMergePreview = {
+      runId: "run-completed",
+      status: "awaiting-acceptance",
+      eligible: true,
+      reasons: [],
+      worktreePath: "/repo/.multi-agent/worktrees/run-completed",
+      repositoryRoot: "/repo",
+      targetBranch: "main",
+      targetClean: true,
+      changes: {
+        files: [{ status: "M", path: "client/src/BoardPage.tsx" }],
+        fileCount: 1,
+        summary: "1 file changed",
+        unifiedDiff: { text: "diff", truncated: false, maxBytes: 1024 }
+      },
+      safeGitCommands: [],
+      evidence: {
+        assets: [],
+        structuredE2eCount: 1,
+        acceptedVerdict: true,
+        gates: [
+          { gateId: "quality-test", required: true, status: "passed", requiredCapability: "quality.test", mode: "before-completion" },
+          { gateId: "independent-review", required: true, status: "passed", requiredCapability: "quality.audit", mode: "before-completion" }
+        ]
+      },
+      confirmationToken: "MERGE run-completed",
+      discardConfirmationToken: "DISCARD run-completed"
+    };
+    fetchMock.mockImplementation((input: RequestInfo) => Promise.resolve({
+      ok: String(input).endsWith("/api/runs/run-completed/merge-preview"),
+      status: 200,
+      json: async () => ({ data: preview })
+    }));
+    const completed: InvocationRecord = {
+      id: "inv-completed",
+      target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench", taskId: requirement.id },
+      status: "completed",
+      phase: "done",
+      requestSummary: requirement.title,
+      runId: "run-completed",
+      instanceIds: [],
+      createdAt: "2026-08-10T04:00:00.000Z",
+      updatedAt: "2026-08-10T04:00:02.000Z",
+      completedAt: "2026-08-10T04:00:02.000Z",
+      transitions: []
+    };
+
+    act(() => root.render(<BoardPage
+      spaceId={project.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+      invocations={[completed]}
+    />));
+    for (let attempt = 0; attempt < 20 && (await service.getRequirement(requirement.id)).lane !== "acceptance"; attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }
+
+    const accepted = await service.getRequirement(requirement.id);
+    expect(accepted.lane).toBe("acceptance");
+    expect(accepted.evidence.acceptance).toMatchObject({
+      runId: "run-completed",
+      eligible: true,
+      testGate: { gateId: "quality-test", status: "passed" },
+      reviewGate: { gateId: "independent-review", status: "passed" }
+    });
+    expect(container.querySelector<HTMLElement>('section[aria-label^="待验收"]')?.textContent).toContain(requirement.title);
   });
 });

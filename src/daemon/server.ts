@@ -867,6 +867,20 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     const parsed = Number(request.query.limit ?? 50);
     send(response, await service.listRuns(Number.isFinite(parsed) ? parsed : 50));
   }));
+  app.get("/api/runs/:id/monitor", asyncRoute(async (request, response) => {
+    const receipt = await service.resumeWorkflowMonitor(routeParam(request, "id"));
+    const invocationId = receipt.invocation.id;
+    send(response, {
+      ...receipt,
+      statusUrl: `/api/invocations/${encodeURIComponent(invocationId)}`,
+      progressUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress`,
+      monitor: {
+        ...receipt.monitor,
+        waitUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress/wait`
+      },
+      streamUrl: "/api/activity/stream"
+    });
+  }));
   app.get("/api/runs/:id/merge-preview", asyncRoute(async (request, response) => {
     send(response, await service.getRunMergePreview(routeParam(request, "id")));
   }));
@@ -975,6 +989,26 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       source,
       { providerCwd: mcpExecutionRoot(request, source) }
     ));
+  }));
+  app.post("/api/publications/:id/start", asyncRoute(async (request, response) => {
+    const source = invocationSource(request, "http");
+    const started = await service.startPublication(
+      routeParam(request, "id"),
+      jsonObject(request.body ?? {}, "publication input"),
+      source,
+      { providerCwd: mcpExecutionRoot(request, source) }
+    );
+    const invocationId = started.invocation.id;
+    send(response, {
+      ...started,
+      statusUrl: `/api/invocations/${encodeURIComponent(invocationId)}`,
+      progressUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress`,
+      monitor: {
+        ...started.monitor,
+        waitUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress/wait`
+      },
+      streamUrl: "/api/activity/stream"
+    }, 202);
   }));
 
   app.get("/a2a/:publicationId/.well-known/agent-card.json", (request, response, next) => {

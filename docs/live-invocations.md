@@ -60,14 +60,17 @@ A2A 自动记录 Publication、context ID 和 task ID。MCP 的调用工具接�
 | GET | `/api/activity` | 最近 Invocation 和 Work Instance 快照 |
 | GET | `/api/activity/stream` | SSE 快照、状态迁移和实时节点事件 |
 | POST | `/api/workflows/:id/start` | 异步受理 Workflow 并立即返回 Invocation/Run 编号 |
+| POST | `/api/publications/:id/start` | 通过稳定调用包异步受理 Workflow |
 | GET | `/api/invocations/:id` | 查询一次异步调用和节点状态 |
-| POST | `/api/publications/:id/invoke` | 通过稳定调用包执行单 Agent 或多 Agent 团队 |
+| GET | `/api/invocations/:id/progress/wait` | 按 cursor 等待变化或心跳 |
+| GET | `/api/runs/:id/monitor` | 按 Run ID 恢复 Workflow 监听回执 |
+| POST | `/api/publications/:id/invoke` | 同步执行 Employee Publication 或短任务兼容调用 |
 
 MCP 推荐入口：
 
 ```json
 {
-  "tool": "invoke_publication",
+  "tool": "start_publication",
   "arguments": {
     "publicationId": "design-review-team",
     "input": { "message": "检查当前页面" },
@@ -76,6 +79,8 @@ MCP 推荐入口：
   }
 }
 ```
+
+收到启动回执后必须立即以 `monitor.initialCursor` 循环调用 `wait_workflow_progress`，每次改用返回的 `nextCursor`；`terminal=false` 时保持原回合，变化与心跳都转述 `progressReport`，终态才交付。断线后用 `resume_workflow_monitor(runId)` 重挂。
 
 ## 6. UI 责任
 

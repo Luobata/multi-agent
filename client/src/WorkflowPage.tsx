@@ -237,7 +237,7 @@ function GraphWorkflowPage({ data, refresh, notify }: PageProps) {
               ? "此编排已归档，以下内容仅供历史参考，当前不可调用。"
               : selectedPublication
                 ? <>其他会话使用 Publication ID <code>{selectedPublication.id}</code>，无需了解内部节点与 Prompt。</>
-                : "尚未建立活动调用包；以下示例使用 run_workflow 直接调试该编排。"}</p>
+                : "尚未建立活动调用包；以下示例使用 start_workflow 异步启动并持续监听该编排。"}</p>
           </div>
           {workflowPublications.length > 1
             ? <label className="workflow-publication-select"><span>选择调用包</span><SelectControl ariaLabel="选择 Workflow 调用包" value={selectedPublication?.id ?? ""} options={workflowPublications.map((publication) => ({ value: publication.id, label: publication.name, description: `${publication.id} · v${publication.version}` }))} onChange={setPublicationId} /></label>

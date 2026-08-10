@@ -25,13 +25,15 @@ Supervisor Workflow 也不负责判断每个外部请求是否需要领队。需
 
 异步启动 Supervisor Workflow 时，Workbench 会同时原子创建一个持久的领队 `EmployeeSession`。该 Session 固定主管 Employee/version，并记录原始 `invocationId`、`runId`、Workflow/version 和用户任务。Graph Workflow 只有 Invocation/Run，不创建领队 Session，也不会伪装成主管对话。
 
-`start_workflow` 和 Entrance Policy 的异步 `leader` 分发回执包含：
+`start_workflow`、Workflow Publication 的 `start_publication` 和 Entrance Policy 的异步 `leader` 分发回执包含：
 
 - `invocation.id` / `runId`；
 - Supervisor 专属的 `leaderSessionId`；
 - `monitor` 长轮询契约，包括 `initialCursor`、默认 30 秒心跳和不超过 55 秒的超时上限。
 
 MCP 宿主收到回执后应立即循环调用 `wait_workflow_progress`：传入上次响应的 `nextCursor`，在 `terminal=false` 时保持当前回合，并把每次变化或心跳的中文 `progressReport` 告知用户；终态时主动交付最终摘要。等待由 Invocation/WorkInstance 活动事件唤醒，不使用忙轮询，超时、变化、终态和连接中止都会清理 listener/timer。`get_workflow_progress` 保留为兼容快照接口。
+
+如果宿主回合或连接已经结束，但调用方保存了 `runId`，可调用 `resume_workflow_monitor(runId)` 取得同一 Invocation 的新 monitor 回执，再从新的 `initialCursor` 恢复上述循环；这不会创建第二次 Run。
 
 运行期间，Workbench 会把去重的系统进度消息写入领队 Session；终态写入领队交付消息，但 Session 仍保持 `active`。之后可用 `continue_workflow_conversation(leaderSessionId, message)` 调用固定版本的主管 Employee 继续对话。服务端会反查 Session 与原 Supervisor Invocation、Run、Workflow 和主管绑定，普通 Employee Session 不能冒充领队 Session；通用 `invoke_employee` 也不能绕过此入口复用领队 Session。
 

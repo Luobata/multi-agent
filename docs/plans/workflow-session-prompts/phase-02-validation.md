@@ -39,8 +39,8 @@
 
 ## Implementation Steps
 
-1. 断言有包时输出 `invoke_publication` 与正确 publicationId。
-2. 断言无包时输出 `run_workflow`、workflowId 和“调试入口”语义。
+1. 断言有包时输出 `start_publication`、正确 publicationId 与持续监听协议。
+2. 断言无包时输出 `start_workflow`、workflowId 和持续监听协议。
 3. 断言示例不含节点、Prompt、Skill、文件路径或未知字段。
 4. 用键盘完成选择调用包、复制两个块和跳转调用包页面。
 5. 完成四档视口、离线只读、长 ID/长 JSON 检查并运行 `npm run check`。
