@@ -109,6 +109,20 @@ describe("worktree delivery merge gate", () => {
       .rejects.toThrow(/没有可打开的 worktree/);
   }, 15_000);
 
+  it("preserves the first porcelain status column when listing unstaged changes", async () => {
+    const root = repository();
+    const runId = "run-delivery-status-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "README.md"), "unstaged change\n", "utf8");
+    const runDir = artifactDirectory();
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+
+    const preview = await previewRunMerge(run, runDir);
+
+    expect(preview.changes.files).toEqual([{ status: "M", path: "README.md" }]);
+  }, 15_000);
+
   it("keeps preview read-only and merges only after the exact run confirmation", async () => {
     const root = repository();
     const runId = "run-delivery-preview-1";

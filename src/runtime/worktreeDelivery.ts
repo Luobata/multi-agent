@@ -136,7 +136,10 @@ async function git(cwd: string, args: string[]): Promise<string> {
   if (result.code !== 0) {
     throw new Error(result.stderr.trim() || result.stdout.trim() || `git ${args[0] ?? "command"} failed`);
   }
-  return result.stdout.trim();
+  // Porcelain status uses a leading space to distinguish an unstaged change
+  // (for example ` M README.md`). Trimming the start shifts the first row and
+  // corrupts its path during fixed-column parsing, so only remove line endings.
+  return result.stdout.trimEnd();
 }
 
 function assertRunId(runId: string): void {
