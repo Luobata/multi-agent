@@ -58,6 +58,7 @@ const data: Bootstrap = {
 };
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   document.body.replaceChildren();
 });
 
@@ -79,6 +80,54 @@ describe("Publication Employee targets", () => {
     const optionText = Array.from(document.querySelectorAll('[role="option"]')).map((option) => option.textContent ?? "").join("\n");
     expect(optionText).toContain("普通员工");
     expect(optionText).not.toContain("小知 · 项目知识管理员");
+
+    act(() => root.unmount());
+  });
+
+  it("recommends asynchronous start and durable monitoring for Workflow publications", async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    })));
+    const workflowData: Bootstrap = {
+      ...data,
+      workflows: [{
+        id: "review-team",
+        version: 1,
+        status: "active",
+        architecture: "graph",
+        description: "Review changes.",
+        nodes: [],
+        maxConcurrency: 2,
+        failFast: false,
+        createdAt: timestamp,
+        updatedAt: timestamp
+      }],
+      publications: [{
+        id: "review-package",
+        version: 1,
+        status: "active",
+        name: "Review Package",
+        description: "Stable review workflow package.",
+        target: { kind: "workflow", id: "review-team" },
+        createdAt: timestamp,
+        updatedAt: timestamp
+      }]
+    };
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(<PublicationsPage data={workflowData} refresh={vi.fn()} notify={vi.fn()} />);
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain('"tool": "start_publication"');
+    expect(container.textContent).toContain("循环调用 wait_workflow_progress");
+    expect(container.textContent).toContain("resume_workflow_monitor(runId)");
+    expect(container.textContent).toContain("/api/publications/review-package/start");
 
     act(() => root.unmount());
   });
