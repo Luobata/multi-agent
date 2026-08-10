@@ -148,7 +148,7 @@ describe("Office floor runtime status", () => {
       streamStatus="live"
       data={bootstrapWith({
         employees: [mihuhu],
-        activity: { invocations: [], instances: [instance("i-1", mihuhu.id, "failed", timestamp, "mock 输出校验失败")] }
+        activity: { invocations: [], instances: [instance("i-1", mihuhu.id, "failed", new Date().toISOString(), "mock 输出校验失败")] }
       })}
     />);
 
@@ -156,6 +156,42 @@ describe("Office floor runtime status", () => {
     expect(html).toContain("runtime-chip--failed");
     expect(html).toContain("故障");
     expect(html).toContain("打开实时台查看运行证据");
+  });
+
+  it("does not let an older Employee version keep the current seat in failure", () => {
+    const mihuhu = { ...employee("mihuhu-frontend-engineer", "米糊糊 · 前端"), version: 2 };
+    const oldFailure = { ...instance("i-old", mihuhu.id, "failed", new Date().toISOString()), employeeVersion: 1 };
+    const html = renderToStaticMarkup(<OfficePage
+      streamStatus="live"
+      data={bootstrapWith({ employees: [mihuhu], activity: { invocations: [], instances: [oldFailure] } })}
+    />);
+
+    expect(html).toContain("office-employee runtime-idle");
+    expect(html).not.toContain("office-employee runtime-failed");
+  });
+
+  it("labels budget, schema, and restart failures separately", () => {
+    const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
+    const budget = {
+      ...instance("i-budget", mihuhu.id, "failed", new Date().toISOString(), "Reached maximum budget ($3)"),
+      failure: { category: "provider" as const, kind: "budget" as const, retryable: false }
+    };
+    const schema = {
+      ...instance("i-schema", mihuhu.id, "failed", new Date(Date.now() - 1000).toISOString(), "additional properties"),
+      failure: { category: "output-validation" as const, retryable: true }
+    };
+    const interrupted = {
+      ...instance("i-restart", mihuhu.id, "failed", new Date(Date.now() - 2000).toISOString(), "runtime restarted"),
+      phase: "interrupted",
+      failure: { category: "interrupted" as const, retryable: true }
+    };
+    const html = renderToStaticMarkup(<OfficePage
+      streamStatus="live"
+      data={bootstrapWith({ employees: [mihuhu], activity: { invocations: [], instances: [budget, schema, interrupted] } })}
+    />);
+
+    expect(html).toContain("Provider 预算耗尽");
+    expect(html).toContain("当前 v1 近 3 次：成功 0 · 阻塞 0 · 故障 2 · 中断 1");
   });
 
   it("keeps completed visible briefly through the shared linger rule", () => {

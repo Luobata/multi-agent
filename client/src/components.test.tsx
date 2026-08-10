@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { COMPLETED_STATE_LINGER_MS, RuntimeStatusChip, SelectControl, SwitchControl, employeeRuntimeStatus } from "./components";
+import { COMPLETED_STATE_LINGER_MS, TERMINAL_ATTENTION_LINGER_MS, RuntimeStatusChip, SelectControl, SwitchControl, employeeRuntimeHealth, employeeRuntimeStatus } from "./components";
 import type { WorkInstanceRecord } from "./types";
 
 const options = [
@@ -281,9 +281,13 @@ describe("employeeRuntimeStatus", () => {
     expect(employeeRuntimeStatus([record("queued", "2026-08-01T11:59:00.000Z")], now)).toBe("queued");
   });
 
-  it("keeps failures and blocks visible instead of expiring them", () => {
-    expect(employeeRuntimeStatus([record("failed", "2020-01-01T00:00:00.000Z")], now)).toBe("failed");
-    expect(employeeRuntimeStatus([record("blocked", "2020-01-01T00:00:00.000Z")], now)).toBe("blocked");
+  it("keeps recent failures and blocks visible without pinning a seat forever", () => {
+    const recent = new Date(now - TERMINAL_ATTENTION_LINGER_MS + 1000).toISOString();
+    const stale = new Date(now - TERMINAL_ATTENTION_LINGER_MS - 1000).toISOString();
+    expect(employeeRuntimeStatus([record("failed", recent)], now)).toBe("failed");
+    expect(employeeRuntimeStatus([record("blocked", recent)], now)).toBe("blocked");
+    expect(employeeRuntimeStatus([record("failed", stale)], now)).toBe("idle");
+    expect(employeeRuntimeStatus([record("blocked", stale)], now)).toBe("idle");
   });
 
   it("lets a completed state linger briefly, then returns to idle", () => {
@@ -295,5 +299,18 @@ describe("employeeRuntimeStatus", () => {
 
   it("is idle without instances and never derives from archive state", () => {
     expect(employeeRuntimeStatus([], now)).toBe("idle");
+  });
+});
+
+describe("employeeRuntimeHealth", () => {
+  it("uses only the current Employee version and separates interruptions from technical failures", () => {
+    const records = [
+      { employeeVersion: 2, status: "completed" as const, phase: "done", updatedAt: "2026-08-01T12:00:00.000Z" },
+      { employeeVersion: 2, status: "blocked" as const, phase: "done", updatedAt: "2026-08-01T11:59:00.000Z" },
+      { employeeVersion: 2, status: "failed" as const, phase: "error", failure: { category: "provider" as const, kind: "exit" as const, retryable: false }, updatedAt: "2026-08-01T11:58:00.000Z" },
+      { employeeVersion: 2, status: "failed" as const, phase: "interrupted", failure: { category: "interrupted" as const, retryable: true }, updatedAt: "2026-08-01T11:57:00.000Z" },
+      { employeeVersion: 1, status: "failed" as const, phase: "error", updatedAt: "2026-08-01T11:56:00.000Z" }
+    ];
+    expect(employeeRuntimeHealth(records, 2)).toEqual({ total: 4, completed: 1, blocked: 1, failed: 1, interrupted: 1 });
   });
 });

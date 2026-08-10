@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ProviderExecutionError } from "../src/core/errors.js";
 import type { ProviderRegistry } from "../src/runtime/providers.js";
 import type { JsonObject, RoleVerdictDefinition } from "../src/core/types.js";
 import { WorkbenchService } from "../src/workbench/service.js";
@@ -879,6 +880,125 @@ describe("Local Agent Workbench", () => {
     expect(result.run.nodes["supervisor-r1"]).toMatchObject({ status: "passed", attempts: 2 });
     expect(prompts[1]).toContain("Previous structured-decision validation error");
     expect(prompts[1]).toContain("output schema validation failed");
+  });
+
+  it("repairs a malformed delegated specialist result inside the Employee attempt budget", async () => {
+    let workerAttempts = 0;
+    const workerPrompts: string[] = [];
+    const providers: ProviderRegistry = new Map([["repairing-member", {
+      id: "repairing-member",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role === "supervisor") {
+          return round === 1
+            ? { stdout: JSON.stringify({ action: "delegate", assignments: [{ roleId: "worker", task: "Return strict output." }] }), stderr: "", durationMs: 1 }
+            : { stdout: JSON.stringify({ action: "finish", summary: "Worker repaired its output.", result: { repaired: true } }), stderr: "", durationMs: 1 };
+        }
+        workerAttempts += 1;
+        workerPrompts.push(invocation.prompt);
+        return workerAttempts === 1
+          ? { stdout: JSON.stringify({ message: "done", unexpected: true }), stderr: "", durationMs: 1 }
+          : { stdout: JSON.stringify({ message: "done" }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("repairing-member-provider", { adapter: "repairing-member", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "member-repair-manager",
+      identity: { displayName: "Member Repair Manager", background: "Coordinates.", responsibilities: ["Manage"] },
+      providerId: "repairing-member-provider"
+    });
+    await service.createEmployee({
+      id: "member-repair-worker",
+      identity: { displayName: "Member Repair Worker", background: "Repairs strict output.", responsibilities: ["Work"] },
+      providerId: "repairing-member-provider",
+      maxAttempts: 2,
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message"],
+        properties: { message: { type: "string" } }
+      }
+    });
+    await service.createManagementPolicy({
+      id: "member-repair-policy",
+      description: "Repair specialist output once.",
+      allowedRoleIds: ["worker"],
+      instructions: "Delegate once, then finish.",
+      completion: { requireDelegation: true }
+    });
+    await service.createWorkflow({
+      id: "member-repair-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "member-repair-manager" },
+      managementPolicy: { id: "member-repair-policy" },
+      members: [{ roleId: "worker", employeeId: "member-repair-worker" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("member-repair-team", { message: "Repair member output" });
+    expect(result.run.status).toBe("passed");
+    expect(result.run.nodes["worker-r1-1"]).toMatchObject({ status: "passed", attempts: 2 });
+    expect(workerPrompts[1]).toContain("Previous structured-output validation error");
+    expect(workerPrompts[1]).toContain("additional properties");
+  });
+
+  it("opens the Supervisor circuit after a deterministic member budget failure", async () => {
+    let workerCalls = 0;
+    const providers: ProviderRegistry = new Map([["budget-circuit", {
+      id: "budget-circuit",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role === "supervisor") {
+          return {
+            stdout: JSON.stringify({ action: "delegate", assignments: [{ roleId: "designer", task: "Repeat the same expensive design task." }] }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        workerCalls += 1;
+        throw new ProviderExecutionError("provider design exhausted its configured budget", "", "", {
+          kind: "budget",
+          retryable: false
+        });
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("budget-circuit-provider", { adapter: "budget-circuit", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "budget-manager",
+      identity: { displayName: "Budget Manager", background: "Coordinates.", responsibilities: ["Manage"] },
+      providerId: "budget-circuit-provider"
+    });
+    await service.createEmployee({
+      id: "budget-designer",
+      identity: { displayName: "Budget Designer", background: "Designs.", responsibilities: ["Design"] },
+      providerId: "budget-circuit-provider",
+      maxAttempts: 3
+    });
+    await service.createManagementPolicy({
+      id: "budget-circuit-policy",
+      description: "Stop deterministic Provider repeats.",
+      allowedRoleIds: ["designer"],
+      instructions: "Do not repeat deterministic technical failures.",
+      completion: { requireDelegation: true }
+    });
+    await service.createWorkflow({
+      id: "budget-circuit-team",
+      architecture: "supervisor",
+      supervisor: { employeeId: "budget-manager" },
+      managementPolicy: { id: "budget-circuit-policy" },
+      members: [{ roleId: "designer", employeeId: "budget-designer" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("budget-circuit-team", { message: "Respect the budget circuit" });
+    expect(workerCalls).toBe(1);
+    expect(result.run.status).toBe("blocked");
+    expect(result.run.output).toMatchObject({ reason: expect.stringContaining("technical circuit opened for designer") });
+    expect(service.getActivitySnapshot().instances.find((instance) => instance.employeeId === "budget-designer")?.failure)
+      .toEqual({ category: "provider", kind: "budget", retryable: false });
   });
 
   it("does not execute an unchanged blocked delegation repeatedly", async () => {

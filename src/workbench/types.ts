@@ -695,6 +695,7 @@ export interface WorkInstanceRecord {
   status: WorkInstanceStatus;
   phase: string;
   error?: string;
+  failure?: import("../core/types.js").NodeRunFailure;
   createdAt: string;
   startedAt?: string;
   updatedAt: string;

@@ -32,7 +32,7 @@ describe("manifest compilation", () => {
       ["final-decision"]
     ]);
     expect(formatPlanMermaid(plan)).toContain("product_review --> final_decision");
-    expect(plan.nodes[0]?.with).toEqual({});
+    expect(plan.nodes[0]?.with).toEqual({ __previousAttemptError: "" });
   });
 
   it("reports cycles as an architecture error", () => {

@@ -62,6 +62,51 @@ export type ProviderRegistry = Map<string, ProviderAdapter>;
  */
 const TRANSIENT_FAILURE_PATTERN = /rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up|\b5\d{2}\b|internalservererror|internalserverexception|internal server error|service unavailable|bad gateway|gateway timeout|upstream|厂商资源|资源问题|断连/;
 
+function safeProviderDiagnostic(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const compact = value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!compact) return undefined;
+  return compact
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/g, "[redacted]")
+    .slice(0, 240);
+}
+
+/**
+ * Provider CLIs often report the actionable reason in their final JSON event while leaving
+ * stderr empty. Extract only bounded, known diagnostic fields; raw streams remain in Run evidence.
+ */
+export function providerExitDiagnostic(stdout: string, stderr: string): string | undefined {
+  const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= Math.max(0, lines.length - 30); index -= 1) {
+    try {
+      const event = JSON.parse(lines[index]!) as Record<string, unknown>;
+      const errors = Array.isArray(event.errors) ? event.errors : [];
+      const explicit = errors.map(safeProviderDiagnostic).find(Boolean)
+        ?? safeProviderDiagnostic(event.error)
+        ?? (event.is_error ? safeProviderDiagnostic(event.result) : undefined);
+      if (explicit) return explicit;
+      const terminal = safeProviderDiagnostic(event.terminal_reason);
+      if (terminal) return terminal.replaceAll("_", " ");
+      const subtype = safeProviderDiagnostic(event.subtype);
+      if (subtype?.startsWith("error_")) return subtype.replaceAll("_", " ");
+    } catch {
+      // Stream output may mix plain progress with JSON events; inspect the preceding line.
+    }
+  }
+  const stderrLine = stderr.split(/\r?\n/).map((line) => safeProviderDiagnostic(line)).findLast(Boolean);
+  return stderrLine;
+}
+
+function providerExitMessage(providerId: string, status: number | null, kind: "budget" | "rate-limit" | "exit", stdout: string, stderr: string): string {
+  const detail = providerExitDiagnostic(stdout, stderr);
+  const reason = kind === "budget"
+    ? "exhausted its configured budget"
+    : kind === "rate-limit"
+      ? "was rejected by a transient upstream limit"
+      : `exited with status ${status}`;
+  return `provider ${providerId} ${reason}${detail ? `: ${detail}` : ""}`;
+}
+
 function validateTimeoutPolicy(prefix: string, definition: Record<string, unknown>): string[] {
   const issues: string[] = [];
   for (const key of ["timeoutMs", "idleTimeoutMs", "hardTimeoutMs"] as const) {
@@ -459,11 +504,12 @@ class CommandProviderAdapter implements ProviderAdapter {
             return;
           }
           if (status !== 0) {
+            const options = failureOptions(status);
             reject(new ProviderExecutionError(
-              `provider ${invocation.providerId} exited with status ${status}`,
+              providerExitMessage(invocation.providerId, status, options.kind, stdout, stderr),
               stdout,
               stderr,
-              failureOptions(status)
+              options
             ));
             return;
           }
@@ -695,8 +741,9 @@ class CodexProviderAdapter implements ProviderAdapter {
           const detail = `${stdout}\n${stderr}`.toLowerCase();
           const budget = /maximum budget|max_budget|budget exhausted/.test(detail);
           const transient = TRANSIENT_FAILURE_PATTERN.test(detail);
-          reject(new ProviderExecutionError(`provider ${invocation.providerId} exited with status ${status}`, stdout, stderr, {
-            kind: budget ? "budget" : transient ? "rate-limit" : "exit",
+          const kind = budget ? "budget" : transient ? "rate-limit" : "exit";
+          reject(new ProviderExecutionError(providerExitMessage(invocation.providerId, status, kind, stdout, stderr), stdout, stderr, {
+            kind,
             retryable: transient,
             durationMs: Date.now() - started
           }));

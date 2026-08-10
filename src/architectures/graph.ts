@@ -103,7 +103,13 @@ function compileGraph(loaded: LoadedManifest, workflowId: string): ExecutionPlan
       ready.map((node) => {
         const role = loaded.manifest.roles[node.role];
         if (!role) throw new ManifestValidationError([`unknown role ${node.role}`]);
-        return { id: node.id, role: node.role, provider: role.provider, needs: node.needs ?? [], with: node.with ?? {} };
+        return {
+          id: node.id,
+          role: node.role,
+          provider: role.provider,
+          needs: node.needs ?? [],
+          with: { ...(node.with ?? {}), __previousAttemptError: "" }
+        };
       })
     );
     for (const node of ready) {
@@ -211,7 +217,7 @@ async function executeGraph(context: ArchitectureExecutionContext): Promise<void
       for (const node of ready) {
         if (running.size >= concurrency) break;
         pending.delete(node.id);
-        running.set(node.id, context.executeNode(node).then((result) => ({ nodeId: node.id, result })));
+        running.set(node.id, context.executeNode(node, { retryValidation: true }).then((result) => ({ nodeId: node.id, result })));
       }
     }
 

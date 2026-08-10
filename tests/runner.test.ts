@@ -353,6 +353,7 @@ describe("workflow runtime", () => {
 
     expect(calls).toBe(1);
     expect(result.run.nodes.review?.attempts).toBe(1);
+    expect(result.run.nodes.review?.failure).toEqual({ category: "provider", kind: "budget", retryable: false });
     expect(result.run.status).toBe("failed");
   });
 

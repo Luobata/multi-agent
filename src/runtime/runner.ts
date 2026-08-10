@@ -14,6 +14,7 @@ import type {
   JsonValue,
   LoadedManifest,
   NodeRunResult,
+  NodeRunFailure,
   RuntimeHumanDecisionOutcome,
   RuntimeHumanDecisionRequest,
   WorkflowRunIsolation,
@@ -227,6 +228,7 @@ async function executeNode(
   await emit("node.started", node.id, { provider: node.provider, needs: node.needs });
   const maxAttempts = role.maxAttempts ?? 1;
   let lastError: unknown;
+  let lastFailure: NodeRunFailure | undefined;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     result.attempts = attempt;
@@ -312,6 +314,9 @@ async function executeNode(
       const retryable = error instanceof ProviderExecutionError
         ? error.retryable
         : Boolean(options.retryValidation);
+      lastFailure = error instanceof ProviderExecutionError
+        ? { category: "provider", kind: error.kind, retryable }
+        : { category: "output-validation", retryable };
       const willRetry = attempt < maxAttempts && retryable;
       if (willRetry && validationFailure) {
         node.with = {
@@ -342,11 +347,19 @@ async function executeNode(
     ...result,
     status: "failed",
     completedAt: now(),
-    error: lastError instanceof Error ? lastError.message : String(lastError)
+    error: lastError instanceof Error ? lastError.message : String(lastError),
+    failure: lastFailure
   };
   run.nodes[node.id] = failed;
   await store.writeRun(run);
-  await emit("node.failed", node.id, { error: failed.error ?? "Provider invocation failed" });
+  await emit("node.failed", node.id, {
+    error: failed.error ?? "Provider invocation failed",
+    failure: failed.failure ? {
+      category: failed.failure.category,
+      ...(failed.failure.kind ? { kind: failed.failure.kind } : {}),
+      retryable: failed.failure.retryable
+    } : null
+  });
   return failed;
 }
 
@@ -443,11 +456,16 @@ export async function runWorkflow(
         status: "failed",
         attempts: 0,
         completedAt: now(),
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        failure: { category: "preparation", retryable: false }
       };
       run.nodes[node.id] = failed;
       await store.writeRun(run);
-      await emit("node.failed", node.id, { error: failed.error ?? "node preparation failed", phase: "prepare" });
+      await emit("node.failed", node.id, {
+        error: failed.error ?? "node preparation failed",
+        phase: "prepare",
+        failure: { category: "preparation", retryable: false }
+      });
       return failed;
     }
     return executeNode(

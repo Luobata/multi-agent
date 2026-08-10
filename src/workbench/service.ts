@@ -1850,6 +1850,7 @@ export class WorkbenchService {
         instance.status = "failed";
         instance.phase = "interrupted";
         instance.error = "Local runtime restarted before this work instance completed.";
+        instance.failure = { category: "interrupted", retryable: true };
         instance.updatedAt = timestamp;
         instance.completedAt = timestamp;
         instance.transitions.push({
@@ -2522,7 +2523,8 @@ export class WorkbenchService {
     nodeId: string,
     status: WorkInstanceStatus,
     phase: string,
-    message?: string
+    message?: string,
+    failure?: WorkInstanceRecord["failure"]
   ): Promise<WorkInstanceRecord | undefined> {
     const timestamp = now();
     const instance = await this.store.mutate((state) => {
@@ -2536,7 +2538,10 @@ export class WorkbenchService {
       target.updatedAt = timestamp;
       if (status === "running") target.startedAt ??= timestamp;
       if (isInstanceTerminal(status)) target.completedAt = timestamp;
-      if (status === "failed") target.error = message;
+      if (status === "failed") {
+        target.error = message;
+        target.failure = failure;
+      }
       const previous = target.transitions.at(-1);
       if (previous?.status !== status || previous.phase !== phase || (message && previous.message !== message)) {
         target.transitions.push({ at: timestamp, status, phase, message });
@@ -2599,8 +2604,8 @@ export class WorkbenchService {
       } else if (event.type === "node.blocked") {
         await this.transitionInstance(invocationId, event.nodeId, "blocked", "done");
       } else if (event.type === "node.failed") {
-        const detail = event.detail as { error?: string } | undefined;
-        await this.transitionInstance(invocationId, event.nodeId, "failed", "error", detail?.error);
+        const detail = event.detail as { error?: string; failure?: WorkInstanceRecord["failure"] } | undefined;
+        await this.transitionInstance(invocationId, event.nodeId, "failed", "error", detail?.error, detail?.failure);
       } else if (event.type === "node.skipped") {
         const detail = event.detail as { reason?: string } | undefined;
         await this.transitionInstance(invocationId, event.nodeId, "skipped", "done", detail?.reason);

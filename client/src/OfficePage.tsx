@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { api } from "./api";
-import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeStatus, formatTime } from "./components";
+import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeHealth, employeeRuntimeStatus, formatTime } from "./components";
 import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
 import { activeSupervisorInvocations, completionRatio, progressTone, studioSupervisorInvocations } from "./officeStudio";
 import type {
@@ -51,6 +51,18 @@ function phaseLabel(phase: string): string {
   return phaseLabels[phase] ?? phase;
 }
 
+function failureLabel(instance: WorkInstanceRecord): string {
+  if (instance.phase === "interrupted" || instance.failure?.category === "interrupted") return "服务重启中断";
+  if (instance.failure?.category === "output-validation") return "输出格式错误";
+  if (instance.failure?.category === "preparation") return "执行环境准备失败";
+  if (instance.failure?.kind === "budget") return "Provider 预算耗尽";
+  if (instance.failure?.kind === "rate-limit") return "Provider 临时限流";
+  if (instance.failure?.kind === "idle-timeout") return "Provider 无进展超时";
+  if (instance.failure?.kind === "hard-timeout") return "Provider 安全上限中断";
+  if (instance.failure?.category === "provider") return "Provider 技术故障";
+  return "执行故障";
+}
+
 function sourceName(instance: WorkInstanceRecord | InvocationRecord): string {
   const { source } = instance;
   if (source.project) return source.project;
@@ -93,7 +105,7 @@ function WorkInstanceCard({ instance, invocation, clock }: {
   return <article className={`instance-card instance-card--${instance.status}`}>
     <header>
       <div><span>{sourceCode(instance)}</span><strong>{sourceName(instance)}</strong></div>
-      <RuntimeStatusChip status={instance.status} />
+      <RuntimeStatusChip status={instance.status} label={instance.status === "failed" ? failureLabel(instance) : undefined} />
     </header>
     <p>{invocation?.requestSummary ?? "调用上下文已固定到对应 Run。"}</p>
     <dl>
@@ -106,6 +118,7 @@ function WorkInstanceCard({ instance, invocation, clock }: {
       <dt>Run</dt><dd><code>{instance.runId}</code></dd>
     </dl>
     {instance.error && <div className="instance-error">{instance.error}</div>}
+    {instance.status === "failed" && <div className="instance-failure-kind"><strong>{failureLabel(instance)}</strong><span>{instance.failure?.retryable ? "可在条件恢复后重试" : "需要调整配置或输出后再推进"}</span></div>}
     {instance.status === "failed" && <div className="instance-evidence">
       <button type="button" className="instance-evidence-action" onClick={() => { window.location.hash = "runs"; }}>查看运行证据 →</button>
     </div>}
@@ -134,8 +147,10 @@ function EmployeeActivityDrawer({ employee, data, clock, onClose }: {
     };
   }, []);
   const instances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
-  const active = instances.filter((instance) => activeInstanceStatuses.has(instance.status));
-  const state = employeeRuntimeStatus(instances, clock);
+  const currentInstances = instances.filter((instance) => instance.employeeVersion === employee.version);
+  const active = currentInstances.filter((instance) => activeInstanceStatuses.has(instance.status));
+  const state = employeeRuntimeStatus(currentInstances, clock);
+  const health = employeeRuntimeHealth(instances, employee.version);
   return <div className="activity-drawer-layer" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <aside className="employee-activity-drawer" role="dialog" aria-modal="true" aria-label={`${employee.identity.displayName} 实时工作台`}>
       <header className="activity-drawer-header">
@@ -148,6 +163,7 @@ function EmployeeActivityDrawer({ employee, data, clock, onClose }: {
         <div><span>当前出勤</span><strong>{active.length}</strong></div>
         <div><span>累计实例</span><strong>{instances.length}</strong></div>
         <div><span>当前档案</span><strong>v{employee.version}</strong></div>
+        <div><span>当前版本近况</span><strong>{health.total ? `${health.completed}/${health.total}` : "—"}</strong></div>
       </section>
       <section className="drawer-model-strip">
         <span>启动配置</span><code>{employee.providerId}</code><code>{data.providers.find((provider) => provider.id === employee.providerId)?.definition.model ?? "由 Provider 决定"}</code>
@@ -231,9 +247,11 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [activeSupervisorKey]);
   const renderRoster = (employees: Employee[], systemLevel: boolean) => employees.map((employee, index) => {
-    const employeeInstances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
+    const allEmployeeInstances = data.activity.instances.filter((instance) => instance.employeeId === employee.id);
+    const employeeInstances = allEmployeeInstances.filter((instance) => instance.employeeVersion === employee.version);
     const active = employeeInstances.filter((instance) => activeInstanceStatuses.has(instance.status));
     const state = employeeRuntimeStatus(employeeInstances, clock);
+    const health = employeeRuntimeHealth(allEmployeeInstances, employee.version);
     const terminalLatest = state === "failed" || state === "blocked" || state === "completed"
       ? [...employeeInstances].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]
       : undefined;
@@ -276,9 +294,9 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
         <p>{employeeRole(employee)}</p>
       </div>
       <div className="office-assignment">
-        {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.status === "failed" ? `故障：${latest.error ?? "执行失败"} · 打开实时台查看运行证据` : `${latest.workflowId} / ${latest.nodeId} · ${elapsed(latest.startedAt, latest.completedAt, clock)}`}</small></> : systemLevel ? <><span>INTERNAL ONLY</span><strong>仅接受内部项目角色调度</strong><small>内部项目 {scope?.projectId}{scope?.roleId ? ` · 角色 ${scope.roleId}` : ""} · {entryCount} 个项目角色可触达</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
+        {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.status === "failed" ? `${failureLabel(latest)}：${latest.error ?? "执行失败"} · 打开实时台查看运行证据` : `${latest.workflowId} / ${latest.nodeId} · ${elapsed(latest.startedAt, latest.completedAt, clock)}`}</small></> : systemLevel ? <><span>INTERNAL ONLY</span><strong>仅接受内部项目角色调度</strong><small>内部项目 {scope?.projectId}{scope?.roleId ? ` · 角色 ${scope.roleId}` : ""} · {entryCount} 个项目角色可触达</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
       </div>
-      <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>查看实时台 →</span></footer>
+      <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>{health.total ? `当前 v${employee.version} 近 ${health.total} 次：成功 ${health.completed} · 阻塞 ${health.blocked} · 故障 ${health.failed} · 中断 ${health.interrupted} · ` : ""}查看实时台 →</span></footer>
     </button>;
   });
 

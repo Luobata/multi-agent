@@ -320,6 +320,8 @@ const runtimeChipLabels: Record<RuntimeChipStatus, string> = {
 
 /** Terminal success stays visible for a short dwell before the seat returns to idle. */
 export const COMPLETED_STATE_LINGER_MS = 20_000;
+/** Failures and business blocks remain prominent briefly, but never pin a seat red forever. */
+export const TERMINAL_ATTENTION_LINGER_MS = 5 * 60_000;
 
 /**
  * Derives one employee-facing runtime status from real Work Instance records.
@@ -336,9 +338,39 @@ export function employeeRuntimeStatus(
     .filter((instance) => instance.status === "failed" || instance.status === "blocked" || instance.status === "completed")
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
   if (!terminal) return "idle";
-  if (terminal.status === "failed") return "failed";
-  if (terminal.status === "blocked") return "blocked";
+  const age = now - new Date(terminal.updatedAt).getTime();
+  if (terminal.status === "failed") return age <= TERMINAL_ATTENTION_LINGER_MS ? "failed" : "idle";
+  if (terminal.status === "blocked") return age <= TERMINAL_ATTENTION_LINGER_MS ? "blocked" : "idle";
   return now - new Date(terminal.updatedAt).getTime() <= COMPLETED_STATE_LINGER_MS ? "completed" : "idle";
+}
+
+export interface EmployeeRuntimeHealth {
+  total: number;
+  completed: number;
+  blocked: number;
+  failed: number;
+  interrupted: number;
+}
+
+/** Rolling current-version health; historical Employee versions never affect the current seat. */
+export function employeeRuntimeHealth(
+  instances: ReadonlyArray<Pick<WorkInstanceRecord, "employeeVersion" | "status" | "phase" | "failure" | "updatedAt">>,
+  employeeVersion: number,
+  limit = 10
+): EmployeeRuntimeHealth {
+  const recent = instances
+    .filter((instance) => instance.employeeVersion === employeeVersion)
+    .filter((instance) => instance.status === "completed" || instance.status === "blocked" || instance.status === "failed")
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, limit);
+  const interrupted = recent.filter((instance) => instance.phase === "interrupted" || instance.failure?.category === "interrupted").length;
+  return {
+    total: recent.length,
+    completed: recent.filter((instance) => instance.status === "completed").length,
+    blocked: recent.filter((instance) => instance.status === "blocked").length,
+    failed: recent.filter((instance) => instance.status === "failed").length - interrupted,
+    interrupted
+  };
 }
 
 function RuntimeChipShape({ status }: { status: RuntimeChipStatus }) {

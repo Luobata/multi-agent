@@ -158,6 +158,13 @@ export interface LoadedManifest {
 export type NodeRunStatus = "pending" | "running" | "passed" | "blocked" | "failed" | "skipped";
 export type WorkflowRunStatus = "running" | "passed" | "blocked" | "failed";
 
+export interface NodeRunFailure {
+  category: "provider" | "output-validation" | "preparation" | "interrupted";
+  /** Provider-specific machine classification. Absent for validation/preparation failures. */
+  kind?: import("./errors.js").ProviderFailureKind;
+  retryable: boolean;
+}
+
 export interface NodeRunResult {
   nodeId: string;
   roleId: string;
@@ -168,6 +175,7 @@ export interface NodeRunResult {
   completedAt?: string;
   output?: JsonValue;
   error?: string;
+  failure?: NodeRunFailure;
   artifactDir?: string;
 }
 

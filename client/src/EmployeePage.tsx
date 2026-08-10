@@ -697,7 +697,9 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
   const selectedSystemScope = selected ? systemEmployeeScope(selected) : undefined;
   const selectedProvider = selected ? data.providers.find((provider) => provider.id === selected.providerId) : undefined;
   const selectedRuntime = providerRuntimeSummary(selectedProvider);
-  const selectedRuntimeState = selected ? employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === selected.id), clock) : "idle";
+  const selectedRuntimeState = selected ? employeeRuntimeStatus(data.activity.instances.filter((instance) => (
+    instance.employeeId === selected.id && instance.employeeVersion === selected.version
+  )), clock) : "idle";
   const sessions = selected ? data.sessions.filter((session) => session.employeeId === selected.id) : [];
   const [versions, setVersions] = useState<Employee[]>([]);
   const [editor, setEditor] = useState<"new" | "edit" | null>(null);
@@ -759,7 +761,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
           { id: "system", title: "系统级员工", note: "仅供内部项目角色调用，可在此管理", employees: visibleSystem }
         ].map((group) => <section className={`employee-roster-group employee-roster-group--${group.id}`} key={group.id} aria-labelledby={`employee-group-${group.id}`}>
           <header><div><h2 id={`employee-group-${group.id}`}>{group.title}</h2><span>{group.employees.length}</span></div><p>{group.note}</p></header>
-          <div>{group.employees.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); const runtimeState = employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id), clock); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
+          <div>{group.employees.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); const runtimeState = employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id && instance.employeeVersion === employee.version), clock); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
             <EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} />
             <span className="employee-card-copy"><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><small>{employee.description}</small><span className="employee-runtime"><span>模型 <code>{runtime.model}</code></span><span title={runtime.launchCommand}>启动 <code>{runtime.launchPreview}</code></span></span></span>
             <span className="employee-card-stamps">{group.id === "system" && <span className="system-level-badge">系统级</span>}<Stamp status={employee.status} />{runtimeState !== "idle" && <RuntimeStatusChip status={runtimeState} />}</span>

@@ -169,6 +169,42 @@ function repeatedBlockedAssignment(
   return prerequisiteProgress ? undefined : prior;
 }
 
+function technicalCircuitReason(
+  assignment: SupervisorAssignment,
+  ledger: DelegationRecord[]
+): string | undefined {
+  const failures = ledger.filter((record) => (
+    record.assignment.roleId === assignment.roleId
+    && record.result.status === "failed"
+  ));
+  const latest = failures.at(-1);
+  if (!latest?.result.failure) return undefined;
+  const failure = latest.result.failure;
+  const providerKind = failure.category === "provider" ? failure.kind : undefined;
+
+  // A budget or startup failure cannot be repaired by reissuing the same assignment. Stop after
+  // the first occurrence so the caller can change budget/runtime configuration deliberately.
+  if (providerKind === "budget" || providerKind === "start") {
+    return `technical circuit opened for ${assignment.roleId}: ${latest.result.error ?? providerKind}`;
+  }
+
+  const matching = failures.filter((record) => (
+    record.result.failure?.category === failure.category
+    && record.result.failure?.kind === failure.kind
+  ));
+  if (matching.length < 2) return undefined;
+  const latestFailureRound = typeof latest.worker.metadata?.round === "number" ? latest.worker.metadata.round : 0;
+  const recovered = ledger.some((record) => (
+    record.assignment.roleId === assignment.roleId
+    && record.result.status === "passed"
+    && typeof record.worker.metadata?.round === "number"
+    && record.worker.metadata.round >= latestFailureRound
+  ));
+  return recovered
+    ? undefined
+    : `technical circuit opened for ${assignment.roleId} after ${matching.length} repeated ${failure.kind ?? failure.category} failures: ${latest.result.error ?? "no diagnostic detail"}`;
+}
+
 type GateRunStatus = "pending" | "passed" | "blocked" | "skipped";
 
 interface GateActivation {
@@ -1304,6 +1340,24 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       }
     }
 
+    const openCircuit = next.assignments
+      .map((assignment) => ({ assignment, reason: technicalCircuitReason(assignment, delegationLedger) }))
+      .find((candidate) => candidate.reason);
+    if (openCircuit?.reason) {
+      history.push({
+        round,
+        supervisorNodeId: node.id,
+        decision: next as unknown as JsonValue,
+        decisionRejected: openCircuit.reason
+      });
+      await context.emit("supervisor.delegation.rejected", node.id, {
+        reason: openCircuit.reason,
+        roleId: openCircuit.assignment.roleId,
+        circuitOpen: true
+      });
+      return blocked(openCircuit.reason, round, delegationCount, trackers, dagTrackers);
+    }
+
     const dagViolation = async (reason: string): Promise<ArchitectureExecutionResult> => {
       await context.emit("supervisor.dag.blocked", node.id, {
         reason,
@@ -1406,7 +1460,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             __changeSet: changeSet ?? "",
             __gateExecution: null,
             __delegatedContext: assignment.context ?? {},
-            __supervisorSummary: next.summary ?? ""
+            __supervisorSummary: next.summary ?? "",
+            __previousAttemptError: ""
           },
           metadata: {
             kind: "member",
@@ -1430,7 +1485,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     const completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
       assignment,
       worker,
-      result: await context.executeNode(worker, { deadlineAt })
+      result: await context.executeNode(worker, { deadlineAt, retryValidation: true })
     })));
     if (dagTrackers) {
       for (const record of completed) {

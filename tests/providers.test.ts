@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ProviderExecutionError } from "../src/core/errors.js";
-import { buildCodexInvocationArgs, createDefaultProviderRegistry, registerProviderAdapter } from "../src/runtime/providers.js";
+import { buildCodexInvocationArgs, createDefaultProviderRegistry, providerExitDiagnostic, registerProviderAdapter } from "../src/runtime/providers.js";
 
 describe("provider adapters", () => {
   it("includes a deterministic local mock adapter", async () => {
@@ -115,6 +115,16 @@ describe("provider adapters", () => {
 
     expect(failure).toBeInstanceOf(ProviderExecutionError);
     expect(failure).toMatchObject({ kind: "budget", retryable: false });
+    expect((failure as Error).message).toContain("exhausted its configured budget");
+    expect((failure as Error).message).toContain("error max budget usd");
+  });
+
+  it("extracts the bounded actionable reason from a Claude terminal stream event", () => {
+    const output = [
+      JSON.stringify({ type: "assistant", message: { content: [] } }),
+      JSON.stringify({ is_error: true, terminal_reason: "budget_exhausted", errors: ["Reached maximum budget ($3)"], type: "result" })
+    ].join("\n");
+    expect(providerExitDiagnostic(output, "")).toBe("Reached maximum budget ($3)");
   });
 
   it("classifies an explicit rate limit exit as retryable", async () => {

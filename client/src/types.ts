@@ -255,6 +255,11 @@ export interface WorkInstanceRecord {
   status: WorkInstanceStatus;
   phase: string;
   error?: string;
+  failure?: {
+    category: "provider" | "output-validation" | "preparation" | "interrupted";
+    kind?: "aborted" | "budget" | "rate-limit" | "start" | "timeout" | "idle-timeout" | "hard-timeout" | "exit" | "unknown";
+    retryable: boolean;
+  };
   createdAt: string;
   startedAt?: string;
   updatedAt: string;

@@ -228,7 +228,8 @@ describe("Employee runtime status", () => {
   });
 
   it("keeps failures visible with an entry to the run evidence", () => {
-    const data: Bootstrap = { ...bootstrap, activity: { invocations: [], instances: [workInstance("i-1", "failed", "mock 输出校验失败")] } };
+    const failure = { ...workInstance("i-1", "failed", "mock 输出校验失败"), updatedAt: new Date().toISOString() };
+    const data: Bootstrap = { ...bootstrap, activity: { invocations: [], instances: [failure] } };
     const html = renderToStaticMarkup(<EmployeePage data={data} refresh={vi.fn()} notify={vi.fn()} />);
 
     expect(html).toContain("runtime-chip--failed");
