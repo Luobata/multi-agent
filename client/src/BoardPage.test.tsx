@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BoardPage, requirementStewardOutput } from "./BoardPage";
 import { createDashboardService } from "./dashboard/service";
-import type { InvocationRecord, Project, Session } from "./types";
+import type { HumanDecisionRequest, InvocationRecord, Project, Session } from "./types";
 
 function connectedProject(): Project {
   return {
@@ -272,11 +272,50 @@ describe("BoardPage AI requirement creation", () => {
     }, config.pollIntervalMs);
     const go = vi.fn();
     const onOpenRun = vi.fn();
+    const humanDecisionBase: Omit<HumanDecisionRequest, "id" | "idempotencyKey" | "round" | "status" | "createdAt" | "updatedAt"> = {
+      invocationId: "inv-confirmation",
+      runId: "run-confirmation",
+      workflowId: "team-flow",
+      workflowVersion: 1,
+      supervisorNodeId: "supervisor-r2",
+      riskCategory: "irreversible-other",
+      summary: "需要再次确认测试环境已经恢复",
+      proposedAction: { assignments: [] }
+    };
+    const humanDecisionRequests: HumanDecisionRequest[] = [
+      {
+        ...humanDecisionBase,
+        id: "decision-approved",
+        idempotencyKey: "decision:approved",
+        round: 1,
+        status: "approved",
+        createdAt: "2026-08-10T03:00:00.000Z",
+        updatedAt: "2026-08-10T03:00:02.000Z",
+        decidedAt: "2026-08-10T03:00:02.000Z"
+      },
+      {
+        ...humanDecisionBase,
+        id: "decision-pending",
+        idempotencyKey: "decision:pending",
+        round: 2,
+        status: "pending",
+        createdAt: "2026-08-10T03:01:00.000Z",
+        updatedAt: "2026-08-10T03:01:00.000Z"
+      }
+    ];
 
-    act(() => root.render(<BoardPage spaceId="connected-a" go={go} notify={vi.fn()} service={service} onOpenRun={onOpenRun} />));
+    act(() => root.render(<BoardPage
+      spaceId="connected-a"
+      go={go}
+      notify={vi.fn()}
+      service={service}
+      humanDecisionRequests={humanDecisionRequests}
+      onOpenRun={onOpenRun}
+    />));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
 
-    expect(container.textContent).toContain("Run 已暂停，不会自行继续");
+    expect(container.textContent).toContain("新的确认请求");
+    expect(container.textContent).toContain("上一项决定已生效；Run 在第 2 轮暂停");
     await act(async () => { button("处理待确认").click(); });
     expect(onOpenRun).toHaveBeenCalledWith("run-confirmation");
     expect(go).not.toHaveBeenCalled();

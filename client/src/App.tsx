@@ -17,7 +17,7 @@ import { SettingsPage } from "./SettingsPage";
 import { SkillsPage } from "./SkillsPage";
 import { dashboardService } from "./dashboard/service";
 import { ErrorBlock, SkeletonBlock } from "./dashboard/view";
-import type { ActivityEvent, ActivitySnapshot, Bootstrap } from "./types";
+import type { ActivityEvent, ActivitySnapshot, Bootstrap, HumanDecisionRequest } from "./types";
 import { WorkflowPage } from "./WorkflowPage";
 import { applyTheme, DEFAULT_THEME, readTheme, type ThemeName } from "./theme";
 
@@ -235,6 +235,23 @@ export function App() {
   const go = (hash: string) => { window.location.hash = hash; };
   const invocationRevision = data.activity.invocations.reduce((latest, invocation) => invocation.updatedAt > latest ? invocation.updatedAt : latest, "");
   const activityRevision = data.activity.instances.reduce((latest, instance) => instance.updatedAt > latest ? instance.updatedAt : latest, invocationRevision);
+  const awaitingDecisionRevision = data.activity.invocations
+    .filter((invocation) => invocation.status === "awaiting-human-decision")
+    .map((invocation) => `${invocation.id}:${invocation.updatedAt}`)
+    .sort()
+    .join("|");
+  useEffect(() => {
+    if (daemon !== "online" || !awaitingDecisionRevision) return;
+    let current = true;
+    api<HumanDecisionRequest[]>("/api/human-decision-requests")
+      .then((requests) => {
+        if (current) setData((snapshot) => ({ ...snapshot, humanDecisionRequests: requests }));
+      })
+      .catch(() => {
+        // Invocation state still keeps the board correct; decision metadata is progressive disclosure.
+      });
+    return () => { current = false; };
+  }, [awaitingDecisionRevision, daemon]);
   const nav = [
     { id: "office" as const, label: "员工大厅", icon: "office" as const },
     { id: "dashboard" as const, label: "工作台", icon: "dashboard" as const },
@@ -301,6 +318,7 @@ export function App() {
         catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")}
         projects={data.projects}
         invocations={data.activity.invocations}
+        humanDecisionRequests={data.humanDecisionRequests ?? []}
         onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }}
       />}
       {page === "requirement" && route.requirementId && <RequirementDetailPage

@@ -183,7 +183,8 @@ roles:
             type: string
     permissions:
       write: none
-      tools: [Read, Glob, Grep, WebFetch, browser]
+      # Employee 与项目角色取权限交集；Bash 必须在两侧都声明，独立测试才能真实执行 npm/vitest。
+      tools: [Read, Glob, Grep, WebFetch, Bash, browser]
   knowledge-steward:
     displayName: 项目知识管理员
     description: 通过受限 Knowledge Control MCP 查询知识状态、生成变更提案，并把最终审批留给人。

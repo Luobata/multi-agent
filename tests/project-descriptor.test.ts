@@ -258,6 +258,15 @@ describe("project descriptor", () => {
       outputSchema: expect.objectContaining({ required: ["message", "nextAction", "draft"] })
     });
 
+    const testEngineerRole = project.roles.find((role) => role.id === "test-engineer");
+    expect(testEngineerRole).toMatchObject({
+      requiredSkills: ["browser-e2e-validation"],
+      permissions: {
+        write: "none",
+        tools: ["Read", "Glob", "Grep", "WebFetch", "Bash", "browser"]
+      }
+    });
+
     const knowledgeSteward = project.roles.find((role) => role.id === "knowledge-steward");
     expect(knowledgeSteward).toMatchObject({
       requiredSkills: ["knowledge-control-conversation"],

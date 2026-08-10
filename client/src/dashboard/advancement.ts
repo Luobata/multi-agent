@@ -74,6 +74,10 @@ export function advancementLane(status: RequirementAdvancementStatus, current: R
   if (status === "queued" || status === "dispatching") return "queued";
   if (status === "awaiting-human-decision") return "confirmation";
   if (status === "running" || status === "completed") return "running";
+  // Blocked / failed / cancelled are exception overlays, not lifecycle lanes.
+  // Once a paused Run terminates it must leave the confirmation lane; otherwise
+  // the card keeps looking actionable even though there is no pending decision.
+  if (current === "confirmation") return "running";
   return current;
 }
 

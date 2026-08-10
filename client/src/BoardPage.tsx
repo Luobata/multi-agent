@@ -8,7 +8,7 @@ import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { ManagedProject, Requirement, RequirementException, RequirementPriority, SpaceNode } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_LANES, REQUIREMENT_PRIORITY_LABELS } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
-import type { InvocationRecord, JsonValue, Project, Session } from "./types";
+import type { HumanDecisionRequest, InvocationRecord, JsonValue, Project, Session } from "./types";
 import "./board-ai.css";
 
 const REQUIREMENT_STEWARD_ROLE_ID = "requirement-steward";
@@ -62,7 +62,7 @@ function exceptionChip(exception: Requirement["exception"]) {
   return null;
 }
 
-export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", projects: connectedProjects = [], invocations = [], onOpenRun }: {
+export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", projects: connectedProjects = [], invocations = [], humanDecisionRequests = [], onOpenRun }: {
   spaceId?: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
@@ -70,6 +70,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   catalogRevision?: string;
   projects?: Project[];
   invocations?: InvocationRecord[];
+  humanDecisionRequests?: HumanDecisionRequest[];
   onOpenRun?: (runId: string) => void;
 }) {
   const daemonAvailable = useDaemonAvailable();
@@ -307,6 +308,16 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
                 {cards.map((requirement) => {
                   const awaitingDecision = requirement.advancement?.status === "awaiting-human-decision";
                   const runId = requirement.advancement?.runId;
+                  const invocationId = requirement.advancement?.invocationId;
+                  const invocationDecisions = invocationId
+                    ? humanDecisionRequests.filter((request) => request.invocationId === invocationId)
+                    : [];
+                  const pendingDecision = invocationDecisions
+                    .filter((request) => request.status === "pending")
+                    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+                  const isRepeatedDecision = Boolean(pendingDecision && invocationDecisions.some((request) =>
+                    request.id !== pendingDecision.id && (request.status === "approved" || request.status === "rejected")
+                  ));
                   const openRequirement = () => go(`requirements/${requirement.id}`);
                   const openDecision = () => {
                     if (runId && onOpenRun) onOpenRun(runId);
@@ -326,7 +337,12 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
                       </footer>
                     </button>
                     {awaitingDecision && <div className="board-card-confirmation" role="status">
-                      <span><strong>等待你的决定</strong><small>Run 已暂停，不会自行继续</small></span>
+                      <span>
+                        <strong>{isRepeatedDecision ? "新的确认请求" : "等待你的决定"}</strong>
+                        <small>{pendingDecision
+                          ? `${isRepeatedDecision ? "上一项决定已生效；" : ""}Run 在第 ${pendingDecision.round} 轮暂停 · ${formatTime(pendingDecision.createdAt)}`
+                          : "Run 已暂停，不会自行继续"}</small>
+                      </span>
                       <button type="button" className="button primary" onClick={openDecision}>{runId && onOpenRun ? "处理待确认 →" : "查看待确认详情 →"}</button>
                     </div>}
                   </article>;

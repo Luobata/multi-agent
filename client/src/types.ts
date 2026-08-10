@@ -1406,6 +1406,7 @@ export interface Bootstrap {
   projects: Project[];
   projectBindings: ProjectBinding[];
   passiveProjectAccesses?: PassiveProjectAccess[];
+  humanDecisionRequests?: HumanDecisionRequest[];
   activity: ActivitySnapshot;
 }
 

@@ -112,6 +112,8 @@ describe("requirement advancement control state", () => {
     expect(advancementLane("queued", "inbox")).toBe("queued");
     expect(advancementLane("awaiting-human-decision", "running")).toBe("confirmation");
     expect(advancementLane("running", "confirmation")).toBe("running");
+    expect(advancementLane("blocked", "confirmation")).toBe("running");
+    expect(advancementLane("failed", "confirmation")).toBe("running");
     expect(advancementLane("failed", "running")).toBe("running");
   });
 
