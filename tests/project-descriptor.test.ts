@@ -197,6 +197,15 @@ describe("project descriptor", () => {
     }));
   });
 
+  it("seeds the frontend project Employee on the Codex Provider", () => {
+    const employee = JSON.parse(
+      fs.readFileSync(path.resolve("templates/workbench/mihuhu-frontend-engineer.employee.json"), "utf8")
+    ) as { providerId?: string; identity?: { metadata?: { providerPersona?: string } } };
+
+    expect(employee.providerId).toBe("codex");
+    expect(employee.identity?.metadata?.providerPersona).toBe("codex");
+  });
+
   it("connects every current Employee through a bounded project role", async () => {
     const root = path.resolve(".");
     const project = await loadProjectDescriptor({ rootPath: root, descriptorPath: "multi-agent.project.yaml" });

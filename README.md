@@ -17,7 +17,7 @@
 - 从四种常用多 Agent 模板生成 Graph 草稿，在画布拖动节点、改派员工与编辑依赖，并保存不可变 Run 证据；
 - 将一个 Employee 或 Workflow 发布成 A2A v1 Agent；
 - 在员工运行结束后自动提炼跨会话经验到本地 memory，按 employee/project 维度通过 search_memory 工具、daemon 路由或 CLI 按需检索，避免全量注入。
-- 在 `127.0.0.1` 上运行由 `claude-day1` 设计的「档案室 / Dossier Office」客户端。
+- 在 `127.0.0.1` 上运行由项目产品设计角色设计的「档案室 / Dossier Office」客户端。
 
 ## 形态
 
