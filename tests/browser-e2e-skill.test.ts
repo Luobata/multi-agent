@@ -27,6 +27,10 @@ describe("browser-e2e-validation skill template", () => {
     expect(skill.instructions).toContain("ctx.agent");
     expect(skill.instructions).toContain("aiAct");
     expect(skill.instructions).toContain("npx -y @midscene/web@1");
+    expect(skill.instructions).toContain("act --prompt");
+    expect(skill.instructions).toContain("assert --prompt");
+    expect(skill.instructions).toContain("禁止写成 `act 文本`、`assert 文本`");
+    expect(skill.instructions).toContain("无限重试");
     expect(skill.instructions).toContain("一次只执行一条 Midscene 命令");
     expect(skill.instructions).toContain("禁止用裸 Chrome --headless");
     expect(skill.instructions).toContain("禁止退回裸浏览器/CDP/DOM 方案");
