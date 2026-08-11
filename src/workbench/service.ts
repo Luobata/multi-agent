@@ -7415,6 +7415,21 @@ export class WorkbenchService {
     return copied;
   }
 
+  private async recoverInterruptedEvidenceRerun(
+    runDir: string,
+    id: string,
+    current: NonNullable<RunDeliveryRecord["evidenceRerun"]> | undefined
+  ): Promise<boolean> {
+    if (!current || !["queued", "running"].includes(current.status) || this.evidenceReruns.has(id)) return false;
+    await updateRunEvidenceRerun(runDir, id, {
+      ...current,
+      status: "failed",
+      updatedAt: now(),
+      message: "daemon 重启中断了上一轮截图补采；候选 worktree 与已有证据均已保留，可以重新补采。"
+    });
+    return true;
+  }
+
   async requestRunEvidenceRerun(id: string, input: { actor: string }): Promise<RunDeliveryRecord> {
     const actor = requireText(input.actor, "evidence rerun actor");
     const { run, runDir } = await this.getRunDeliveryContext(id);
@@ -7426,7 +7441,8 @@ export class WorkbenchService {
     }
     const current = preview.delivery?.evidenceRerun;
     if (current?.status === "queued" || current?.status === "running") {
-      return preview.delivery!;
+      if (this.evidenceReruns.has(id)) return preview.delivery!;
+      await this.recoverInterruptedEvidenceRerun(runDir, id, current);
     }
     const requestedAt = now();
     const queued = await updateRunEvidenceRerun(runDir, id, {
@@ -7624,7 +7640,10 @@ export class WorkbenchService {
 
   async getRunMergePreview(id: string): Promise<RunMergePreview> {
     const { run, runDir } = await this.getRunDeliveryContext(id);
-    const preview = await previewRunMerge(run, runDir);
+    let preview = await previewRunMerge(run, runDir);
+    if (await this.recoverInterruptedEvidenceRerun(runDir, id, preview.delivery?.evidenceRerun)) {
+      preview = await previewRunMerge(run, runDir);
+    }
     if (["queued-for-merge", "retesting", "merging"].includes(preview.status)) {
       this.scheduleQueuedMerge(id, preview);
     }

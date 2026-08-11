@@ -187,6 +187,27 @@ describe("run delivery daemon routes", () => {
     expect(previewEnvelope.data.safeGitCommands.length).toBeGreaterThan(0);
     expect(git(repo, "rev-parse", "HEAD")).toBe(headBefore);
 
+    // A daemon restart loses the in-memory worker. The first preview must turn
+    // its durable queued/running marker into a retryable terminal state instead
+    // of leaving the UI disabled forever.
+    fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
+      runId,
+      status: "awaiting-acceptance",
+      updatedAt: "2026-08-11T06:03:35.570Z",
+      evidenceRerun: {
+        status: "running",
+        actor: "workbench-operator",
+        requestedAt: "2026-08-11T06:03:35.535Z",
+        updatedAt: "2026-08-11T06:03:35.570Z"
+      }
+    }, null, 2)}\n`, "utf8");
+    const recoveredResponse = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
+    expect(recoveredResponse.status).toBe(200);
+    expect(recoveredResponse.json).toMatchObject({ data: { delivery: { evidenceRerun: {
+      status: "failed",
+      message: expect.stringContaining("daemon 重启中断")
+    } } } });
+
     const kept = await invokeRoute(app, "post", "/api/runs/:id/keep", {
       params: { id: runId },
       body: { actor: "daemon-reviewer", note: "retain while reviewing" }
@@ -235,6 +256,9 @@ describe("run delivery daemon routes", () => {
     }
     expect(mergedPreview).toMatchObject({ status: "merged", delivery: { runId, targetBranch: "main" } });
     expect(fs.readFileSync(path.join(repo, "feature.txt"), "utf8")).toBe("accepted through daemon\n");
+    for (let attempt = 0; attempt < 100 && fs.existsSync(worktree!.path); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     expect(fs.existsSync(worktree!.path)).toBe(false);
   }, 15_000);
 });

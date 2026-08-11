@@ -238,7 +238,8 @@ describe("BoardPage AI requirement creation", () => {
     expect(button("确认创建并进入收件箱").disabled).toBe(true);
     expect(await service.listBoard()).toEqual([]);
 
-    act(() => setText(textarea, "购物车空态"));
+    const followupTextarea = document.querySelector('textarea[aria-label="描述需求"]') as HTMLTextAreaElement;
+    act(() => setText(followupTextarea, "购物车空态"));
     await act(async () => { button("继续说明").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
 
     expect(JSON.parse(String(fetchMock.mock.calls[1]![1]?.body))).toMatchObject({
