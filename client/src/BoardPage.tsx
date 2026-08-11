@@ -92,6 +92,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   const [createPriority, setCreatePriority] = useState<RequirementPriority>("medium");
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState("");
+  const [createProjectInvalid, setCreateProjectInvalid] = useState(false);
   const [agentOpen, setAgentOpen] = useState(false);
   const [agentProjectId, setAgentProjectId] = useState(spaceId ?? "");
   const [agentSession, setAgentSession] = useState<Session>();
@@ -103,6 +104,10 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   const data = state.status === "ready" ? state.data : undefined;
   const project = data?.nodes.find((node) => node.id === spaceId && node.kind === "project");
   const projects = (data?.nodes ?? []).filter((node): node is ManagedProject => node.kind === "project" && !node.archivedAt);
+  const defaultCreateProjectId = () => {
+    const candidate = spaceId ?? (projectFilter !== "all" ? projectFilter : "");
+    return projects.some((item) => item.id === candidate) ? candidate : "";
+  };
   const projectName = (projectId: string) => data?.nodes.find((node) => node.id === projectId)?.name ?? projectId;
   const filtered = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -195,12 +200,13 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   }, [connectedProjects, data, invocations, notify, service, setData]);
 
   const openCreate = () => {
-    setCreateProjectId(spaceId ?? projects[0]?.id ?? "");
+    setCreateProjectId(defaultCreateProjectId());
+    setCreateProjectInvalid(false);
     setFormError("");
     setCreateOpen(true);
   };
 
-  const resetAgentConversation = (projectId = spaceId ?? projects[0]?.id ?? "") => {
+  const resetAgentConversation = (projectId = "") => {
     setAgentProjectId(projectId);
     setAgentSession(undefined);
     setAgentDraft(undefined);
@@ -210,7 +216,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   };
 
   const openAgentCreate = () => {
-    resetAgentConversation();
+    resetAgentConversation(defaultCreateProjectId());
     setAgentOpen(true);
   };
 
@@ -289,6 +295,12 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
 
   const createRequirement = async () => {
     if (!data) return;
+    if (!createProjectId) {
+      setCreateProjectInvalid(true);
+      setFormError("");
+      window.requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('[aria-label="需求所属项目"]')?.focus());
+      return;
+    }
     setSaving(true);
     setFormError("");
     try {
@@ -386,7 +398,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
 
     {createOpen && <Modal title="创建需求" eyebrow="REQUIREMENT · INBOX" onClose={() => setCreateOpen(false)} wide>
       <form className="modal-body compact-form board-create-form" onSubmit={(event) => { event.preventDefault(); void createRequirement(); }}>
-        <Field label="项目"><SelectControl ariaLabel="需求所属项目" value={createProjectId} options={projects.map((item) => ({ value: item.id, label: item.name }))} onChange={setCreateProjectId} /></Field>
+        <Field label="项目" hint="请先选择需求所属项目"><SelectControl ariaLabel="需求所属项目" value={createProjectId} placeholder="请选择所属项目" invalid={createProjectInvalid} errorMessage={createProjectInvalid ? "请选择需求所属项目后再创建。" : undefined} options={projects.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => { setCreateProjectId(value); setCreateProjectInvalid(false); }} /></Field>
         <Field label="优先级"><SelectControl ariaLabel="需求优先级" value={createPriority} options={[{ value: "high", label: "高" }, { value: "medium", label: "中" }, { value: "low", label: "低" }]} onChange={(value) => setCreatePriority(value as RequirementPriority)} /></Field>
         <Field label="标题"><input required maxLength={80} value={title} onChange={(event) => setTitle(event.target.value)} /></Field>
         <Field label="摘要"><input maxLength={160} value={summary} onChange={(event) => setSummary(event.target.value)} /></Field>
@@ -400,7 +412,8 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       <div className="board-ai-layout">
         <section className="board-ai-conversation" aria-label="需求管家对话">
           <header><div><span className="ai-content-badge">AI 生成内容</span><h3>先描述，再决定怎么推进</h3></div><p>文字、粘贴图片和飞书文档都会进入同一份会话证据；Agent 只整理草稿，不会替你创建需求。</p></header>
-          <Field label="所属项目"><SelectControl ariaLabel="AI 需求所属项目" value={agentProjectId} options={projects.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => resetAgentConversation(value)} /></Field>
+          <Field label="所属项目"><SelectControl ariaLabel="AI 需求所属项目" value={agentProjectId} placeholder="请选择所属项目" options={projects.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => resetAgentConversation(value)} /></Field>
+          {!agentProjectId && <p className="muted">请先选择归属项目，再向需求管家描述需求。</p>}
           <div className="board-ai-transcript" aria-live="polite">
             {!agentSession && <div className="board-ai-welcome"><strong>把现在知道的都说出来</strong><p>可以是零散描述、界面截图或飞书 docx / wiki 链接。信息不足时我会先追问；足够时才给出可编辑草稿。</p></div>}
             {agentSession?.messages.map((message) => <article className={`board-ai-message board-ai-message--${message.role}`} key={message.id}>
@@ -428,7 +441,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
             <Field label="原始需求" hint="保留你的逐轮原话，可在确认前补充"><textarea rows={6} value={agentDraft.rawRequirement} onChange={(event) => setAgentDraft({ ...agentDraft, rawRequirement: event.target.value })} /></Field>
             <Field label="验收标准" hint="每行一条"><textarea rows={6} value={agentDraft.acceptanceCriteria.join("\n")} onChange={(event) => setAgentDraft({ ...agentDraft, acceptanceCriteria: event.target.value.split("\n").map((item) => item.trim()).filter(Boolean) })} /></Field>
           </div>}
-          <footer className="board-ai-confirm"><span>{agentDraft ? "只有下方确认按钮会调用 createRequirement。" : agentPhase === "clarify" ? "等待你的补充；当前对话不会写入看板。" : "等待需求草稿；当前对话不会写入看板。"}</span><button type="button" className="button primary" disabled={!agentDraft || saving || !agentDraft.title.trim() || !agentDraft.rawRequirement.trim()} onClick={() => void confirmAgentRequirement()}>{saving ? "创建中…" : "确认创建并进入收件箱"}</button></footer>
+          <footer className="board-ai-confirm"><span>{agentDraft ? "只有下方确认按钮会调用 createRequirement。" : agentPhase === "clarify" ? "等待你的补充；当前对话不会写入看板。" : "等待需求草稿；当前对话不会写入看板。"}</span><button type="button" className="button primary" disabled={!agentProjectId || !agentDraft || saving || !agentDraft.title.trim() || !agentDraft.rawRequirement.trim()} onClick={() => void confirmAgentRequirement()}>{saving ? "创建中…" : "确认创建并进入收件箱"}</button></footer>
         </section>
       </div>
     </Modal>}

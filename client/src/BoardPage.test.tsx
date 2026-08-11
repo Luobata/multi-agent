@@ -23,6 +23,10 @@ function connectedProject(): Project {
   };
 }
 
+function connectedProjectB(): Project {
+  return { ...connectedProject(), id: "connected-b", name: "真实项目 B", rootPath: "/workspace/connected-b", descriptorPath: "/workspace/connected-b/multi-agent.project.yaml" };
+}
+
 function button(label: string): HTMLButtonElement {
   const found = [...document.querySelectorAll("button")].find((candidate) => candidate.textContent?.includes(label));
   if (!(found instanceof HTMLButtonElement)) throw new Error(`button not found: ${label}`);
@@ -34,6 +38,15 @@ function setText(control: HTMLInputElement | HTMLTextAreaElement, value: string)
   const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
   setter?.call(control, value);
   control.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+async function chooseSelect(ariaLabel: string, optionLabel: string): Promise<void> {
+  const trigger = document.querySelector<HTMLButtonElement>(`[role="combobox"][aria-label="${ariaLabel}"]`);
+  if (!trigger) throw new Error(`select not found: ${ariaLabel}`);
+  await act(async () => { trigger.click(); });
+  const option = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((item) => item.textContent?.includes(optionLabel));
+  if (!option) throw new Error(`option not found: ${optionLabel}`);
+  await act(async () => { option.click(); });
 }
 
 describe("requirementStewardOutput", () => {
@@ -111,6 +124,93 @@ describe("BoardPage AI requirement creation", () => {
     document.body.replaceChildren();
     fetchMock.mockReset();
     vi.unstubAllGlobals();
+  });
+
+  it("snapshots the current board project independently whenever either creation entry opens", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    service.syncConnectedProjects([connectedProject(), connectedProjectB()]);
+    act(() => root.render(<BoardPage go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    await chooseSelect("筛选项目", "真实项目 B");
+    await act(async () => { button("手动创建").click(); });
+    expect(document.querySelector('[aria-label="需求所属项目"]')?.textContent).toContain("真实项目 B");
+    await act(async () => { button("取消").click(); });
+    await chooseSelect("筛选项目", "真实项目 A");
+    await act(async () => { button("手动创建").click(); });
+    expect(document.querySelector('[aria-label="需求所属项目"]')?.textContent).toContain("真实项目 A");
+    await act(async () => { button("取消").click(); });
+
+    await chooseSelect("筛选项目", "真实项目 B");
+    await act(async () => { button("和 AI 说需求").click(); });
+    expect(document.querySelector('[aria-label="AI 需求所属项目"]')?.textContent).toContain("真实项目 B");
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')!;
+    act(() => setText(textarea, "项目 B 的需求"));
+    await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/api/projects/connected-b/");
+    expect(new Headers(fetchMock.mock.calls[0]![1]?.headers).get("x-multi-agent-project")).toBe("connected-b");
+  });
+
+  it("requires an explicit project in aggregate mode and restores both entries after selection", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    service.syncConnectedProjects([connectedProject(), connectedProjectB()]);
+    const createSpy = vi.spyOn(service, "createRequirement");
+    act(() => root.render(<BoardPage go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    await act(async () => { button("手动创建").click(); });
+    const projectSelect = document.querySelector<HTMLButtonElement>('[aria-label="需求所属项目"]')!;
+    expect(projectSelect.textContent).toContain("请选择所属项目");
+    expect(container.textContent).toContain("请先选择需求所属项目");
+    expect(button("创建并进入收件箱").disabled).toBe(true);
+    await act(async () => { projectSelect.closest("form")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    expect(projectSelect.getAttribute("aria-invalid")).toBe("true");
+    expect(projectSelect.getAttribute("aria-describedby")).toBeTruthy();
+    expect(document.activeElement).toBe(projectSelect);
+    expect(container.textContent).toContain("请选择需求所属项目后再创建。");
+    expect(createSpy).not.toHaveBeenCalled();
+    await chooseSelect("需求所属项目", "真实项目 B");
+    expect(button("创建并进入收件箱").disabled).toBe(false);
+    await act(async () => { button("取消").click(); button("和 AI 说需求").click(); });
+
+    const agentSelect = document.querySelector<HTMLButtonElement>('[aria-label="AI 需求所属项目"]')!;
+    expect(agentSelect.textContent).toContain("请选择所属项目");
+    expect(container.textContent).toContain("请先选择归属项目，再向需求管家描述需求。");
+    expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')?.disabled).toBe(true);
+    expect(button("确认创建并进入收件箱").disabled).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await chooseSelect("AI 需求所属项目", "真实项目 B");
+    expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')?.disabled).toBe(false);
+  });
+
+  it("uses manual and AI project overrides and clears an AI draft when its project changes", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    service.syncConnectedProjects([connectedProject(), connectedProjectB()]);
+    const createSpy = vi.spyOn(service, "createRequirement");
+    act(() => root.render(<BoardPage go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    await chooseSelect("筛选项目", "真实项目 B");
+    await act(async () => { button("手动创建").click(); });
+    await chooseSelect("需求所属项目", "真实项目 A");
+    const inputs = [...document.querySelectorAll<HTMLInputElement>("dialog input")];
+    act(() => { setText(inputs[0]!, "手动需求"); setText(document.querySelector<HTMLTextAreaElement>("dialog textarea")!, "原始需求"); });
+    await act(async () => { button("创建并进入收件箱").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(createSpy).toHaveBeenLastCalledWith(expect.objectContaining({ projectId: "connected-a" }));
+
+    await act(async () => { button("和 AI 说需求").click(); });
+    const composer = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')!;
+    act(() => setText(composer, "AI 需求"));
+    await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.querySelector(".board-ai-draft-fields")).toBeTruthy();
+    await chooseSelect("AI 需求所属项目", "真实项目 A");
+    expect(container.querySelector(".board-ai-draft-fields")).toBeNull();
+    expect(container.textContent).not.toContain("我已整理成草稿，请确认。");
+    act(() => setText(composer, "切换后的 AI 需求"));
+    await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain("/api/projects/connected-a/");
+    await act(async () => { button("确认创建并进入收件箱").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(createSpy).toHaveBeenLastCalledWith(expect.objectContaining({ projectId: "connected-a" }));
   });
 
   it("keeps the board unchanged until the user confirms the editable Agent draft", async () => {
