@@ -52,6 +52,7 @@ export function buildConflictExecutionRequest(input: {
   targetBranch: string;
   targetCommit: string;
   conflictMessage: string;
+  conflictPaths: string[];
   leaderPlan: string;
   originalRequest?: string;
 }): string {
@@ -62,12 +63,14 @@ export function buildConflictExecutionRequest(input: {
     `目标分支：${input.targetBranch}`,
     `必须 rebase 到的精确目标 commit：${input.targetCommit}`,
     `合入预检冲突：${input.conflictMessage}`,
+    `运行核心已启动 rebase；本轮必须解决的冲突文件：${input.conflictPaths.join("、")}`,
     ...(input.originalRequest ? ["原需求：", input.originalRequest] : []),
     "【原领队处置计划】",
     input.leaderPlan,
-    `你是运行核心按原领队计划委派的工程执行角色。只在上面的原 worktree 内实际执行：检查 Git 状态；如存在中断 rebase，判断后安全继续或 abort；执行 git rebase ${input.targetCommit}；逐项解决冲突，同时保留原需求与目标分支有效改动；运行定向测试；把结果提交在当前交付源分支并保证 worktree 干净。`,
-    "不得安装或升级依赖，不得改写真实目标分支，不得 push，不得删除 worktree，不得整体选择 ours/theirs。不得只给建议或代码片段，必须真实执行 Git、编辑、测试和提交。",
-    `只有全部动作真实完成时，最终单独输出 ${CONFLICT_EXECUTION_PASS}；否则输出 CONFLICT_EXECUTION: BLOCK，并给出已执行命令、剩余冲突文件和阻塞原因。`
+    "你是运行核心按原领队计划委派的工程执行角色。受信任运行核心已经开始 rebase，并保留 Git 元数据写权限；你只在上面的原 worktree 内逐项编辑本轮冲突文件，同时保留原需求与目标分支有效改动，然后运行原领队指定的定向测试。",
+    "不要执行 git rebase、git add、git commit 或 git rebase --continue；这些 Git 状态迁移会由运行核心在你报告完成后执行。看到 unmerged 状态是本阶段的正常现象，不得因无权写 .git/worktrees 元数据而阻塞。",
+    "不得安装或升级依赖，不得改写真实目标分支，不得 push，不得删除 worktree，不得整体选择 ours/theirs。不得只给建议或代码片段，必须真实编辑并测试。",
+    `只有本轮所有冲突文件都已真实编辑、无冲突标记且定向测试通过时，最终单独输出 ${CONFLICT_EXECUTION_PASS}；否则输出 CONFLICT_EXECUTION: BLOCK，并给出已执行命令、剩余冲突文件和阻塞原因。`
   ].join("\n");
 }
 

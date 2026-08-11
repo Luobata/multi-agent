@@ -172,6 +172,12 @@ export interface RunWorktreeOpenResult {
   repositoryRoot: string;
 }
 
+export interface ManagedRunRebaseStep {
+  status: "conflict" | "completed";
+  conflictPaths: string[];
+  message: string;
+}
+
 interface GitResult {
   stdout: string;
   stderr: string;
@@ -267,6 +273,105 @@ export async function transitionRunDelivery(
     ...(input.mergeValidation ? { mergeValidation: input.mergeValidation } : {}),
     ...(input.conflictResolution ? { conflictResolution: input.conflictResolution } : {})
   }));
+}
+
+async function managedRunRebaseContext(
+  run: WorkflowRunRecord,
+  runDir: string,
+  targetCommit: string
+): Promise<{ worktreePath: string; repositoryRoot: string; sourceBranch: string }> {
+  assertRunId(run.id);
+  const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
+  const delivery = await readRunDelivery(runDir);
+  if (!worktreePath || !delivery?.sourceBranch || !delivery.targetBranch) {
+    throw new Error("冲突修复缺少受管 worktree、交付源分支或目标分支");
+  }
+  const repositoryRoot = await registeredRepositoryRoot(worktreePath, run.id);
+  const currentTarget = await git(repositoryRoot, ["rev-parse", "--verify", `refs/heads/${delivery.targetBranch}^{commit}`]);
+  if (currentTarget !== targetCommit) throw new Error("冲突修复开始前目标分支已再次变化，请重新进入队列预检");
+  return { worktreePath, repositoryRoot, sourceBranch: delivery.sourceBranch };
+}
+
+async function rebaseStateExists(worktreePath: string): Promise<boolean> {
+  const gitDir = await git(worktreePath, ["rev-parse", "--path-format=absolute", "--git-dir"]);
+  return Promise.any([
+    fs.access(path.join(gitDir, "rebase-merge")).then(() => true),
+    fs.access(path.join(gitDir, "rebase-apply")).then(() => true)
+  ]).catch(() => false);
+}
+
+async function unmergedPaths(worktreePath: string): Promise<string[]> {
+  const output = await git(worktreePath, ["diff", "--name-only", "--diff-filter=U", "-z", "--"]);
+  return output.split("\u0000").filter(Boolean);
+}
+
+/**
+ * Starts a rebase at the trusted delivery boundary. Provider sandboxes may edit
+ * files inside a Run worktree, but they intentionally cannot write the parent
+ * repository's `.git/worktrees/*` metadata. Git state transitions therefore
+ * stay here while an engineering project role resolves only the working files.
+ */
+export async function beginManagedRunRebase(
+  run: WorkflowRunRecord,
+  runDir: string,
+  targetCommit: string
+): Promise<ManagedRunRebaseStep> {
+  const { worktreePath, sourceBranch } = await managedRunRebaseContext(run, runDir, targetCommit);
+  if (await rebaseStateExists(worktreePath)) {
+    await git(worktreePath, ["rebase", "--abort"]);
+  }
+  const branch = await git(worktreePath, ["branch", "--show-current"]);
+  if (branch !== sourceBranch) throw new Error("冲突修复改变了受管交付源分支");
+  const working = await git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  if (working.length > 0) throw new Error("开始冲突修复前 worktree 存在未提交文件");
+
+  const result = await runGit(worktreePath, ["rebase", targetCommit]);
+  if (result.code === 0) {
+    return { status: "completed", conflictPaths: [], message: "运行核心已完成无冲突 rebase。" };
+  }
+  const conflictPaths = await unmergedPaths(worktreePath);
+  if (conflictPaths.length === 0) {
+    if (await rebaseStateExists(worktreePath)) await runGit(worktreePath, ["rebase", "--abort"]);
+    throw new Error((result.stderr.trim() || result.stdout.trim() || "rebase 启动失败").slice(0, 8_000));
+  }
+  return {
+    status: "conflict",
+    conflictPaths,
+    message: (result.stderr.trim() || result.stdout.trim() || "rebase 等待解决冲突").slice(0, 8_000)
+  };
+}
+
+/** Accepts one engineering resolution round and advances the trusted rebase. */
+export async function continueManagedRunRebase(
+  run: WorkflowRunRecord,
+  runDir: string,
+  targetCommit: string
+): Promise<ManagedRunRebaseStep> {
+  const { worktreePath } = await managedRunRebaseContext(run, runDir, targetCommit);
+  const conflictPaths = await unmergedPaths(worktreePath);
+  if (conflictPaths.length === 0) throw new Error("运行核心没有找到等待处理的冲突文件");
+  const check = await runGit(worktreePath, ["diff", "--check", "--"]);
+  if (check.code !== 0) {
+    throw new Error((check.stderr.trim() || check.stdout.trim() || "冲突文件仍包含无效标记").slice(0, 8_000));
+  }
+  await git(worktreePath, ["add", "--", ...conflictPaths]);
+  const result = await runGit(worktreePath, [
+    "-c", "core.editor=true",
+    "-c", "sequence.editor=true",
+    "rebase", "--continue"
+  ]);
+  if (result.code === 0) {
+    return { status: "completed", conflictPaths: [], message: "运行核心已暂存工程修复并完成 rebase。" };
+  }
+  const nextPaths = await unmergedPaths(worktreePath);
+  if (nextPaths.length === 0) {
+    throw new Error((result.stderr.trim() || result.stdout.trim() || "rebase continue 失败").slice(0, 8_000));
+  }
+  return {
+    status: "conflict",
+    conflictPaths: nextPaths,
+    message: (result.stderr.trim() || result.stdout.trim() || "rebase 进入下一轮冲突").slice(0, 8_000)
+  };
 }
 
 /**

@@ -7,6 +7,8 @@ import type { WorkflowRunRecord } from "../src/core/types.js";
 import { createRunWorktree } from "../src/runtime/worktree.js";
 import {
   acceptRebasedRunSource,
+  beginManagedRunRebase,
+  continueManagedRunRebase,
   assessQueuedRun,
   createMergeValidationWorktree,
   discardRunWorktree,
@@ -272,6 +274,42 @@ describe("worktree delivery merge gate", () => {
     });
     expect(merged.status).toBe("merged");
     expect(fs.readFileSync(path.join(root, "README.md"), "utf8")).toBe("target change\nsource change\n");
+  }, 15_000);
+
+  it("keeps rebase metadata in the trusted core while an engineer only edits conflict files", async () => {
+    const root = repository();
+    const runId = "run-delivery-core-rebase-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "README.md"), "source change\n", "utf8");
+    const runDir = artifactDirectory();
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+    await queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      actor: "reviewer"
+    });
+    fs.writeFileSync(path.join(root, "README.md"), "target change\n", "utf8");
+    git(root, "add", "README.md");
+    git(root, "commit", "-m", "target conflict");
+    const targetCommit = git(root, "rev-parse", "HEAD");
+    await transitionRunDelivery(runDir, runId, "conflict", {
+      conflictResolution: {
+        status: "resolving",
+        targetCommit,
+        updatedAt: new Date().toISOString()
+      }
+    });
+
+    const started = await beginManagedRunRebase(run, runDir, targetCommit);
+    expect(started).toMatchObject({ status: "conflict", conflictPaths: ["README.md"] });
+    expect(git(worktree!.path, "diff", "--name-only", "--diff-filter=U")).toBe("README.md");
+
+    fs.writeFileSync(path.join(worktree!.path, "README.md"), "target change\nsource change\n", "utf8");
+    const completed = await continueManagedRunRebase(run, runDir, targetCommit);
+    expect(completed).toMatchObject({ status: "completed", conflictPaths: [] });
+    expect(git(worktree!.path, "status", "--porcelain")).toBe("");
+    expect(git(worktree!.path, "merge-base", "--is-ancestor", targetCommit, "HEAD")).toBe("");
   }, 15_000);
 
   it("queues an approved candidate and revalidates it after target drift before or after acceptance", async () => {

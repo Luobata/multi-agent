@@ -29,10 +29,13 @@ describe("merge conflict leader protocol", () => {
       targetBranch: "main",
       targetCommit: "abc123",
       conflictMessage: "client/src/BoardPage.tsx conflicts",
+      conflictPaths: ["client/src/BoardPage.tsx"],
       leaderPlan: "preserve both navigation behaviors",
       originalRequest: "keep board navigation stable"
     });
-    expect(execution).toContain("git rebase");
+    expect(execution).toContain("运行核心已经开始 rebase");
+    expect(execution).toContain("不要执行 git rebase");
+    expect(execution).toContain("client/src/BoardPage.tsx");
     expect(execution).toContain("abc123");
     expect(execution).toContain("不得安装或升级依赖");
     expect(execution).toContain(CONFLICT_EXECUTION_PASS);

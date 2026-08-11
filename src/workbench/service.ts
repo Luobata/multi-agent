@@ -100,6 +100,8 @@ import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../r
 import { createRunWorktree, removeRunWorktree, worktreeHasChanges } from "../runtime/worktree.js";
 import {
   acceptRebasedRunSource,
+  beginManagedRunRebase,
+  continueManagedRunRebase,
   assessQueuedRun,
   createMergeValidationWorktree,
   discardRunWorktree,
@@ -7669,36 +7671,46 @@ export class WorkbenchService {
           message: leaderResult.message
         }
       });
-      const executionResult = await this.invokeProjectRoleAtPath(
-        projectId,
-        executionRoleId,
-        taskId,
-        worktreePath,
-        buildConflictExecutionRequest({
-          runId: id,
+      let rebaseStep = await beginManagedRunRebase(run, runDir, resolution.targetCommit);
+      let executionRunId: string | undefined;
+      let executionMessage = rebaseStep.message;
+      for (let round = 1; rebaseStep.status === "conflict"; round += 1) {
+        if (round > 20) throw new Error("冲突修复超过 20 轮，已停止以避免无限重试");
+        const executionResult = await this.invokeProjectRoleAtPath(
+          projectId,
+          executionRoleId,
+          taskId,
           worktreePath,
-          targetBranch: current.targetBranch,
-          targetCommit: resolution.targetCommit,
-          conflictMessage: resolution.conflictMessage ?? current.delivery?.message ?? "合入预检发现冲突",
-          leaderPlan: leaderResult.message,
-          originalRequest
-        }),
-        "system:merge-conflict-execution"
-      );
-      if (executionResult.status !== "passed"
-        || !hasExplicitDeliveryPass(executionResult.output, executionResult.message, CONFLICT_EXECUTION_PASS)) {
-        throw new Error(`${executionRoleId} 没有完成冲突修复：${executionResult.message}`);
+          buildConflictExecutionRequest({
+            runId: id,
+            worktreePath,
+            targetBranch: current.targetBranch,
+            targetCommit: resolution.targetCommit,
+            conflictMessage: rebaseStep.message,
+            conflictPaths: rebaseStep.conflictPaths,
+            leaderPlan: leaderResult.message,
+            originalRequest
+          }),
+          `system:merge-conflict-execution-r${round}`
+        );
+        if (executionResult.status !== "passed"
+          || !hasExplicitDeliveryPass(executionResult.output, executionResult.message, CONFLICT_EXECUTION_PASS)) {
+          throw new Error(`${executionRoleId} 没有完成第 ${round} 轮冲突修复：${executionResult.message}`);
+        }
+        executionRunId = executionResult.runId;
+        executionMessage = executionResult.message;
+        rebaseStep = await continueManagedRunRebase(run, runDir, resolution.targetCommit);
       }
       await transitionRunDelivery(runDir, id, "conflict", {
-        message: `${executionRoleId} 已提交冲突修复，运行核心正在验证 rebase 结果。`,
+        message: `${executionRoleId} 已解决冲突并通过定向测试，运行核心已完成 rebase，正在验证结果。`,
         conflictResolution: {
           ...resolution,
           status: "resolving",
           leaderPlanRunId: leaderResult.runId,
           executionRoleId,
-          resolutionRunId: executionResult.runId,
+          ...(executionRunId ? { resolutionRunId: executionRunId } : {}),
           updatedAt: now(),
-          message: executionResult.message
+          message: executionMessage
         }
       });
       await acceptRebasedRunSource(run, runDir, resolution.targetCommit);
