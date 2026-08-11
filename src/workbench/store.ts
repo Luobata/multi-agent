@@ -279,6 +279,69 @@ function migrateLegacyCodexProvider(state: WorkbenchState): void {
   };
 }
 
+const LEGACY_RELAY_RETRY_KEYS = new Set([
+  "initialDelayMs",
+  "maxDelayMs",
+  "multiplier",
+  "jitterRatio"
+]);
+const LEGACY_RELAY_SESSION_KEYS = new Set([
+  "idArgs",
+  "resumeArgs",
+  "resumeInputTemplate",
+  "maxReconnects",
+  "initialDelayMs",
+  "maxDelayMs",
+  "multiplier",
+  "jitterRatio"
+]);
+
+function legacyRelayObject(value: unknown, allowedKeys: ReadonlySet<string>): value is Record<string, unknown> {
+  return typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+/**
+ * One released relay experiment persisted Provider-level `retry` and `session`
+ * objects, then the generic command adapter deliberately returned to stateless
+ * Attempts. A daemon opened by the newer runtime could still read that state,
+ * materialize the retired fields into a fresh manifest, and fail before a Run
+ * received any Provider output.
+ *
+ * Migrate only the two known local relay ids and only when every retired object
+ * has the exact historical key family. Unknown shapes remain fail-closed under
+ * normal adapter validation. The experiment also shipped a fixed $3 CLI budget;
+ * remove that pair in the same compatibility migration, preserving every other
+ * argument and all immutable historical Run manifests.
+ */
+function migrateLegacyRelayRecoveryProvider(state: WorkbenchState): void {
+  for (const id of ["claude-relay", "claude-relay-execution"] as const) {
+    const definition = state.providers[id];
+    if (definition?.adapter !== "command") continue;
+    const retry = definition.retry;
+    const session = definition.session;
+    if (retry === undefined && session === undefined) continue;
+    if (retry !== undefined && !legacyRelayObject(retry, LEGACY_RELAY_RETRY_KEYS)) continue;
+    if (session !== undefined && !legacyRelayObject(session, LEGACY_RELAY_SESSION_KEYS)) continue;
+
+    delete definition.retry;
+    delete definition.session;
+    if (Array.isArray(definition.args) && definition.args.every((argument) => typeof argument === "string")) {
+      const migratedArgs: string[] = [];
+      for (let index = 0; index < definition.args.length; index += 1) {
+        if (definition.args[index] === "--max-budget-usd" && typeof definition.args[index + 1] === "string") {
+          index += 1;
+          continue;
+        }
+        migratedArgs.push(definition.args[index] as string);
+      }
+      definition.args = migratedArgs;
+    }
+  }
+}
+
 function initialState(): WorkbenchState {
   return {
     schemaVersion: 1,
@@ -341,6 +404,7 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
     state.providers.mock.model = "deterministic-mock";
   }
   migrateLegacyCodexProvider(state);
+  migrateLegacyRelayRecoveryProvider(state);
   const currentKnowledgeControl = state.providers["codex-knowledge-control"];
   state.providers["codex-knowledge-control"] = {
     ...codexKnowledgeControlProvider(),

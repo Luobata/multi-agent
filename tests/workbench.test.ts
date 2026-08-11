@@ -150,6 +150,103 @@ describe("Local Agent Workbench", () => {
     });
   });
 
+  it("migrates the retired relay retry/session experiment before materializing a new Run", async () => {
+    const dataRoot = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot });
+    await service.putProvider("claude-relay", {
+      adapter: "command",
+      command: process.execPath,
+      args: ["-e", "process.stdout.write(JSON.stringify({ message: 'relay recovered' }))"],
+      outputProtocol: "json"
+    });
+
+    const statePath = path.join(dataRoot, "state.json");
+    const legacy = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      providers: Record<string, Record<string, unknown>>;
+    };
+    const legacyRelay = legacy.providers["claude-relay"]!;
+    legacyRelay.args = [
+      ...legacyRelay.args as string[],
+      "--max-budget-usd",
+      "3"
+    ];
+    legacyRelay.retry = {
+      initialDelayMs: 2_000,
+      maxDelayMs: 30_000,
+      multiplier: 2,
+      jitterRatio: 0.2
+    };
+    legacyRelay.session = {
+      idArgs: ["--session-id", "{{providerSession.id}}"],
+      resumeArgs: ["--resume", "{{providerSession.id}}"],
+      resumeInputTemplate: "Continue the interrupted Provider Session.",
+      maxReconnects: 3,
+      initialDelayMs: 2_000,
+      maxDelayMs: 30_000,
+      multiplier: 2,
+      jitterRatio: 0.2
+    };
+    fs.writeFileSync(statePath, `${JSON.stringify(legacy, null, 2)}\n`, "utf8");
+
+    const reopened = await WorkbenchService.open({ dataRoot });
+    const migrated = reopened.listProviders().find((provider) => provider.id === "claude-relay")!.definition;
+    expect(migrated).not.toHaveProperty("retry");
+    expect(migrated).not.toHaveProperty("session");
+    expect(migrated.args).not.toContain("--max-budget-usd");
+
+    const employee = await reopened.createEmployee({
+      id: "relay-recovery-worker",
+      identity: {
+        displayName: "Relay Recovery Worker",
+        background: "Verifies Provider state compatibility.",
+        responsibilities: ["Return one structured response"]
+      },
+      providerId: "claude-relay",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message"],
+        properties: { message: { type: "string" } }
+      }
+    });
+    const result = await reopened.invokeEmployee(employee.id, { message: "Verify compatibility" });
+    expect(result.status).toBe("passed");
+    expect(result.output).toEqual({ message: "relay recovered" });
+
+    const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      providers: Record<string, Record<string, unknown>>;
+    };
+    expect(persisted.providers["claude-relay"]).not.toHaveProperty("retry");
+    expect(persisted.providers["claude-relay"]).not.toHaveProperty("session");
+  });
+
+  it("keeps unknown relay recovery shapes fail-closed", async () => {
+    const dataRoot = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot });
+    await service.putProvider("claude-relay", {
+      adapter: "command",
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('{}')"],
+      outputProtocol: "json"
+    });
+
+    const statePath = path.join(dataRoot, "state.json");
+    const legacy = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      providers: Record<string, Record<string, unknown>>;
+    };
+    legacy.providers["claude-relay"]!.retry = { arbitraryExecutionPolicy: true };
+    fs.writeFileSync(statePath, `${JSON.stringify(legacy, null, 2)}\n`, "utf8");
+
+    const reopened = await WorkbenchService.open({ dataRoot });
+    const provider = reopened.listProviders().find((candidate) => candidate.id === "claude-relay")!.definition;
+    expect(provider).toHaveProperty("retry");
+    expect(createDefaultProviderRegistry().get("command")?.validate({
+      providerId: "claude-relay",
+      definition: provider,
+      projectRoot: dataRoot
+    })).toContain("provider claude-relay command adapter does not support property retry");
+  });
+
   it("repairs persisted invocation metadata written with the legacy header encoding", async () => {
     const root = temporaryRoot();
     const service = await WorkbenchService.open({ dataRoot: root });
