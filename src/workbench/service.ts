@@ -7834,6 +7834,17 @@ export class WorkbenchService {
       delivery = await previewRunMerge(run, runDir);
     }
     const assessment = await assessQueuedRun(run, runDir);
+    const completedValidation = delivery.delivery?.mergeValidation;
+    if (delivery.status === "merging"
+      && completedValidation?.status === "passed"
+      && completedValidation.targetCommit === assessment.currentTargetCommit) {
+      if (!delivery.targetBranch) throw new Error("恢复合入前无法解析目标分支");
+      await mergeAcceptedRun(run, runDir, {
+        confirmation: delivery.confirmationToken,
+        targetBranch: delivery.targetBranch
+      });
+      return;
+    }
     if (assessment.conflict && !conflictRevalidated) {
       await transitionRunDelivery(runDir, id, "conflict", {
         message: `${assessment.conflictMessage ?? "候选与目标分支发生冲突"}；已留在待合入队列，正在通知原需求领队在原 worktree rebase 处理。`,

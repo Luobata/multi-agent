@@ -7,7 +7,12 @@ import type { Express, NextFunction, Request, Response } from "express";
 import type { WorkflowRunRecord } from "../src/core/types.js";
 import { createDaemonApp } from "../src/daemon/server.js";
 import { createRunWorktree } from "../src/runtime/worktree.js";
-import type { RunMergePreview } from "../src/runtime/worktreeDelivery.js";
+import {
+  assessQueuedRun,
+  queueAcceptedRun,
+  transitionRunDelivery,
+  type RunMergePreview
+} from "../src/runtime/worktreeDelivery.js";
 import { WorkbenchService } from "../src/workbench/service.js";
 
 const roots: string[] = [];
@@ -267,6 +272,95 @@ describe("run delivery daemon routes", () => {
     }
     expect(mergedPreview).toMatchObject({ status: "merged", delivery: { runId, targetBranch: "main" } });
     expect(fs.readFileSync(path.join(repo, "feature.txt"), "utf8")).toBe("accepted through daemon\n");
+    for (let attempt = 0; attempt < 100 && fs.existsSync(worktree!.path); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(fs.existsSync(worktree!.path)).toBe(false);
+  }, 15_000);
+
+  it("resumes a validated merging delivery without repeating target-drift tests", async () => {
+    const dataRoot = temporaryRoot("multi-agent-delivery-resume-data-");
+    const repo = repository();
+    const runId = "run-delivery-resume-validated-1";
+    const worktree = await createRunWorktree(repo, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "validated.txt"), "validated candidate\n", "utf8");
+
+    const runDir = path.join(dataRoot, "artifacts", "runs", runId);
+    fs.mkdirSync(path.join(runDir, "evidence"), { recursive: true });
+    fs.writeFileSync(path.join(runDir, "evidence", "acceptance.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const run: WorkflowRunRecord = {
+      id: runId,
+      workflow: "delivery-resume",
+      architecture: "supervisor",
+      manifestPath: path.join(runDir, "multi-agent.yaml"),
+      artifactDir: runDir,
+      status: "passed",
+      createdAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      isolation: { mode: "worktree", worktreePath: worktree!.path, baseCommit: worktree!.baseCommit },
+      output: {
+        gates: [
+          {
+            gateId: "quality-test", requiredCapability: "quality.test", mode: "before-completion",
+            required: true, status: "passed"
+          },
+          {
+            gateId: "quality-audit", requiredCapability: "quality.audit", mode: "before-completion",
+            required: true, status: "passed"
+          }
+        ]
+      },
+      nodes: {
+        tester: {
+          nodeId: "tester",
+          roleId: "test-engineer",
+          status: "passed",
+          attempts: 1,
+          output: {
+            verdict: "pass",
+            e2eEvidence: [{ method: "browser", steps: "Validate candidate", observed: "Candidate passed" }]
+          }
+        }
+      }
+    };
+    fs.writeFileSync(path.join(runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`, "utf8");
+
+    await queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      actor: "daemon-reviewer"
+    });
+    fs.writeFileSync(path.join(repo, "target-drift.txt"), "target drift\n", "utf8");
+    git(repo, "add", "target-drift.txt");
+    git(repo, "commit", "-m", "advance target after queue");
+    const targetCommit = (await assessQueuedRun(run, runDir)).currentTargetCommit;
+    await transitionRunDelivery(runDir, runId, "merging", {
+      message: "Target-drift validation passed; daemon stopped before merge.",
+      mergeValidation: {
+        required: true,
+        status: "passed",
+        runId: "validation-run-1",
+        targetCommit,
+        message: "Independent validation passed.",
+        updatedAt: new Date().toISOString()
+      }
+    });
+
+    const service = await WorkbenchService.open({ dataRoot });
+    const app = createDaemonApp(service, { staticDir: path.join(dataRoot, "missing-client") });
+    let mergedPreview: RunMergePreview | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const response = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
+      mergedPreview = (response.json as { data: RunMergePreview }).data;
+      if (mergedPreview.status === "merged") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(mergedPreview).toMatchObject({
+      status: "merged",
+      delivery: { mergeValidation: { status: "passed", runId: "validation-run-1", targetCommit } }
+    });
+    expect(fs.readFileSync(path.join(repo, "validated.txt"), "utf8")).toBe("validated candidate\n");
     for (let attempt = 0; attempt < 100 && fs.existsSync(worktree!.path); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
