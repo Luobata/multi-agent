@@ -6,11 +6,15 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { WorkflowRunRecord } from "../src/core/types.js";
 import { createRunWorktree } from "../src/runtime/worktree.js";
 import {
+  assessQueuedRun,
+  createMergeValidationWorktree,
   discardRunWorktree,
   keepRunWorktree,
   mergeAcceptedRun,
   openManagedRunWorktree,
   previewRunMerge,
+  queueAcceptedRun,
+  removeMergeValidationWorktree,
   readRunDelivery
 } from "../src/runtime/worktreeDelivery.js";
 
@@ -209,6 +213,45 @@ describe("worktree delivery merge gate", () => {
     expect(fs.readFileSync(path.join(root, "README.md"), "utf8")).toBe("target change\n");
     expect(fs.existsSync(worktree!.path)).toBe(true);
     expect(git(root, "status", "--porcelain")).toBe("");
+  }, 15_000);
+
+  it("queues an approved candidate and revalidates it in a temporary integration worktree after target drift", async () => {
+    const root = repository();
+    const runId = "run-delivery-queue-drift-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), "candidate\n", "utf8");
+    const runDir = artifactDirectory();
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+
+    const queued = await queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      actor: "reviewer"
+    });
+    expect(queued).toMatchObject({
+      status: "queued-for-merge",
+      delivery: {
+        status: "queued-for-merge",
+        queuedTargetCommit: expect.any(String),
+        humanDecision: { action: "merge", actor: "reviewer" }
+      }
+    });
+    expect((await assessQueuedRun(run, runDir)).targetChanged).toBe(false);
+
+    fs.writeFileSync(path.join(root, "target.txt"), "target drift\n", "utf8");
+    git(root, "add", "target.txt");
+    git(root, "commit", "-m", "advance target");
+    const assessment = await assessQueuedRun(run, runDir);
+    expect(assessment).toMatchObject({ targetChanged: true, conflict: false });
+
+    const validation = await createMergeValidationWorktree(run, runDir);
+    expect(fs.readFileSync(path.join(validation.worktreePath, "candidate.txt"), "utf8")).toBe("candidate\n");
+    expect(fs.readFileSync(path.join(validation.worktreePath, "target.txt"), "utf8")).toBe("target drift\n");
+    expect(git(root, "rev-parse", "HEAD")).toBe(assessment.currentTargetCommit);
+    await removeMergeValidationWorktree(validation);
+    expect(fs.existsSync(validation.worktreePath)).toBe(false);
+    expect(fs.existsSync(worktree!.path)).toBe(true);
   }, 15_000);
 
   it("withholds merge when run status, acceptance, media, or worktree changes are missing", async () => {

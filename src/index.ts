@@ -13,22 +13,30 @@ export { createDefaultProviderRegistry, registerProviderAdapter } from "./runtim
 export type * from "./runtime/providers.js";
 export { runWorkflow } from "./runtime/runner.js";
 export {
+  assessQueuedRun,
+  createMergeValidationWorktree,
   discardRunWorktree,
   discoverRunEvidenceAssets,
   keepRunWorktree,
   mergeAcceptedRun,
   openManagedRunWorktree,
   previewRunMerge,
+  queueAcceptedRun,
   readRunDelivery,
+  removeMergeValidationWorktree,
   resolveRunEvidenceAsset
 } from "./runtime/worktreeDelivery.js";
 export type {
   DeliveryStatus,
+  EvidenceRerunStatus,
+  MergeValidationWorktree,
+  QueuedRunAssessment,
   RunDeliveryActionResult,
   RunDeliveryRecord,
   RunEvidenceAsset,
   RunGateEvidence,
   RunMergePreview,
+  RunMergeQueueResult,
   RunMergeResult,
   RunWorktreeOpenResult
 } from "./runtime/worktreeDelivery.js";

@@ -123,8 +123,9 @@ export function reserveAdvancement(
     throw new Error("这轮推进已经产生 Run；请先在运行卷宗处理结果，再决定是否重新推进");
   }
   if (requirement.lane === "clarify") throw new Error("需求仍在待澄清；请先补齐关键信息并迁移回收件箱或已规划");
-  if (requirement.lane === "acceptance" || requirement.lane === "done") {
-    throw new Error(`需求已经位于「${requirement.lane === "acceptance" ? "待验收" : "已完成"}」，不能重新开始推进`);
+  if (requirement.lane === "acceptance" || requirement.lane === "merging" || requirement.lane === "done") {
+    const label = requirement.lane === "acceptance" ? "待验收" : requirement.lane === "merging" ? "待合入" : "已完成";
+    throw new Error(`需求已经位于「${label}」，不能重新开始推进`);
   }
   if (requirement.exception === "cancelled") throw new Error("已取消的需求不能开始推进");
   if (requirement.acceptanceCriteria.length === 0) throw new Error("缺少验收标准；请先补齐可观察的验收标准");

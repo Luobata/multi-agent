@@ -3,8 +3,8 @@
  * 状态词严格复用 components.tsx 的 Stamp / RuntimeStatusChip 语义，不新增状态词。
  */
 
-/** 看板八列（与异常态正交）；confirmation 专门承接等待人工决定的真实 Run。 */
-export type RequirementLane = "inbox" | "clarify" | "planned" | "queued" | "running" | "confirmation" | "acceptance" | "done";
+/** 看板九列（与异常态正交）；merging 专门承接已人工验收、等待串行合入的候选。 */
+export type RequirementLane = "inbox" | "clarify" | "planned" | "queued" | "running" | "confirmation" | "acceptance" | "merging" | "done";
 
 /** 阻塞 / 失败 / 取消三种异常态，与所在列正交叠加。 */
 export type RequirementException = "blocked" | "failed" | "cancelled" | null;
@@ -50,6 +50,7 @@ export const REQUIREMENT_LANES: ReadonlyArray<{ id: RequirementLane; label: stri
   { id: "running", label: "执行中" },
   { id: "confirmation", label: "待确认" },
   { id: "acceptance", label: "待验收" },
+  { id: "merging", label: "待合入" },
   { id: "done", label: "已完成" }
 ];
 

@@ -1,4 +1,4 @@
-/** 需求看板：八列 + 阻塞/失败/取消三异常态（与列正交）。第一阶段无拖拽，列迁移走详情页。 */
+/** 需求看板：九列数据契约、七列可见视图 + 三种正交异常态。列迁移走详情页。 */
 import { useEffect, useMemo, useState } from "react";
 import { api, writeBody } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
@@ -160,7 +160,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
           }, config?.pollIntervalMs ?? 15_000);
         }
         if (invocation.status !== "completed" || !invocation.runId
-          || updated.lane === "acceptance" || updated.lane === "done") return updated;
+          || updated.lane === "acceptance" || updated.lane === "merging" || updated.lane === "done") return updated;
         try {
           const preview = await api<RunMergePreview>(`/api/runs/${encodeURIComponent(invocation.runId)}/merge-preview`);
           if (!preview.eligible) {
@@ -309,9 +309,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
 
   return <main className="dash-page">
     <PageHeader
-      eyebrow="BOARD / SIX LANES"
+      eyebrow="BOARD / SEVEN LANES"
       title={project ? `${project.name} · 需求看板` : "需求看板"}
-      description="六列流转；排队中 / 执行中 / 待确认只由真实 Run 自动更新，门禁与交付证据通过后自动进入待验收。阻塞 / 失败 / 取消与列正交叠加。"
+      description="七列流转；排队中 / 执行中 / 待确认 / 待合入只由真实 Run 自动更新。人工验收后进入串行合入队列，冲突或重测异常会退回待验收。"
       actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
     />
     <OfflineNotice />

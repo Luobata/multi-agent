@@ -5,7 +5,7 @@ import { SupervisorRunTopology } from "./SupervisorRunTopology";
 import { EffectiveProfileView } from "./EffectiveProfileView";
 import { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
 import type { DashboardService } from "./dashboard/service";
-import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunMergePreview, RunMergeResult, RunNode, RunWorktreeOpenResult } from "./types";
+import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunDeliveryRecord, RunMergePreview, RunMergeQueueResult, RunNode, RunWorktreeOpenResult } from "./types";
 
 export { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
 
@@ -328,7 +328,9 @@ function RunDeliveryPanel({
   openingWorktree,
   onOpenKeep,
   onOpenDiscard,
-  onSubmitToBoard
+  onSubmitToBoard,
+  onRerunEvidence,
+  evidenceRerunError
 }: {
   preview?: RunMergePreview;
   loading: boolean;
@@ -342,6 +344,8 @@ function RunDeliveryPanel({
   onOpenKeep: () => void;
   onOpenDiscard: () => void;
   onSubmitToBoard: () => void;
+  onRerunEvidence: () => void;
+  evidenceRerunError: string;
 }) {
   if (loading && !preview) return <p className="run-delivery-loading">正在核对 worktree 与验收证据…</p>;
   if (!preview) return null;
@@ -349,10 +353,22 @@ function RunDeliveryPanel({
   const merged = preview.status === "merged" || preview.delivery?.status === "merged";
   const kept = preview.status === "kept" || preview.delivery?.status === "kept";
   const discarded = preview.status === "discarded" || preview.delivery?.status === "discarded";
-  const actionable = !merged && !discarded && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept");
+  const queued = preview.status === "queued-for-merge" || preview.delivery?.status === "queued-for-merge";
+  const retesting = preview.status === "retesting" || preview.delivery?.status === "retesting";
+  const merging = preview.status === "merging" || preview.delivery?.status === "merging";
+  const returned = preview.status === "returned-to-acceptance" || preview.delivery?.status === "returned-to-acceptance";
+  const mergeBusy = queued || retesting || merging;
+  const evidenceRerun = preview.delivery?.evidenceRerun;
+  const evidenceBusy = evidenceRerun?.status === "queued" || evidenceRerun?.status === "running";
+  const actionable = !merged && !discarded && !mergeBusy && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept" || preview.status === "returned-to-acceptance");
+  const canQueueMerge = preview.eligible && !merged && !discarded && !mergeBusy && !evidenceBusy && preview.status !== "conflict";
   const diff = preview.changes.unifiedDiff;
   return <div className="run-delivery-panel">
     {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>目标分支存在合并冲突</strong><p>{preview.delivery?.message ?? "worktree 已保留，请处理目标分支变化后重新预览。"}</p></div>}
+    {queued && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>已进入待合入队列</strong><p>{preview.delivery?.message ?? "同一目标分支上的候选会按批准顺序串行处理。"}</p></div>}
+    {retesting && <div className="run-delivery-callout run-delivery-callout--retesting" role="status"><strong>目标分支变化，正在重测</strong><p>{preview.delivery?.message ?? "系统正在临时集成 worktree 上执行独立回归，不会改动真实目标分支。"}</p></div>}
+    {merging && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>重测通过，正在合入</strong><p>{preview.delivery?.message ?? "正在写入已批准的目标分支。"}</p></div>}
+    {returned && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>自动合入已退回待验收</strong><p>{preview.delivery?.message ?? "候选 worktree 已保留，请处理异常后重新验收。"}</p></div>}
     {merged && <div className="run-delivery-callout run-delivery-callout--merged"><strong>交付已合并</strong><p>{preview.delivery?.mergeCommit ? <>Merge commit：<code>{preview.delivery.mergeCommit}</code></> : "合并记录已归档。"}</p></div>}
     {kept && <div className="run-delivery-callout run-delivery-callout--kept"><strong>交付已人工保留</strong><p>{preview.delivery?.humanDecision ? <>由 <code>{preview.delivery.humanDecision.actor}</code> 于 {formatTime(preview.delivery.humanDecision.at)} 标记保留；候选 worktree 原样保留，未执行 merge 或 push。{preview.delivery.humanDecision.note ? <> 备注:{preview.delivery.humanDecision.note}</> : null}</> : (preview.delivery?.message ?? "候选 worktree 已保留，未执行 merge 或 push。")}</p></div>}
     {discarded && <div className="run-delivery-callout run-delivery-callout--discarded" role="alert"><strong>候选结果已丢弃</strong><p>{preview.delivery?.humanDecision ? <>由 <code>{preview.delivery.humanDecision.actor}</code> 于 {formatTime(preview.delivery.humanDecision.at)} 确认丢弃；候选 worktree 已清理，合并、保留与丢弃操作均已关闭。{preview.delivery.humanDecision.note ? <> 备注:{preview.delivery.humanDecision.note}</> : null}</> : "候选 worktree 已清理，不能再合并、保留或丢弃。"}</p></div>}
@@ -378,7 +394,7 @@ function RunDeliveryPanel({
     <div className="run-delivery-evidence">
       <div className="run-delivery-evidence-head"><strong>Evidence wall</strong><span>{preview.evidence.assets.length} 项媒体证据</span></div>
       {preview.evidence.assets.length === 0
-        ? <p className="run-delivery-evidence-empty">没有可展示的截图或录屏。</p>
+        ? <div className="run-delivery-evidence-empty"><p>没有可展示的截图或录屏。结构化 E2E 仍会保留，但你可以让独立测试角色补采真实界面证据。</p><button type="button" className="button secondary" disabled={evidenceBusy || mergeBusy || !preview.worktreePath || discarded || merged} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "正在补采截图…" : evidenceRerun?.status === "failed" ? "重新补采验收截图" : "补采验收截图"}</button>{evidenceRerun?.message && <small className={evidenceRerun.status === "failed" ? "inline-error" : ""}>{evidenceRerun.message}</small>}{evidenceRerunError && <small className="inline-error" role="alert">{evidenceRerunError}</small>}</div>
         : <div className="run-delivery-evidence-wall">{preview.evidence.assets.map((asset) => <figure key={asset.id} className="run-delivery-evidence-card">
           {asset.kind === "screenshot"
             ? <a href={asset.url} target="_blank" rel="noreferrer" aria-label={`打开证据 ${asset.name}`}><img className="run-delivery-evidence-media" src={asset.url} alt={asset.name} loading="lazy" /></a>
@@ -391,7 +407,7 @@ function RunDeliveryPanel({
       {canSubmitToBoard && <button type="button" className="button secondary" disabled={boardSubmitting} aria-busy={boardSubmitting} onClick={onSubmitToBoard} title={taskId ? `写入看板需求 ${taskId} 的验收快照并迁移到待验收` : undefined}>{boardSubmitting ? "提交中…" : "提交该需求到待验收"}</button>}
       {actionable && <button type="button" className="button danger" onClick={onOpenDiscard}>丢弃候选结果</button>}
       {actionable && <button type="button" className="button secondary" onClick={onOpenKeep}>人工保留</button>}
-      {preview.eligible && !merged && !discarded && <button type="button" className="button primary" onClick={onOpenMerge}>合并到目标分支</button>}
+      {canQueueMerge && <button type="button" className="button primary" onClick={onOpenMerge}>批准并加入待合入</button>}
     </div>}
   </div>;
 }
@@ -484,9 +500,9 @@ function RunMergeConfirmation({
   onClose: () => void;
   onMerge: () => void;
 }) {
-  return <Modal title="确认合并 Run 交付" eyebrow="READ-ONLY PREVIEW · EXPLICIT ACCEPTANCE" onClose={onClose} wide>
+  return <Modal title="批准并加入待合入" eyebrow="HUMAN ACCEPTANCE · SERIAL MERGE QUEUE" onClose={onClose} wide>
     <div className="modal-body run-delivery-confirm">
-      <div className="run-delivery-callout"><strong>预览为只读</strong><p>打开此窗口不会提交或修改 Git。只有勾选明确确认并点击下方按钮后，才会发送一次合并请求。</p></div>
+      <div className="run-delivery-callout"><strong>批准后由队列串行推进</strong><p>当前预览只读。确认后候选进入待合入；若前序合并改变目标分支，系统会先在临时集成 worktree 重测。冲突、重测失败或意外会保留候选并退回待验收，不会自动 push。</p></div>
       <dl className="ledger">
         <dt>Run</dt><dd><code>{preview.runId}</code></dd>
         <dt>目标分支</dt><dd><code>{preview.targetBranch}</code></dd>
@@ -495,8 +511,8 @@ function RunMergeConfirmation({
         <dt>确认 token</dt><dd><code>{preview.confirmationToken}</code></dd>
       </dl>
       {error && <div className="inline-error" role="alert">{error}</div>}
-      <label className="run-delivery-confirm-check"><input type="checkbox" checked={confirmed} disabled={busy} onChange={(event) => onConfirmedChange(event.target.checked)} /><span><strong>我已核对代码变更与验收证据，并明确同意合并</strong><small>目标分支变化、工作区非洁净或 token 不匹配时，服务端仍会拒绝。</small></span></label>
-      <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="button" className="button primary" disabled={busy || !confirmed} onClick={onMerge}>{busy ? "合并中…" : `确认合并到 ${preview.targetBranch}`}</button></div>
+      <label className="run-delivery-confirm-check"><input type="checkbox" checked={confirmed} disabled={busy} onChange={(event) => onConfirmedChange(event.target.checked)} /><span><strong>我已核对代码变更与验收证据，并批准进入目标分支合入队列</strong><small>这次确认不会被自动化扩大到其它候选；每个需求仍需独立人工批准。</small></span></label>
+      <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="button" className="button primary" disabled={busy || !confirmed} onClick={onMerge}>{busy ? "入队中…" : `批准并排队合入 ${preview.targetBranch}`}</button></div>
     </div>
   </Modal>;
 }
@@ -533,6 +549,7 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
   const [discardError, setDiscardError] = useState("");
   const [boardSubmitting, setBoardSubmitting] = useState(false);
   const [boardSubmitError, setBoardSubmitError] = useState("");
+  const [evidenceRerunError, setEvidenceRerunError] = useState("");
   const [openingWorktree, setOpeningWorktree] = useState(false);
   const [humanRequests, setHumanRequests] = useState<HumanDecisionRequest[]>([]);
   const [humanRequestsLoading, setHumanRequestsLoading] = useState(false);
@@ -597,12 +614,31 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
     setDiscardNote("");
     setDiscardError("");
     setBoardSubmitError("");
+    setEvidenceRerunError("");
     api<RunMergePreview>(`/api/runs/${encodeURIComponent(selected.id)}/merge-preview`)
       .then((value) => { if (current) setMergePreview(value); })
       .catch((error: unknown) => { if (current) notify(error instanceof Error ? error.message : String(error), "error"); })
       .finally(() => { if (current) setMergePreviewLoading(false); });
     return () => { current = false; };
   }, [selected?.id, activityRevision, deliveryRevision, notify]);
+  useEffect(() => {
+    const status = mergePreview?.delivery?.status;
+    const evidenceStatus = mergePreview?.delivery?.evidenceRerun?.status;
+    if (!["queued-for-merge", "retesting", "merging"].includes(status ?? "")
+      && !["queued", "running"].includes(evidenceStatus ?? "")) return;
+    const timer = window.setTimeout(() => setDeliveryRevision((value) => value + 1), 2_000);
+    return () => window.clearTimeout(timer);
+  }, [mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt, mergePreview?.delivery?.evidenceRerun?.status]);
+  useEffect(() => {
+    if (!dashboard || !selected?.taskId || !mergePreview?.delivery) return;
+    const status = mergePreview.delivery.status;
+    if (!["queued-for-merge", "retesting", "merging", "merged", "conflict", "returned-to-acceptance"].includes(status)) return;
+    void dashboard.syncRequirementDelivery(
+      selected.taskId,
+      selected.id,
+      status as "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance"
+    ).catch(() => undefined);
+  }, [dashboard, selected?.taskId, selected?.id, mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt]);
   useEffect(() => {
     if (!selected?.id) {
       setHumanRequests([]);
@@ -669,24 +705,43 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
     setMerging(true);
     setMergeError("");
     try {
-      const result = await api<RunMergeResult>(`/api/runs/${encodeURIComponent(selected.id)}/merge`, {
+      if (dashboard && selected.taskId) {
+        await dashboard.submitRequirementForAcceptance(
+          selected.taskId,
+          acceptanceSnapshotFromPreview(mergePreview, new Date().toISOString())
+        );
+      }
+      const result = await api<RunMergeQueueResult>(`/api/runs/${encodeURIComponent(selected.id)}/merge-queue`, {
         method: "POST",
         body: JSON.stringify({
           confirmation: mergePreview.confirmationToken,
-          targetBranch: mergePreview.targetBranch
+          targetBranch: mergePreview.targetBranch,
+          actor: "workbench-operator"
         })
       });
       setMergeOpen(false);
-      setDeliveryRevision((value) => value + 1);
-      if (result.status === "conflict") {
-        notify(result.delivery.message ?? "合并冲突；候选 worktree 已保留。", "error");
-      } else {
-        notify(`Run ${selected.id} 已合并到 ${result.delivery.targetBranch}。`, "success");
+      if (dashboard && selected.taskId) {
+        await dashboard.syncRequirementDelivery(selected.taskId, selected.id, result.status);
       }
+      setDeliveryRevision((value) => value + 1);
+      notify(`Run ${selected.id} 已进入 ${result.delivery.targetBranch} 的待合入队列。`, "success");
     } catch (error) {
       setMergeError(error instanceof Error ? error.message : String(error));
     } finally {
       setMerging(false);
+    }
+  };
+  const rerunEvidence = async () => {
+    if (!selected || !mergePreview?.worktreePath) return;
+    setEvidenceRerunError("");
+    try {
+      await api<RunDeliveryRecord>(`/api/runs/${encodeURIComponent(selected.id)}/evidence-rerun`, writeBody({
+        actor: "workbench-operator"
+      }));
+      setDeliveryRevision((value) => value + 1);
+      notify(`Run ${selected.id} 已进入独立截图验收队列。`, "success");
+    } catch (error) {
+      setEvidenceRerunError(error instanceof Error ? error.message : String(error));
     }
   };
   const keepDelivery = async () => {
@@ -759,7 +814,12 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
       setOpeningWorktree(false);
     }
   };
-  const canSubmitToBoard = Boolean(dashboard && selected?.taskId && mergePreview?.eligible);
+  const canSubmitToBoard = Boolean(
+    dashboard
+    && selected?.taskId
+    && mergePreview?.eligible
+    && !["queued-for-merge", "retesting", "merging", "merged", "discarded"].includes(mergePreview.status)
+  );
   const profileEntries = Object.entries(selected?.effectiveProfiles ?? {});
   const showHumanDecisionFirst = humanRequestsLoading || humanRequests.some((request) => request.status === "pending");
   return <div className="page-grid page-grid--runs">
@@ -786,6 +846,8 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
         onOpenKeep={() => { setKeepError(""); setKeepOpen(true); }}
         onOpenDiscard={() => { setDiscardError(""); setDiscardToken(""); setDiscardOpen(true); }}
         onSubmitToBoard={() => void submitToBoard()}
+        onRerunEvidence={() => void rerunEvidence()}
+        evidenceRerunError={evidenceRerunError}
       /></DossierSection>
     </div>}</main>
     {mergeOpen && mergePreview?.eligible && <RunMergeConfirmation preview={mergePreview} confirmed={mergeConfirmed} busy={merging} error={mergeError} onConfirmedChange={setMergeConfirmed} onClose={() => { if (!merging) setMergeOpen(false); }} onMerge={() => void mergeDelivery()} />}

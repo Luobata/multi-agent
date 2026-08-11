@@ -220,12 +220,20 @@ describe("run delivery daemon routes", () => {
     expect(rejected.json).toMatchObject({ error: { message: expect.stringContaining("明确合并确认") } });
     expect(git(repo, "rev-parse", "HEAD")).toBe(headBefore);
 
-    const merged = await invokeRoute(app, "post", "/api/runs/:id/merge", {
+    const queued = await invokeRoute(app, "post", "/api/runs/:id/merge-queue", {
       params: { id: runId },
-      body: { confirmation: previewEnvelope.data.confirmationToken, targetBranch: "main" }
+      body: { confirmation: previewEnvelope.data.confirmationToken, targetBranch: "main", actor: "daemon-reviewer" }
     });
-    expect(merged.status).toBe(200);
-    expect(merged.json).toMatchObject({ data: { status: "merged", delivery: { runId, targetBranch: "main" } } });
+    expect(queued.status).toBe(202);
+    expect(queued.json).toMatchObject({ data: { status: "queued-for-merge", delivery: { runId, targetBranch: "main" } } });
+    let mergedPreview: RunMergePreview | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const response = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
+      mergedPreview = (response.json as { data: RunMergePreview }).data;
+      if (mergedPreview.status === "merged") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(mergedPreview).toMatchObject({ status: "merged", delivery: { runId, targetBranch: "main" } });
     expect(fs.readFileSync(path.join(repo, "feature.txt"), "utf8")).toBe("accepted through daemon\n");
     expect(fs.existsSync(worktree!.path)).toBe(false);
   }, 15_000);

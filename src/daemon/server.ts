@@ -898,6 +898,26 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       targetBranch: body.targetBranch
     }));
   }));
+  app.post("/api/runs/:id/merge-queue", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "run merge queue input");
+    if (typeof body.confirmation !== "string") throw new Error("run merge confirmation is required");
+    if (typeof body.targetBranch !== "string" || !body.targetBranch.trim()) {
+      throw new Error("run merge targetBranch is required");
+    }
+    if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("run merge actor is required");
+    send(response, await service.queueRunMerge(routeParam(request, "id"), {
+      confirmation: body.confirmation,
+      targetBranch: body.targetBranch,
+      actor: body.actor
+    }), 202);
+  }));
+  app.post("/api/runs/:id/evidence-rerun", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "run evidence rerun input");
+    if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("run evidence rerun actor is required");
+    send(response, await service.requestRunEvidenceRerun(routeParam(request, "id"), {
+      actor: body.actor
+    }), 202);
+  }));
   app.post("/api/runs/:id/keep", asyncRoute(async (request, response) => {
     const body = jsonObject(request.body ?? {}, "run keep input");
     if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("run keep actor is required");

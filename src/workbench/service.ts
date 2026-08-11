@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -97,15 +98,23 @@ import { isSystemManagedProviderId } from "../runtime/systemProviders.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
 import { createRunWorktree, removeRunWorktree, worktreeHasChanges } from "../runtime/worktree.js";
 import {
+  assessQueuedRun,
+  createMergeValidationWorktree,
   discardRunWorktree,
   keepRunWorktree,
   mergeAcceptedRun,
   openManagedRunWorktree,
   previewRunMerge,
+  queueAcceptedRun,
+  removeMergeValidationWorktree,
   resolveRunEvidenceAsset,
+  transitionRunDelivery,
+  updateRunEvidenceRerun,
   type RunDeliveryActionResult,
+  type RunDeliveryRecord,
   type RunEvidenceAsset,
   type RunMergePreview,
+  type RunMergeQueueResult,
   type RunMergeResult
 } from "../runtime/worktreeDelivery.js";
 import {
@@ -1691,6 +1700,9 @@ export class WorkbenchService {
   private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly backgroundInvocations = new Map<string, Promise<void>>();
+  private readonly evidenceReruns = new Map<string, Promise<void>>();
+  private readonly activeMergeRuns = new Map<string, Promise<void>>();
+  private readonly mergeBranchQueues = new Map<string, Promise<void>>();
   /**
    * Closes the small race between two callers that dispatch the same durable task cycle at once.
    * The persisted Invocation source remains the source of truth across daemon restarts.
@@ -7330,9 +7342,303 @@ export class WorkbenchService {
     };
   }
 
+  private invocationForRun(id: string): InvocationRecord | undefined {
+    return Object.values(this.snapshot().invocations).find((candidate) => candidate.runId === id);
+  }
+
+  private async invokeProjectTestRoleAtPath(
+    projectId: string,
+    taskId: string | undefined,
+    providerCwd: string,
+    message: string,
+    caller: string
+  ): Promise<EmployeeInvocationResult> {
+    const project = this.getProject(projectId);
+    if (project.status !== "active") throw new Error(`project ${projectId} is archived`);
+    const resolved = this.resolveProjectEmployee(projectId, "test-engineer");
+    const currentEmployee = this.getEmployee(resolved.employee.id);
+    if (currentEmployee.status !== "active") throw new Error(`employee ${resolved.employee.id} is archived`);
+    return this.invokeResolvedEmployee({
+      employee: resolved.employee,
+      input: { message },
+      source: {
+        kind: "workbench",
+        project: projectId,
+        projectRole: "test-engineer",
+        projectBindingVersion: resolved.binding.version,
+        caller,
+        ...(taskId ? { taskId } : {})
+      },
+      assignment: {
+        projectId,
+        projectVersion: resolved.project.version,
+        projectBindingVersion: resolved.binding.version,
+        roleId: "test-engineer"
+      },
+      providerCwd: await this.validatedProviderCwd(providerCwd),
+      workflow: {
+        id: `project-${projectId}-test-engineer`,
+        version: resolved.binding.version,
+        description: `${resolved.project.name} / 合入与验收独立测试`
+      }
+    });
+  }
+
+  private async copyEvidenceMedia(sourceRoot: string, destinationRoot: string): Promise<number> {
+    const mediaExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov"]);
+    let copied = 0;
+    const visit = async (directory: string, depth: number): Promise<void> => {
+      if (depth > 8 || copied >= 200) return;
+      let entries: Dirent[];
+      try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      for (const entry of entries) {
+        if (copied >= 200) break;
+        if (entry.isSymbolicLink()) continue;
+        const candidate = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          await visit(candidate, depth + 1);
+          continue;
+        }
+        if (!entry.isFile() || !mediaExtensions.has(path.extname(entry.name).toLowerCase())) continue;
+        await fs.mkdir(destinationRoot, { recursive: true });
+        const destination = path.join(destinationRoot, `${String(copied + 1).padStart(3, "0")}-${path.basename(entry.name)}`);
+        await fs.copyFile(candidate, destination);
+        copied += 1;
+      }
+    };
+    await visit(sourceRoot, 0);
+    return copied;
+  }
+
+  async requestRunEvidenceRerun(id: string, input: { actor: string }): Promise<RunDeliveryRecord> {
+    const actor = requireText(input.actor, "evidence rerun actor");
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    const preview = await previewRunMerge(run, runDir);
+    if (!preview.worktreePath) throw new Error("该 Run 没有可用于截图验收的 worktree");
+    if (preview.evidence.assets.length > 0) throw new Error("该 Run 已有媒体证据，无需重复补采");
+    if (["queued-for-merge", "retesting", "merging", "merged", "discarded"].includes(preview.status)) {
+      throw new Error("该交付已进入合入或终态，不能再启动截图补采");
+    }
+    const current = preview.delivery?.evidenceRerun;
+    if (current?.status === "queued" || current?.status === "running") {
+      return preview.delivery!;
+    }
+    const requestedAt = now();
+    const queued = await updateRunEvidenceRerun(runDir, id, {
+      status: "queued",
+      actor,
+      requestedAt,
+      updatedAt: requestedAt,
+      message: "已进入独立截图验收队列。"
+    });
+    const invocation = this.invocationForRun(id);
+    const projectId = invocation?.source.project;
+    const taskId = invocation?.source.taskId;
+    const worktreePath = preview.worktreePath;
+    const stagingRoot = path.join(worktreePath, ".multi-agent", "evidence-rerun", `${id}-${randomUUID()}`);
+    const job = (async () => {
+      try {
+        if (!projectId) throw new Error("原 Run 缺少项目来源，无法路由项目 test-engineer");
+        await fs.mkdir(stagingRoot, { recursive: true });
+        await updateRunEvidenceRerun(runDir, id, {
+          status: "running",
+          actor,
+          requestedAt,
+          updatedAt: now(),
+          message: "独立测试角色正在复现验收路径并采集截图。"
+        });
+        const result = await this.invokeProjectTestRoleAtPath(
+          projectId,
+          taskId,
+          worktreePath,
+          [
+            "【补采验收截图】",
+            `父 Run：${id}`,
+            `候选 worktree：${worktreePath}`,
+            `截图输出目录：${stagingRoot}`,
+            "请独立启动或复用现有服务，逐条复现可观察验收路径，并把真实截图或录屏写入指定目录。",
+            "不得安装依赖，不得修改产品代码、配置、Git 历史或目标分支；若环境不具备验收条件，请返回 block 并说明缺口。",
+            "至少产出一张能辨认验收结果的截图；只写媒体证据到指定目录。"
+          ].join("\n"),
+          "system:evidence-rerun"
+        );
+        const destination = path.join(runDir, "evidence-reruns", result.runId);
+        const mediaCount = await this.copyEvidenceMedia(stagingRoot, destination);
+        if (result.status !== "passed" || mediaCount === 0) {
+          throw new Error(result.status !== "passed"
+            ? `独立截图验收未通过：${result.message}`
+            : "独立测试角色未产出可展示的截图或录屏");
+        }
+        await updateRunEvidenceRerun(runDir, id, {
+          status: "passed",
+          actor,
+          requestedAt,
+          updatedAt: now(),
+          runId: result.runId,
+          mediaCount,
+          message: `已补采 ${mediaCount} 项媒体证据。`
+        });
+      } catch (error) {
+        await updateRunEvidenceRerun(runDir, id, {
+          status: "failed",
+          actor,
+          requestedAt,
+          updatedAt: now(),
+          message: error instanceof Error ? error.message : String(error)
+        });
+      } finally {
+        await fs.rm(stagingRoot, { recursive: true, force: true });
+      }
+    })().finally(() => {
+      if (this.evidenceReruns.get(id) === job) this.evidenceReruns.delete(id);
+    });
+    this.evidenceReruns.set(id, job);
+    return queued;
+  }
+
+  private scheduleQueuedMerge(id: string, preview?: RunMergePreview): void {
+    if (this.activeMergeRuns.has(id)) return;
+    const start = async (): Promise<void> => {
+      const currentPreview = preview ?? await (async () => {
+        const { run, runDir } = await this.getRunDeliveryContext(id);
+        return previewRunMerge(run, runDir);
+      })();
+      if (!currentPreview.repositoryRoot || !currentPreview.targetBranch) {
+        throw new Error("待合入记录缺少目标仓库或目标分支");
+      }
+      const queueKey = `${currentPreview.repositoryRoot}\u0000${currentPreview.targetBranch}`;
+      const previous = this.mergeBranchQueues.get(queueKey) ?? Promise.resolve();
+      const worker = previous.catch(() => undefined).then(() => this.processQueuedMerge(id));
+      const tail = worker.finally(() => {
+        if (this.mergeBranchQueues.get(queueKey) === tail) this.mergeBranchQueues.delete(queueKey);
+      });
+      this.mergeBranchQueues.set(queueKey, tail);
+      await worker;
+    };
+    const job = start().catch(async (error) => {
+      const { runDir } = await this.getRunDeliveryContext(id);
+      await transitionRunDelivery(runDir, id, "returned-to-acceptance", {
+        message: `自动合入意外终止：${error instanceof Error ? error.message : String(error)}；候选 worktree 已保留。`
+      });
+    }).finally(() => {
+      if (this.activeMergeRuns.get(id) === job) this.activeMergeRuns.delete(id);
+    });
+    this.activeMergeRuns.set(id, job);
+  }
+
+  private async processQueuedMerge(id: string): Promise<void> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    const delivery = await previewRunMerge(run, runDir);
+    if (!["queued-for-merge", "retesting", "merging"].includes(delivery.status)) return;
+    const assessment = await assessQueuedRun(run, runDir);
+    if (assessment.conflict) {
+      await transitionRunDelivery(runDir, id, "conflict", {
+        message: `${assessment.conflictMessage ?? "候选与目标分支发生冲突"}；自动合入已停止，候选 worktree 已保留并退回待验收。`
+      });
+      return;
+    }
+
+    if (assessment.targetChanged) {
+      const invocation = this.invocationForRun(id);
+      const projectId = invocation?.source.project;
+      if (!projectId) throw new Error("原 Run 缺少项目来源，目标分支变化后无法路由独立重测");
+      await transitionRunDelivery(runDir, id, "retesting", {
+        message: "目标分支在排队期间发生变化，正在临时集成 worktree 上执行独立回归。",
+        mergeValidation: {
+          required: true,
+          status: "running",
+          targetCommit: assessment.currentTargetCommit,
+          updatedAt: now()
+        }
+      });
+      const validation = await createMergeValidationWorktree(run, runDir);
+      try {
+        const result = await this.invokeProjectTestRoleAtPath(
+          projectId,
+          invocation?.source.taskId,
+          validation.worktreePath,
+          [
+            "【待合入队列目标漂移重测】",
+            `候选 Run：${id}`,
+            `目标分支：${validation.targetBranch}`,
+            `目标 commit：${validation.targetCommit}`,
+            `候选 commit：${validation.sourceCommit}`,
+            "当前目录是系统创建的临时集成 worktree，已合入候选但尚未写入真实目标分支。",
+            "请执行与本需求相关的独立回归测试并给出结构化 verdict。不得安装依赖，不得修改代码、Git 历史或任何真实分支。",
+            "测试失败、环境异常或无法证明通过时必须返回 block，不能把工具失败当作通过。"
+          ].join("\n"),
+          "system:merge-queue-retest"
+        );
+        if (result.status !== "passed") {
+          await transitionRunDelivery(runDir, id, "returned-to-acceptance", {
+            message: `目标分支变化后的独立重测未通过：${result.message}；候选已保留，请重新验收。`,
+            mergeValidation: {
+              required: true,
+              status: "failed",
+              runId: result.runId,
+              targetCommit: validation.targetCommit,
+              message: result.message,
+              updatedAt: now()
+            }
+          });
+          return;
+        }
+        await transitionRunDelivery(runDir, id, "merging", {
+          message: "目标漂移回归已通过，正在写入真实目标分支。",
+          mergeValidation: {
+            required: true,
+            status: "passed",
+            runId: result.runId,
+            targetCommit: validation.targetCommit,
+            message: result.message,
+            updatedAt: now()
+          }
+        });
+      } finally {
+        await removeMergeValidationWorktree(validation);
+      }
+    } else {
+      await transitionRunDelivery(runDir, id, "merging", {
+        message: "目标分支未发生变化，正在执行已批准的串行合入。",
+        mergeValidation: {
+          required: false,
+          status: "not-required",
+          targetCommit: assessment.currentTargetCommit,
+          updatedAt: now()
+        }
+      });
+    }
+
+    const latest = await previewRunMerge(run, runDir);
+    if (!latest.targetBranch) throw new Error("合入前无法解析目标分支");
+    await mergeAcceptedRun(run, runDir, {
+      confirmation: latest.confirmationToken,
+      targetBranch: latest.targetBranch
+    });
+  }
+
   async getRunMergePreview(id: string): Promise<RunMergePreview> {
     const { run, runDir } = await this.getRunDeliveryContext(id);
-    return previewRunMerge(run, runDir);
+    const preview = await previewRunMerge(run, runDir);
+    if (["queued-for-merge", "retesting", "merging"].includes(preview.status)) {
+      this.scheduleQueuedMerge(id, preview);
+    }
+    return preview;
+  }
+
+  async queueRunMerge(
+    id: string,
+    input: { confirmation: string; targetBranch: string; actor: string }
+  ): Promise<RunMergeQueueResult> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    const queued = await queueAcceptedRun(run, runDir, input);
+    this.scheduleQueuedMerge(id);
+    return queued;
   }
 
   async mergeRun(

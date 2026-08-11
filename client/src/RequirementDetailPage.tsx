@@ -39,7 +39,7 @@ function startBlockedReason(detail: RequirementDetail, configured: boolean, poli
   if (!configured) return "项目尚未配置需求推进入口";
   if (!policyAvailable) return "项目配置的入口策略不存在或已归档";
   if (detail.lane === "clarify") return "需求仍在待澄清，请先补齐关键信息";
-  if (detail.lane === "acceptance" || detail.lane === "done") return "该需求已经进入验收或完成阶段";
+  if (detail.lane === "acceptance" || detail.lane === "merging" || detail.lane === "done") return "该需求已经进入验收、待合入或完成阶段";
   if (detail.exception === "cancelled") return "已取消的需求不能开始推进";
   if (detail.acceptanceCriteria.length === 0) return "请先补齐至少一条可观察的验收标准";
   if (detail.advancement?.invocationId
@@ -269,7 +269,7 @@ export function RequirementDetailPage({
             invalid={Boolean(migrateError)}
             errorMessage={migrateError || undefined}
             options={VISIBLE_REQUIREMENT_LANES.map((lane) => {
-              const runtimeControlled = lane.id === "queued" || lane.id === "running" || lane.id === "confirmation";
+              const runtimeControlled = lane.id === "queued" || lane.id === "running" || lane.id === "confirmation" || lane.id === "merging";
               return {
                 value: lane.id,
                 label: lane.label,

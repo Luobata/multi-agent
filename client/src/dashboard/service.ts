@@ -79,6 +79,12 @@ export interface DashboardService {
   failRequirementAdvancement(id: string, idempotencyKey: string, message: string): Promise<Requirement>;
   /** 原子提交：验证全套 Run 验收证据后，一次性写入 evidence 并迁移到「待验收」。 */
   submitRequirementForAcceptance(requirementId: string, snapshot: RunAcceptanceSnapshot): Promise<Requirement>;
+  /** 仅接受与固定验收快照同一 Run 的服务端交付状态，驱动待合入 / 完成 / 退回验收。 */
+  syncRequirementDelivery(
+    requirementId: string,
+    runId: string,
+    status: "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance"
+  ): Promise<Requirement>;
   archiveRequirement(id: string): Promise<ArchiveRecord>;
   getProjectProfile(id: string): Promise<ProjectProfile>;
   bindRepository(input: { projectId: string; label: string; path: string; defaultBranch?: string }): Promise<ManagedProject>;
@@ -667,7 +673,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         if (!REQUIREMENT_LANES.some((entry) => entry.id === lane)) throw failure("目标列不存在", "请重新选择目标列", "未写入任何变更");
         if (requirement.exception === "cancelled") throw failure("已取消的需求不能迁移列", "请先在看板恢复其状态或联系领队", "未写入任何变更");
         if (requirement.lane === lane) return { ...requirement };
-        if (lane === "queued" || lane === "running" || lane === "confirmation") {
+        if (lane === "queued" || lane === "running" || lane === "confirmation" || lane === "merging") {
           throw failure(
             `「${requirementLaneLabel(lane)}」只能由真实 Run 更新`,
             "请在需求详情点击「开始推进」，系统会按 Invocation 状态自动迁移",
@@ -808,6 +814,36 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         record("提交验收", requirement.code, moved ? `${from} → 待验收；Run ${fixed.runId} 验收快照已固定。` : `Run ${fixed.runId} 验收快照已更新。`);
         const { rawRequirement: _raw, acceptanceCriteria: _ac, dag: _dag, timeline: _tl, resourceOverview: _ro, evidence: _ev, ...summary } = requirement;
         return { ...summary };
+      });
+    },
+    syncRequirementDelivery(requirementId, runId, status) {
+      return respond(() => {
+        const requirement = store.requirements.find((candidate) => candidate.id === requirementId);
+        if (!requirement || requirement.archivedAt) throw failure("没有找到这条需求", "请回到需求看板重新选择", "未写入任何变更");
+        const acceptedRunId = requirement.evidence.acceptance?.runId;
+        if (!acceptedRunId || acceptedRunId !== runId) {
+          throw failure(
+            "交付状态与已固定的验收 Run 不一致",
+            "请从该需求绑定的运行卷宗重新发起合入",
+            "需求列和验收快照均未改变"
+          );
+        }
+        const lane: RequirementLane = status === "merged"
+          ? "done"
+          : status === "conflict" || status === "returned-to-acceptance"
+            ? "acceptance"
+            : "merging";
+        if (requirement.lane === lane) return requirementSummary(requirement);
+        const from = requirementLaneLabel(requirement.lane);
+        requirement.lane = lane;
+        requirement.exception = status === "conflict" ? "blocked" : null;
+        requirement.updatedAt = touch();
+        record(
+          status === "merged" ? "完成合入" : lane === "acceptance" ? "退回验收" : "进入待合入",
+          requirement.code,
+          `${from} → ${requirementLaneLabel(lane)}；Run ${runId} 交付状态 ${status}。`
+        );
+        return requirementSummary(requirement);
       });
     },
     archiveRequirement(id) {

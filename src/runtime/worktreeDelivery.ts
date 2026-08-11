@@ -13,7 +13,18 @@ const MAX_UNTRACKED_DIFF_FILES = 100;
 const MAX_EVIDENCE_FILES = 2_000;
 const MAX_EVIDENCE_DEPTH = 10;
 
-export type DeliveryStatus = "awaiting-acceptance" | "conflict" | "merged" | "kept" | "discarded";
+export type DeliveryStatus =
+  | "awaiting-acceptance"
+  | "queued-for-merge"
+  | "retesting"
+  | "merging"
+  | "returned-to-acceptance"
+  | "conflict"
+  | "merged"
+  | "kept"
+  | "discarded";
+
+export type EvidenceRerunStatus = "queued" | "running" | "passed" | "failed";
 
 export interface RunEvidenceAsset {
   id: string;
@@ -47,10 +58,28 @@ export interface RunDeliveryRecord {
   sourceCommit?: string;
   targetBranch?: string;
   targetCommitBeforeMerge?: string;
+  queuedTargetCommit?: string;
   mergeCommit?: string;
   message?: string;
+  mergeValidation?: {
+    required: boolean;
+    status: "not-required" | "running" | "passed" | "failed";
+    runId?: string;
+    targetCommit?: string;
+    message?: string;
+    updatedAt: string;
+  };
+  evidenceRerun?: {
+    status: EvidenceRerunStatus;
+    actor: string;
+    requestedAt: string;
+    updatedAt: string;
+    runId?: string;
+    message?: string;
+    mediaCount?: number;
+  };
   humanDecision?: {
-    action: "keep" | "discard";
+    action: "keep" | "discard" | "merge";
     actor: string;
     at: string;
     note?: string;
@@ -93,6 +122,30 @@ export interface RunMergePreview {
 export interface RunMergeResult {
   status: "merged" | "conflict";
   delivery: RunDeliveryRecord;
+}
+
+export interface RunMergeQueueResult {
+  status: "queued-for-merge";
+  delivery: RunDeliveryRecord;
+}
+
+export interface QueuedRunAssessment {
+  repositoryRoot: string;
+  worktreePath: string;
+  targetBranch: string;
+  queuedTargetCommit: string;
+  currentTargetCommit: string;
+  targetChanged: boolean;
+  conflict: boolean;
+  conflictMessage?: string;
+}
+
+export interface MergeValidationWorktree {
+  repositoryRoot: string;
+  worktreePath: string;
+  targetBranch: string;
+  targetCommit: string;
+  sourceCommit: string;
 }
 
 export interface RunDeliveryActionResult {
@@ -164,6 +217,55 @@ async function writeRunDelivery(runDir: string, record: RunDeliveryRecord): Prom
   const temporary = `${destination}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await fs.rename(temporary, destination);
+}
+
+export async function updateRunDelivery(
+  runDir: string,
+  runId: string,
+  update: (current: RunDeliveryRecord | undefined) => RunDeliveryRecord
+): Promise<RunDeliveryRecord> {
+  assertRunId(runId);
+  const current = await readRunDelivery(runDir);
+  if (current?.runId && current.runId !== runId) {
+    throw new Error("交付记录与当前 Run 不匹配，请检查 Run Store 完整性");
+  }
+  const next = update(current);
+  if (next.runId !== runId) throw new Error("交付记录更新不能改变 Run ID");
+  await writeRunDelivery(runDir, next);
+  return next;
+}
+
+export async function transitionRunDelivery(
+  runDir: string,
+  runId: string,
+  status: DeliveryStatus,
+  input: {
+    message?: string;
+    mergeValidation?: RunDeliveryRecord["mergeValidation"];
+  } = {}
+): Promise<RunDeliveryRecord> {
+  return updateRunDelivery(runDir, runId, (current) => ({
+    ...current,
+    runId,
+    status,
+    updatedAt: new Date().toISOString(),
+    ...(input.message !== undefined ? { message: input.message.slice(0, 8_000) } : {}),
+    ...(input.mergeValidation ? { mergeValidation: input.mergeValidation } : {})
+  }));
+}
+
+export async function updateRunEvidenceRerun(
+  runDir: string,
+  runId: string,
+  evidenceRerun: NonNullable<RunDeliveryRecord["evidenceRerun"]>
+): Promise<RunDeliveryRecord> {
+  return updateRunDelivery(runDir, runId, (current) => ({
+    ...current,
+    runId,
+    status: current?.status ?? "awaiting-acceptance",
+    updatedAt: new Date().toISOString(),
+    evidenceRerun
+  }));
 }
 
 const EVIDENCE_MEDIA: Record<string, { kind: RunEvidenceAsset["kind"]; mediaType: string }> = {
@@ -521,20 +623,13 @@ async function currentTargetState(repositoryRoot: string): Promise<{ branch: str
   return { branch, commit: await git(repositoryRoot, ["rev-parse", "HEAD"]) };
 }
 
-export async function mergeAcceptedRun(
+async function ensureDeliverySource(
   run: WorkflowRunRecord,
   runDir: string,
-  input: { confirmation: string; targetBranch: string }
-): Promise<RunMergeResult> {
-  if (input.confirmation !== confirmationToken(run.id)) throw new Error("缺少本次 Run 的明确合并确认");
-  const preview = await previewRunMerge(run, runDir);
-  if (!preview.eligible || !preview.repositoryRoot || !preview.worktreePath || !preview.targetBranch) {
-    throw new Error(preview.reasons.join(" ") || "该 Run 当前不能合并");
-  }
-  if (input.targetBranch !== preview.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
-  const before = await currentTargetState(preview.repositoryRoot);
-  if (before.branch !== input.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
-
+  preview: RunMergePreview,
+  before: { branch: string; commit: string }
+): Promise<RunDeliveryRecord> {
+  if (!preview.repositoryRoot || !preview.worktreePath) throw new Error("该 Run 当前不能准备交付来源");
   let delivery = await readRunDelivery(runDir);
   if (delivery?.sourceCommit) {
     const expectedSourceBranch = deliveryBranch(run.id);
@@ -556,36 +651,155 @@ export async function mergeAcceptedRun(
     if (currentSourceBranch !== expectedSourceBranch || currentSourceCommit !== delivery.sourceCommit) {
       throw new Error("交付记录的源分支或 commit 已变化，请重新核对 worktree");
     }
+    return delivery;
   }
-  if (!delivery?.sourceCommit) {
-    const baseCommit = run.isolation?.baseCommit ?? await git(preview.worktreePath, ["rev-parse", "HEAD"]);
-    const sourceBranch = deliveryBranch(run.id);
-    const currentSourceBranch = await git(preview.worktreePath, ["branch", "--show-current"]);
-    if (currentSourceBranch !== sourceBranch) {
-      const exists = (await git(preview.repositoryRoot, ["branch", "--list", sourceBranch])).length > 0;
-      await git(preview.worktreePath, exists ? ["switch", sourceBranch] : ["switch", "-c", sourceBranch]);
-    }
-    await git(preview.worktreePath, ["add", "-A"]);
-    if ((await git(preview.worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"])).length > 0) {
-      await git(preview.worktreePath, [
-        "-c", "user.name=Local Agent Workbench",
-        "-c", "user.email=workbench@local.invalid",
-        "commit", "--no-verify", "-m", `chore: deliver ${run.id}`
-      ]);
-    }
-    delivery = {
-      ...delivery,
-      runId: run.id,
-      status: "awaiting-acceptance",
-      updatedAt: new Date().toISOString(),
-      baseCommit,
-      sourceBranch,
-      sourceCommit: await git(preview.worktreePath, ["rev-parse", "HEAD"]),
-      targetBranch: before.branch,
-      targetCommitBeforeMerge: before.commit
-    };
-    await writeRunDelivery(runDir, delivery);
+
+  const baseCommit = run.isolation?.baseCommit ?? await git(preview.worktreePath, ["rev-parse", "HEAD"]);
+  const sourceBranch = deliveryBranch(run.id);
+  const currentSourceBranch = await git(preview.worktreePath, ["branch", "--show-current"]);
+  if (currentSourceBranch !== sourceBranch) {
+    const exists = (await git(preview.repositoryRoot, ["branch", "--list", sourceBranch])).length > 0;
+    await git(preview.worktreePath, exists ? ["switch", sourceBranch] : ["switch", "-c", sourceBranch]);
   }
+  await git(preview.worktreePath, ["add", "-A"]);
+  if ((await git(preview.worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"])).length > 0) {
+    await git(preview.worktreePath, [
+      "-c", "user.name=Local Agent Workbench",
+      "-c", "user.email=workbench@local.invalid",
+      "commit", "--no-verify", "-m", `chore: deliver ${run.id}`
+    ]);
+  }
+  delivery = {
+    ...delivery,
+    runId: run.id,
+    status: delivery?.status ?? "awaiting-acceptance",
+    updatedAt: new Date().toISOString(),
+    baseCommit,
+    sourceBranch,
+    sourceCommit: await git(preview.worktreePath, ["rev-parse", "HEAD"]),
+    targetBranch: before.branch,
+    targetCommitBeforeMerge: delivery?.targetCommitBeforeMerge ?? before.commit
+  };
+  await writeRunDelivery(runDir, delivery);
+  return delivery;
+}
+
+export async function queueAcceptedRun(
+  run: WorkflowRunRecord,
+  runDir: string,
+  input: { confirmation: string; targetBranch: string; actor: string }
+): Promise<RunMergeQueueResult> {
+  if (input.confirmation !== confirmationToken(run.id)) throw new Error("缺少本次 Run 的明确合并确认");
+  const actor = humanActor(input.actor);
+  const preview = await previewRunMerge(run, runDir);
+  if (!preview.eligible || !preview.repositoryRoot || !preview.worktreePath || !preview.targetBranch) {
+    throw new Error(preview.reasons.join(" ") || "该 Run 当前不能进入待合入队列");
+  }
+  if (preview.delivery?.evidenceRerun?.status === "queued" || preview.delivery?.evidenceRerun?.status === "running") {
+    throw new Error("验收截图仍在补采，请等待证据任务完成后再批准合入");
+  }
+  if (input.targetBranch !== preview.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
+  const before = await currentTargetState(preview.repositoryRoot);
+  if (before.branch !== input.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
+  const delivery = await ensureDeliverySource(run, runDir, preview, before);
+  if (delivery.status === "merged" || delivery.status === "discarded") {
+    throw new Error(delivery.status === "merged" ? "该交付已经合并" : "该交付已经丢弃");
+  }
+  const queued: RunDeliveryRecord = {
+    ...delivery,
+    status: "queued-for-merge",
+    updatedAt: new Date().toISOString(),
+    targetBranch: before.branch,
+    queuedTargetCommit: ["queued-for-merge", "retesting", "merging"].includes(delivery.status)
+      ? delivery.queuedTargetCommit ?? before.commit
+      : before.commit,
+    message: "人工验收已通过，正在等待目标分支的串行合入协调。",
+    humanDecision: {
+      action: "merge",
+      actor,
+      at: new Date().toISOString()
+    }
+  };
+  await writeRunDelivery(runDir, queued);
+  return { status: "queued-for-merge", delivery: queued };
+}
+
+export async function assessQueuedRun(
+  run: WorkflowRunRecord,
+  runDir: string
+): Promise<QueuedRunAssessment> {
+  const preview = await previewRunMerge(run, runDir);
+  const delivery = await readRunDelivery(runDir);
+  if (!preview.repositoryRoot || !preview.worktreePath || !delivery?.sourceCommit || !delivery.targetBranch || !delivery.queuedTargetCommit) {
+    throw new Error("待合入记录缺少候选来源、目标分支或队列基线");
+  }
+  const current = await currentTargetState(preview.repositoryRoot);
+  if (current.branch !== delivery.targetBranch) throw new Error("目标分支已切换，不能继续自动合入");
+  const mergeCheck = await runGit(preview.repositoryRoot, [
+    "merge-tree", "--write-tree", current.commit, delivery.sourceCommit
+  ]);
+  return {
+    repositoryRoot: preview.repositoryRoot,
+    worktreePath: preview.worktreePath,
+    targetBranch: current.branch,
+    queuedTargetCommit: delivery.queuedTargetCommit,
+    currentTargetCommit: current.commit,
+    targetChanged: current.commit !== delivery.queuedTargetCommit,
+    conflict: mergeCheck.code !== 0,
+    ...(mergeCheck.code !== 0
+      ? { conflictMessage: (mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "合并冲突").slice(0, 8_000) }
+      : {})
+  };
+}
+
+export async function createMergeValidationWorktree(
+  run: WorkflowRunRecord,
+  runDir: string
+): Promise<MergeValidationWorktree> {
+  const assessment = await assessQueuedRun(run, runDir);
+  if (assessment.conflict) throw new Error(assessment.conflictMessage ?? "合并冲突");
+  const delivery = await readRunDelivery(runDir);
+  if (!delivery?.sourceCommit) throw new Error("待合入记录缺少候选 commit");
+  const parent = path.join(assessment.repositoryRoot, ".multi-agent", "merge-validation");
+  await fs.mkdir(parent, { recursive: true });
+  const worktreePath = path.join(parent, `${run.id}-${randomUUID()}`);
+  const added = await runGit(assessment.repositoryRoot, [
+    "worktree", "add", "--detach", worktreePath, assessment.currentTargetCommit
+  ]);
+  if (added.code !== 0) throw new Error(added.stderr.trim() || added.stdout.trim() || "无法创建合入重测 worktree");
+  const merged = await runGit(worktreePath, ["merge", "--no-commit", "--no-ff", delivery.sourceCommit]);
+  if (merged.code !== 0) {
+    await removeRunWorktree(assessment.repositoryRoot, worktreePath);
+    throw new Error(merged.stderr.trim() || merged.stdout.trim() || "合入重测 worktree 发生冲突");
+  }
+  return {
+    repositoryRoot: assessment.repositoryRoot,
+    worktreePath,
+    targetBranch: assessment.targetBranch,
+    targetCommit: assessment.currentTargetCommit,
+    sourceCommit: delivery.sourceCommit
+  };
+}
+
+export async function removeMergeValidationWorktree(input: MergeValidationWorktree): Promise<void> {
+  await removeRunWorktree(input.repositoryRoot, input.worktreePath);
+}
+
+export async function mergeAcceptedRun(
+  run: WorkflowRunRecord,
+  runDir: string,
+  input: { confirmation: string; targetBranch: string }
+): Promise<RunMergeResult> {
+  if (input.confirmation !== confirmationToken(run.id)) throw new Error("缺少本次 Run 的明确合并确认");
+  const preview = await previewRunMerge(run, runDir);
+  if (!preview.eligible || !preview.repositoryRoot || !preview.worktreePath || !preview.targetBranch) {
+    throw new Error(preview.reasons.join(" ") || "该 Run 当前不能合并");
+  }
+  if (input.targetBranch !== preview.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
+  const before = await currentTargetState(preview.repositoryRoot);
+  if (before.branch !== input.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
+
+  const delivery = await ensureDeliverySource(run, runDir, preview, before);
   if (!delivery.baseCommit || !delivery.sourceBranch || !delivery.sourceCommit || !delivery.targetBranch) {
     throw new Error("交付记录缺少合并所需的来源或目标信息");
   }

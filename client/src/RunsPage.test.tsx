@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RunsPage, acceptanceSnapshotFromPreview, filterRuns, sortHumanDecisionRequests } from "./RunsPage";
-import type { HumanDecisionRequest, Run, RunMergePreview, RunMergeResult } from "./types";
+import type { HumanDecisionRequest, Run, RunMergePreview, RunMergeQueueResult } from "./types";
 
 const runs: Run[] = [
   { id: "run-single-1", workflow: "direct-alice", architecture: "graph", artifactDir: "/a", status: "passed", createdAt: "2026-08-06T03:00:00.000Z", nodes: {}, category: "single", project: "demo-project", trigger: "mcp" },
@@ -70,7 +70,7 @@ describe("RunsPage classification filters", () => {
 
   it("shows the concrete delivery blocker and withholds merge when the preview is ineligible", () => {
     expect(container.textContent).toContain("该 Run 没有可交付的 worktree。");
-    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "合并到目标分支")).toBe(false);
+    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "批准并加入待合入")).toBe(false);
   });
 });
 
@@ -372,22 +372,21 @@ describe("RunsPage delivery acceptance", () => {
               : eligiblePreview;
         return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: preview }) });
       }
-      if (url.endsWith("/merge") && init?.method === "POST") {
-        deliveryStatus = "conflict";
-        const result: RunMergeResult = {
-          status: "conflict",
+      if (url.endsWith("/merge-queue") && init?.method === "POST") {
+        const result: RunMergeQueueResult = {
+          status: "queued-for-merge",
           delivery: {
             runId: deliveryRun.id,
-            status: "conflict",
+            status: "queued-for-merge",
             updatedAt: "2026-08-06T06:05:00.000Z",
             baseCommit: "base",
             sourceBranch: "codex/run-delivery-ui-1",
             sourceCommit: "source",
             targetBranch: "main",
-            message: "CONFLICT (content): Merge conflict in client/src/RunsPage.tsx"
+            message: "人工验收已通过，正在等待目标分支的串行合入协调。"
           }
         };
-        return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: result }) });
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: result }) });
       }
       if (url.endsWith("/keep") && init?.method === "POST") {
         deliveryStatus = "kept";
@@ -399,6 +398,14 @@ describe("RunsPage delivery acceptance", () => {
       }
       if (url.endsWith("/open-worktree") && init?.method === "POST") {
         return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: { runId: deliveryRun.id, worktreePath: deliveryRun.isolation?.worktreePath, repositoryRoot: "/repo" } }) });
+      }
+      if (url.endsWith("/evidence-rerun") && init?.method === "POST") {
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: {
+          runId: deliveryRun.id,
+          status: "awaiting-acceptance",
+          updatedAt: "2026-08-06T06:06:00.000Z",
+          evidenceRerun: { status: "queued", actor: "workbench-operator", requestedAt: "2026-08-06T06:06:00.000Z", updatedAt: "2026-08-06T06:06:00.000Z" }
+        } }) });
       }
       if (url === `/api/runs/${deliveryRun.id}`) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: deliveryRun }) });
       return Promise.resolve({ ok: false, status: 404, json: async () => ({ error: { message: "not found" } }) });
@@ -425,7 +432,21 @@ describe("RunsPage delivery acceptance", () => {
   it("shows media evidence and exposes merge only for an eligible preview", () => {
     expect(container.querySelector<HTMLImageElement>('img[alt="acceptance.png"]')?.src).toContain("/evidence/");
     expect(container.querySelector<HTMLVideoElement>('video[aria-label="flow.mp4"]')).toBeTruthy();
-    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "合并到目标分支")).toBe(true);
+    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "批准并加入待合入")).toBe(true);
+  });
+
+  it("offers an independent screenshot rerun when the Evidence wall has no media", async () => {
+    const originalAssets = eligiblePreview.evidence.assets;
+    eligiblePreview.evidence.assets = [];
+    try {
+      await act(async () => { root.render(<RunsPage notify={notify} />); await Promise.resolve(); });
+      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "补采验收截图");
+      expect(rerun).toBeTruthy();
+      await act(async () => { rerun?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
+    } finally {
+      eligiblePreview.evidence.assets = originalAssets;
+    }
   });
 
   it("derives board acceptance from the server eligible result, not the legacy acceptedVerdict", () => {
@@ -459,7 +480,7 @@ describe("RunsPage delivery acceptance", () => {
     const confirm = Array.from(container.querySelectorAll<HTMLButtonElement>("dialog button")).find((button) => button.textContent === "确认人工保留");
     await act(async () => { confirm?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(container.textContent).toContain("交付已人工保留");
-    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "合并到目标分支")).toBe(true);
+    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "批准并加入待合入")).toBe(true);
     expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "丢弃候选结果")).toBe(true);
   });
 
@@ -484,13 +505,13 @@ describe("RunsPage delivery acceptance", () => {
   });
 
   it("keeps preview opening read-only and posts the exact token only after explicit confirmation", async () => {
-    const open = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "合并到目标分支");
+    const open = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "批准并加入待合入");
     await act(async () => { open?.click(); });
-    expect(fetchMock.mock.calls.filter(([input, init]) => String(input).endsWith("/merge") && (init as RequestInit | undefined)?.method === "POST")).toHaveLength(0);
+    expect(fetchMock.mock.calls.filter(([input, init]) => String(input).endsWith("/merge-queue") && (init as RequestInit | undefined)?.method === "POST")).toHaveLength(0);
     const dialog = container.querySelector("dialog");
-    expect(dialog?.textContent).toContain("预览为只读");
+    expect(dialog?.textContent).toContain("批准后由队列串行推进");
     expect(dialog?.textContent).toContain(`MERGE ${deliveryRun.id}`);
-    const submit = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? []).find((button) => button.textContent?.startsWith("确认合并到"));
+    const submit = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? []).find((button) => button.textContent?.startsWith("批准并排队合入"));
     expect(submit?.disabled).toBe(true);
 
     await act(async () => { dialog?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click(); });
@@ -500,13 +521,13 @@ describe("RunsPage delivery acceptance", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const post = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith("/merge") && (init as RequestInit | undefined)?.method === "POST");
+    const post = fetchMock.mock.calls.find(([input, init]) => String(input).endsWith("/merge-queue") && (init as RequestInit | undefined)?.method === "POST");
     expect(JSON.parse(String((post?.[1] as RequestInit | undefined)?.body))).toEqual({
       confirmation: `MERGE ${deliveryRun.id}`,
-      targetBranch: "main"
+      targetBranch: "main",
+      actor: "workbench-operator"
     });
-    expect(container.textContent).toContain("目标分支存在合并冲突");
-    expect(container.textContent).toContain(deliveryRun.isolation?.worktreePath);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("待合入队列"), "success");
   });
 });
 

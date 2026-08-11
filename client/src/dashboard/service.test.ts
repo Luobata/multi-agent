@@ -569,10 +569,10 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
     expect(await expectFailure(service.createRequirement({ ...input, projectId: "missing" }))).toContain("尚未正式接入或已归档");
   });
 
-  it("看板八列契约完整，按项目过滤且去掉详情字段", async () => {
+  it("看板九列契约完整，按项目过滤且去掉详情字段", async () => {
     const service = makeService();
     expect(REQUIREMENT_LANES.map((lane) => lane.id)).toEqual([
-      "inbox", "clarify", "planned", "queued", "running", "confirmation", "acceptance", "done"
+      "inbox", "clarify", "planned", "queued", "running", "confirmation", "acceptance", "merging", "done"
     ]);
     const all = await service.listBoard();
     expect(all.length).toBeGreaterThan(0);
@@ -662,6 +662,26 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
     expect(detail.evidence.acceptance).toEqual(snapshot);
     expect(detail.evidence.testReport).toContain("quality-test");
     expect(detail.evidence.reviewNotes).toContain("independent-review");
+  });
+
+  it("只用同一验收 Run 的交付状态驱动待合入、完成与异常退回", async () => {
+    const service = makeService();
+    const runId = "run-merge-queue-102";
+    await service.submitRequirementForAcceptance("req-102", {
+      runId,
+      eligible: true,
+      worktreePath: `/repo/.multi-agent/worktrees/${runId}`,
+      testGate: { gateId: "quality-test", status: "passed" },
+      reviewGate: { gateId: "independent-review", status: "passed" },
+      mediaCount: 1,
+      structuredE2eCount: 1,
+      diffFiles: ["client/src/RunsPage.tsx"],
+      capturedAt: FIXED_NOW.toISOString()
+    });
+    expect((await service.syncRequirementDelivery("req-102", runId, "queued-for-merge")).lane).toBe("merging");
+    expect((await service.syncRequirementDelivery("req-102", runId, "returned-to-acceptance")).lane).toBe("acceptance");
+    expect((await service.syncRequirementDelivery("req-102", runId, "merged")).lane).toBe("done");
+    expect(await expectFailure(service.syncRequirementDelivery("req-102", "run-other", "merged"))).toContain("不一致");
   });
 
   it("拒绝未知需求、非法目标列与已取消需求", async () => {

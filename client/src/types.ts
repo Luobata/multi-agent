@@ -633,17 +633,35 @@ export interface RunGateEvidence {
 
 export interface RunDeliveryRecord {
   runId: string;
-  status: "awaiting-acceptance" | "conflict" | "merged" | "kept" | "discarded";
+  status: "awaiting-acceptance" | "queued-for-merge" | "retesting" | "merging" | "returned-to-acceptance" | "conflict" | "merged" | "kept" | "discarded";
   updatedAt: string;
-  baseCommit: string;
-  sourceBranch: string;
-  sourceCommit: string;
-  targetBranch: string;
+  baseCommit?: string;
+  sourceBranch?: string;
+  sourceCommit?: string;
+  targetBranch?: string;
   targetCommitBeforeMerge?: string;
+  queuedTargetCommit?: string;
   mergeCommit?: string;
   message?: string;
+  mergeValidation?: {
+    required: boolean;
+    status: "not-required" | "running" | "passed" | "failed";
+    runId?: string;
+    targetCommit?: string;
+    message?: string;
+    updatedAt: string;
+  };
+  evidenceRerun?: {
+    status: "queued" | "running" | "passed" | "failed";
+    actor: string;
+    requestedAt: string;
+    updatedAt: string;
+    runId?: string;
+    message?: string;
+    mediaCount?: number;
+  };
   humanDecision?: {
-    action: "keep" | "discard";
+    action: "keep" | "discard" | "merge";
     actor: string;
     at: string;
     note?: string;
@@ -681,7 +699,7 @@ export interface HumanDecisionRequest {
 
 export interface RunMergePreview {
   runId: string;
-  status: "not-ready" | "awaiting-acceptance" | "conflict" | "merged" | "kept" | "discarded";
+  status: "not-ready" | "awaiting-acceptance" | "queued-for-merge" | "retesting" | "merging" | "returned-to-acceptance" | "conflict" | "merged" | "kept" | "discarded";
   eligible: boolean;
   reasons: string[];
   worktreePath?: string;
@@ -715,6 +733,11 @@ export interface RunMergePreview {
 
 export interface RunMergeResult {
   status: "merged" | "conflict";
+  delivery: RunDeliveryRecord;
+}
+
+export interface RunMergeQueueResult {
+  status: "queued-for-merge";
   delivery: RunDeliveryRecord;
 }
 
