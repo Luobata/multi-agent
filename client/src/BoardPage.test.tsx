@@ -1,8 +1,9 @@
 /** @vitest-environment jsdom */
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BoardPage, requirementStewardOutput } from "./BoardPage";
+import { BoardPage, ConversationMessageContent, normalizeConversationLineBreaks, requirementStewardOutput } from "./BoardPage";
 import { createDashboardService } from "./dashboard/service";
 import type { HumanDecisionRequest, InvocationRecord, Project, RunMergePreview, Session } from "./types";
 
@@ -57,6 +58,19 @@ describe("requirementStewardOutput", () => {
       draft: { title: "标题", summary: "摘要", priority: "high", rawRequirement: "改写", acceptanceCriteria: ["可验收"] }
     })).toMatchObject({ draft: { title: "标题", priority: "high" } });
     expect(requirementStewardOutput({ message: "missing action" })).toBeUndefined();
+  });
+});
+
+describe("ConversationMessageContent", () => {
+  it("decodes line breaks and safely renders paragraphs, lists and bold text", () => {
+    const html = renderToStaticMarkup(<ConversationMessageContent content={'第一段\\n\\n**重点**\\n1) 第一步\\n2. 第二步\\n- 条目<script>alert("x")</script>'} />);
+    expect(normalizeConversationLineBreaks("a\\n\\nb")).toBe("a\n\nb");
+    expect(html).toContain("board-ai-message-spacer");
+    expect(html).toContain("<strong>重点</strong>");
+    expect(html).toContain("<ol><li>第一步</li><li>第二步</li></ol>");
+    expect(html).toContain("<ul><li>条目&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;</li></ul>");
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("\\n");
   });
 });
 
@@ -262,6 +276,31 @@ describe("BoardPage AI requirement creation", () => {
     ]);
     const [created] = await service.listBoard();
     expect(await service.getRequirement(created!.id)).toMatchObject({ rawRequirement: "购物车空态增加优惠推荐" });
+  });
+
+  it("shows an animated waiting bubble only while the steward request is pending", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    service.syncConnectedProjects([connectedProject()]);
+    let resolveRequest!: (value: unknown) => void;
+    fetchMock.mockReset().mockReturnValue(new Promise((resolve) => { resolveRequest = resolve; }));
+    act(() => root.render(<BoardPage spaceId="connected-a" go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    act(() => button("和 AI 说需求").click());
+    const textarea = document.querySelector('textarea[aria-label="描述需求"]') as HTMLTextAreaElement;
+    act(() => setText(textarea, "等待中的需求"));
+    act(() => button("交给需求管家").click());
+
+    expect(document.querySelector('[aria-label="需求管家整理中"]')).toBeTruthy();
+    expect(document.querySelector(".composer-loading")).toBeTruthy();
+    expect(textarea.disabled).toBe(true);
+
+    await act(async () => {
+      resolveRequest({ ok: false, status: 500, json: async () => ({ error: "失败" }) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(document.querySelector('[aria-label="需求管家整理中"]')).toBeNull();
+    expect(document.querySelector(".composer-loading")).toBeNull();
+    expect(textarea.value).toBe("等待中的需求");
   });
 
   it("keeps an unclear requirement in the same session until the user answers the Agent question", async () => {

@@ -15,7 +15,7 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /** FileReader 加载是异步任务，多等几个宏任务确保附件落进状态。 */
 async function settle() {
-  for (let index = 0; index < 10; index += 1) await flush();
+  for (let index = 0; index < 30; index += 1) await flush();
 }
 
 function imageFile(name: string, bytes: number, type = "image/png"): File {
@@ -189,6 +189,28 @@ describe("ConversationComposer", () => {
       container.querySelector<HTMLButtonElement>(".composer-attachment-remove")
         ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
+    expect(container.querySelectorAll(".composer-attachment")).toHaveLength(0);
+  });
+
+  it("previews a staged image without removing it and closes the preview", async () => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    const { textarea } = render(onSend);
+    await act(async () => {
+      pasteFiles(textarea, [imageFile("preview.png", 64)]);
+      await settle();
+    });
+
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="放大预览 preview.png"]')?.click());
+    const preview = document.querySelector<HTMLDialogElement>("dialog.message-evidence-preview-modal");
+    expect(preview?.open).toBe(true);
+    expect(preview?.querySelector<HTMLImageElement>("img")?.src).toMatch(/^data:image\/png;base64,/);
+    expect(container.querySelectorAll(".composer-attachment")).toHaveLength(1);
+
+    act(() => preview?.querySelector<HTMLButtonElement>('[aria-label="关闭弹窗"]')?.click());
+    expect(document.querySelector("dialog.message-evidence-preview-modal")).toBeNull();
+    expect(container.querySelectorAll(".composer-attachment")).toHaveLength(1);
+
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="移除附件 preview.png"]')?.click());
     expect(container.querySelectorAll(".composer-attachment")).toHaveLength(0);
   });
 

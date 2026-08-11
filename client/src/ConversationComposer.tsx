@@ -141,6 +141,8 @@ export function ConversationComposer({
   const [images, setImages] = useState<ComposerImage[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
   const [pending, setPending] = useState(false);
+  const [previewImage, setPreviewImage] = useState<ComposerImage>();
+  const [failedImages, setFailedImages] = useState<Set<string>>(() => new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const errorId = useId();
   const pendingRef = useRef(onPendingChange);
@@ -215,6 +217,7 @@ export function ConversationComposer({
 
   const removeImage = (id: string) => {
     setImages((current) => current.filter((image) => image.id !== id));
+    setPreviewImage((current) => current?.id === id ? undefined : current);
     setAttachmentError("");
   };
 
@@ -251,7 +254,11 @@ export function ConversationComposer({
   return <form className={`composer conversation-composer ${className}`.trim()} onSubmit={(event) => void submit(event)}>
     {images.length > 0 && <ul className="composer-attachments" aria-label="待发送的图片附件">
       {images.map((image) => <li className="composer-attachment" key={image.id}>
-        <img src={`data:${image.mediaType};base64,${image.base64}`} alt="" width={48} height={48} />
+        <button type="button" className="composer-attachment-preview" onClick={() => setPreviewImage(image)} aria-haspopup="dialog" aria-label={`放大预览 ${image.name}`}>
+          {failedImages.has(image.id)
+            ? <span className="composer-attachment-image-error" role="status">无法加载</span>
+            : <img src={`data:${image.mediaType};base64,${image.base64}`} alt="" width={48} height={48} onError={() => setFailedImages((current) => new Set(current).add(image.id))} />}
+        </button>
         <span className="composer-attachment-meta"><strong>{image.name}</strong><small>{image.mediaType.split("/")[1].toUpperCase()} · {formatAttachmentSize(image.sizeBytes)}</small></span>
         <button type="button" className="composer-attachment-remove" disabled={pending} onClick={() => removeImage(image.id)} aria-label={`移除附件 ${image.name}`}>×</button>
       </li>)}
@@ -274,7 +281,7 @@ export function ConversationComposer({
       检测到 {larkLinks.length} 个飞书 / Lark 文档链接，发送后由 lark-cli 只读解析；文档内容不会赋予 Agent 额外权限。
     </p>}
     <div className="composer-footer">
-      <span aria-live="polite">{pending ? sendingLabel : disabled ? offlineHint : `${hint} · 可粘贴或选择图片（≤5 张，单张 ≤8MiB）`}</span>
+      <span aria-live="polite">{pending ? <><span className="composer-loading" aria-hidden="true" />{sendingLabel}</> : disabled ? offlineHint : `${hint} · 可粘贴或选择图片（≤5 张，单张 ≤8MiB）`}</span>
       <div className="composer-actions">
         <input
           ref={fileInputRef}
@@ -294,6 +301,16 @@ export function ConversationComposer({
         <button type="submit" className="button primary" disabled={effectivelyDisabled || !value.trim()}>{pending ? sendingLabel : submitLabel}</button>
       </div>
     </div>
+    {previewImage && <Modal title={previewImage.name} eyebrow="STAGED IMAGE · PREVIEW" onClose={() => setPreviewImage(undefined)} wide className="message-evidence-preview-modal">
+      <div className="message-evidence-preview-body">
+        <div className="message-evidence-preview-viewport">
+          {failedImages.has(previewImage.id)
+            ? <span className="message-evidence-image-error" role="status">图片无法加载</span>
+            : <img src={`data:${previewImage.mediaType};base64,${previewImage.base64}`} alt={previewImage.name} onError={() => setFailedImages((current) => new Set(current).add(previewImage.id))} />}
+        </div>
+        <footer><span>{previewImage.mediaType.split("/")[1].toUpperCase()} · {formatAttachmentSize(previewImage.sizeBytes)}</span></footer>
+      </div>
+    </Modal>}
   </form>;
 }
 

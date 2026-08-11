@@ -1,5 +1,5 @@
 /** 需求看板：九列数据契约、七列可见视图 + 三种正交异常态。列迁移走详情页。 */
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, writeBody } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
 import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
@@ -54,6 +54,54 @@ export function requirementStewardOutput(value: JsonValue | undefined): Requirem
       }
     : null;
   return { message: output.message, nextAction: output.nextAction, draft };
+}
+
+/**
+ * Provider JSON occasionally contains a second, literal escaping layer. Decode only
+ * line-break escapes here; React renders every resulting fragment as an escaped text
+ * node, so message content can never introduce executable HTML.
+ */
+export function normalizeConversationLineBreaks(content: string): string {
+  return content.replace(/\\r\\n|\\n|\\r/g, "\n");
+}
+
+function inlineMarkdown(text: string): ReactNode[] {
+  return text.split(/(\*\*[^*\n]+\*\*)/g).filter(Boolean).map((part, index) =>
+    part.startsWith("**") && part.endsWith("**")
+      ? <strong key={index}>{part.slice(2, -2)}</strong>
+      : <Fragment key={index}>{part}</Fragment>
+  );
+}
+
+export function ConversationMessageContent({ content }: { content: string }) {
+  const lines = normalizeConversationLineBreaks(content).split("\n");
+  const blocks: ReactNode[] = [];
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index]!;
+    const unordered = /^\s*[-*+]\s+(.+)$/.exec(line);
+    const ordered = /^\s*\d+[.)]\s+(.+)$/.exec(line);
+    if (unordered || ordered) {
+      const orderedList = Boolean(ordered);
+      const items: ReactNode[] = [];
+      while (index < lines.length) {
+        const match = orderedList
+          ? /^\s*\d+[.)]\s+(.+)$/.exec(lines[index]!)
+          : /^\s*[-*+]\s+(.+)$/.exec(lines[index]!);
+        if (!match) break;
+        items.push(<li key={index}>{inlineMarkdown(match[1]!)}</li>);
+        index += 1;
+      }
+      blocks.push(orderedList ? <ol key={`list-${index}`}>{items}</ol> : <ul key={`list-${index}`}>{items}</ul>);
+      continue;
+    }
+    if (!line.trim()) {
+      blocks.push(<div className="board-ai-message-spacer" aria-hidden="true" key={`blank-${index}`} />);
+    } else {
+      blocks.push(<p key={`paragraph-${index}`}>{inlineMarkdown(line)}</p>);
+    }
+    index += 1;
+  }
+  return <div className="board-ai-message-content">{blocks}</div>;
 }
 
 function exceptionChip(exception: Requirement["exception"]) {
@@ -418,9 +466,13 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
             {!agentSession && <div className="board-ai-welcome"><strong>把现在知道的都说出来</strong><p>可以是零散描述、界面截图或飞书 docx / wiki 链接。信息不足时我会先追问；足够时才给出可编辑草稿。</p></div>}
             {agentSession?.messages.map((message) => <article className={`board-ai-message board-ai-message--${message.role}`} key={message.id}>
               <div><strong>{message.role === "user" ? "你" : message.role === "employee" ? "需求管家" : "系统"}</strong><time>{formatTime(message.at)}</time>{message.runId && <code>{message.runId}</code>}</div>
-              <p>{message.content}</p>
+              <ConversationMessageContent content={message.content} />
               <ConversationMessageEvidence attachments={message.attachments} documents={message.documents} />
             </article>)}
+            {agentPhase === "waiting" && <article className="board-ai-message board-ai-message--employee board-ai-message--waiting" aria-live="polite" aria-label="需求管家整理中">
+              <div><strong>需求管家</strong><span>整理中</span></div>
+              <div className="board-ai-waiting-dots" aria-hidden="true"><span /><span /><span /></div>
+            </article>}
           </div>
           {agentError && <p className="dash-form-error" role="alert">{agentError}</p>}
           <ConversationComposer
