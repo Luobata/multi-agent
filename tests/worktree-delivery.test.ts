@@ -215,7 +215,7 @@ describe("worktree delivery merge gate", () => {
     expect(git(root, "status", "--porcelain")).toBe("");
   }, 15_000);
 
-  it("queues an approved candidate and revalidates it in a temporary integration worktree after target drift", async () => {
+  it("queues an approved candidate and revalidates it after target drift before or after acceptance", async () => {
     const root = repository();
     const runId = "run-delivery-queue-drift-1";
     const worktree = await createRunWorktree(root, runId);
@@ -223,6 +223,10 @@ describe("worktree delivery merge gate", () => {
     fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), "candidate\n", "utf8");
     const runDir = artifactDirectory();
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+
+    fs.writeFileSync(path.join(root, "target-before-queue.txt"), "target drift before queue\n", "utf8");
+    git(root, "add", "target-before-queue.txt");
+    git(root, "commit", "-m", "advance target before queue");
 
     const queued = await queueAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
@@ -237,7 +241,7 @@ describe("worktree delivery merge gate", () => {
         humanDecision: { action: "merge", actor: "reviewer" }
       }
     });
-    expect((await assessQueuedRun(run, runDir)).targetChanged).toBe(false);
+    expect(await assessQueuedRun(run, runDir)).toMatchObject({ targetChanged: true, conflict: false });
 
     fs.writeFileSync(path.join(root, "target.txt"), "target drift\n", "utf8");
     git(root, "add", "target.txt");
@@ -247,6 +251,7 @@ describe("worktree delivery merge gate", () => {
 
     const validation = await createMergeValidationWorktree(run, runDir);
     expect(fs.readFileSync(path.join(validation.worktreePath, "candidate.txt"), "utf8")).toBe("candidate\n");
+    expect(fs.readFileSync(path.join(validation.worktreePath, "target-before-queue.txt"), "utf8")).toBe("target drift before queue\n");
     expect(fs.readFileSync(path.join(validation.worktreePath, "target.txt"), "utf8")).toBe("target drift\n");
     expect(git(root, "rev-parse", "HEAD")).toBe(assessment.currentTargetCommit);
     await removeMergeValidationWorktree(validation);

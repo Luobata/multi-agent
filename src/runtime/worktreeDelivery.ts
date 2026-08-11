@@ -744,7 +744,12 @@ export async function assessQueuedRun(
     targetBranch: current.branch,
     queuedTargetCommit: delivery.queuedTargetCommit,
     currentTargetCommit: current.commit,
-    targetChanged: current.commit !== delivery.queuedTargetCommit,
+    // Revalidate whenever the integration target differs from either the
+    // candidate's implementation base or the commit observed at queue time.
+    // Checking only the queue snapshot misses code that landed after the
+    // candidate worktree was created but before human acceptance.
+    targetChanged: current.commit !== delivery.baseCommit
+      || current.commit !== delivery.queuedTargetCommit,
     conflict: mergeCheck.code !== 0,
     ...(mergeCheck.code !== 0
       ? { conflictMessage: (mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "合并冲突").slice(0, 8_000) }
