@@ -201,12 +201,23 @@ describe("run delivery daemon routes", () => {
         updatedAt: "2026-08-11T06:03:35.570Z"
       }
     }, null, 2)}\n`, "utf8");
+    const interruptedStaging = path.join(
+      worktree!.path,
+      ".multi-agent",
+      "evidence-rerun",
+      `${runId}-interrupted-attempt`
+    );
+    fs.mkdirSync(interruptedStaging, { recursive: true });
+    fs.writeFileSync(path.join(interruptedStaging, "recovered.png"), png);
     const recoveredResponse = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
     expect(recoveredResponse.status).toBe(200);
     expect(recoveredResponse.json).toMatchObject({ data: { delivery: { evidenceRerun: {
       status: "failed",
-      message: expect.stringContaining("daemon 重启中断")
+      mediaCount: 1,
+      message: expect.stringContaining("已从原 worktree 恢复 1 项媒体证据")
     } } } });
+    expect((recoveredResponse.json as { data: RunMergePreview }).data.evidence.assets.map((candidate) => candidate.name))
+      .toContain("001-recovered.png");
 
     const kept = await invokeRoute(app, "post", "/api/runs/:id/keep", {
       params: { id: runId },

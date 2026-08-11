@@ -7452,14 +7452,40 @@ export class WorkbenchService {
   private async recoverInterruptedEvidenceRerun(
     runDir: string,
     id: string,
+    worktreePath: string,
     current: NonNullable<RunDeliveryRecord["evidenceRerun"]> | undefined
   ): Promise<boolean> {
     if (!current || !["queued", "running"].includes(current.status) || this.evidenceReruns.has(id)) return false;
+    const stagingParent = path.join(worktreePath, ".multi-agent", "evidence-rerun");
+    const requestedAtMs = Date.parse(current.requestedAt);
+    let recoveredMediaCount = 0;
+    try {
+      const entries = await fs.readdir(stagingParent, { withFileTypes: true });
+      const candidates: string[] = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !entry.name.startsWith(`${id}-`)) continue;
+        const candidate = path.join(stagingParent, entry.name);
+        const stat = await fs.stat(candidate);
+        if (Number.isFinite(requestedAtMs) && stat.mtimeMs < requestedAtMs - 5_000) continue;
+        candidates.push(candidate);
+      }
+      for (const [index, candidate] of candidates.sort().entries()) {
+        recoveredMediaCount += await this.copyEvidenceMedia(
+          candidate,
+          path.join(runDir, "evidence-reruns", `recovered-${current.requestedAt.replaceAll(/[^0-9A-Za-z-]/g, "-")}-${index + 1}`)
+        );
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     await updateRunEvidenceRerun(runDir, id, {
       ...current,
       status: "failed",
       updatedAt: now(),
-      message: "daemon 重启中断了上一轮截图补采；候选 worktree 与已有证据均已保留，可以重新补采。"
+      ...(recoveredMediaCount > 0 ? { mediaCount: recoveredMediaCount } : {}),
+      message: recoveredMediaCount > 0
+        ? `daemon 重启中断了上一轮截图补采；已从原 worktree 恢复 ${recoveredMediaCount} 项媒体证据，候选与证据均已保留。`
+        : "daemon 重启中断了上一轮截图补采；候选 worktree 与已有证据均已保留，可以重新补采。"
     });
     return true;
   }
@@ -7476,7 +7502,7 @@ export class WorkbenchService {
     const current = preview.delivery?.evidenceRerun;
     if (current?.status === "queued" || current?.status === "running") {
       if (this.evidenceReruns.has(id)) return preview.delivery!;
-      await this.recoverInterruptedEvidenceRerun(runDir, id, current);
+      await this.recoverInterruptedEvidenceRerun(runDir, id, preview.worktreePath, current);
     }
     const requestedAt = now();
     const queued = await updateRunEvidenceRerun(runDir, id, {
@@ -7493,6 +7519,7 @@ export class WorkbenchService {
     const originalRequest = await this.originalRequestForRun(runDir);
     const stagingRoot = path.join(worktreePath, ".multi-agent", "evidence-rerun", `${id}-${randomUUID()}`);
     const job = (async () => {
+      let preservedMediaCount = 0;
       try {
         if (!projectId) throw new Error("原 Run 缺少项目来源，无法路由项目 test-engineer");
         await fs.mkdir(stagingRoot, { recursive: true });
@@ -7518,6 +7545,7 @@ export class WorkbenchService {
         );
         const destination = path.join(runDir, "evidence-reruns", result.runId);
         const mediaCount = await this.copyEvidenceMedia(stagingRoot, destination);
+        preservedMediaCount = mediaCount;
         if (result.status !== "passed" || mediaCount === 0) {
           throw new Error(result.status !== "passed"
             ? `独立截图验收未通过：${result.message}`
@@ -7533,12 +7561,22 @@ export class WorkbenchService {
           message: `已补采 ${mediaCount} 项媒体证据。`
         });
       } catch (error) {
+        if (preservedMediaCount === 0) {
+          preservedMediaCount = await this.copyEvidenceMedia(
+            stagingRoot,
+            path.join(runDir, "evidence-reruns", `failed-${requestedAt.replaceAll(/[^0-9A-Za-z-]/g, "-")}`)
+          );
+        }
+        const failureMessage = error instanceof Error ? error.message : String(error);
         await updateRunEvidenceRerun(runDir, id, {
           status: "failed",
           actor,
           requestedAt,
           updatedAt: now(),
-          message: error instanceof Error ? error.message : String(error)
+          ...(preservedMediaCount > 0 ? { mediaCount: preservedMediaCount } : {}),
+          message: preservedMediaCount > 0
+            ? `${failureMessage}；已保留 ${preservedMediaCount} 项媒体证据供人工核对。`
+            : failureMessage
         });
       } finally {
         await fs.rm(stagingRoot, { recursive: true, force: true });
@@ -7886,7 +7924,8 @@ export class WorkbenchService {
   async getRunMergePreview(id: string): Promise<RunMergePreview> {
     const { run, runDir } = await this.getRunDeliveryContext(id);
     let preview = await previewRunMerge(run, runDir);
-    if (await this.recoverInterruptedEvidenceRerun(runDir, id, preview.delivery?.evidenceRerun)) {
+    if (preview.worktreePath
+      && await this.recoverInterruptedEvidenceRerun(runDir, id, preview.worktreePath, preview.delivery?.evidenceRerun)) {
       preview = await previewRunMerge(run, runDir);
     }
     const activeConflict = preview.status === "conflict"
