@@ -92,6 +92,12 @@ function employeeRole(employee: Employee): string {
   return employee.identity.responsibilities[0] ?? employee.description;
 }
 
+function providerProfileLabel(providerId: string): string | undefined {
+  if (providerId === "claude-relay") return "只读规划档";
+  if (providerId === "claude-relay-execution") return "命令执行档";
+  return undefined;
+}
+
 function invocationInstances(invocation: InvocationRecord, instances: WorkInstanceRecord[]): WorkInstanceRecord[] {
   const ids = new Set(invocation.instanceIds);
   return instances.filter((instance) => ids.has(instance.id));
@@ -296,7 +302,7 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
       <div className="office-assignment">
         {latest ? <><span>{sourceCode(latest)}</span><strong>{sourceName(latest)}</strong><small>{latest.status === "failed" ? `${failureLabel(latest)}：${latest.error ?? "执行失败"} · 打开实时台查看运行证据` : `${latest.workflowId} / ${latest.nodeId} · ${elapsed(latest.startedAt, latest.completedAt, clock)}`}</small></> : systemLevel ? <><span>INTERNAL ONLY</span><strong>仅接受内部项目角色调度</strong><small>内部项目 {scope?.projectId}{scope?.roleId ? ` · 角色 ${scope.roleId}` : ""} · {entryCount} 个项目角色可触达</small></> : <><span>STANDBY</span><strong>等待外部会话调度</strong><small>{entryCount} 个项目/调用包入口可触达</small></>}
       </div>
-      <footer><code>{employee.providerId}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>{health.total ? `当前 v${employee.version} 近 ${health.total} 次：成功 ${health.completed} · 阻塞 ${health.blocked} · 故障 ${health.failed} · 中断 ${health.interrupted} · ` : ""}查看实时台 →</span></footer>
+      <footer><code>{employee.providerId}{providerProfileLabel(employee.providerId) ? ` · ${providerProfileLabel(employee.providerId)}` : ""}</code><code>{provider?.definition.model ?? "由 Provider 决定"}</code><span>{health.total ? `当前 v${employee.version} 近 ${health.total} 次：成功 ${health.completed} · 阻塞 ${health.blocked} · 故障 ${health.failed} · 中断 ${health.interrupted} · ` : ""}查看实时台 →</span></footer>
     </button>;
   });
 

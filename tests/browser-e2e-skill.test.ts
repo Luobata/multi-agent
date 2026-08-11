@@ -32,6 +32,11 @@ describe("browser-e2e-validation skill template", () => {
     expect(skill.instructions).toContain("禁止写成 `act 文本`、`assert 文本`");
     expect(skill.instructions).toContain("无限重试");
     expect(skill.instructions).toContain("一次只执行一条 Midscene 命令");
+    expect(skill.instructions).toContain("同一工作项只建立一个浏览器会话");
+    expect(skill.instructions).toContain("遇到第一个足以判定验收失败的决定性证据后立即停止");
+    expect(skill.instructions).toContain("先运行与 changedFiles 和验收标准直接相关的定向测试");
+    expect(skill.instructions).toContain("才运行整库类型检查、构建或全量测试");
+    expect(skill.instructions).toContain("同一 commit");
     expect(skill.instructions).toContain("禁止用裸 Chrome --headless");
     expect(skill.instructions).toContain("禁止退回裸浏览器/CDP/DOM 方案");
     expect(skill.instructions).toContain("Midscene HTML/Markdown 报告");

@@ -309,8 +309,9 @@ describe("employeeRuntimeHealth", () => {
       { employeeVersion: 2, status: "blocked" as const, phase: "done", updatedAt: "2026-08-01T11:59:00.000Z" },
       { employeeVersion: 2, status: "failed" as const, phase: "error", failure: { category: "provider" as const, kind: "exit" as const, retryable: false }, updatedAt: "2026-08-01T11:58:00.000Z" },
       { employeeVersion: 2, status: "failed" as const, phase: "interrupted", failure: { category: "interrupted" as const, retryable: true }, updatedAt: "2026-08-01T11:57:00.000Z" },
+      { employeeVersion: 2, status: "completed" as const, phase: "done", failure: { category: "interrupted" as const, retryable: true }, updatedAt: "2026-08-01T11:56:30.000Z" },
       { employeeVersion: 1, status: "failed" as const, phase: "error", updatedAt: "2026-08-01T11:56:00.000Z" }
     ];
-    expect(employeeRuntimeHealth(records, 2)).toEqual({ total: 4, completed: 1, blocked: 1, failed: 1, interrupted: 1 });
+    expect(employeeRuntimeHealth(records, 2)).toEqual({ total: 5, completed: 1, blocked: 1, failed: 1, interrupted: 2 });
   });
 });

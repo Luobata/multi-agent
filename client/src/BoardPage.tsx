@@ -1,5 +1,5 @@
 /** 需求看板：九列数据契约、七列可见视图 + 三种正交异常态。列迁移走详情页。 */
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, writeBody } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
 import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
@@ -148,6 +148,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   const [agentPhase, setAgentPhase] = useState<"idle" | "waiting" | "clarify" | "draft">("idle");
   const [agentSourceMessages, setAgentSourceMessages] = useState<string[]>([]);
   const [agentError, setAgentError] = useState("");
+  const reportedAcceptanceWarnings = useRef(new Set<string>());
 
   const data = state.status === "ready" ? state.data : undefined;
   const project = data?.nodes.find((node) => node.id === spaceId && node.kind === "project");
@@ -188,6 +189,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       const needsStatusSync = invocation.status !== advancement.status;
       const needsAcceptance = invocation.status === "completed"
         && requirement.lane !== "acceptance"
+        && requirement.lane !== "merging"
         && requirement.lane !== "done";
       if (!needsStatusSync && !needsAcceptance) return [];
       return [{ requirement, advancement, invocation }];
@@ -216,8 +218,16 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
           || updated.lane === "acceptance" || updated.lane === "merging" || updated.lane === "done") return updated;
         try {
           const preview = await api<RunMergePreview>(`/api/runs/${encodeURIComponent(invocation.runId)}/merge-preview`);
+          if (preview.status === "merged" || preview.delivery?.status === "merged") {
+            return service.syncRequirementDelivery(requirement.id, invocation.runId, "merged");
+          }
           if (!preview.eligible) {
-            warnings.push(`${requirement.code} 已完成，但交付证据尚未满足自动待验收门禁：${preview.reasons.join("；") || "交付预览未就绪"}`);
+            const warning = `${requirement.code} 已完成，但交付证据尚未满足自动待验收门禁：${preview.reasons.join("；") || "交付预览未就绪"}`;
+            const warningKey = `${requirement.id}:${invocation.runId}:${preview.status}:${warning}`;
+            if (!reportedAcceptanceWarnings.current.has(warningKey)) {
+              reportedAcceptanceWarnings.current.add(warningKey);
+              warnings.push(warning);
+            }
             return updated;
           }
           return service.submitRequirementForAcceptance(

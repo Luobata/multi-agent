@@ -363,12 +363,14 @@ export function employeeRuntimeHealth(
     .filter((instance) => instance.status === "completed" || instance.status === "blocked" || instance.status === "failed")
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
     .slice(0, limit);
-  const interrupted = recent.filter((instance) => instance.phase === "interrupted" || instance.failure?.category === "interrupted").length;
+  const wasInterrupted = (instance: typeof recent[number]) =>
+    instance.phase === "interrupted" || instance.failure?.category === "interrupted";
+  const interrupted = recent.filter(wasInterrupted).length;
   return {
     total: recent.length,
-    completed: recent.filter((instance) => instance.status === "completed").length,
-    blocked: recent.filter((instance) => instance.status === "blocked").length,
-    failed: recent.filter((instance) => instance.status === "failed").length - interrupted,
+    completed: recent.filter((instance) => instance.status === "completed" && !wasInterrupted(instance)).length,
+    blocked: recent.filter((instance) => instance.status === "blocked" && !wasInterrupted(instance)).length,
+    failed: recent.filter((instance) => instance.status === "failed" && !wasInterrupted(instance)).length,
     interrupted
   };
 }

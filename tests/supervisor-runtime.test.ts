@@ -899,16 +899,24 @@ describe("Supervisor workflow version tracking", () => {
     await service.updateWorkflow("vt-team", { architecture: "supervisor", updatePolicy: "locked" });
     await service.updateEmployee("vt-worker", { description: "v2." });
     await service.updateManagementPolicy("vt-policy", { instructions: "v2." });
+    await service.store.mutate((state) => {
+      const current = state.skills["team-orchestration"]!;
+      const next = { ...current, version: current.version + 1, updatedAt: "2026-08-11T00:00:00.000Z" };
+      state.skills["team-orchestration"] = next;
+      (state.skillHistory["team-orchestration"] ??= [current]).push(next);
+    });
 
     const result = await service.refreshWorkflow("vt-team");
     expect(result.changed).toBe(true);
     const kinds = result.changes.map((change) => `${change.kind}:${change.from}->${change.to}`);
     expect(kinds).toContain("member:1->2");
     expect(kinds).toContain("management-policy:1->2");
+    expect(kinds).toContain("orchestration-skill:4->5");
     const refreshed = service.getWorkflow("vt-team");
     if (refreshed.architecture !== "supervisor") throw new Error("expected supervisor workflow");
     expect(refreshed.members[0]!.employeeVersion).toBe(2);
     expect(refreshed.managementPolicy.version).toBe(2);
+    expect(refreshed.orchestrationSkill.version).toBe(5);
 
     // A second refresh with nothing new reports no change.
     const again = await service.refreshWorkflow("vt-team");

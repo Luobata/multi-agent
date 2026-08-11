@@ -645,4 +645,94 @@ describe("BoardPage AI requirement creation", () => {
     });
     expect(container.querySelector<HTMLElement>('section[aria-label^="待验收"]')?.textContent).toContain(requirement.title);
   });
+
+  it("reconciles an already merged Run to done without repeating the acceptance warning", async () => {
+    const service = createDashboardService({
+      delayMs: () => 0,
+      initialData: "empty",
+      now: () => new Date("2026-08-11T04:00:00.000Z")
+    });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "已合入的需求",
+      summary: "本地看板仍停留在执行中",
+      priority: "high",
+      rawRequirement: "合入完成后终态对账",
+      acceptanceCriteria: ["卡片自动进入已完成"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-merged",
+      runId: "run-merged",
+      status: "running",
+      observedAt: "2026-08-11T04:00:01.000Z"
+    }, config.pollIntervalMs);
+    await service.submitRequirementForAcceptance(requirement.id, {
+      runId: "run-merged",
+      eligible: true,
+      worktreePath: "/repo/.multi-agent/worktrees/run-merged",
+      testGate: { gateId: "quality-test", status: "passed" },
+      reviewGate: { gateId: "independent-review", status: "passed" },
+      mediaCount: 1,
+      structuredE2eCount: 1,
+      diffFiles: ["client/src/BoardPage.tsx"],
+      capturedAt: "2026-08-11T04:00:02.000Z"
+    });
+    await service.syncRequirementEvidenceCapture(requirement.id, "run-merged", {
+      status: "running",
+      updatedAt: "2026-08-11T04:00:03.000Z"
+    });
+    const preview: RunMergePreview = {
+      runId: "run-merged",
+      status: "merged",
+      eligible: false,
+      reasons: ["该交付已经合并。"],
+      worktreePath: "/repo/.multi-agent/worktrees/run-merged",
+      repositoryRoot: "/repo",
+      targetBranch: "main",
+      targetClean: true,
+      changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 1024 } },
+      safeGitCommands: [],
+      evidence: { assets: [], structuredE2eCount: 1, acceptedVerdict: true, gates: [] },
+      delivery: { runId: "run-merged", status: "merged", updatedAt: "2026-08-11T04:00:04.000Z" },
+      confirmationToken: "MERGE run-merged",
+      discardConfirmationToken: "DISCARD run-merged"
+    };
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ data: preview }) });
+    const notify = vi.fn();
+    const completed: InvocationRecord = {
+      id: "inv-merged",
+      target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench", taskId: requirement.id },
+      status: "completed",
+      phase: "done",
+      requestSummary: requirement.title,
+      runId: "run-merged",
+      instanceIds: [],
+      createdAt: "2026-08-11T04:00:00.000Z",
+      updatedAt: "2026-08-11T04:00:04.000Z",
+      completedAt: "2026-08-11T04:00:04.000Z",
+      transitions: []
+    };
+
+    act(() => root.render(<BoardPage
+      spaceId={project.id}
+      go={vi.fn()}
+      notify={notify}
+      service={service}
+      projects={[project]}
+      invocations={[completed]}
+    />));
+    for (let attempt = 0; attempt < 20 && (await service.getRequirement(requirement.id)).lane !== "done"; attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }
+
+    expect((await service.getRequirement(requirement.id)).lane).toBe("done");
+    expect(container.querySelector<HTMLElement>('section[aria-label^="已完成"]')?.textContent).toContain(requirement.title);
+    expect(notify).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

@@ -6663,7 +6663,8 @@ export class WorkbenchService {
 
   private normalizeSupervisorWorkflow(
     input: SupervisorWorkflowCreateInput,
-    current?: SupervisorWorkbenchWorkflowDefinition
+    current?: SupervisorWorkbenchWorkflowDefinition,
+    options: { refreshOrchestrationSkill?: boolean } = {}
   ): SupervisorWorkbenchWorkflowDefinition {
     const id = requireId(input.id, "workflow id");
     const state = this.snapshot();
@@ -6729,7 +6730,7 @@ export class WorkbenchService {
       updatePolicy: input.updatePolicy ?? current?.updatePolicy ?? "latest",
       description: input.description?.trim() || `Supervisor workflow ${id}`,
       supervisor: { employeeId: supervisor.id, employeeVersion: supervisor.version },
-      orchestrationSkill: current?.orchestrationSkill ?? {
+      orchestrationSkill: current && !options.refreshOrchestrationSkill ? current.orchestrationSkill : {
         id: "team-orchestration",
         version: orchestrationSkill.version
       },
@@ -6745,7 +6746,8 @@ export class WorkbenchService {
 
   private normalizeWorkflow(
     input: WorkflowCreateInput,
-    current?: WorkbenchWorkflowDefinition
+    current?: WorkbenchWorkflowDefinition,
+    options: { refreshOrchestrationSkill?: boolean } = {}
   ): WorkbenchWorkflowDefinition {
     const architecture = input.architecture ?? current?.architecture ?? "graph";
     if (current && architecture !== current.architecture) {
@@ -6754,7 +6756,8 @@ export class WorkbenchService {
     if (architecture === "supervisor") {
       return this.normalizeSupervisorWorkflow(
         input as SupervisorWorkflowCreateInput,
-        current as SupervisorWorkbenchWorkflowDefinition | undefined
+        current as SupervisorWorkbenchWorkflowDefinition | undefined,
+        options
       );
     }
     return this.normalizeGraphWorkflow(
@@ -6776,7 +6779,11 @@ export class WorkbenchService {
     });
   }
 
-  async updateWorkflow(id: string, input: WorkflowUpdateInput): Promise<WorkbenchWorkflowDefinition> {
+  async updateWorkflow(
+    id: string,
+    input: WorkflowUpdateInput,
+    options: { refreshOrchestrationSkill?: boolean } = {}
+  ): Promise<WorkbenchWorkflowDefinition> {
     const current = this.getWorkflow(id);
     if (input.architecture && input.architecture !== current.architecture) {
       throw new Error(`workflow architecture cannot change from ${current.architecture} to ${input.architecture}`);
@@ -6807,7 +6814,7 @@ export class WorkbenchService {
           flow: "flow" in input ? input.flow : undefined,
           inputSchema: input.inputSchema ?? current.inputSchema,
           presentation: input.presentation ?? current.presentation
-        }, current);
+        }, current, options);
     await this.validateWorkflow(workflow);
     return this.store.mutate((state) => {
       const record = state.workflows[id];
@@ -6876,7 +6883,7 @@ export class WorkbenchService {
       managementPolicy: { id: current.managementPolicy.id },
       members: current.members.map((member) => ({ roleId: member.roleId, description: member.description, employeeId: member.employeeId }))
       // flow omitted → normalizeSupervisorFlow inherits the current flow unchanged.
-    });
+    }, { refreshOrchestrationSkill: true });
     if (updated.architecture !== "supervisor") throw new Error("expected supervisor workflow after refresh");
     return { workflow: updated, changed: true, changes };
   }
