@@ -147,6 +147,7 @@ describe("App navigation freshness", () => {
     fetchMock.mockClear();
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("EventSource", FakeEventSource);
+    try { window.localStorage.clear(); window.sessionStorage.clear(); } catch { /* jsdom storage may be disabled */ }
     window.location.hash = "";
     vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
     container = document.createElement("div");

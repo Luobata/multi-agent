@@ -710,6 +710,61 @@ describe("getSettingsSnapshot", () => {
   });
 });
 
+describe("evidence capture projection", () => {
+  it("treats an identical poll as a no-op and repairs adjacent historical log spam", async () => {
+    const storage = memoryStorage();
+    const service = createDashboardService({ delayMs: () => 0, initialData: "demo", storage, now: () => FIXED_NOW });
+    const runId = "run-capture-idempotent";
+    await service.submitRequirementForAcceptance("req-104", {
+      runId, eligible: true, worktreePath: "/tmp/worktree",
+      testGate: { gateId: "test", status: "passed" }, reviewGate: { gateId: "audit", status: "passed" },
+      mediaCount: 0, structuredE2eCount: 1, diffFiles: ["client/src/RunsPage.tsx"], capturedAt: FIXED_NOW.toISOString()
+    });
+    const observation = { status: "running" as const, updatedAt: "2026-08-09T06:02:00.000Z", mediaCount: 0 };
+    await service.syncRequirementEvidenceCapture("req-104", runId, observation);
+    await service.syncRequirementEvidenceCapture("req-104", runId, observation);
+    expect((await service.getDashboardSummary()).activities.filter((item) => item.action === "同步验收补采")).toHaveLength(1);
+
+    const envelope = JSON.parse(storage.values.get(DASHBOARD_STORAGE_KEY)!) as { version: number; store: { activities: Array<{ id: string; action: string; target: string; detail: string }> } };
+    const capture = envelope.store.activities.find((item) => item.action === "同步验收补采")!;
+    envelope.store.activities.unshift({ ...capture, id: "historical-duplicate" });
+    storage.values.set(DASHBOARD_STORAGE_KEY, JSON.stringify(envelope));
+    const repaired = createDashboardService({ delayMs: () => 0, initialData: "empty", storage, now: () => FIXED_NOW });
+    expect((await repaired.getDashboardSummary()).activities.filter((item) => item.action === "同步验收补采")).toHaveLength(1);
+  });
+
+  it("persists queued/running and returns passed/failed captures to acceptance", async () => {
+    const storage = memoryStorage();
+    const service = createDashboardService({ delayMs: () => 0, initialData: "demo", storage, now: () => FIXED_NOW });
+    await service.submitRequirementForAcceptance("req-104", {
+      runId: "run-capture", eligible: true, worktreePath: "/tmp/worktree",
+      testGate: { gateId: "test", status: "passed" }, reviewGate: { gateId: "audit", status: "passed" },
+      mediaCount: 0, structuredE2eCount: 1, diffFiles: ["client/src/App.tsx"], capturedAt: FIXED_NOW.toISOString()
+    });
+    expect(await service.syncRequirementEvidenceCapture("req-104", "run-capture", { status: "queued", updatedAt: "2026-08-09T06:01:00.000Z" })).toMatchObject({ lane: "running", evidenceCapture: { status: "queued" } });
+    const restored = createDashboardService({ delayMs: () => 0, initialData: "empty", storage, now: () => FIXED_NOW });
+    expect(await restored.getRequirement("req-104")).toMatchObject({ lane: "running", evidenceCapture: { status: "queued" } });
+    expect(await restored.syncRequirementEvidenceCapture("req-104", "run-capture", { status: "running", updatedAt: "2026-08-09T06:02:00.000Z" })).toMatchObject({ lane: "running", evidenceCapture: { status: "running" } });
+    expect(await restored.syncRequirementEvidenceCapture("req-104", "run-capture", { status: "passed", updatedAt: "2026-08-09T06:03:00.000Z", mediaCount: 3 })).toMatchObject({ lane: "acceptance", exception: null, evidenceCapture: { status: "passed", mediaCount: 3 } });
+    expect((await restored.getRequirement("req-104")).evidence.acceptance?.mediaCount).toBe(3);
+    expect(await restored.syncRequirementEvidenceCapture("req-104", "run-capture", { status: "running", updatedAt: "2026-08-09T06:02:30.000Z" })).toMatchObject({ lane: "acceptance", evidenceCapture: { status: "passed" } });
+    expect(await restored.syncRequirementEvidenceCapture("req-104", "run-capture", { status: "failed", updatedAt: "2026-08-09T06:04:00.000Z", message: "浏览器退出" })).toMatchObject({ lane: "acceptance", exception: "failed", evidenceCapture: { status: "failed", message: "浏览器退出" } });
+    expect((await restored.getRequirement("req-104")).evidence.acceptance).toMatchObject({ runId: "run-capture", capturedAt: FIXED_NOW.toISOString() });
+  });
+
+  it("does not let retained capture metadata pull a merged requirement back to acceptance", async () => {
+    const service = makeService();
+    const runId = "run-capture-merged";
+    await service.submitRequirementForAcceptance("req-104", {
+      runId, eligible: true, worktreePath: `/repo/worktree/${runId}`,
+      testGate: { gateId: "quality-test", status: "passed" }, reviewGate: { gateId: "independent-review", status: "passed" },
+      mediaCount: 0, structuredE2eCount: 1, diffFiles: ["client/src/RunsPage.tsx"], capturedAt: "2026-08-09T06:00:00.000Z"
+    });
+    await service.syncRequirementDelivery("req-104", runId, "merged");
+    expect(await service.syncRequirementEvidenceCapture("req-104", runId, { status: "passed", updatedAt: "2026-08-09T06:05:00.000Z", mediaCount: 1 })).toMatchObject({ lane: "done" });
+  });
+});
+
 describe("project profile / repository bindings", () => {
   it("集中返回成员、Skills、知识和多个仓库，并可新增路径绑定", async () => {
     const service = makeService();

@@ -27,21 +27,64 @@ export interface PageRoute {
   page: Page;
   spaceId?: string;
   requirementId?: string;
+  runId?: string;
+  recordId?: string;
+  section?: "overview" | "run" | "acceptance";
 }
 
 const TOP_LEVEL_PAGES: Page[] = ["office", "employees", "projects", "skills", "knowledge", "workflows", "runs", "publications", "memory", "dashboard", "board", "archive", "settings"];
+const NAVIGATION_MEMORY_KEY = "local-agent-workbench.navigation.v1";
+const SCROLL_MEMORY_PREFIX = "local-agent-workbench.scroll.v1:";
 const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], gateValidators: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
+
+function navigationGroup(page: Page): Page {
+  if (page === "requirement") return "board";
+  if (page === "project") return "projects";
+  return page;
+}
+
+export function readNavigationMemory(storage: Pick<Storage, "getItem"> | undefined = typeof window === "undefined" ? undefined : window.localStorage): Partial<Record<Page, string>> {
+  if (!storage) return {};
+  try {
+    const parsed = JSON.parse(storage.getItem(NAVIGATION_MEMORY_KEY) ?? "{}") as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(parsed).filter(([page, hash]) =>
+      TOP_LEVEL_PAGES.includes(page as Page) && typeof hash === "string" && hash.length > 0
+    )) as Partial<Record<Page, string>>;
+  } catch {
+    return {};
+  }
+}
+
+export function rememberNavigationHash(
+  memory: Partial<Record<Page, string>>,
+  route: PageRoute,
+  hash: string,
+  storage: Pick<Storage, "setItem"> | undefined = typeof window === "undefined" ? undefined : window.localStorage
+): Partial<Record<Page, string>> {
+  const group = navigationGroup(route.page);
+  const next = { ...memory, [group]: hash.replace(/^#/, "") || group };
+  try { storage?.setItem(NAVIGATION_MEMORY_KEY, JSON.stringify(next)); } catch { /* private mode keeps in-memory navigation */ }
+  return next;
+}
 
 /** 二级 hash：#projects/<id>、#projects/<id>/board、#requirements/<id>；旧 #spaces 路由兼容收敛到项目。 */
 export function pageFromHash(hash = window.location.hash): PageRoute {
-  const segments = hash.replace(/^#/, "").split("/").filter(Boolean);
+  const [path, query = ""] = hash.replace(/^#/, "").split("?", 2);
+  const params = new URLSearchParams(query);
+  const segments = path.split("/").filter(Boolean);
   const [head, second, third] = segments;
   if ((head === "projects" || head === "spaces") && second) {
     return third === "board" ? { page: "board", spaceId: decodeURIComponent(second) } : { page: "project", spaceId: decodeURIComponent(second) };
   }
   if (head === "spaces") return { page: "projects" };
-  if (head === "requirements" && second) return { page: "requirement", requirementId: decodeURIComponent(second) };
-  return TOP_LEVEL_PAGES.includes(head as Page) ? { page: head as Page } : { page: "office" };
+  if (head === "requirements" && second) {
+    const section = params.get("section");
+    return { page: "requirement", requirementId: decodeURIComponent(second), ...(section === "overview" || section === "run" || section === "acceptance" ? { section } : {}) };
+  }
+  if (head === "runs") return { page: "runs", ...(params.get("run") ? { runId: params.get("run")! } : {}) };
+  return TOP_LEVEL_PAGES.includes(head as Page)
+    ? { page: head as Page, ...(params.get("item") ? { recordId: params.get("item")! } : {}) }
+    : { page: "office" };
 }
 
 function upsertById<T extends { id: string }>(items: T[], value: T): T[] {
@@ -131,7 +174,7 @@ export function App() {
   const [activityStream, setActivityStream] = useState<"connecting" | "live" | "reconnecting" | "offline">("connecting");
   const [notice, setNotice] = useState<{ message: string; kind: "success" | "error"; retryRefresh?: boolean }>();
   const [commandOpen, setCommandOpen] = useState(false);
-  const [pendingRunId, setPendingRunId] = useState("");
+  const lastHashByPage = useRef<Partial<Record<Page, string>>>(readNavigationMemory());
   const [syncing, setSyncing] = useState(false);
   const [theme, setTheme] = useState<ThemeName>(() => (typeof window === "undefined" ? DEFAULT_THEME : readTheme()));
   useEffect(() => { applyTheme(theme); }, [theme]);
@@ -206,13 +249,45 @@ export function App() {
     return () => stream.close();
   }, [daemon]);
   useEffect(() => {
-    const update = () => setRoute(pageFromHash());
+    const initial = pageFromHash();
+    lastHashByPage.current = rememberNavigationHash(lastHashByPage.current, initial, window.location.hash);
+    const update = () => {
+      const next = pageFromHash();
+      lastHashByPage.current = rememberNavigationHash(lastHashByPage.current, next, window.location.hash);
+      setRoute(next);
+    };
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
   }, []);
   useEffect(() => {
-    window.scrollTo({ top: 0, behavior: "auto" });
-  }, [page]);
+    const hash = window.location.hash || "#office";
+    const key = `${SCROLL_MEMORY_PREFIX}${hash}`;
+    let restored = 0;
+    try { restored = Number(window.sessionStorage.getItem(key) ?? 0) || 0; } catch { /* keep the default */ }
+    if ("scrollRestoration" in window.history) window.history.scrollRestoration = "manual";
+    const restore = () => {
+      if ((window.location.hash || "#office") === hash) window.scrollTo({ top: restored, behavior: "auto" });
+    };
+    const frame = window.requestAnimationFrame(restore);
+    // Dossiers load asynchronously; repeat after their height becomes available.
+    const timers = [window.setTimeout(restore, 240), window.setTimeout(restore, 800)];
+    let scheduled = false;
+    const remember = () => {
+      if (scheduled) return;
+      scheduled = true;
+      window.requestAnimationFrame(() => {
+        scheduled = false;
+        try { window.sessionStorage.setItem(key, String(window.scrollY)); } catch { /* view memory is best-effort */ }
+      });
+    };
+    window.addEventListener("scroll", remember, { passive: true });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      timers.forEach((timer) => window.clearTimeout(timer));
+      window.removeEventListener("scroll", remember);
+      try { window.sessionStorage.setItem(key, String(window.scrollY)); } catch { /* view memory is best-effort */ }
+    };
+  }, [page, route.spaceId, route.requirementId, route.runId, route.recordId, route.section]);
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -228,8 +303,9 @@ export function App() {
   // Clicking the already-active tab is an explicit "give me fresh data" gesture.
   const navigate = (next: Page) => {
     if (next === page) { refreshQuietly(); return; }
-    window.location.hash = next;
-    setRoute({ page: next });
+    const target = lastHashByPage.current[next] ?? next;
+    window.location.hash = target;
+    setRoute(pageFromHash(`#${target}`));
   };
   /** Dashboard 子路由（项目详情 / 项目看板 / 需求详情）只换 hash，由 hashchange 统一收编。 */
   const go = (hash: string) => { window.location.hash = hash; };
@@ -297,7 +373,7 @@ export function App() {
     </nav>
     <DaemonGate status={daemon}><div id="main-content" className="app-content" tabIndex={-1}>
       {page === "office" && <OfficePage data={data} streamStatus={activityStream} />}
-      {page === "employees" && <EmployeePage data={data} refresh={refresh} notify={notify} />}
+      {page === "employees" && <EmployeePage data={data} refresh={refresh} notify={notify} focusedEmployeeId={route.recordId} onSelectEmployee={(employeeId) => go(`employees?item=${encodeURIComponent(employeeId)}`)} />}
       {page === "projects" && (daemon === "online"
         ? <ProjectsHubPage data={data} refresh={refresh} go={go} notify={notify} />
         : daemon === "checking"
@@ -306,8 +382,8 @@ export function App() {
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
-      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} pendingRunId={pendingRunId} onConsumePending={() => setPendingRunId("")} dashboard={dashboardService} />}
-      {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
+      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} onSelectRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} dashboard={dashboardService} />}
+      {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
       {page === "dashboard" && <DashboardPage go={go} />}
       {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} />}
@@ -319,10 +395,11 @@ export function App() {
         projects={data.projects}
         invocations={data.activity.invocations}
         humanDecisionRequests={data.humanDecisionRequests ?? []}
-        onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }}
+        onOpenRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)}
       />}
       {page === "requirement" && route.requirementId && <RequirementDetailPage
         requirementId={route.requirementId}
+        section={route.section ?? "overview"}
         go={go}
         notify={notify}
         projects={data.projects}
@@ -330,7 +407,7 @@ export function App() {
         workflows={data.workflows}
         managementPolicies={data.managementPolicies ?? []}
         invocations={data.activity.invocations}
-        onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }}
+        onOpenRun={() => go(`requirements/${encodeURIComponent(route.requirementId!)}?section=run`)}
       />}
       {page === "archive" && <ArchivePage go={go} notify={notify} />}
       {page === "settings" && <SettingsPage />}

@@ -15,6 +15,7 @@ import type {
   Requirement,
   RequirementAdvancement,
   RequirementDetail,
+  RequirementEvidenceCapture,
   RequirementLane,
   RunAcceptanceSnapshot,
   SettingsSnapshot,
@@ -84,6 +85,12 @@ export interface DashboardService {
     requirementId: string,
     runId: string,
     status: "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance"
+  ): Promise<Requirement>;
+  /** 补采任务的持久化需求投影；不覆盖已经固定的 acceptance snapshot。 */
+  syncRequirementEvidenceCapture(
+    requirementId: string,
+    runId: string,
+    observation: Omit<RequirementEvidenceCapture, "runId">
   ): Promise<Requirement>;
   archiveRequirement(id: string): Promise<ArchiveRecord>;
   getProjectProfile(id: string): Promise<ProjectProfile>;
@@ -295,6 +302,20 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
     const reconciledLane = advancementLane(requirement.advancement.status, requirement.lane);
     if (reconciledLane === requirement.lane) continue;
     requirement.lane = reconciledLane;
+    repairedPersistedData = true;
+  }
+  // A historical UI polling loop could append the exact same capture projection
+  // repeatedly. Collapse only adjacent identical capture entries so a genuine
+  // later rerun (separated by another action) remains auditable.
+  const repairedActivities = store.activities.filter((activity, index, activities) => {
+    if (activity.action !== "同步验收补采" || index === 0) return true;
+    const previous = activities[index - 1];
+    return previous?.action !== activity.action
+      || previous.target !== activity.target
+      || previous.detail !== activity.detail;
+  });
+  if (repairedActivities.length !== store.activities.length) {
+    store.activities = repairedActivities;
     repairedPersistedData = true;
   }
   const persist = () => {
@@ -843,6 +864,53 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
           requirement.code,
           `${from} → ${requirementLaneLabel(lane)}；Run ${runId} 交付状态 ${status}。`
         );
+        return requirementSummary(requirement);
+      });
+    },
+    syncRequirementEvidenceCapture(requirementId, runId, observation) {
+      return respond(() => {
+        const requirement = store.requirements.find((candidate) => candidate.id === requirementId);
+        if (!requirement || requirement.archivedAt) throw failure("没有找到这条需求", "请回到需求看板重新选择", "未写入任何变更");
+        const acceptedRunId = requirement.evidence.acceptance?.runId;
+        if (!acceptedRunId || acceptedRunId !== runId) throw failure("补采状态与已固定的验收 Run 不一致", "请从该需求绑定的运行卷宗重新补采", "需求列和验收快照均未改变");
+        if (requirement.evidenceCapture
+          && new Date(observation.updatedAt).getTime() < new Date(requirement.evidenceCapture.updatedAt).getTime()) {
+          return requirementSummary(requirement);
+        }
+        const lifecycleLocked = requirement.lane === "merging" || requirement.lane === "done";
+        const projectedLane = lifecycleLocked
+          ? requirement.lane
+          : observation.status === "queued" || observation.status === "running" ? "running" : "acceptance";
+        const projectedException = lifecycleLocked
+          ? requirement.exception
+          : observation.status === "failed" ? "failed" : null;
+        const projectedMediaCount = observation.status === "passed" && observation.mediaCount !== undefined && requirement.evidence.acceptance
+          ? Math.max(requirement.evidence.acceptance.mediaCount, observation.mediaCount)
+          : requirement.evidence.acceptance?.mediaCount;
+        const previousCapture = requirement.evidenceCapture;
+        const unchanged = previousCapture?.runId === runId
+          && previousCapture.status === observation.status
+          && previousCapture.updatedAt === observation.updatedAt
+          && previousCapture.message === observation.message
+          && previousCapture.mediaCount === observation.mediaCount
+          && requirement.lane === projectedLane
+          && requirement.exception === projectedException
+          && requirement.evidence.acceptance?.mediaCount === projectedMediaCount;
+        if (unchanged) return requirementSummary(requirement);
+        const from = requirementLaneLabel(requirement.lane);
+        requirement.evidenceCapture = { runId, ...observation };
+        // A completed merge is newer lifecycle evidence than the retained capture
+        // record. Re-rendering the Run dossier must never pull a merged card back.
+        if (requirement.lane !== "merging" && requirement.lane !== "done") {
+          requirement.lane = projectedLane;
+          requirement.exception = projectedException;
+        }
+        if (observation.status === "passed" && observation.mediaCount !== undefined && requirement.evidence.acceptance) {
+          requirement.evidence.acceptance.mediaCount = Math.max(requirement.evidence.acceptance.mediaCount, observation.mediaCount);
+          requirement.evidence.reviewNotes = `quality.audit Gate「${requirement.evidence.acceptance.reviewGate!.gateId}」passed；媒体证据 ${requirement.evidence.acceptance.mediaCount} 项；候选 worktree ${requirement.evidence.acceptance.worktreePath}。`;
+        }
+        requirement.updatedAt = requirement.evidenceCapture.updatedAt;
+        record("同步验收补采", requirement.code, `${from} → ${requirementLaneLabel(requirement.lane)}；Run ${runId} 补采 ${observation.status}。`);
         return requirementSummary(requirement);
       });
     },

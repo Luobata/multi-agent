@@ -143,9 +143,18 @@ export interface Requirement {
   priority: RequirementPriority;
   owner: string;
   advancement?: RequirementAdvancement;
+  evidenceCapture?: RequirementEvidenceCapture;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string | null;
+}
+
+export interface RequirementEvidenceCapture {
+  runId: string;
+  status: "queued" | "running" | "passed" | "failed";
+  updatedAt: string;
+  message?: string;
+  mediaCount?: number;
 }
 
 export interface RepositoryBinding {

@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, writeBody } from "./api";
 import { DossierSection, EmptyState, Modal, SelectControl, Stamp, formatTime, scrollRecordIntoView } from "./components";
 import { SupervisorRunTopology } from "./SupervisorRunTopology";
 import { EffectiveProfileView } from "./EffectiveProfileView";
 import { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
 import type { DashboardService } from "./dashboard/service";
+import type { Requirement } from "./dashboard/types";
 import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunDeliveryRecord, RunMergePreview, RunMergeQueueResult, RunNode, RunWorktreeOpenResult } from "./types";
 
 export { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
@@ -517,14 +518,21 @@ function RunMergeConfirmation({
   </Modal>;
 }
 
-export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onConsumePending, dashboard }: {
+export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pendingRunId = "", onConsumePending, onSelectRun, onDashboardSync, mode = "full", view = "all", dashboard }: {
   notify: (message: string, kind?: "success" | "error") => void;
   activityRevision?: string;
+  focusedRunId?: string;
+  /** @deprecated use focusedRunId; retained for callers during the hash-routing migration. */
   pendingRunId?: string;
   onConsumePending?: () => void;
+  onSelectRun?: (runId: string) => void;
+  onDashboardSync?: (requirement: Requirement) => void;
+  mode?: "full" | "embedded";
+  view?: "all" | "acceptance";
   /** 可选看板服务；注入后合格交付可以把验收快照原子写回需求看板。 */
   dashboard?: DashboardService;
 }) {
+  const requestedRunId = focusedRunId || pendingRunId;
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [detail, setDetail] = useState<Run>();
@@ -558,6 +566,11 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
   const [deciding, setDeciding] = useState(false);
   const [decisionError, setDecisionError] = useState("");
   const [decisionRevision, setDecisionRevision] = useState(0);
+  // Dashboard projection callbacks are UI events, not polling inputs. Keeping the
+  // latest callback in a ref prevents an inline parent callback from retriggering
+  // terminal delivery/capture effects on every render.
+  const onDashboardSyncRef = useRef(onDashboardSync);
+  onDashboardSyncRef.current = onDashboardSync;
   useEffect(() => {
     let current = true;
     api<Run[]>("/api/runs?limit=100").then((value) => {
@@ -566,16 +579,16 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
       setSelectedId((selected) => selected || value[0]?.id || "");
       // A memory detail can hand us a run to open. Select and reveal it once the
       // list confirms the run exists; silently ignore ids absent from the list.
-      if (pendingRunId && value.some((run) => run.id === pendingRunId)) {
-        setSelectedId(pendingRunId);
-        scrollRecordIntoView(pendingRunId);
-        onConsumePending?.();
+      if (requestedRunId && value.some((run) => run.id === requestedRunId)) {
+        setSelectedId(requestedRunId);
+        if (mode === "full") scrollRecordIntoView(requestedRunId);
+        if (pendingRunId) onConsumePending?.();
       }
     }).catch((error: unknown) => {
       if (current) notify(error instanceof Error ? error.message : String(error), "error");
     }).finally(() => { if (current) setLoading(false); });
     return () => { current = false; };
-  }, [notify, activityRevision, pendingRunId, onConsumePending]);
+  }, [notify, activityRevision, requestedRunId, pendingRunId, onConsumePending, mode]);
   useEffect(() => {
     if (!selectedId) { setDetail(undefined); return; }
     let current = true;
@@ -637,8 +650,18 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
       selected.taskId,
       selected.id,
       status as "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance"
-    ).catch(() => undefined);
+    ).then((updated) => onDashboardSyncRef.current?.(updated)).catch(() => undefined);
   }, [dashboard, selected?.taskId, selected?.id, mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt]);
+  useEffect(() => {
+    const capture = mergePreview?.delivery?.evidenceRerun;
+    if (!dashboard || !selected?.taskId || !selected.id || !capture) return;
+    void dashboard.syncRequirementEvidenceCapture(selected.taskId, selected.id, {
+      status: capture.status,
+      updatedAt: capture.updatedAt,
+      message: capture.message,
+      mediaCount: mergePreview.evidence.assets.length
+    }).then((updated) => onDashboardSyncRef.current?.(updated)).catch(() => undefined);
+  }, [dashboard, selected?.taskId, selected?.id, mergePreview?.delivery?.evidenceRerun?.status, mergePreview?.delivery?.evidenceRerun?.updatedAt, mergePreview?.evidence.assets.length]);
   useEffect(() => {
     if (!selected?.id) {
       setHumanRequests([]);
@@ -706,10 +729,11 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
     setMergeError("");
     try {
       if (dashboard && selected.taskId) {
-        await dashboard.submitRequirementForAcceptance(
+        const updated = await dashboard.submitRequirementForAcceptance(
           selected.taskId,
           acceptanceSnapshotFromPreview(mergePreview, new Date().toISOString())
         );
+        onDashboardSyncRef.current?.(updated);
       }
       const result = await api<RunMergeQueueResult>(`/api/runs/${encodeURIComponent(selected.id)}/merge-queue`, {
         method: "POST",
@@ -721,7 +745,8 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
       });
       setMergeOpen(false);
       if (dashboard && selected.taskId) {
-        await dashboard.syncRequirementDelivery(selected.taskId, selected.id, result.status);
+        const updated = await dashboard.syncRequirementDelivery(selected.taskId, selected.id, result.status);
+        onDashboardSyncRef.current?.(updated);
       }
       setDeliveryRevision((value) => value + 1);
       notify(`Run ${selected.id} 已进入 ${result.delivery.targetBranch} 的待合入队列。`, "success");
@@ -735,9 +760,18 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
     if (!selected || !mergePreview?.worktreePath) return;
     setEvidenceRerunError("");
     try {
-      await api<RunDeliveryRecord>(`/api/runs/${encodeURIComponent(selected.id)}/evidence-rerun`, writeBody({
+      const delivery = await api<RunDeliveryRecord>(`/api/runs/${encodeURIComponent(selected.id)}/evidence-rerun`, writeBody({
         actor: "workbench-operator"
       }));
+      if (dashboard && selected.taskId && delivery.evidenceRerun) {
+        const updated = await dashboard.syncRequirementEvidenceCapture(selected.taskId, selected.id, {
+          status: delivery.evidenceRerun.status,
+          updatedAt: delivery.evidenceRerun.updatedAt,
+          message: delivery.evidenceRerun.message,
+          mediaCount: mergePreview.evidence.assets.length
+        });
+        onDashboardSyncRef.current?.(updated);
+      }
       setDeliveryRevision((value) => value + 1);
       notify(`Run ${selected.id} 已进入独立截图验收队列。`, "success");
     } catch (error) {
@@ -795,6 +829,7 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
     try {
       const snapshot = acceptanceSnapshotFromPreview(mergePreview, new Date().toISOString());
       const updated = await dashboard.submitRequirementForAcceptance(selected.taskId, snapshot);
+      onDashboardSyncRef.current?.(updated);
       notify(`${updated.code} 已提交到待验收；Run ${snapshot.runId} 验收快照已固定。`, "success");
     } catch (error) {
       setBoardSubmitError(error instanceof Error ? error.message : String(error));
@@ -822,17 +857,17 @@ export function RunsPage({ notify, activityRevision = "", pendingRunId = "", onC
   );
   const profileEntries = Object.entries(selected?.effectiveProfiles ?? {});
   const showHumanDecisionFirst = humanRequestsLoading || humanRequests.some((request) => request.status === "pending");
-  return <div className="page-grid page-grid--runs">
-    <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="run-filter-bar"><div data-testid="run-type-filter"><SelectControl ariaLabel="按类型筛选运行卷宗" value={categoryFilter} options={[{ value: "all", label: "全部类型" }, { value: "single", label: "单任务" }, { value: "graph", label: "Graph 编排" }, { value: "supervisor", label: "领队协作" }]} onChange={(value) => setCategoryFilter(value as typeof categoryFilter)} /></div><div data-testid="run-project-filter"><SelectControl ariaLabel="按项目筛选运行卷宗" value={projectFilter} options={[{ value: "all", label: "全部项目" }, { value: "none", label: "无项目" }, ...projectOptions.map((project) => ({ value: project, label: project }))]} onChange={(value) => setProjectFilter(value)} /></div></div><div className="record-scroll run-list">{visibleRuns.map((run) => <button key={run.id} id={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => setSelectedId(run.id)}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {run.architecture} · {Object.keys(run.nodes).length} 节点</small><div className="run-card-tags">{run.category && <span className={`run-category-tag run-category-tag--${run.category}`}>{CATEGORY_LABELS[run.category]}</span>}{run.project && <span className="run-project-chip">{run.project}</span>}</div></div><Stamp status={run.status} /></button>)}{!loading && visibleRuns.length === 0 && <div className="mini-empty">{runs.length === 0 ? "还没有 Run 证据。" : "没有符合筛选条件的卷宗。"}</div>}</div><footer className="list-footer"><span>{visibleRuns.length}/{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
+  return <div className={`page-grid page-grid--runs${mode === "embedded" ? " page-grid--runs-embedded" : ""}`}>
+    <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="run-filter-bar"><div data-testid="run-type-filter"><SelectControl ariaLabel="按类型筛选运行卷宗" value={categoryFilter} options={[{ value: "all", label: "全部类型" }, { value: "single", label: "单任务" }, { value: "graph", label: "Graph 编排" }, { value: "supervisor", label: "领队协作" }]} onChange={(value) => setCategoryFilter(value as typeof categoryFilter)} /></div><div data-testid="run-project-filter"><SelectControl ariaLabel="按项目筛选运行卷宗" value={projectFilter} options={[{ value: "all", label: "全部项目" }, { value: "none", label: "无项目" }, ...projectOptions.map((project) => ({ value: project, label: project }))]} onChange={(value) => setProjectFilter(value)} /></div></div><div className="record-scroll run-list">{visibleRuns.map((run) => <button key={run.id} id={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => { setSelectedId(run.id); onSelectRun?.(run.id); }}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {run.architecture} · {Object.keys(run.nodes).length} 节点</small><div className="run-card-tags">{run.category && <span className={`run-category-tag run-category-tag--${run.category}`}>{CATEGORY_LABELS[run.category]}</span>}{run.project && <span className="run-project-chip">{run.project}</span>}</div></div><Stamp status={run.status} /></button>)}{!loading && visibleRuns.length === 0 && <div className="mini-empty">{runs.length === 0 ? "还没有 Run 证据。" : "没有符合筛选条件的卷宗。"}</div>}</div><footer className="list-footer"><span>{visibleRuns.length}/{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
     <main className="detail-pane">{loading ? <div className="skeleton-page" aria-label="正在调取运行卷宗"><i /><i /><i /></div> : !selected ? <EmptyState title="尚无运行卷宗">直接交办员工或签发一次 Workflow 后，这里会出现不可变的执行记录。</EmptyState> : <div className="dossier run-dossier">
       <header className="dossier-cover"><div className="file-index"><span>RUN EVIDENCE RECORD</span><code>{selected.id}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">证</div><div><h2>{selected.workflow}</h2><p>{selected.status === "blocked" ? "流程已完成，但存在业务阻塞结论。" : selected.status === "failed" ? "执行发生技术故障，可查看原始输出与错误证据。" : selected.status === "running" ? "执行仍在进行。" : "流程完成，证据已归档。"}</p></div><Stamp status={selected.status} /></div></header>
-      {showHumanDecisionFirst && <DossierSection number="待办" title="需要你的决定"><HumanDecisionPanel requests={humanRequests} loading={humanRequestsLoading} commentDrafts={commentDrafts} deciding={deciding} onCommentChange={(requestId, value) => setCommentDrafts((drafts) => ({ ...drafts, [requestId]: value }))} onOpenDecision={openDecision} /></DossierSection>}
+      {view === "all" && <>{showHumanDecisionFirst && <DossierSection number="待办" title="需要你的决定"><HumanDecisionPanel requests={humanRequests} loading={humanRequestsLoading} commentDrafts={commentDrafts} deciding={deciding} onCommentChange={(requestId, value) => setCommentDrafts((drafts) => ({ ...drafts, [requestId]: value }))} onOpenDecision={openDecision} /></DossierSection>}
       <DossierSection number="01" title="运行元数据"><dl className="ledger"><dt>Run ID</dt><dd><code>{selected.id}</code></dd><dt>Architecture</dt><dd>{selected.architecture}</dd><dt>创建时间</dt><dd>{formatTime(selected.createdAt)}</dd><dt>完成时间</dt><dd>{formatTime(selected.completedAt)}</dd><dt>证据目录</dt><dd><code className="path-code">{selected.artifactDir}</code></dd><dt>隔离</dt><dd><IsolationValue isolation={selected.isolation} /></dd></dl></DossierSection>
       {profileEntries.length > 0 && <DossierSection number="02" title="有效执行配置与来源"><div className="run-profile-list">{profileEntries.map(([nodeId, profile]) => <details key={nodeId} open={profileEntries.length === 1}><summary><strong>{nodeId}</strong><span>{profile.employee.displayName} · v{profile.employee.version}</span></summary><EffectiveProfileView profile={profile} /></details>)}</div></DossierSection>}
       {selected.architecture === "supervisor" && <DossierSection number={profileEntries.length > 0 ? "03" : "02"} title="动态执行图"><SupervisorRunTopology nodes={Object.values(selected.nodes)} /></DossierSection>}
       <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "04" : "03") : (selected.architecture === "supervisor" ? "03" : "02")} title="节点结果"><div className="run-node-list">{Object.values(selected.nodes).map((node, index) => { const decision = supervisorDecision(node); return <article key={node.nodeId}><div className="run-node-head"><span className="node-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{node.nodeId}</strong><code>{node.roleId}{node.metadata?.kind === "supervisor" ? ` · 领队 Round ${node.metadata.round ?? "—"}` : node.metadata?.kind === "member" ? ` · 成员 Round ${node.metadata.round ?? "—"}` : ""}{dagFlowTag(node)}</code></div><Stamp status={node.status} /></div><dl className="ledger horizontal"><dt>尝试</dt><dd>{node.attempts}</dd><dt>开始</dt><dd>{formatTime(node.startedAt)}</dd><dt>结束</dt><dd>{formatTime(node.completedAt)}</dd></dl>{decision && <div className="supervisor-decision-summary"><code>{decision.action.toUpperCase()}</code><span>{decision.summary ?? "领队未提供本轮摘要。"}</span></div>}{node.error && <div className="inline-error">{node.error}</div>}{node.output !== undefined && <><E2eEvidenceList entries={e2eEvidenceEntries(node.output)} /><pre className="result-json">{JSON.stringify(node.output, null, 2)}</pre></>}<code className="artifact-path">{node.artifactDir}</code></article>; })}</div></DossierSection>
       {selected.output !== undefined && <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "05" : "04") : (selected.architecture === "supervisor" ? "04" : "03")} title="Workflow 最终输出">{finalSummary(selected) && <p className="workflow-final-summary">{finalSummary(selected)}</p>}<GateVerdictList gates={gateVerdicts(selected.output)} /><E2eEvidenceList entries={e2eEvidenceEntries(selected.output)} /><pre className="result-json">{JSON.stringify(selected.output, null, 2)}</pre></DossierSection>}
-      {!showHumanDecisionFirst && <DossierSection number="人审" title="人在回路"><HumanDecisionPanel requests={humanRequests} loading={humanRequestsLoading} commentDrafts={commentDrafts} deciding={deciding} onCommentChange={(requestId, value) => setCommentDrafts((drafts) => ({ ...drafts, [requestId]: value }))} onOpenDecision={openDecision} /></DossierSection>}
+      {!showHumanDecisionFirst && <DossierSection number="人审" title="人在回路"><HumanDecisionPanel requests={humanRequests} loading={humanRequestsLoading} commentDrafts={commentDrafts} deciding={deciding} onCommentChange={(requestId, value) => setCommentDrafts((drafts) => ({ ...drafts, [requestId]: value }))} onOpenDecision={openDecision} /></DossierSection>}</>}
       <DossierSection number="交付" title="验收与合并"><RunDeliveryPanel
         preview={mergePreview?.runId === selected.id ? mergePreview : undefined}
         loading={mergePreviewLoading}

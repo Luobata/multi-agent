@@ -672,7 +672,10 @@ function KnowledgePreviewModal({ employee, onClose, notify }: {
   return <Modal title="知识试跑" eyebrow={`${employee.id} · NO PROVIDER CALL`} onClose={onClose} wide><form className="modal-body compact-form" onSubmit={preview}><div className="project-connect-note"><strong>只运行 Resolver、Router 与 Retriever。</strong><p>不会调用 Provider，也不会创建 Session；用它检查 Profile 是否过宽、过窄或没有命中。</p></div><Field label="模拟任务"><textarea required rows={4} disabled={!daemonAvailable || loading} value={message} onChange={(event) => setMessage(event.target.value)} /></Field>{result && <div className="knowledge-preview-result"><ReadonlyEvidence label="Knowledge Plan" value={JSON.stringify(result.plan, null, 2)} mono /><ReadonlyEvidence label={`Evidence · ${result.evidence.length} 条`} value={result.evidence.length ? JSON.stringify(result.evidence, null, 2) : "没有内容达到相关度门槛。请检查 Profile 范围、发布 Revision、元数据标签或任务措辞。"} mono /></div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>关闭</button><button className="button primary" disabled={!daemonAvailable || loading}>{loading ? "路由中…" : "预览知识计划"}</button></div></form></Modal>;
 }
 
-export function EmployeePage({ data, refresh, notify }: PageProps) {
+export function EmployeePage({ data, refresh, notify, focusedEmployeeId, onSelectEmployee }: PageProps & {
+  focusedEmployeeId?: string;
+  onSelectEmployee?: (employeeId: string) => void;
+}) {
   const daemonAvailable = useDaemonAvailable();
   // Lightweight page clock so a short-lived "completed" chip actually fades
   // after its dwell while someone stays on this page. Cleaned up on unmount.
@@ -692,8 +695,15 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
   const visibleProject = visible.filter(isProjectEmployee);
   const visibleGlobal = visibleExternal.filter((employee) => !isProjectEmployee(employee));
   const visibleSystem = visible.filter(isSystemEmployee);
-  const [selectedId, setSelectedId] = useState(visible[0]?.id ?? "");
+  const [selectedId, setSelectedId] = useState(() => focusedEmployeeId && data.employees.some((employee) => employee.id === focusedEmployeeId) ? focusedEmployeeId : visible[0]?.id ?? "");
   const selected = data.employees.find((employee) => employee.id === selectedId) ?? visible[0];
+  const selectEmployee = (employeeId: string) => {
+    setSelectedId(employeeId);
+    onSelectEmployee?.(employeeId);
+  };
+  useEffect(() => {
+    if (focusedEmployeeId && data.employees.some((employee) => employee.id === focusedEmployeeId)) setSelectedId(focusedEmployeeId);
+  }, [focusedEmployeeId, data.employees]);
   const selectedSystemScope = selected ? systemEmployeeScope(selected) : undefined;
   const selectedProvider = selected ? data.providers.find((provider) => provider.id === selected.providerId) : undefined;
   const selectedRuntime = providerRuntimeSummary(selectedProvider);
@@ -726,7 +736,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
     if (!selected) return;
     try {
       const cloned = await api<Employee>(`/api/employees/${selected.id}/clone`, writeBody(cloneDraft));
-      notify(`已复制为 ${cloned.id}；Session 与 Run 历史未复制`); setCloneOpen(false); setSelectedId(cloned.id); await refresh();
+      notify(`已复制为 ${cloned.id}；Session 与 Run 历史未复制`); setCloneOpen(false); selectEmployee(cloned.id); await refresh();
     } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
   };
   const archive = async () => {
@@ -761,7 +771,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
           { id: "system", title: "系统级员工", note: "仅供内部项目角色调用，可在此管理", employees: visibleSystem }
         ].map((group) => <section className={`employee-roster-group employee-roster-group--${group.id}`} key={group.id} aria-labelledby={`employee-group-${group.id}`}>
           <header><div><h2 id={`employee-group-${group.id}`}>{group.title}</h2><span>{group.employees.length}</span></div><p>{group.note}</p></header>
-          <div>{group.employees.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); const runtimeState = employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id && instance.employeeVersion === employee.version), clock); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => setSelectedId(employee.id)}>
+          <div>{group.employees.map((employee) => { const runtime = providerRuntimeSummary(data.providers.find((provider) => provider.id === employee.providerId)); const runtimeState = employeeRuntimeStatus(data.activity.instances.filter((instance) => instance.employeeId === employee.id && instance.employeeVersion === employee.version), clock); return <button className={`employee-card ${selected?.id === employee.id ? "selected" : ""}`} key={employee.id} onClick={() => selectEmployee(employee.id)}>
             <EmployeeAvatar displayName={employee.identity.displayName} presentation={employee.presentation} />
             <span className="employee-card-copy"><strong>{employee.identity.displayName}</strong><code>{employee.id} · v{employee.version}</code><small>{employee.description}</small><span className="employee-runtime"><span>模型 <code>{runtime.model}</code></span><span title={runtime.launchCommand}>启动 <code>{runtime.launchPreview}</code></span></span></span>
             <span className="employee-card-stamps">{group.id === "system" && <span className="system-level-badge">系统级</span>}<Stamp status={employee.status} />{runtimeState !== "idle" && <RuntimeStatusChip status={runtimeState} />}</span>
@@ -796,7 +806,7 @@ export function EmployeePage({ data, refresh, notify }: PageProps) {
       </div>}
     </main>
 
-    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} data={data} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); setSelectedId(saved.id); await refresh(); }} />}
+    {editor && <EmployeeEditor employee={editor === "edit" ? selected : undefined} data={data} notify={notify} onClose={() => setEditor(null)} onSaved={async (saved) => { setEditor(null); selectEmployee(saved.id); await refresh(); }} />}
     {registryOpen && <RegistryModal data={data} onClose={() => setRegistryOpen(false)} refresh={refresh} notify={notify} />}
     {skillManagerMode && selected && <EmployeeSkillManager employee={selected} skills={data.skills} mode={skillManagerMode} notify={notify} onClose={() => setSkillManagerMode(null)} onSaved={async () => { setSkillManagerMode(null); await refresh(); }} />}
     {knowledgePreviewOpen && selected && <KnowledgePreviewModal employee={selected} notify={notify} onClose={() => setKnowledgePreviewOpen(false)} />}

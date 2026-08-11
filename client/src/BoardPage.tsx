@@ -360,6 +360,8 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
                         <span className={`board-priority board-priority--${requirement.priority}`}>{REQUIREMENT_PRIORITY_LABELS[requirement.priority]}</span>
                         <span>{requirementOwnerLabel(requirement)}</span>
                         <time>{formatTime(requirement.updatedAt)}</time>
+                        {(requirement.evidenceCapture?.status === "queued" || requirement.evidenceCapture?.status === "running") && <span className="board-evidence-capture" role="status">验收补采中</span>}
+                        {requirement.evidenceCapture?.status === "failed" && <span className="board-evidence-capture board-evidence-capture--failed" role="status">验收补采失败</span>}
                         {exceptionChip(requirement.exception)}
                       </footer>
                     </button>

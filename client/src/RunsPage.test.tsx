@@ -3,6 +3,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RunsPage, acceptanceSnapshotFromPreview, filterRuns, sortHumanDecisionRequests } from "./RunsPage";
+import type { DashboardService } from "./dashboard/service";
+import type { Requirement } from "./dashboard/types";
 import type { HumanDecisionRequest, Run, RunMergePreview, RunMergeQueueResult } from "./types";
 
 const runs: Run[] = [
@@ -219,11 +221,10 @@ describe("RunsPage dossier isolation status", () => {
   });
 });
 
-describe("RunsPage pendingRunId cross-page selection", () => {
+describe("RunsPage focused hash selection", () => {
   let container: HTMLDivElement;
   let root: Root;
   const fetchMock = vi.fn();
-  const onConsumePending = vi.fn();
 
   beforeEach(async () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -238,7 +239,7 @@ describe("RunsPage pendingRunId cross-page selection", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
-    act(() => root.render(<RunsPage notify={vi.fn()} pendingRunId="run-graph-1" onConsumePending={onConsumePending} />));
+    act(() => root.render(<RunsPage notify={vi.fn()} focusedRunId="run-graph-1" />));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
   });
 
@@ -247,13 +248,26 @@ describe("RunsPage pendingRunId cross-page selection", () => {
     container.remove();
     document.body.replaceChildren();
     fetchMock.mockReset();
-    onConsumePending.mockReset();
   });
 
-  it("auto-selects the run named by pendingRunId once loaded, not the first run", () => {
+  it("restores the exact run named by the hash after loading, not the first run", () => {
     expect(container.querySelector("#run-graph-1")?.classList.contains("selected")).toBe(true);
     expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
-    expect(onConsumePending).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates the deep link when the operator selects another run", async () => {
+    const onSelectRun = vi.fn();
+    await act(async () => { root.render(<RunsPage notify={vi.fn()} focusedRunId="run-graph-1" onSelectRun={onSelectRun} />); await Promise.resolve(); });
+    const target = container.querySelector<HTMLButtonElement>("#run-sup-1");
+    await act(async () => { target?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(onSelectRun).toHaveBeenCalledWith("run-sup-1");
+  });
+
+  it("embeds an acceptance-only work surface without the separate run list", async () => {
+    await act(async () => { root.render(<RunsPage notify={vi.fn()} mode="embedded" view="acceptance" focusedRunId="run-graph-1" />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.querySelector(".page-grid--runs-embedded")).toBeTruthy();
+    expect(container.textContent).toContain("验收与合并");
+    expect(container.textContent).not.toContain("运行元数据");
   });
 });
 
@@ -264,6 +278,7 @@ const deliveryRun: Run = {
   artifactDir: "/delivery",
   status: "passed",
   createdAt: "2026-08-06T06:00:00.000Z",
+  taskId: "req-104",
   nodes: {},
   isolation: { mode: "worktree", worktreePath: "/repo/.multi-agent/worktrees/run-delivery-ui-1" }
 };
@@ -439,11 +454,16 @@ describe("RunsPage delivery acceptance", () => {
     const originalAssets = eligiblePreview.evidence.assets;
     eligiblePreview.evidence.assets = [];
     try {
-      await act(async () => { root.render(<RunsPage notify={notify} />); await Promise.resolve(); });
+      const projected = { id: "req-104", code: "REQ-104", lane: "running" } as Requirement;
+      const dashboard = { syncRequirementEvidenceCapture: vi.fn().mockResolvedValue(projected) } as unknown as DashboardService;
+      const onDashboardSync = vi.fn();
+      await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} onDashboardSync={onDashboardSync} />); await Promise.resolve(); });
       const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "补采验收截图");
       expect(rerun).toBeTruthy();
       await act(async () => { rerun?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
       expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
+      expect(dashboard.syncRequirementEvidenceCapture).toHaveBeenCalledTimes(1);
+      expect(onDashboardSync).toHaveBeenCalledWith(projected);
     } finally {
       eligiblePreview.evidence.assets = originalAssets;
     }

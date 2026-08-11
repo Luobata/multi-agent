@@ -193,6 +193,22 @@ describe("RequirementDetailPage advancement launch", () => {
     expect(button("查看 Run 与证据")).toBeTruthy();
   });
 
+  it("keeps lifecycle sections inside one deep-linked requirement dossier", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", idSeed: () => "req-section" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id, title: "连续需求卷宗", summary: "不再跨页寻找上下文", priority: "medium",
+      rawRequirement: "把需求和验收放在同一处", acceptanceCriteria: ["刷新仍位于相同分区"]
+    });
+    const go = vi.fn();
+    act(() => root.render(<RequirementDetailPage requirementId={requirement.id} section="run" go={go} notify={vi.fn()} service={service} projects={[project]} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.querySelector(".requirement-lifecycle-nav")?.textContent).toContain("需求定义");
+    expect(container.textContent).toContain("尚未绑定 Run");
+    act(() => button("验收与合入").click());
+    expect(go).toHaveBeenCalledWith(`requirements/${requirement.id}?section=acceptance`);
+  });
+
   it("explains the pending decision and opens the exact Run as the primary action", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T02:00:00.000Z"), idSeed: () => "req-confirm" });
     service.syncConnectedProjects([project]);

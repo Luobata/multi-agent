@@ -1,12 +1,13 @@
 /** 需求详情：原始需求 / 验收标准 / 任务 DAG / Agent 时间线 / Diff·测试·Review·交付物。
  *  DAG / 时间线 / 资源概览的演示徽标完全由数据 demo 标记驱动。列迁移走目标列 SelectControl。 */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { DemoBadge, DossierSection, EmptyState, Modal, ReadonlyEvidence, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
 import { isActiveRequirementAdvancement, requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
-import type { DagTaskNode, RequirementDetail, RequirementLane } from "./dashboard/types";
+import type { DagTaskNode, Requirement, RequirementDetail, RequirementLane } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, VISIBLE_REQUIREMENT_LANES, requirementLaneLabel } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
+import { RunsPage } from "./RunsPage";
 import {
   buildRequirementAdvancementInput,
   requirementAdvancementGateway,
@@ -52,6 +53,7 @@ function startBlockedReason(detail: RequirementDetail, configured: boolean, poli
 
 export function RequirementDetailPage({
   requirementId,
+  section = "overview",
   go,
   notify,
   service = dashboardService,
@@ -64,6 +66,7 @@ export function RequirementDetailPage({
   onOpenRun
 }: {
   requirementId: string;
+  section?: "overview" | "run" | "acceptance";
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
@@ -99,6 +102,12 @@ export function RequirementDetailPage({
   const blockedStart = detail ? startBlockedReason(detail, Boolean(advancementConfig), Boolean(activePolicy)) : undefined;
   const canRestart = detail?.advancement?.status === "failed" || detail?.advancement?.status === "blocked";
   const awaitingDecision = detail?.advancement?.status === "awaiting-human-decision";
+  const syncDashboardProjection = useCallback((updated: Requirement) => {
+    if (!detail || detail.id !== updated.id) return;
+    // The embedded Run already has the new projection. Merge it into the open
+    // dossier without returning the whole page to its loading skeleton.
+    setData({ ...detail, ...updated });
+  }, [detail, setData]);
 
   useEffect(() => {
     if (!detail?.advancement || !activeInvocation || detail.advancement.status === activeInvocation.status) return;
@@ -209,12 +218,18 @@ export function RequirementDetailPage({
   };
 
   return <main className="dash-page">
-    <PageHeader eyebrow="REQUIREMENT / DOSSIER" title="需求详情" description="第一阶段列迁移在此完成；DAG 与时间线展示以数据徽标为准。" actions={<button type="button" className="button secondary" onClick={() => go(detail ? `projects/${detail.projectId}/board` : "board")}>← 返回看板</button>} />
+    <PageHeader eyebrow="REQUIREMENT / LIFECYCLE DOSSIER" title="需求工作卷宗" description="需求、执行、人工决策、验收证据和合入操作集中在同一份卷宗；当前分区会写入链接，刷新后仍回到这里。" actions={<button type="button" className="button secondary" onClick={() => go(detail ? `projects/${detail.projectId}/board` : "board")}>← 返回看板</button>} />
     <OfflineNotice />
     {state.status === "loading" && <SkeletonBlock rows={5} label="正在加载需求详情" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
     {state.status === "ready" && !detail && <EmptyState title="没有找到这条需求" action={<button type="button" className="button secondary" onClick={() => go("board")}>返回需求看板</button>}><p>它可能已被移除；看板数据未受影响。</p></EmptyState>}
-    {state.status === "ready" && detail && <div className="dash-dossier">
+    {state.status === "ready" && detail && <nav className="requirement-lifecycle-nav" aria-label="需求生命周期">
+      {(["overview", "run", "acceptance"] as const).map((item, index) => <button key={item} type="button" aria-current={section === item ? "page" : undefined} className={section === item ? "active" : ""} onClick={() => go(`requirements/${encodeURIComponent(detail.id)}?section=${item}`)}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item === "overview" ? "需求定义" : item === "run" ? "执行与决策" : "验收与合入"}</strong><small>{item === "overview" ? requirementLaneLabel(detail.lane) : item === "run" ? detail.advancement?.runId ? "真实 Run 已绑定" : "等待启动" : detail.evidence.acceptance ? "验收快照已固定" : "等待交付"}</small></button>)}
+      {detail.advancement?.runId && <button type="button" className="standalone-run-link" onClick={() => go(`runs?run=${encodeURIComponent(detail.advancement!.runId!)}`)}>独立运行卷宗 ↗</button>}
+    </nav>}
+    {state.status === "ready" && detail && (section === "run" || section === "acceptance") && detail.advancement?.runId && <RunsPage mode="embedded" view={section === "acceptance" ? "acceptance" : "all"} focusedRunId={detail.advancement.runId} notify={notify} dashboard={service} onDashboardSync={syncDashboardProjection} />}
+    {state.status === "ready" && detail && (section === "run" || section === "acceptance") && !detail.advancement?.runId && <EmptyState title="尚未绑定 Run">开始推进后，完整决策、证据、验收与合入操作会在这里出现。</EmptyState>}
+    {state.status === "ready" && detail && section === "overview" && <div className="dash-dossier dash-dossier--overview">
       <div className="dash-panel dash-req-cover">
         <div className="dash-req-title">
           <code>{detail.code}</code>
