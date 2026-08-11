@@ -7603,7 +7603,7 @@ export class WorkbenchService {
       const queueKey = `${currentPreview.repositoryRoot}\u0000${currentPreview.targetBranch}`;
       const previous = this.mergeBranchQueues.get(queueKey) ?? Promise.resolve();
       const worker = previous.catch(() => undefined).then(() => this.processQueuedMerge(id));
-      const tail = worker.finally(() => {
+      const tail = worker.catch(() => undefined).finally(() => {
         if (this.mergeBranchQueues.get(queueKey) === tail) this.mergeBranchQueues.delete(queueKey);
       });
       this.mergeBranchQueues.set(queueKey, tail);

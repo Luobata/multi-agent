@@ -11,6 +11,7 @@ import {
   assessQueuedRun,
   queueAcceptedRun,
   transitionRunDelivery,
+  updateRunDelivery,
   type RunMergePreview
 } from "../src/runtime/worktreeDelivery.js";
 import { WorkbenchService } from "../src/workbench/service.js";
@@ -331,9 +332,25 @@ describe("run delivery daemon routes", () => {
       targetBranch: "main",
       actor: "daemon-reviewer"
     });
-    fs.writeFileSync(path.join(repo, "target-drift.txt"), "target drift\n", "utf8");
-    git(repo, "add", "target-drift.txt");
-    git(repo, "commit", "-m", "advance target after queue");
+    fs.writeFileSync(path.join(repo, "target-before-rebase.txt"), "target before rebase\n", "utf8");
+    git(repo, "add", "target-before-rebase.txt");
+    git(repo, "commit", "-m", "advance target before managed rebase");
+    const rebasedTargetCommit = git(repo, "rev-parse", "HEAD");
+    git(worktree!.path, "rebase", rebasedTargetCommit);
+    const rebasedSourceCommit = git(worktree!.path, "rev-parse", "HEAD");
+    await updateRunDelivery(runDir, runId, (current) => ({
+      ...current!,
+      runId,
+      baseCommit: rebasedTargetCommit,
+      sourceCommit: rebasedSourceCommit,
+      queuedTargetCommit: rebasedTargetCommit,
+      targetCommitBeforeMerge: rebasedTargetCommit,
+      updatedAt: new Date().toISOString()
+    }));
+
+    fs.writeFileSync(path.join(repo, "target-after-rebase.txt"), "target after rebase\n", "utf8");
+    git(repo, "add", "target-after-rebase.txt");
+    git(repo, "commit", "-m", "advance target after managed rebase");
     const targetCommit = (await assessQueuedRun(run, runDir)).currentTargetCommit;
     await transitionRunDelivery(runDir, runId, "merging", {
       message: "Target-drift validation passed; daemon stopped before merge.",
@@ -346,9 +363,37 @@ describe("run delivery daemon routes", () => {
         updatedAt: new Date().toISOString()
       }
     });
+    await updateRunDelivery(runDir, runId, (current) => ({
+      ...current!,
+      runId,
+      // The current target is not an ancestor of the rebased candidate. This
+      // deliberately exercises the queue worker rejection path first.
+      baseCommit: targetCommit,
+      updatedAt: new Date().toISOString()
+    }));
 
     const service = await WorkbenchService.open({ dataRoot });
     const app = createDaemonApp(service, { staticDir: path.join(dataRoot, "missing-client") });
+    let rejectedPreview: RunMergePreview | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const response = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
+      rejectedPreview = (response.json as { data: RunMergePreview }).data;
+      if (rejectedPreview.status === "returned-to-acceptance") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(rejectedPreview).toMatchObject({
+      status: "returned-to-acceptance",
+      delivery: { message: expect.stringContaining("受管 rebase 基线") }
+    });
+    await updateRunDelivery(runDir, runId, (current) => ({
+      ...current!,
+      runId,
+      status: "merging",
+      baseCommit: rebasedTargetCommit,
+      updatedAt: new Date().toISOString(),
+      message: "Retry the already validated merge after correcting its trusted base."
+    }));
+
     let mergedPreview: RunMergePreview | undefined;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const response = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });

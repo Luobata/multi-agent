@@ -814,7 +814,12 @@ async function ensureDeliverySource(
     }
     const acceptedRebase = delivery.conflictResolution?.status === "passed"
       && delivery.baseCommit === delivery.conflictResolution.targetCommit;
-    if (run.isolation?.baseCommit && delivery.baseCommit !== run.isolation.baseCommit && !acceptedRebase) {
+    const independentlyValidatedSource = delivery.mergeValidation?.status === "passed"
+      && delivery.mergeValidation.targetCommit === before.commit;
+    if (run.isolation?.baseCommit
+      && delivery.baseCommit !== run.isolation.baseCommit
+      && !acceptedRebase
+      && !independentlyValidatedSource) {
       throw new Error("交付记录的 worktree 基线与当前 Run 不匹配");
     }
     const [currentSourceBranch, currentSourceCommit] = await Promise.all([
@@ -823,6 +828,12 @@ async function ensureDeliverySource(
     ]);
     if (currentSourceBranch !== expectedSourceBranch || currentSourceCommit !== delivery.sourceCommit) {
       throw new Error("交付记录的源分支或 commit 已变化，请重新核对 worktree");
+    }
+    if (independentlyValidatedSource) {
+      const ancestry = await runGit(preview.worktreePath, [
+        "merge-base", "--is-ancestor", delivery.baseCommit, currentSourceCommit
+      ]);
+      if (ancestry.code !== 0) throw new Error("独立回归对应的候选不再包含受管 rebase 基线");
     }
     return delivery;
   }
