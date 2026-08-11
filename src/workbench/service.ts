@@ -53,6 +53,7 @@ import { webpageToKnowledgeDocuments } from "../knowledge/urlImport.js";
 import { MemoryStore } from "../memory/store.js";
 import { MemoryRetriever } from "../memory/retriever.js";
 import { MemoryExtractor, summarizerContent, buildRunEvidence, type RunLike, type SummarizeFn } from "../memory/extractor.js";
+import { buildEvidenceRerunRequest, parseOriginalRunRequest } from "./evidenceRerun.js";
 import type { MemoryEvidence, MemoryRecord, MemoryScope, MemorySearchQuery } from "../memory/types.js";
 import type {
   KnowledgeBaseCreateInput,
@@ -7415,6 +7416,16 @@ export class WorkbenchService {
     return copied;
   }
 
+  private async originalRequestForRun(runDir: string): Promise<string | undefined> {
+    try {
+      return parseOriginalRunRequest(JSON.parse(await fs.readFile(path.join(runDir, "input.json"), "utf8")));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      if (error instanceof SyntaxError) return undefined;
+      throw error;
+    }
+  }
+
   private async recoverInterruptedEvidenceRerun(
     runDir: string,
     id: string,
@@ -7456,6 +7467,7 @@ export class WorkbenchService {
     const projectId = invocation?.source.project;
     const taskId = invocation?.source.taskId;
     const worktreePath = preview.worktreePath;
+    const originalRequest = await this.originalRequestForRun(runDir);
     const stagingRoot = path.join(worktreePath, ".multi-agent", "evidence-rerun", `${id}-${randomUUID()}`);
     const job = (async () => {
       try {
@@ -7472,15 +7484,13 @@ export class WorkbenchService {
           projectId,
           taskId,
           worktreePath,
-          [
-            "【补采验收截图】",
-            `父 Run：${id}`,
-            `候选 worktree：${worktreePath}`,
-            `截图输出目录：${stagingRoot}`,
-            "请独立启动或复用现有服务，逐条复现可观察验收路径，并把真实截图或录屏写入指定目录。",
-            "不得安装依赖，不得修改产品代码、配置、Git 历史或目标分支；若环境不具备验收条件，请返回 block 并说明缺口。",
-            "至少产出一张能辨认验收结果的截图；只写媒体证据到指定目录。"
-          ].join("\n"),
+          buildEvidenceRerunRequest({
+            runId: id,
+            worktreePath,
+            stagingRoot,
+            originalRequest,
+            changedFiles: preview.changes.files.map((file) => file.path)
+          }),
           "system:evidence-rerun"
         );
         const destination = path.join(runDir, "evidence-reruns", result.runId);
