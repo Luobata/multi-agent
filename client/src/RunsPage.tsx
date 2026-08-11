@@ -566,6 +566,11 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   const [deciding, setDeciding] = useState(false);
   const [decisionError, setDecisionError] = useState("");
   const [decisionRevision, setDecisionRevision] = useState(0);
+  // A deep link should reveal its Run once when the operator enters the dossier.
+  // Activity SSE updates also refresh this list; treating every refresh as a new
+  // navigation would repeatedly scroll the operator away from the evidence they
+  // are currently reading.
+  const revealedRunIdRef = useRef("");
   // Dashboard projection callbacks are UI events, not polling inputs. Keeping the
   // latest callback in a ref prevents an inline parent callback from retriggering
   // terminal delivery/capture effects on every render.
@@ -581,7 +586,6 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
       // list confirms the run exists; silently ignore ids absent from the list.
       if (requestedRunId && value.some((run) => run.id === requestedRunId)) {
         setSelectedId(requestedRunId);
-        if (mode === "full") scrollRecordIntoView(requestedRunId);
         if (pendingRunId) onConsumePending?.();
       }
     }).catch((error: unknown) => {
@@ -589,6 +593,17 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     }).finally(() => { if (current) setLoading(false); });
     return () => { current = false; };
   }, [notify, activityRevision, requestedRunId, pendingRunId, onConsumePending, mode]);
+  useEffect(() => {
+    if (!requestedRunId) {
+      revealedRunIdRef.current = "";
+      return;
+    }
+    if (mode !== "full"
+      || revealedRunIdRef.current === requestedRunId
+      || !runs.some((run) => run.id === requestedRunId)) return;
+    revealedRunIdRef.current = requestedRunId;
+    scrollRecordIntoView(requestedRunId);
+  }, [mode, requestedRunId, runs]);
   useEffect(() => {
     if (!selectedId) { setDetail(undefined); return; }
     let current = true;

@@ -225,6 +225,9 @@ describe("RunsPage focused hash selection", () => {
   let container: HTMLDivElement;
   let root: Root;
   const fetchMock = vi.fn();
+  const scrollIntoView = vi.fn();
+  const nativeScrollIntoView = HTMLElement.prototype.scrollIntoView;
+  const nativeMatchMedia = window.matchMedia;
 
   beforeEach(async () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -236,6 +239,11 @@ describe("RunsPage focused hash selection", () => {
       return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
     });
     vi.stubGlobal("fetch", fetchMock);
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }))
+    });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -248,11 +256,29 @@ describe("RunsPage focused hash selection", () => {
     container.remove();
     document.body.replaceChildren();
     fetchMock.mockReset();
+    scrollIntoView.mockReset();
+    if (nativeScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: nativeScrollIntoView });
+    else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    if (nativeMatchMedia) Object.defineProperty(window, "matchMedia", { configurable: true, value: nativeMatchMedia });
+    else Reflect.deleteProperty(window, "matchMedia");
   });
 
   it("restores the exact run named by the hash after loading, not the first run", () => {
     expect(container.querySelector("#run-graph-1")?.classList.contains("selected")).toBe(true);
     expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not auto-scroll the completed dossier again when background activity refreshes the list", async () => {
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      root.render(<RunsPage notify={vi.fn()} focusedRunId="run-graph-1" activityRevision="another-agent-updated" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/runs?")).length).toBeGreaterThan(1);
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
   });
 
   it("updates the deep link when the operator selects another run", async () => {
