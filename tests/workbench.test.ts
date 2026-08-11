@@ -1686,8 +1686,10 @@ describe("Local Agent Workbench", () => {
     expect(definition.args).toEqual(expect.arrayContaining([
       "--tools",
       "{{role.toolsCsv}}",
-      "--allowedTools"
+      "--allowedTools",
+      "--no-session-persistence"
     ]));
+    expect(definition.args).not.toContain("--max-budget-usd");
     expect(definition.hardTimeoutMs).toBeUndefined();
   });
 

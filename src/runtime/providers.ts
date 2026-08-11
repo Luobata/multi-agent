@@ -77,7 +77,7 @@ export type ProviderRegistry = Map<string, ProviderAdapter>;
  * lowercased stdout+stderr blob. Includes vendor-relay phrasings observed in practice, e.g.
  * "InternalServerException" and the Chinese "厂商资源问题断连" (upstream resource disconnect).
  */
-const TRANSIENT_FAILURE_PATTERN = /rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up|\b5\d{2}\b|internalservererror|internalserverexception|internal server error|service unavailable|bad gateway|gateway timeout|upstream|厂商资源|资源问题|断连/;
+const TRANSIENT_FAILURE_PATTERN = /rate.?limit|\b429\b|overloaded|temporar(?:y|ily unavailable)|econnreset|etimedout|socket hang up|connection (?:was )?lost|lost connection|mid-response|network error|\b5\d{2}\b|internalservererror|internalserverexception|internal server error|service unavailable|bad gateway|gateway timeout|upstream|厂商资源|资源问题|断连/;
 
 // A Provider CLI can exit while one of its descendants keeps stdout/stderr inherited. In that
 // state Node emits `exit` for the direct child but never emits `close`, so merely signalling the

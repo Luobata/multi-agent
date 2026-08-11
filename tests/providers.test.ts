@@ -175,6 +175,24 @@ describe("provider adapters", () => {
     expect(failure).toMatchObject({ kind: "rate-limit", retryable: true });
   });
 
+  it("classifies a relay connection lost mid-response as transient and retryable", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const failure = await adapter.invoke({
+      providerId: "relay-mid-response-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", "process.stderr.write('API Error: Connection lost mid-response. The response above may be incomplete.'); process.exit(1)"]
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {}
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "rate-limit", retryable: true });
+  });
+
   it("keeps an active Provider alive after the soft timeout", async () => {
     const adapter = createDefaultProviderRegistry().get("command")!;
     const progress: Array<{ kind: string; longRunning: boolean }> = [];

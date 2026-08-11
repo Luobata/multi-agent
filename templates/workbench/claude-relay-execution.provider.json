@@ -20,8 +20,6 @@
     "--allowedTools",
     "{{role.toolsCsv}}",
     "--no-session-persistence",
-    "--max-budget-usd",
-    "3",
     "--json-schema",
     "{{role.outputSchemaJson}}"
   ],
