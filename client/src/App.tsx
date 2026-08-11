@@ -38,7 +38,6 @@ const SCROLL_MEMORY_PREFIX = "local-agent-workbench.scroll.v1:";
 const emptyBootstrap: Bootstrap = { providers: [], skills: [], knowledgeBases: [], knowledgeProfiles: [], architectureTemplates: [], gateValidators: [], employees: [], managementPolicies: [], entrancePolicies: [], workflows: [], sessions: [], publications: [], projects: [], projectBindings: [], activity: { invocations: [], instances: [] } };
 
 function navigationGroup(page: Page): Page {
-  if (page === "requirement") return "board";
   if (page === "project") return "projects";
   return page;
 }
@@ -47,9 +46,13 @@ export function readNavigationMemory(storage: Pick<Storage, "getItem"> | undefin
   if (!storage) return {};
   try {
     const parsed = JSON.parse(storage.getItem(NAVIGATION_MEMORY_KEY) ?? "{}") as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(parsed).filter(([page, hash]) =>
-      TOP_LEVEL_PAGES.includes(page as Page) && typeof hash === "string" && hash.length > 0
-    )) as Partial<Record<Page, string>>;
+    return Object.fromEntries(Object.entries(parsed).filter(([page, hash]) => {
+      if (!TOP_LEVEL_PAGES.includes(page as Page) || typeof hash !== "string" || hash.length === 0) return false;
+      // Older builds grouped requirement dossiers under the board navigation
+      // memory. Reject those stale cross-route entries so the sidebar's board
+      // button always opens an actual board.
+      return navigationGroup(pageFromHash(`#${hash}`).page) === page;
+    })) as Partial<Record<Page, string>>;
   } catch {
     return {};
   }
@@ -62,6 +65,10 @@ export function rememberNavigationHash(
   storage: Pick<Storage, "setItem"> | undefined = typeof window === "undefined" ? undefined : window.localStorage
 ): Partial<Record<Page, string>> {
   const group = navigationGroup(route.page);
+  // Nested dossiers own their URL but never replace a top-level sidebar target.
+  // This keeps requirement detail as a true sibling route instead of a remembered
+  // board sub-view.
+  if (!TOP_LEVEL_PAGES.includes(group)) return memory;
   const next = { ...memory, [group]: hash.replace(/^#/, "") || group };
   try { storage?.setItem(NAVIGATION_MEMORY_KEY, JSON.stringify(next)); } catch { /* private mode keeps in-memory navigation */ }
   return next;

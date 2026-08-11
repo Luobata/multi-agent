@@ -679,6 +679,12 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
       capturedAt: FIXED_NOW.toISOString()
     });
     expect((await service.syncRequirementDelivery("req-102", runId, "queued-for-merge")).lane).toBe("merging");
+    const conflict = await service.syncRequirementDelivery("req-102", runId, "conflict");
+    expect(conflict.lane).toBe("merging");
+    expect(conflict.exception).toBe("blocked");
+    const retesting = await service.syncRequirementDelivery("req-102", runId, "retesting");
+    expect(retesting.lane).toBe("merging");
+    expect(retesting.exception).toBeNull();
     expect((await service.syncRequirementDelivery("req-102", runId, "returned-to-acceptance")).lane).toBe("acceptance");
     expect((await service.syncRequirementDelivery("req-102", runId, "merged")).lane).toBe("done");
     expect(await expectFailure(service.syncRequirementDelivery("req-102", "run-other", "merged"))).toContain("不一致");

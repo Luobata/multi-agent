@@ -6,7 +6,7 @@ import { EffectiveProfileView } from "./EffectiveProfileView";
 import { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
 import type { DashboardService } from "./dashboard/service";
 import type { Requirement } from "./dashboard/types";
-import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunDeliveryRecord, RunMergePreview, RunMergeQueueResult, RunNode, RunWorktreeOpenResult } from "./types";
+import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunDeliveryRecord, RunEvidenceAsset, RunMergePreview, RunMergeQueueResult, RunNode, RunWorktreeOpenResult } from "./types";
 
 export { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
 
@@ -331,7 +331,10 @@ function RunDeliveryPanel({
   onOpenDiscard,
   onSubmitToBoard,
   onRerunEvidence,
-  evidenceRerunError
+  evidenceRerunError,
+  onRetryConflict,
+  conflictRetrying,
+  conflictRetryError
 }: {
   preview?: RunMergePreview;
   loading: boolean;
@@ -347,6 +350,9 @@ function RunDeliveryPanel({
   onSubmitToBoard: () => void;
   onRerunEvidence: () => void;
   evidenceRerunError: string;
+  onRetryConflict: () => void;
+  conflictRetrying: boolean;
+  conflictRetryError: string;
 }) {
   if (loading && !preview) return <p className="run-delivery-loading">正在核对 worktree 与验收证据…</p>;
   if (!preview) return null;
@@ -360,12 +366,14 @@ function RunDeliveryPanel({
   const returned = preview.status === "returned-to-acceptance" || preview.delivery?.status === "returned-to-acceptance";
   const mergeBusy = queued || retesting || merging;
   const evidenceRerun = preview.delivery?.evidenceRerun;
+  const conflictResolution = preview.delivery?.conflictResolution;
   const evidenceBusy = evidenceRerun?.status === "queued" || evidenceRerun?.status === "running";
-  const actionable = !merged && !discarded && !mergeBusy && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept" || preview.status === "returned-to-acceptance");
+  const conflictBusy = conflict && ["resolving", "retesting", "leader-review"].includes(conflictResolution?.status ?? "");
+  const actionable = !merged && !discarded && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept" || preview.status === "returned-to-acceptance");
   const canQueueMerge = preview.eligible && !merged && !discarded && !mergeBusy && !evidenceBusy && preview.status !== "conflict";
   const diff = preview.changes.unifiedDiff;
   return <div className="run-delivery-panel">
-    {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>目标分支存在合并冲突</strong><p>{preview.delivery?.message ?? "worktree 已保留，请处理目标分支变化后重新预览。"}</p></div>}
+    {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>{conflictResolution?.status === "resolving" ? "原领队正在处理合入冲突" : conflictResolution?.status === "retesting" ? "冲突已解决，正在回跑测试" : conflictResolution?.status === "leader-review" ? "测试已通过，等待原领队放行" : conflictResolution?.status === "failed" ? "AI 冲突处理需要介入" : "目标分支存在合并冲突"}</strong><p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p>{conflictResolution?.resolutionRunId && <small>修复 Run：<code>{conflictResolution.resolutionRunId}</code></small>}{conflictResolution?.testRunId && <small>复测 Run：<code>{conflictResolution.testRunId}</code></small>}{conflictResolution?.leaderReviewRunId && <small>领队复验 Run：<code>{conflictResolution.leaderReviewRunId}</code></small>}{conflictResolution?.status === "failed" && <button type="button" className="button secondary" disabled={conflictRetrying} aria-busy={conflictRetrying} onClick={onRetryConflict}>{conflictRetrying ? "正在重新排队…" : "重新让原领队处理冲突"}</button>}{conflictRetryError && <small className="inline-error">{conflictRetryError}</small>}</div>}
     {queued && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>已进入待合入队列</strong><p>{preview.delivery?.message ?? "同一目标分支上的候选会按批准顺序串行处理。"}</p></div>}
     {retesting && <div className="run-delivery-callout run-delivery-callout--retesting" role="status"><strong>目标分支变化，正在重测</strong><p>{preview.delivery?.message ?? "系统正在临时集成 worktree 上执行独立回归，不会改动真实目标分支。"}</p></div>}
     {merging && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>重测通过，正在合入</strong><p>{preview.delivery?.message ?? "正在写入已批准的目标分支。"}</p></div>}
@@ -396,12 +404,7 @@ function RunDeliveryPanel({
       <div className="run-delivery-evidence-head"><strong>Evidence wall</strong><span>{preview.evidence.assets.length} 项媒体证据</span></div>
       {preview.evidence.assets.length === 0
         ? <div className="run-delivery-evidence-empty"><p>没有可展示的截图或录屏。结构化 E2E 仍会保留，但你可以让独立测试角色补采真实界面证据。</p><button type="button" className="button secondary" disabled={evidenceBusy || mergeBusy || !preview.worktreePath || discarded || merged} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "正在补采截图…" : evidenceRerun?.status === "failed" ? "重新补采验收截图" : "补采验收截图"}</button>{evidenceRerun?.message && <small className={evidenceRerun.status === "failed" ? "inline-error" : ""}>{evidenceRerun.message}</small>}{evidenceRerunError && <small className="inline-error" role="alert">{evidenceRerunError}</small>}</div>
-        : <div className="run-delivery-evidence-wall">{preview.evidence.assets.map((asset) => <figure key={asset.id} className="run-delivery-evidence-card">
-          {asset.kind === "screenshot"
-            ? <a href={asset.url} target="_blank" rel="noreferrer" aria-label={`打开证据 ${asset.name}`}><img className="run-delivery-evidence-media" src={asset.url} alt={asset.name} loading="lazy" /></a>
-            : <video className="run-delivery-evidence-media" src={asset.url} controls preload="metadata" aria-label={asset.name} />}
-          <figcaption><strong>{asset.name}</strong><span>{asset.kind === "screenshot" ? "截图" : "录屏"} · {formatBytes(asset.sizeBytes)}</span><code>{asset.relativePath}</code></figcaption>
-        </figure>)}</div>}
+        : <div className="run-delivery-evidence-wall">{preview.evidence.assets.map((asset) => <RunEvidenceCard key={asset.id} asset={asset} />)}</div>}
     </div>
     {boardSubmitError && <div className="inline-error" role="alert">{boardSubmitError}</div>}
     {(preview.eligible || actionable || canSubmitToBoard) && !discarded && <div className="run-delivery-actions">
@@ -411,6 +414,24 @@ function RunDeliveryPanel({
       {canQueueMerge && <button type="button" className="button primary" onClick={onOpenMerge}>批准并加入待合入</button>}
     </div>}
   </div>;
+}
+
+function RunEvidenceCard({ asset }: { asset: RunEvidenceAsset }) {
+  const [previewOpen, setPreviewOpen] = useState(false);
+  return <>
+    <figure className="run-delivery-evidence-card">
+      {asset.kind === "screenshot"
+        ? <button type="button" className="run-delivery-evidence-trigger" aria-haspopup="dialog" aria-label={`在项目内预览证据 ${asset.name}`} onClick={() => setPreviewOpen(true)}><img className="run-delivery-evidence-media" src={asset.url} alt={asset.name} loading="lazy" /></button>
+        : <video className="run-delivery-evidence-media" src={asset.url} controls preload="metadata" aria-label={asset.name} />}
+      <figcaption><strong>{asset.name}</strong><span>{asset.kind === "screenshot" ? "截图 · 点击放大" : "录屏"} · {formatBytes(asset.sizeBytes)}</span><code>{asset.relativePath}</code></figcaption>
+    </figure>
+    {asset.kind === "screenshot" && previewOpen && <Modal title={asset.name} eyebrow="PROJECT EVIDENCE · IMAGE VIEWER" onClose={() => setPreviewOpen(false)} wide className="run-evidence-viewer-modal">
+      <div className="run-evidence-viewer">
+        <div className="run-evidence-viewer-stage"><img src={asset.url} alt={asset.name} /></div>
+        <footer><span>{asset.mediaType.split("/")[1]?.toUpperCase()} · {formatBytes(asset.sizeBytes)}</span><code>{asset.relativePath}</code><a className="button secondary" href={asset.url} target="_blank" rel="noreferrer">打开原始文件</a></footer>
+      </div>
+    </Modal>}
+  </>;
 }
 
 function RunKeepConfirmation({
@@ -558,6 +579,8 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   const [boardSubmitting, setBoardSubmitting] = useState(false);
   const [boardSubmitError, setBoardSubmitError] = useState("");
   const [evidenceRerunError, setEvidenceRerunError] = useState("");
+  const [conflictRetrying, setConflictRetrying] = useState(false);
+  const [conflictRetryError, setConflictRetryError] = useState("");
   const [openingWorktree, setOpeningWorktree] = useState(false);
   const [humanRequests, setHumanRequests] = useState<HumanDecisionRequest[]>([]);
   const [humanRequestsLoading, setHumanRequestsLoading] = useState(false);
@@ -643,6 +666,7 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     setDiscardError("");
     setBoardSubmitError("");
     setEvidenceRerunError("");
+    setConflictRetryError("");
     api<RunMergePreview>(`/api/runs/${encodeURIComponent(selected.id)}/merge-preview`)
       .then((value) => { if (current) setMergePreview(value); })
       .catch((error: unknown) => { if (current) notify(error instanceof Error ? error.message : String(error), "error"); })
@@ -652,11 +676,13 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   useEffect(() => {
     const status = mergePreview?.delivery?.status;
     const evidenceStatus = mergePreview?.delivery?.evidenceRerun?.status;
+    const conflictStatus = mergePreview?.delivery?.conflictResolution?.status;
     if (!["queued-for-merge", "retesting", "merging"].includes(status ?? "")
+      && !["resolving", "retesting", "leader-review"].includes(conflictStatus ?? "")
       && !["queued", "running"].includes(evidenceStatus ?? "")) return;
     const timer = window.setTimeout(() => setDeliveryRevision((value) => value + 1), 2_000);
     return () => window.clearTimeout(timer);
-  }, [mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt, mergePreview?.delivery?.evidenceRerun?.status]);
+  }, [mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt, mergePreview?.delivery?.conflictResolution?.status, mergePreview?.delivery?.evidenceRerun?.status]);
   useEffect(() => {
     if (!dashboard || !selected?.taskId || !mergePreview?.delivery) return;
     const status = mergePreview.delivery.status;
@@ -793,6 +819,20 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
       setEvidenceRerunError(error instanceof Error ? error.message : String(error));
     }
   };
+  const retryConflict = async () => {
+    if (!selected || conflictRetrying) return;
+    setConflictRetrying(true);
+    setConflictRetryError("");
+    try {
+      await api<RunMergeQueueResult>(`/api/runs/${encodeURIComponent(selected.id)}/merge-conflict-retry`, writeBody({ actor: "workbench-operator" }));
+      setDeliveryRevision((value) => value + 1);
+      notify(`Run ${selected.id} 已重新进入冲突处理队列，原领队会继续使用保留的 worktree。`, "success");
+    } catch (error) {
+      setConflictRetryError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setConflictRetrying(false);
+    }
+  };
   const keepDelivery = async () => {
     if (!selected || keeping) return;
     setKeeping(true);
@@ -898,6 +938,9 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
         onSubmitToBoard={() => void submitToBoard()}
         onRerunEvidence={() => void rerunEvidence()}
         evidenceRerunError={evidenceRerunError}
+        onRetryConflict={() => void retryConflict()}
+        conflictRetrying={conflictRetrying}
+        conflictRetryError={conflictRetryError}
       /></DossierSection>
     </div>}</main>
     {mergeOpen && mergePreview?.eligible && <RunMergeConfirmation preview={mergePreview} confirmed={mergeConfirmed} busy={merging} error={mergeError} onConfirmedChange={setMergeConfirmed} onClose={() => { if (!merging) setMergeOpen(false); }} onMerge={() => void mergeDelivery()} />}

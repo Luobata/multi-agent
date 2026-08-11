@@ -851,16 +851,17 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         }
         const lane: RequirementLane = status === "merged"
           ? "done"
-          : status === "conflict" || status === "returned-to-acceptance"
+          : status === "returned-to-acceptance"
             ? "acceptance"
             : "merging";
-        if (requirement.lane === lane) return requirementSummary(requirement);
+        const nextException = status === "conflict" ? "blocked" : null;
+        if (requirement.lane === lane && requirement.exception === nextException) return requirementSummary(requirement);
         const from = requirementLaneLabel(requirement.lane);
         requirement.lane = lane;
-        requirement.exception = status === "conflict" ? "blocked" : null;
+        requirement.exception = nextException;
         requirement.updatedAt = touch();
         record(
-          status === "merged" ? "完成合入" : lane === "acceptance" ? "退回验收" : "进入待合入",
+          status === "merged" ? "完成合入" : status === "conflict" ? "合入冲突" : lane === "acceptance" ? "退回验收" : "进入待合入",
           requirement.code,
           `${from} → ${requirementLaneLabel(lane)}；Run ${runId} 交付状态 ${status}。`
         );

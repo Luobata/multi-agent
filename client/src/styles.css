@@ -4078,11 +4078,17 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
 .run-delivery-evidence-empty p, .run-delivery-evidence-empty small { margin: 0; }
 .run-delivery-evidence-wall { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: var(--space-3); }
 .run-delivery-evidence-card { min-width: 0; margin: 0; border: 1px solid var(--line); background: var(--paper-sunken); }
-.run-delivery-evidence-card > a { display: block; }
+.run-delivery-evidence-trigger { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
 .run-delivery-evidence-media { display: block; width: 100%; aspect-ratio: 16 / 10; border: 0; background: #151515; object-fit: contain; }
 .run-delivery-evidence-card figcaption { display: grid; gap: 2px; padding: var(--space-2); }
 .run-delivery-evidence-card figcaption strong, .run-delivery-evidence-card figcaption span, .run-delivery-evidence-card figcaption code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-delivery-evidence-card figcaption span, .run-delivery-evidence-card figcaption code { color: var(--ink-3); font-size: var(--text-xs); }
+.run-evidence-viewer-modal .modal-frame { width: min(94vw, 1440px); }
+.run-evidence-viewer { display: grid; min-height: 0; max-height: min(82vh, 980px); background: var(--paper-raised); }
+.run-evidence-viewer-stage { display: grid; place-items: center; min-height: 0; overflow: auto; padding: var(--space-3); background: #151515; }
+.run-evidence-viewer-stage img { display: block; max-width: 100%; max-height: 70vh; object-fit: contain; }
+.run-evidence-viewer footer { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); padding: var(--space-3); border-top: 2px solid var(--line-strong); }
+.run-evidence-viewer footer code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); }
 .run-delivery-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); padding-top: var(--space-2); border-top: 1px solid var(--line); }
 .run-delivery-confirm { display: grid; gap: var(--space-4); }
 .run-delivery-confirm-check { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: var(--space-3); padding: var(--space-3); border: 1px solid var(--line-strong); background: var(--paper); cursor: pointer; }

@@ -53,7 +53,7 @@ describe("multi-project console routes", () => {
     expect(pageFromHash("#requirements/req-1?section=unknown")).toEqual({ page: "requirement", requirementId: "req-1" });
   });
 
-  it("persists the exact dossier link under its top-level navigation entry", () => {
+  it("keeps requirement dossiers separate from the board navigation memory", () => {
     const values = new Map<string, string>();
     const storage = {
       getItem: (key: string) => values.get(key) ?? null,
@@ -61,10 +61,16 @@ describe("multi-project console routes", () => {
     };
     let memory = rememberNavigationHash({}, { page: "requirement", requirementId: "req-1", section: "acceptance" }, "#requirements/req-1?section=acceptance", storage);
     memory = rememberNavigationHash(memory, { page: "runs", runId: "run-1" }, "#runs?run=run-1", storage);
-    expect(memory.board).toBe("requirements/req-1?section=acceptance");
+    expect(memory.board).toBeUndefined();
     expect(readNavigationMemory(storage)).toMatchObject({
-      board: "requirements/req-1?section=acceptance",
       runs: "runs?run=run-1"
     });
+  });
+
+  it("drops a legacy board memory entry that points at a requirement dossier", () => {
+    const storage = {
+      getItem: () => JSON.stringify({ board: "requirements/req-1?section=acceptance", projects: "projects/prj-1" })
+    };
+    expect(readNavigationMemory(storage)).toEqual({ projects: "projects/prj-1" });
   });
 });

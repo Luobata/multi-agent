@@ -346,7 +346,7 @@ describe("RunsPage delivery acceptance", () => {
   let root: Root;
   const fetchMock = vi.fn();
   const notify = vi.fn();
-  let deliveryStatus: "base" | "conflict" | "kept" | "discarded" = "base";
+  let deliveryStatus: "base" | "conflict" | "conflict-failed" | "kept" | "discarded" = "base";
 
   beforeEach(async () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -363,7 +363,7 @@ describe("RunsPage delivery acceptance", () => {
       const url = String(input);
       if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [deliveryRun] }) });
       if (url.endsWith("/merge-preview")) {
-        const preview = deliveryStatus === "conflict"
+        const preview = deliveryStatus === "conflict" || deliveryStatus === "conflict-failed"
           ? {
             ...eligiblePreview,
             status: "conflict" as const,
@@ -375,6 +375,14 @@ describe("RunsPage delivery acceptance", () => {
               sourceBranch: "codex/run-delivery-ui-1",
               sourceCommit: "source",
               targetBranch: "main",
+              ...(deliveryStatus === "conflict-failed" ? {
+                conflictResolution: {
+                  status: "failed" as const,
+                  targetCommit: "target",
+                  updatedAt: "2026-08-06T06:05:00.000Z",
+                  message: "原领队没有完成冲突处理，候选仍保留在待合入队列。"
+                }
+              } : {}),
               message: "CONFLICT (content): Merge conflict in client/src/RunsPage.tsx"
             }
           }
@@ -429,6 +437,19 @@ describe("RunsPage delivery acceptance", () => {
         };
         return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: result }) });
       }
+      if (url.endsWith("/merge-conflict-retry") && init?.method === "POST") {
+        deliveryStatus = "conflict";
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: {
+          status: "queued-for-merge",
+          delivery: {
+            runId: deliveryRun.id,
+            status: "queued-for-merge",
+            updatedAt: "2026-08-06T06:06:00.000Z",
+            targetBranch: "main",
+            message: "冲突处理已重新排队。"
+          }
+        } }) });
+      }
       if (url.endsWith("/keep") && init?.method === "POST") {
         deliveryStatus = "kept";
         return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: { status: "kept", delivery: { runId: deliveryRun.id, status: "kept" } } }) });
@@ -470,9 +491,14 @@ describe("RunsPage delivery acceptance", () => {
     Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
   });
 
-  it("shows media evidence and exposes merge only for an eligible preview", () => {
+  it("shows media evidence in an in-project viewer and exposes merge only for an eligible preview", async () => {
     expect(container.querySelector<HTMLImageElement>('img[alt="acceptance.png"]')?.src).toContain("/evidence/");
     expect(container.querySelector<HTMLVideoElement>('video[aria-label="flow.mp4"]')).toBeTruthy();
+    const preview = container.querySelector<HTMLButtonElement>('[aria-label="在项目内预览证据 acceptance.png"]');
+    expect(preview).toBeTruthy();
+    await act(async () => { preview?.click(); await Promise.resolve(); });
+    expect(document.querySelector('.run-evidence-viewer-modal [aria-label="关闭弹窗"]')).toBeTruthy();
+    expect(document.querySelector('.run-evidence-viewer-stage img[alt="acceptance.png"]')).toBeTruthy();
     expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "批准并加入待合入")).toBe(true);
   });
 
@@ -493,6 +519,20 @@ describe("RunsPage delivery acceptance", () => {
     } finally {
       eligiblePreview.evidence.assets = originalAssets;
     }
+  });
+
+  it("lets the operator retry a failed conflict through the original leader workflow", async () => {
+    deliveryStatus = "conflict-failed";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="conflict-failed" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const retry = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent === "重新让原领队处理冲突");
+    expect(retry).toBeTruthy();
+    await act(async () => { retry?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/merge-conflict-retry") && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("原领队"), "success");
   });
 
   it("derives board acceptance from the server eligible result, not the legacy acceptedVerdict", () => {

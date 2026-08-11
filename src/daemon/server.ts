@@ -918,6 +918,11 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       actor: body.actor
     }), 202);
   }));
+  app.post("/api/runs/:id/merge-conflict-retry", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "run merge conflict retry input");
+    if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("conflict retry actor is required");
+    send(response, await service.retryRunMergeConflict(routeParam(request, "id"), { actor: body.actor }), 202);
+  }));
   app.post("/api/runs/:id/keep", asyncRoute(async (request, response) => {
     const body = jsonObject(request.body ?? {}, "run keep input");
     if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("run keep actor is required");

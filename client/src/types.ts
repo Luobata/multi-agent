@@ -643,6 +643,16 @@ export interface RunDeliveryRecord {
   queuedTargetCommit?: string;
   mergeCommit?: string;
   message?: string;
+  conflictResolution?: {
+    status: "resolving" | "retesting" | "leader-review" | "passed" | "failed";
+    targetCommit: string;
+    updatedAt: string;
+    conflictMessage?: string;
+    resolutionRunId?: string;
+    testRunId?: string;
+    leaderReviewRunId?: string;
+    message?: string;
+  };
   mergeValidation?: {
     required: boolean;
     status: "not-required" | "running" | "passed" | "failed";

@@ -41,8 +41,14 @@ const GATE_CONTROL_TOOLS = [
 ];
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const SYSTEM_SKILL_TIMESTAMP = "1970-01-01T00:00:00.000Z";
+const TEAM_ORCHESTRATION_SKILL_VERSION = 2;
+const TEAM_ORCHESTRATION_INSTRUCTIONS = [
+  "Coordinate the assigned team within the Supervisor workflow policy. Delegate explicit work, preserve evidence, respect runtime limits and gates, and finish only when the required work is complete.",
+  "When the delivery queue calls the original leader back for a merge conflict, work only in the preserved original worktree. Rebase onto the exact target commit supplied by the runtime, resolve every conflict by preserving both the accepted requirement and valid target-branch behavior, never install dependencies, never modify or push the real target branch, and leave a clean committed source branch.",
+  "After conflict repair, require the independent project test role to rerun requirement-scoped tests and browser evidence, then perform a final leader review. Emit the runtime-requested PASS marker only when the rebased code, test evidence, and original requirement all remain valid; otherwise block with concrete evidence. Automatic merge remains owned by the deterministic serial delivery queue."
+].join("\n\n");
 
-function teamOrchestrationSkill(version = 1, createdAt = SYSTEM_SKILL_TIMESTAMP): WorkbenchSkillDefinition {
+function teamOrchestrationSkill(version = TEAM_ORCHESTRATION_SKILL_VERSION, createdAt = SYSTEM_SKILL_TIMESTAMP): WorkbenchSkillDefinition {
   return {
     id: "team-orchestration",
     version,
@@ -52,7 +58,7 @@ function teamOrchestrationSkill(version = 1, createdAt = SYSTEM_SKILL_TIMESTAMP)
     displayName: "Team orchestration",
     description: "System-owned guidance for a Supervisor runtime that plans, delegates, verifies, and delivers team work.",
     summary: "Plan, delegate, verify, and deliver team work as the Supervisor runtime.",
-    instructions: "Coordinate the assigned team within the Supervisor workflow policy. Delegate explicit work, preserve evidence, respect runtime limits and gates, and finish only when the required work is complete.",
+    instructions: TEAM_ORCHESTRATION_INSTRUCTIONS,
     tools: [],
     createdAt,
     updatedAt: SYSTEM_SKILL_TIMESTAMP
@@ -74,8 +80,10 @@ function ensureSystemSkills(state: WorkbenchState): void {
     state.skillHistory[skill.id] = [skill];
     return;
   }
-  if (existing.owner === "system" && existing.injection === "supervisor") return;
-  const skill = teamOrchestrationSkill(existing.version + 1, existing.createdAt);
+  if (existing.owner === "system"
+    && existing.injection === "supervisor"
+    && existing.instructions === TEAM_ORCHESTRATION_INSTRUCTIONS) return;
+  const skill = teamOrchestrationSkill(Math.max(existing.version + 1, TEAM_ORCHESTRATION_SKILL_VERSION), existing.createdAt);
   state.skills[skill.id] = skill;
   (state.skillHistory[skill.id] ??= [existing]).push(skill);
 }

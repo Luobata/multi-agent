@@ -99,6 +99,7 @@ import { isSystemManagedProviderId } from "../runtime/systemProviders.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
 import { createRunWorktree, removeRunWorktree, worktreeHasChanges } from "../runtime/worktree.js";
 import {
+  acceptRebasedRunSource,
   assessQueuedRun,
   createMergeValidationWorktree,
   discardRunWorktree,
@@ -110,6 +111,7 @@ import {
   removeMergeValidationWorktree,
   resolveRunEvidenceAsset,
   transitionRunDelivery,
+  updateRunDelivery,
   updateRunEvidenceRerun,
   type RunDeliveryActionResult,
   type RunDeliveryRecord,
@@ -118,6 +120,13 @@ import {
   type RunMergeQueueResult,
   type RunMergeResult
 } from "../runtime/worktreeDelivery.js";
+import {
+  CONFLICT_RESOLUTION_PASS,
+  LEADER_REVALIDATION_PASS,
+  buildConflictResolutionRequest,
+  buildLeaderRevalidationRequest,
+  hasExplicitDeliveryPass
+} from "./conflictResolution.js";
 import {
   materializeWorkflow,
   resolveSkillBinding,
@@ -7557,19 +7566,196 @@ export class WorkbenchService {
     this.activeMergeRuns.set(id, job);
   }
 
-  private async processQueuedMerge(id: string): Promise<void> {
-    const { run, runDir } = await this.getRunDeliveryContext(id);
-    const delivery = await previewRunMerge(run, runDir);
-    if (!["queued-for-merge", "retesting", "merging"].includes(delivery.status)) return;
-    const assessment = await assessQueuedRun(run, runDir);
-    if (assessment.conflict) {
+  private async completeConflictRevalidation(
+    id: string,
+    run: WorkflowRunRecord,
+    runDir: string,
+    preview: RunMergePreview
+  ): Promise<void> {
+    let current = preview;
+    let resolution = current.delivery?.conflictResolution;
+    if (!current.worktreePath || !current.targetBranch || !resolution) {
+      throw new Error("冲突修复记录缺少原 worktree、目标分支或目标 commit");
+    }
+    const worktreePath = current.worktreePath;
+    const invocation = this.invocationForRun(id);
+    const projectId = invocation?.source.project;
+    const taskId = invocation?.source.taskId;
+    const leaderSessionId = invocation?.sessionId;
+    if (!projectId) throw new Error("原 Run 缺少项目来源，无法回跑项目测试");
+    if (!leaderSessionId) throw new Error("原 Run 缺少持久化领队 Session，不能由原领队处理冲突");
+
+    if (resolution.status === "resolving") {
+      const leaderResult = await this.continueWorkflowConversation(
+        leaderSessionId,
+        buildConflictResolutionRequest({
+          runId: id,
+          worktreePath,
+          targetBranch: current.targetBranch,
+          targetCommit: resolution.targetCommit,
+          sourceCommit: current.delivery?.sourceCommit,
+          conflictMessage: resolution.conflictMessage ?? current.delivery?.message ?? "合入预检发现冲突",
+          originalRequest: await this.originalRequestForRun(runDir)
+        }),
+        { kind: "workbench", caller: "system:merge-conflict-resolution", project: projectId, ...(taskId ? { taskId } : {}) },
+        { providerCwd: worktreePath }
+      );
+      if (leaderResult.status !== "passed"
+        || !hasExplicitDeliveryPass(leaderResult.output, leaderResult.message, CONFLICT_RESOLUTION_PASS)) {
+        throw new Error(`原领队没有放行冲突修复：${leaderResult.message}`);
+      }
       await transitionRunDelivery(runDir, id, "conflict", {
-        message: `${assessment.conflictMessage ?? "候选与目标分支发生冲突"}；自动合入已停止，候选 worktree 已保留并退回待验收。`
+        message: "原领队已提交冲突修复，运行核心正在验证 rebase 结果。",
+        conflictResolution: {
+          ...resolution,
+          status: "resolving",
+          resolutionRunId: leaderResult.runId,
+          updatedAt: now(),
+          message: leaderResult.message
+        }
       });
-      return;
+      await acceptRebasedRunSource(run, runDir, resolution.targetCommit);
+      current = await previewRunMerge(run, runDir);
+      resolution = current.delivery?.conflictResolution;
+      if (!resolution) throw new Error("rebase 完成后冲突修复审计记录丢失");
     }
 
-    if (assessment.targetChanged) {
+    if (resolution.status === "retesting") {
+      const testResult = await this.invokeProjectTestRoleAtPath(
+        projectId,
+        taskId,
+        worktreePath,
+        [
+          "【冲突修复后原需求回归】",
+          `候选 Run：${id}`,
+          `已 rebase 目标 commit：${resolution.targetCommit}`,
+          `冲突修复后候选 commit：${current.delivery?.sourceCommit ?? "unknown"}`,
+          "请在原候选 worktree 上重新执行与原需求及冲突文件相关的独立测试流程，界面路径必须使用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码或 Git 历史。",
+          "测试、环境或证据有任一缺口必须返回 Block；只有可复现且证据充分才返回 Pass。"
+        ].join("\n"),
+        "system:merge-conflict-retest"
+      );
+      if (testResult.status !== "passed") throw new Error(`冲突修复后的独立测试未通过：${testResult.message}`);
+      await transitionRunDelivery(runDir, id, "retesting", {
+        message: "冲突修复后的独立测试已通过，正在等待原需求领队最终复验。",
+        conflictResolution: {
+          ...resolution,
+          status: "leader-review",
+          testRunId: testResult.runId,
+          updatedAt: now(),
+          message: testResult.message
+        },
+        mergeValidation: {
+          required: true,
+          status: "running",
+          runId: testResult.runId,
+          targetCommit: resolution.targetCommit,
+          message: testResult.message,
+          updatedAt: now()
+        }
+      });
+      current = await previewRunMerge(run, runDir);
+      resolution = current.delivery?.conflictResolution;
+      if (!resolution) throw new Error("独立测试后冲突修复审计记录丢失");
+    }
+
+    if (resolution.status === "leader-review") {
+      if (!resolution.testRunId || !current.delivery?.sourceCommit) throw new Error("原领队复验缺少测试 Run 或 rebased 候选 commit");
+      const leaderReview = await this.continueWorkflowConversation(
+        leaderSessionId,
+        buildLeaderRevalidationRequest({
+          runId: id,
+          targetCommit: resolution.targetCommit,
+          sourceCommit: current.delivery.sourceCommit,
+          testRunId: resolution.testRunId,
+          testMessage: resolution.message ?? "独立测试通过"
+        }),
+        { kind: "workbench", caller: "system:merge-conflict-leader-review", project: projectId, ...(taskId ? { taskId } : {}) },
+        { providerCwd: worktreePath }
+      );
+      if (leaderReview.status !== "passed"
+        || !hasExplicitDeliveryPass(leaderReview.output, leaderReview.message, LEADER_REVALIDATION_PASS)) {
+        throw new Error(`原领队未放行冲突修复后的交付：${leaderReview.message}`);
+      }
+      await transitionRunDelivery(runDir, id, "merging", {
+        message: "冲突修复、独立测试和原领队复验均已通过，正在按队列顺序自动合入。",
+        conflictResolution: {
+          ...resolution,
+          status: "passed",
+          leaderReviewRunId: leaderReview.runId,
+          updatedAt: now(),
+          message: leaderReview.message
+        },
+        mergeValidation: {
+          required: true,
+          status: "passed",
+          runId: resolution.testRunId,
+          targetCommit: resolution.targetCommit,
+          message: `独立测试与原领队复验通过：${leaderReview.message}`,
+          updatedAt: now()
+        }
+      });
+    }
+  }
+
+  private async failConflictRevalidation(id: string, run: WorkflowRunRecord, runDir: string, error: unknown): Promise<void> {
+    const preview = await previewRunMerge(run, runDir);
+    const resolution = preview.delivery?.conflictResolution;
+    await transitionRunDelivery(runDir, id, "conflict", {
+      message: `AI 冲突处理未通过：${error instanceof Error ? error.message : String(error)}；候选仍在待合入队列，原 worktree 与证据均已保留。`,
+      ...(resolution ? {
+        conflictResolution: {
+          ...resolution,
+          status: "failed",
+          updatedAt: now(),
+          message: error instanceof Error ? error.message : String(error)
+        }
+      } : {})
+    });
+  }
+
+  private async processQueuedMerge(id: string): Promise<void> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    let delivery = await previewRunMerge(run, runDir);
+    const activeConflict = delivery.status === "conflict"
+      && ["resolving", "retesting", "leader-review"].includes(delivery.delivery?.conflictResolution?.status ?? "");
+    const legacyConflict = delivery.status === "conflict"
+      && !delivery.delivery?.conflictResolution
+      && delivery.delivery?.humanDecision?.action === "merge";
+    if (!["queued-for-merge", "retesting", "merging"].includes(delivery.status) && !activeConflict && !legacyConflict) return;
+    let conflictRevalidated = false;
+    if (activeConflict) {
+      try {
+        await this.completeConflictRevalidation(id, run, runDir, delivery);
+        conflictRevalidated = true;
+      } catch (error) {
+        await this.failConflictRevalidation(id, run, runDir, error);
+        return;
+      }
+      delivery = await previewRunMerge(run, runDir);
+    }
+    const assessment = await assessQueuedRun(run, runDir);
+    if (assessment.conflict && !conflictRevalidated) {
+      await transitionRunDelivery(runDir, id, "conflict", {
+        message: `${assessment.conflictMessage ?? "候选与目标分支发生冲突"}；已留在待合入队列，正在通知原需求领队在原 worktree rebase 处理。`,
+        conflictResolution: {
+          status: "resolving",
+          targetCommit: assessment.currentTargetCommit,
+          conflictMessage: assessment.conflictMessage,
+          updatedAt: now(),
+          message: "等待原领队处理冲突。"
+        }
+      });
+      try {
+        await this.completeConflictRevalidation(id, run, runDir, await previewRunMerge(run, runDir));
+        conflictRevalidated = true;
+      } catch (error) {
+        await this.failConflictRevalidation(id, run, runDir, error);
+        return;
+      }
+    }
+
+    if (assessment.targetChanged && !conflictRevalidated) {
       const invocation = this.invocationForRun(id);
       const projectId = invocation?.source.project;
       if (!projectId) throw new Error("原 Run 缺少项目来源，目标分支变化后无法路由独立重测");
@@ -7628,7 +7814,7 @@ export class WorkbenchService {
       } finally {
         await removeMergeValidationWorktree(validation);
       }
-    } else {
+    } else if (!conflictRevalidated) {
       await transitionRunDelivery(runDir, id, "merging", {
         message: "目标分支未发生变化，正在执行已批准的串行合入。",
         mergeValidation: {
@@ -7654,7 +7840,12 @@ export class WorkbenchService {
     if (await this.recoverInterruptedEvidenceRerun(runDir, id, preview.delivery?.evidenceRerun)) {
       preview = await previewRunMerge(run, runDir);
     }
-    if (["queued-for-merge", "retesting", "merging"].includes(preview.status)) {
+    const activeConflict = preview.status === "conflict"
+      && ["resolving", "retesting", "leader-review"].includes(preview.delivery?.conflictResolution?.status ?? "");
+    const legacyConflict = preview.status === "conflict"
+      && !preview.delivery?.conflictResolution
+      && preview.delivery?.humanDecision?.action === "merge";
+    if (["queued-for-merge", "retesting", "merging"].includes(preview.status) || activeConflict || legacyConflict) {
       this.scheduleQueuedMerge(id, preview);
     }
     return preview;
@@ -7668,6 +7859,29 @@ export class WorkbenchService {
     const queued = await queueAcceptedRun(run, runDir, input);
     this.scheduleQueuedMerge(id);
     return queued;
+  }
+
+  async retryRunMergeConflict(id: string, input: { actor: string }): Promise<RunMergeQueueResult> {
+    const actor = requireText(input.actor, "conflict retry actor");
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    const preview = await previewRunMerge(run, runDir);
+    if (preview.status !== "conflict" || preview.delivery?.conflictResolution?.status !== "failed") {
+      throw new Error("只有 AI 冲突处理失败的待合入候选可以重新处理");
+    }
+    if (preview.delivery.humanDecision?.action !== "merge") throw new Error("该候选缺少原始人工合入批准");
+    const queued = await updateRunDelivery(runDir, id, (current) => {
+      if (!current) throw new Error("交付记录不存在");
+      const { conflictResolution: _previousAttempt, ...preserved } = current;
+      return {
+        ...preserved,
+        runId: id,
+        status: "queued-for-merge",
+        updatedAt: now(),
+        message: `${actor} 已要求原领队重新处理合入冲突；候选保持原队列批准，不需要再次人工验收。`
+      };
+    });
+    this.scheduleQueuedMerge(id);
+    return { status: "queued-for-merge", delivery: queued };
   }
 
   async mergeRun(

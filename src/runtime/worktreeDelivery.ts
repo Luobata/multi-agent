@@ -25,6 +25,7 @@ export type DeliveryStatus =
   | "discarded";
 
 export type EvidenceRerunStatus = "queued" | "running" | "passed" | "failed";
+export type ConflictResolutionStatus = "resolving" | "retesting" | "leader-review" | "passed" | "failed";
 
 export interface RunEvidenceAsset {
   id: string;
@@ -61,6 +62,16 @@ export interface RunDeliveryRecord {
   queuedTargetCommit?: string;
   mergeCommit?: string;
   message?: string;
+  conflictResolution?: {
+    status: ConflictResolutionStatus;
+    targetCommit: string;
+    updatedAt: string;
+    conflictMessage?: string;
+    resolutionRunId?: string;
+    testRunId?: string;
+    leaderReviewRunId?: string;
+    message?: string;
+  };
   mergeValidation?: {
     required: boolean;
     status: "not-required" | "running" | "passed" | "failed";
@@ -242,6 +253,7 @@ export async function transitionRunDelivery(
   input: {
     message?: string;
     mergeValidation?: RunDeliveryRecord["mergeValidation"];
+    conflictResolution?: RunDeliveryRecord["conflictResolution"];
   } = {}
 ): Promise<RunDeliveryRecord> {
   return updateRunDelivery(runDir, runId, (current) => ({
@@ -250,8 +262,60 @@ export async function transitionRunDelivery(
     status,
     updatedAt: new Date().toISOString(),
     ...(input.message !== undefined ? { message: input.message.slice(0, 8_000) } : {}),
-    ...(input.mergeValidation ? { mergeValidation: input.mergeValidation } : {})
+    ...(input.mergeValidation ? { mergeValidation: input.mergeValidation } : {}),
+    ...(input.conflictResolution ? { conflictResolution: input.conflictResolution } : {})
   }));
+}
+
+/**
+ * Fail-closed verification after the original leader says a conflict is resolved.
+ * The leader may edit Git state, but only this deterministic boundary can accept
+ * the rebased source commit back into the delivery queue.
+ */
+export async function acceptRebasedRunSource(
+  run: WorkflowRunRecord,
+  runDir: string,
+  targetCommit: string
+): Promise<RunDeliveryRecord> {
+  const preview = await previewRunMerge(run, runDir);
+  const delivery = await readRunDelivery(runDir);
+  if (!preview.repositoryRoot || !preview.worktreePath || !delivery?.sourceBranch) {
+    throw new Error("冲突修复缺少受管 worktree、目标仓库或交付源分支");
+  }
+  const branch = await git(preview.worktreePath, ["branch", "--show-current"]);
+  if (branch !== delivery.sourceBranch) throw new Error("冲突修复改变了受管交付源分支");
+  const working = await git(preview.worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  if (working.length > 0) throw new Error("冲突修复后 worktree 仍有未提交文件或未完成的 rebase");
+  const sourceCommit = await git(preview.worktreePath, ["rev-parse", "HEAD"]);
+  const ancestry = await runGit(preview.worktreePath, ["merge-base", "--is-ancestor", targetCommit, sourceCommit]);
+  if (ancestry.code !== 0) throw new Error("冲突修复结果没有 rebase 到指定目标 commit");
+  const changes = await git(preview.worktreePath, ["diff", "--name-only", targetCommit, sourceCommit, "--"]);
+  if (!changes.trim()) throw new Error("冲突修复后候选不再包含需求代码变更");
+  const mergeCheck = await runGit(preview.repositoryRoot, ["merge-tree", "--write-tree", targetCommit, sourceCommit]);
+  if (mergeCheck.code !== 0) {
+    throw new Error((mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "冲突仍未解决").slice(0, 8_000));
+  }
+  return updateRunDelivery(runDir, run.id, (current) => {
+    if (!current?.conflictResolution) throw new Error("缺少冲突修复审计记录");
+    return {
+      ...current,
+      runId: run.id,
+      status: "retesting",
+      baseCommit: targetCommit,
+      sourceCommit,
+      queuedTargetCommit: targetCommit,
+      targetCommitBeforeMerge: targetCommit,
+      updatedAt: new Date().toISOString(),
+      message: "AI 已在原 worktree 完成 rebase 并通过 Git 完整性检查；正在回跑独立测试与原领队复验。",
+      conflictResolution: {
+        ...current.conflictResolution,
+        status: "retesting",
+        targetCommit,
+        updatedAt: new Date().toISOString(),
+        message: "rebase 结果已由运行核心验证。"
+      }
+    };
+  });
 }
 
 export async function updateRunEvidenceRerun(
@@ -641,7 +705,9 @@ async function ensureDeliverySource(
     ) {
       throw new Error("交付记录与当前 Run 不匹配，请检查 Run Store 完整性");
     }
-    if (run.isolation?.baseCommit && delivery.baseCommit !== run.isolation.baseCommit) {
+    const acceptedRebase = delivery.conflictResolution?.status === "passed"
+      && delivery.baseCommit === delivery.conflictResolution.targetCommit;
+    if (run.isolation?.baseCommit && delivery.baseCommit !== run.isolation.baseCommit && !acceptedRebase) {
       throw new Error("交付记录的 worktree 基线与当前 Run 不匹配");
     }
     const [currentSourceBranch, currentSourceCommit] = await Promise.all([
