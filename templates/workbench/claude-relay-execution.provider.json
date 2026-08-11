@@ -19,7 +19,6 @@
     "{{role.toolsCsv}}",
     "--allowedTools",
     "{{role.toolsCsv}}",
-    "--no-session-persistence",
     "--json-schema",
     "{{role.outputSchemaJson}}"
   ],

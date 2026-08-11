@@ -45,7 +45,6 @@ providers:
       - "{{role.outputSchemaJson}}"
       - --permission-mode
       - acceptEdits
-      - --no-session-persistence
       - --allowedTools
       - "{{role.toolsCsv}}"
       - --disallowedTools=Write,Edit
