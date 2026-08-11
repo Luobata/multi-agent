@@ -1,6 +1,7 @@
 import type { JsonValue } from "../core/types.js";
 
-export const CONFLICT_RESOLUTION_PASS = "CONFLICT_RESOLUTION: PASS";
+export const CONFLICT_PLAN_READY = "CONFLICT_PLAN: READY";
+export const CONFLICT_EXECUTION_PASS = "CONFLICT_EXECUTION: PASS";
 export const LEADER_REVALIDATION_PASS = "LEADER_REVALIDATION: PASS";
 
 function evidenceText(output: JsonValue | undefined, message: string): string {
@@ -11,7 +12,17 @@ export function hasExplicitDeliveryPass(output: JsonValue | undefined, message: 
   return evidenceText(output, message).includes(marker.toUpperCase());
 }
 
-export function buildConflictResolutionRequest(input: {
+export function selectConflictExecutionRole(conflictMessage: string): "frontend-developer" | "backend-developer" | "fullstack-developer" {
+  const normalized = conflictMessage.toLowerCase();
+  const frontend = /(?:^|[\s\t])(?:client|frontend|web)\//m.test(normalized) || /\.(?:tsx|jsx|css|scss|html)\b/.test(normalized);
+  const backend = /(?:^|[\s\t])(?:server|backend|src\/(?:daemon|runtime|workbench))\//m.test(normalized)
+    || /\.(?:go|py|java|kt|rs|sql)\b/.test(normalized);
+  if (frontend && !backend) return "frontend-developer";
+  if (backend && !frontend) return "backend-developer";
+  return "fullstack-developer";
+}
+
+export function buildConflictPlanningRequest(input: {
   runId: string;
   worktreePath: string;
   targetBranch: string;
@@ -21,7 +32,7 @@ export function buildConflictResolutionRequest(input: {
   originalRequest?: string;
 }): string {
   return [
-    "【待合入队列 · 原领队冲突修复】",
+    "【待合入队列 · 原领队冲突处置计划】",
     `候选 Run：${input.runId}`,
     `原 worktree：${input.worktreePath}`,
     `目标分支：${input.targetBranch}`,
@@ -29,9 +40,34 @@ export function buildConflictResolutionRequest(input: {
     ...(input.sourceCommit ? [`当前候选 commit：${input.sourceCommit}`] : []),
     `合入预检冲突：${input.conflictMessage}`,
     ...(input.originalRequest ? ["原需求：", input.originalRequest] : []),
-    "你是该需求的原领队。只在当前原 worktree 内处理这次合入冲突：先检查 Git 状态；如存在中断的 rebase，判断后安全继续或 abort，再执行 git rebase 到上面的精确目标 commit。逐个解决冲突，必须同时保留原需求意图与目标分支已合入的有效改动。",
-    "不得安装或升级依赖，不得改写真实目标分支，不得 push，不得删除 worktree，不得用 ours/theirs 整体覆盖来规避逐项判断。完成后运行与冲突文件和原需求直接相关的定向测试，把修复提交在当前交付源分支，并保证 worktree 干净。",
-    `只有 rebase、冲突处理、定向自检和提交全部完成时，最终单独输出 ${CONFLICT_RESOLUTION_PASS}；否则输出 CONFLICT_RESOLUTION: BLOCK 并说明仍需处理的文件和原因。`
+    "你是该需求的原领队，当前阶段负责判断冲突双方意图、列出必须保留的行为、指定定向测试与风险边界。不要因为领队本人是只读角色而阻塞；运行核心会把你的计划委派给具备 Git、写文件和测试权限的工程角色实际执行。",
+    "不得要求安装或升级依赖，不得允许改写真实目标分支、push、删除 worktree，也不得用 ours/theirs 整体覆盖来规避逐项判断。计划必须让工程角色在原 worktree rebase 到精确目标 commit，逐项解冲突，运行与冲突文件及原需求直接相关的测试，提交当前交付源分支并保证 worktree 干净。",
+    `计划具体且可以交给工程角色执行时，最终单独输出 ${CONFLICT_PLAN_READY}；若需求取舍本身无法判断，输出 CONFLICT_PLAN: BLOCK 并说明需要哪项人工决定。`
+  ].join("\n");
+}
+
+export function buildConflictExecutionRequest(input: {
+  runId: string;
+  worktreePath: string;
+  targetBranch: string;
+  targetCommit: string;
+  conflictMessage: string;
+  leaderPlan: string;
+  originalRequest?: string;
+}): string {
+  return [
+    "【待合入队列 · 工程角色执行冲突修复】",
+    `候选 Run：${input.runId}`,
+    `必须操作的原 worktree：${input.worktreePath}`,
+    `目标分支：${input.targetBranch}`,
+    `必须 rebase 到的精确目标 commit：${input.targetCommit}`,
+    `合入预检冲突：${input.conflictMessage}`,
+    ...(input.originalRequest ? ["原需求：", input.originalRequest] : []),
+    "【原领队处置计划】",
+    input.leaderPlan,
+    `你是运行核心按原领队计划委派的工程执行角色。只在上面的原 worktree 内实际执行：检查 Git 状态；如存在中断 rebase，判断后安全继续或 abort；执行 git rebase ${input.targetCommit}；逐项解决冲突，同时保留原需求与目标分支有效改动；运行定向测试；把结果提交在当前交付源分支并保证 worktree 干净。`,
+    "不得安装或升级依赖，不得改写真实目标分支，不得 push，不得删除 worktree，不得整体选择 ours/theirs。不得只给建议或代码片段，必须真实执行 Git、编辑、测试和提交。",
+    `只有全部动作真实完成时，最终单独输出 ${CONFLICT_EXECUTION_PASS}；否则输出 CONFLICT_EXECUTION: BLOCK，并给出已执行命令、剩余冲突文件和阻塞原因。`
   ].join("\n");
 }
 

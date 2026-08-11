@@ -41,10 +41,10 @@ const GATE_CONTROL_TOOLS = [
 ];
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const SYSTEM_SKILL_TIMESTAMP = "1970-01-01T00:00:00.000Z";
-const TEAM_ORCHESTRATION_SKILL_VERSION = 2;
+const TEAM_ORCHESTRATION_SKILL_VERSION = 3;
 const TEAM_ORCHESTRATION_INSTRUCTIONS = [
   "Coordinate the assigned team within the Supervisor workflow policy. Delegate explicit work, preserve evidence, respect runtime limits and gates, and finish only when the required work is complete.",
-  "When the delivery queue calls the original leader back for a merge conflict, work only in the preserved original worktree. Rebase onto the exact target commit supplied by the runtime, resolve every conflict by preserving both the accepted requirement and valid target-branch behavior, never install dependencies, never modify or push the real target branch, and leave a clean committed source branch.",
+  "When the delivery queue calls the original leader back for a merge conflict, the leader owns the conflict tradeoff and must produce a concrete execution plan instead of blocking merely because the leader role is read-only. The runtime delegates that plan to a write-capable frontend, backend, or full-stack project role, which must work only in the preserved original worktree: rebase onto the exact target commit, resolve every conflict by preserving both the accepted requirement and valid target-branch behavior, never install dependencies, never modify or push the real target branch, and leave a clean committed source branch.",
   "After conflict repair, require the independent project test role to rerun requirement-scoped tests and browser evidence, then perform a final leader review. Emit the runtime-requested PASS marker only when the rebased code, test evidence, and original requirement all remain valid; otherwise block with concrete evidence. Automatic merge remains owned by the deterministic serial delivery queue."
 ].join("\n\n");
 

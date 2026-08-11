@@ -67,6 +67,8 @@ export interface RunDeliveryRecord {
     targetCommit: string;
     updatedAt: string;
     conflictMessage?: string;
+    leaderPlanRunId?: string;
+    executionRoleId?: string;
     resolutionRunId?: string;
     testRunId?: string;
     leaderReviewRunId?: string;

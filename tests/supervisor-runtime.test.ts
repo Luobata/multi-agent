@@ -175,7 +175,7 @@ describe("Supervisor flow persistence and materialization", () => {
       managementPolicy: { id: "materialize-policy" },
       members: [{ roleId: "builder", employeeId: "materialized-builder" }]
     });
-    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 2 });
+    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 3 });
 
     const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Inspect materialization" });
     const manifest = JSON.parse(fs.readFileSync(result.run.manifestPath, "utf8")) as {
@@ -184,17 +184,17 @@ describe("Supervisor flow persistence and materialization", () => {
     };
     expect(manifest.roles.supervisor?.skills.map((skill) => skill.id)).toEqual([
       "lead-method-v1",
-      "team-orchestration-v2"
+      "team-orchestration-v3"
     ]);
     expect(manifest.roles["member-builder"]?.skills.map((skill) => skill.id)).toEqual(["build-method-v1"]);
     expect(manifest.roles.supervisor?.identity.metadata.runtimeSkillInjections).toEqual([{
       skillId: "team-orchestration",
-      version: 2,
+      version: 3,
       reason: "supervisor-runtime"
     }]);
     expect(manifest.roles["member-builder"]?.identity.metadata.runtimeSkillInjections).toBeUndefined();
     expect(manifest.workflows[workflow.id]?.config).toMatchObject({
-      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 2 } },
+      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 3 } },
       members: [{
         roleId: "builder",
         capabilities: ["code.backend"],
@@ -237,7 +237,7 @@ describe("Supervisor flow persistence and materialization", () => {
     if (migrated.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
     expect(migrated.flow).toMatchObject({ version: 1, gates: [] });
     expect(migrated.flow.stages.map((stage) => stage.kind)).toEqual(["supervisor", "delegation-loop", "delivery"]);
-    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 2 });
+    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 3 });
   });
 });
 

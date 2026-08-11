@@ -121,11 +121,14 @@ import {
   type RunMergeResult
 } from "../runtime/worktreeDelivery.js";
 import {
-  CONFLICT_RESOLUTION_PASS,
+  CONFLICT_EXECUTION_PASS,
+  CONFLICT_PLAN_READY,
   LEADER_REVALIDATION_PASS,
-  buildConflictResolutionRequest,
+  buildConflictExecutionRequest,
+  buildConflictPlanningRequest,
   buildLeaderRevalidationRequest,
-  hasExplicitDeliveryPass
+  hasExplicitDeliveryPass,
+  selectConflictExecutionRole
 } from "./conflictResolution.js";
 import {
   materializeWorkflow,
@@ -7356,8 +7359,9 @@ export class WorkbenchService {
     return Object.values(this.snapshot().invocations).find((candidate) => candidate.runId === id);
   }
 
-  private async invokeProjectTestRoleAtPath(
+  private async invokeProjectRoleAtPath(
     projectId: string,
+    roleId: string,
     taskId: string | undefined,
     providerCwd: string,
     message: string,
@@ -7365,7 +7369,7 @@ export class WorkbenchService {
   ): Promise<EmployeeInvocationResult> {
     const project = this.getProject(projectId);
     if (project.status !== "active") throw new Error(`project ${projectId} is archived`);
-    const resolved = this.resolveProjectEmployee(projectId, "test-engineer");
+    const resolved = this.resolveProjectEmployee(projectId, roleId);
     const currentEmployee = this.getEmployee(resolved.employee.id);
     if (currentEmployee.status !== "active") throw new Error(`employee ${resolved.employee.id} is archived`);
     return this.invokeResolvedEmployee({
@@ -7374,7 +7378,7 @@ export class WorkbenchService {
       source: {
         kind: "workbench",
         project: projectId,
-        projectRole: "test-engineer",
+        projectRole: roleId,
         projectBindingVersion: resolved.binding.version,
         caller,
         ...(taskId ? { taskId } : {})
@@ -7383,15 +7387,25 @@ export class WorkbenchService {
         projectId,
         projectVersion: resolved.project.version,
         projectBindingVersion: resolved.binding.version,
-        roleId: "test-engineer"
+        roleId
       },
       providerCwd: await this.validatedProviderCwd(providerCwd),
       workflow: {
-        id: `project-${projectId}-test-engineer`,
+        id: `project-${projectId}-${roleId}`,
         version: resolved.binding.version,
-        description: `${resolved.project.name} / 合入与验收独立测试`
+        description: `${resolved.project.name} / ${resolved.project.roles.find((role) => role.id === roleId)?.displayName ?? roleId}`
       }
     });
+  }
+
+  private invokeProjectTestRoleAtPath(
+    projectId: string,
+    taskId: string | undefined,
+    providerCwd: string,
+    message: string,
+    caller: string
+  ): Promise<EmployeeInvocationResult> {
+    return this.invokeProjectRoleAtPath(projectId, "test-engineer", taskId, providerCwd, message, caller);
   }
 
   private async copyEvidenceMedia(sourceRoot: string, destinationRoot: string): Promise<number> {
@@ -7586,32 +7600,67 @@ export class WorkbenchService {
     if (!leaderSessionId) throw new Error("原 Run 缺少持久化领队 Session，不能由原领队处理冲突");
 
     if (resolution.status === "resolving") {
+      const originalRequest = await this.originalRequestForRun(runDir);
       const leaderResult = await this.continueWorkflowConversation(
         leaderSessionId,
-        buildConflictResolutionRequest({
+        buildConflictPlanningRequest({
           runId: id,
           worktreePath,
           targetBranch: current.targetBranch,
           targetCommit: resolution.targetCommit,
           sourceCommit: current.delivery?.sourceCommit,
           conflictMessage: resolution.conflictMessage ?? current.delivery?.message ?? "合入预检发现冲突",
-          originalRequest: await this.originalRequestForRun(runDir)
+          originalRequest
         }),
-        { kind: "workbench", caller: "system:merge-conflict-resolution", project: projectId, ...(taskId ? { taskId } : {}) },
+        { kind: "workbench", caller: "system:merge-conflict-plan", project: projectId, ...(taskId ? { taskId } : {}) },
         { providerCwd: worktreePath }
       );
       if (leaderResult.status !== "passed"
-        || !hasExplicitDeliveryPass(leaderResult.output, leaderResult.message, CONFLICT_RESOLUTION_PASS)) {
-        throw new Error(`原领队没有放行冲突修复：${leaderResult.message}`);
+        || !hasExplicitDeliveryPass(leaderResult.output, leaderResult.message, CONFLICT_PLAN_READY)) {
+        throw new Error(`原领队没有形成可执行的冲突处置计划：${leaderResult.message}`);
       }
+      const executionRoleId = selectConflictExecutionRole(resolution.conflictMessage ?? current.delivery?.message ?? "");
       await transitionRunDelivery(runDir, id, "conflict", {
-        message: "原领队已提交冲突修复，运行核心正在验证 rebase 结果。",
+        message: `原领队已完成冲突取舍，正在委派 ${executionRoleId} 在原 worktree 执行 rebase。`,
         conflictResolution: {
           ...resolution,
           status: "resolving",
-          resolutionRunId: leaderResult.runId,
+          leaderPlanRunId: leaderResult.runId,
+          executionRoleId,
           updatedAt: now(),
           message: leaderResult.message
+        }
+      });
+      const executionResult = await this.invokeProjectRoleAtPath(
+        projectId,
+        executionRoleId,
+        taskId,
+        worktreePath,
+        buildConflictExecutionRequest({
+          runId: id,
+          worktreePath,
+          targetBranch: current.targetBranch,
+          targetCommit: resolution.targetCommit,
+          conflictMessage: resolution.conflictMessage ?? current.delivery?.message ?? "合入预检发现冲突",
+          leaderPlan: leaderResult.message,
+          originalRequest
+        }),
+        "system:merge-conflict-execution"
+      );
+      if (executionResult.status !== "passed"
+        || !hasExplicitDeliveryPass(executionResult.output, executionResult.message, CONFLICT_EXECUTION_PASS)) {
+        throw new Error(`${executionRoleId} 没有完成冲突修复：${executionResult.message}`);
+      }
+      await transitionRunDelivery(runDir, id, "conflict", {
+        message: `${executionRoleId} 已提交冲突修复，运行核心正在验证 rebase 结果。`,
+        conflictResolution: {
+          ...resolution,
+          status: "resolving",
+          leaderPlanRunId: leaderResult.runId,
+          executionRoleId,
+          resolutionRunId: executionResult.runId,
+          updatedAt: now(),
+          message: executionResult.message
         }
       });
       await acceptRebasedRunSource(run, runDir, resolution.targetCommit);

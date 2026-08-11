@@ -1,15 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
-  CONFLICT_RESOLUTION_PASS,
+  CONFLICT_EXECUTION_PASS,
+  CONFLICT_PLAN_READY,
   LEADER_REVALIDATION_PASS,
-  buildConflictResolutionRequest,
+  buildConflictExecutionRequest,
+  buildConflictPlanningRequest,
   buildLeaderRevalidationRequest,
-  hasExplicitDeliveryPass
+  hasExplicitDeliveryPass,
+  selectConflictExecutionRole
 } from "../src/workbench/conflictResolution.js";
 
 describe("merge conflict leader protocol", () => {
-  it("pins conflict repair to the original worktree and exact target commit", () => {
-    const prompt = buildConflictResolutionRequest({
+  it("has the read-only original leader plan and a write-capable project role execute in the original worktree", () => {
+    const plan = buildConflictPlanningRequest({
       runId: "run-conflict-1",
       worktreePath: "/repo/.multi-agent/worktrees/run-conflict-1",
       targetBranch: "main",
@@ -18,10 +21,24 @@ describe("merge conflict leader protocol", () => {
       conflictMessage: "BoardPage.tsx conflicts",
       originalRequest: "keep board navigation stable"
     });
-    expect(prompt).toContain("git rebase");
-    expect(prompt).toContain("abc123");
-    expect(prompt).toContain("不得安装或升级依赖");
-    expect(prompt).toContain(CONFLICT_RESOLUTION_PASS);
+    expect(plan).toContain("运行核心会把你的计划委派");
+    expect(plan).toContain(CONFLICT_PLAN_READY);
+    const execution = buildConflictExecutionRequest({
+      runId: "run-conflict-1",
+      worktreePath: "/repo/.multi-agent/worktrees/run-conflict-1",
+      targetBranch: "main",
+      targetCommit: "abc123",
+      conflictMessage: "client/src/BoardPage.tsx conflicts",
+      leaderPlan: "preserve both navigation behaviors",
+      originalRequest: "keep board navigation stable"
+    });
+    expect(execution).toContain("git rebase");
+    expect(execution).toContain("abc123");
+    expect(execution).toContain("不得安装或升级依赖");
+    expect(execution).toContain(CONFLICT_EXECUTION_PASS);
+    expect(selectConflictExecutionRole("client/src/BoardPage.tsx conflicts")).toBe("frontend-developer");
+    expect(selectConflictExecutionRole("src/workbench/service.ts conflicts")).toBe("backend-developer");
+    expect(selectConflictExecutionRole("client/App.tsx and src/workbench/service.ts conflict")).toBe("fullstack-developer");
   });
 
   it("requires an explicit leader pass after independent test evidence", () => {
