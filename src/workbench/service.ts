@@ -95,6 +95,7 @@ import type {
   KnowledgeWikiView
 } from "../knowledge/types.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime/providers.js";
+import { RunStore } from "../runtime/artifacts.js";
 import { isSystemManagedProviderId } from "../runtime/systemProviders.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
 import { createRunWorktree, removeRunWorktree, worktreeHasChanges } from "../runtime/worktree.js";
@@ -1850,16 +1851,78 @@ export class WorkbenchService {
     return this.store.snapshot();
   }
 
+  private async reconcileInterruptedRun(runId: string, timestamp: string): Promise<void> {
+    if (!/^run-[A-Za-z0-9-]+$/.test(runId)) return;
+    const runDir = path.join(this.store.dataRoot, "artifacts", "runs", runId);
+    let run: WorkflowRunRecord;
+    try {
+      const parsed = JSON.parse(await fs.readFile(path.join(runDir, "run.json"), "utf8")) as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || (parsed as { id?: unknown }).id !== runId) return;
+      run = parsed as WorkflowRunRecord;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      // A damaged historical Run must not prevent the daemon from recovering the
+      // durable Invocation and Work Instance control records.
+      return;
+    }
+    if (run.status !== "running") return;
+
+    const interruption = "Local runtime restarted before this run completed.";
+    const store = new RunStore(runDir);
+    const interruptedNodeIds: string[] = [];
+    const skippedNodeIds: string[] = [];
+    for (const node of Object.values(run.nodes)) {
+      if (node.status === "running") {
+        node.status = "failed";
+        node.completedAt = timestamp;
+        node.error = interruption;
+        node.failure = { category: "interrupted", retryable: true };
+        interruptedNodeIds.push(node.nodeId);
+      } else if (node.status === "pending") {
+        node.status = "skipped";
+        node.completedAt = timestamp;
+        node.error = "Local runtime restarted before this node started.";
+        node.failure = { category: "interrupted", retryable: true };
+        skippedNodeIds.push(node.nodeId);
+      }
+    }
+    run.status = "failed";
+    run.error = interruption;
+    run.completedAt = timestamp;
+    await store.writeRun(run);
+    for (const nodeId of interruptedNodeIds) {
+      await store.appendEvent({
+        at: timestamp,
+        type: "node.failed",
+        nodeId,
+        detail: { error: interruption, failure: { category: "interrupted", retryable: true } }
+      });
+    }
+    for (const nodeId of skippedNodeIds) {
+      await store.appendEvent({
+        at: timestamp,
+        type: "node.skipped",
+        nodeId,
+        detail: { reason: "Local runtime restarted before this node started." }
+      });
+    }
+    await store.appendEvent({ at: timestamp, type: "run.failed", detail: { error: interruption } });
+  }
+
   async recoverInterruptedActivity(): Promise<void> {
     const state = this.snapshot();
     const hasInterrupted = Object.values(state.invocations).some((invocation) => !isInvocationTerminal(invocation.status));
     const hasPendingDecision = Object.values(state.humanDecisionRequests).some((request) => request.status === "pending");
-    if (!hasInterrupted && !hasPendingDecision) return;
+    const hasInterruptedRunReference = Object.values(state.invocations)
+      .some((invocation) => invocation.phase === "interrupted" && Boolean(invocation.runId));
+    if (!hasInterrupted && !hasPendingDecision && !hasInterruptedRunReference) return;
     const timestamp = now();
     const voidedDecisionKeys: string[] = [];
+    const newlyInterruptedInvocationIds = new Set<string>();
     await this.store.mutate((next) => {
       for (const invocation of Object.values(next.invocations)) {
         if (isInvocationTerminal(invocation.status)) continue;
+        newlyInterruptedInvocationIds.add(invocation.id);
         invocation.status = "failed";
         invocation.phase = "interrupted";
         invocation.error = "Local runtime restarted before this invocation completed.";
@@ -1904,7 +1967,9 @@ export class WorkbenchService {
     }
     const recovered = this.snapshot();
     for (const invocation of Object.values(recovered.invocations)) {
-      if (invocation.phase !== "interrupted" || invocation.completedAt !== timestamp) continue;
+      if (invocation.phase !== "interrupted") continue;
+      await this.reconcileInterruptedRun(invocation.runId, invocation.completedAt ?? timestamp);
+      if (!newlyInterruptedInvocationIds.has(invocation.id)) continue;
       this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
       for (const instanceId of invocation.instanceIds) {
         const instance = recovered.workInstances[instanceId];

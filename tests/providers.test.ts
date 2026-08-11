@@ -193,6 +193,30 @@ describe("provider adapters", () => {
     expect(failure).toMatchObject({ kind: "rate-limit", retryable: true });
   });
 
+  it("treats a zero-exit Claude aborted stream result as a retryable Provider interruption", async () => {
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const failure = await adapter.invoke({
+      providerId: "relay-aborted-stream-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", [
+          "process.stdout.write(JSON.stringify({",
+          "type: 'result', is_error: true, subtype: 'error_during_execution',",
+          "terminal_reason: 'aborted_streaming', errors: ['Request interrupted by user']",
+          "}) + '\\n')"
+        ].join(" ")]
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {}
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "aborted", retryable: true });
+    expect((failure as Error).message).toContain("Request interrupted by user");
+  });
+
   it("keeps an active Provider alive after the soft timeout", async () => {
     const adapter = createDefaultProviderRegistry().get("command")!;
     const progress: Array<{ kind: string; longRunning: boolean }> = [];
@@ -283,9 +307,11 @@ describe("provider adapters", () => {
         adapter: "command",
         command: process.execPath,
         args: ["-e", "setInterval(() => process.stderr.write('tick'), 10)"],
-        timeoutMs: 50,
-        idleTimeoutMs: 250,
-        hardTimeoutMs: 300
+        // Keep enough distance between process startup, idle, and hard deadlines that a
+        // CPU-saturated full-suite run cannot misclassify scheduler delay as Provider idleness.
+        timeoutMs: 100,
+        idleTimeoutMs: 1_200,
+        hardTimeoutMs: 1_500
       },
       cwd: process.cwd(),
       prompt: "unused",

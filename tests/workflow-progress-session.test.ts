@@ -281,6 +281,47 @@ describe("Supervisor workflow progress sessions", () => {
       status: "failed",
       phase: "interrupted"
     });
+    const interruptedRun = await reopened.getRun(receipt.runId) as {
+      status: string;
+      error?: string;
+      nodes: Record<string, { status: string; failure?: { category: string; retryable: boolean } }>;
+    };
+    expect(interruptedRun).toMatchObject({
+      status: "failed",
+      error: "Local runtime restarted before this run completed."
+    });
+    expect(Object.values(interruptedRun.nodes).find((node) => node.failure?.category === "interrupted"))
+      .toMatchObject({ status: "failed", failure: { category: "interrupted", retryable: true } });
+
+    // Recovery is idempotent and also repairs historical interrupted Invocation records whose
+    // Run Store was left in the old false-running state by an earlier daemon version.
+    const runPath = path.join(dataRoot, "artifacts", "runs", receipt.runId, "run.json");
+    const staleRun = JSON.parse(fs.readFileSync(runPath, "utf8")) as {
+      status: string;
+      completedAt?: string;
+      error?: string;
+      nodes: Record<string, { status: string; completedAt?: string; error?: string; failure?: unknown }>;
+    };
+    staleRun.status = "running";
+    delete staleRun.completedAt;
+    delete staleRun.error;
+    const staleNode = Object.values(staleRun.nodes).find((node) => node.status === "failed");
+    if (!staleNode) throw new Error("expected interrupted node");
+    staleNode.status = "running";
+    delete staleNode.completedAt;
+    delete staleNode.error;
+    delete staleNode.failure;
+    fs.writeFileSync(runPath, `${JSON.stringify(staleRun, null, 2)}\n`, "utf8");
+    await reopened.recoverInterruptedActivity();
+    expect(await reopened.getRun(receipt.runId)).toMatchObject({
+      status: "failed",
+      nodes: expect.objectContaining({
+        "supervisor-r1": expect.objectContaining({
+          status: "failed",
+          failure: { category: "interrupted", retryable: true }
+        })
+      })
+    });
 
     const continued = await reopened.continueWorkflowConversation(receipt.leaderSessionId!, "原运行发生了什么？");
     expect(continued.message).toBe("已在原领队会话中继续回答。");

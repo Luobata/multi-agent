@@ -175,7 +175,9 @@ describe("Supervisor flow persistence and materialization", () => {
       managementPolicy: { id: "materialize-policy" },
       members: [{ roleId: "builder", employeeId: "materialized-builder" }]
     });
-    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 4 });
+    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 5 });
+    expect(service.listSkills(true).find((skill) => skill.id === "team-orchestration")?.instructions)
+      .toContain("Split oversized validation into two or three explicit assignments");
 
     const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Inspect materialization" });
     const manifest = JSON.parse(fs.readFileSync(result.run.manifestPath, "utf8")) as {
@@ -184,17 +186,17 @@ describe("Supervisor flow persistence and materialization", () => {
     };
     expect(manifest.roles.supervisor?.skills.map((skill) => skill.id)).toEqual([
       "lead-method-v1",
-      "team-orchestration-v4"
+      "team-orchestration-v5"
     ]);
     expect(manifest.roles["member-builder"]?.skills.map((skill) => skill.id)).toEqual(["build-method-v1"]);
     expect(manifest.roles.supervisor?.identity.metadata.runtimeSkillInjections).toEqual([{
       skillId: "team-orchestration",
-      version: 4,
+      version: 5,
       reason: "supervisor-runtime"
     }]);
     expect(manifest.roles["member-builder"]?.identity.metadata.runtimeSkillInjections).toBeUndefined();
     expect(manifest.workflows[workflow.id]?.config).toMatchObject({
-      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 4 } },
+      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 5 } },
       members: [{
         roleId: "builder",
         capabilities: ["code.backend"],
@@ -237,7 +239,7 @@ describe("Supervisor flow persistence and materialization", () => {
     if (migrated.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
     expect(migrated.flow).toMatchObject({ version: 1, gates: [] });
     expect(migrated.flow.stages.map((stage) => stage.kind)).toEqual(["supervisor", "delegation-loop", "delivery"]);
-    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 4 });
+    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 5 });
   });
 });
 
@@ -911,12 +913,12 @@ describe("Supervisor workflow version tracking", () => {
     const kinds = result.changes.map((change) => `${change.kind}:${change.from}->${change.to}`);
     expect(kinds).toContain("member:1->2");
     expect(kinds).toContain("management-policy:1->2");
-    expect(kinds).toContain("orchestration-skill:4->5");
+    expect(kinds).toContain("orchestration-skill:5->6");
     const refreshed = service.getWorkflow("vt-team");
     if (refreshed.architecture !== "supervisor") throw new Error("expected supervisor workflow");
     expect(refreshed.members[0]!.employeeVersion).toBe(2);
     expect(refreshed.managementPolicy.version).toBe(2);
-    expect(refreshed.orchestrationSkill.version).toBe(5);
+    expect(refreshed.orchestrationSkill.version).toBe(6);
 
     // A second refresh with nothing new reports no change.
     const again = await service.refreshWorkflow("vt-team");

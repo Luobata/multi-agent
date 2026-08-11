@@ -120,6 +120,40 @@ export function providerExitDiagnostic(stdout: string, stderr: string): string |
   return stderrLine;
 }
 
+function successfulCommandTerminalFailure(stdout: string, stderr: string, durationMs: number): {
+  kind: "aborted" | "budget" | "rate-limit" | "exit";
+  retryable: boolean;
+  durationMs: number;
+} | undefined {
+  const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= Math.max(0, lines.length - 30); index -= 1) {
+    try {
+      const event = JSON.parse(lines[index]!) as Record<string, unknown>;
+      if (event.type !== "result") continue;
+      const subtype = safeProviderDiagnostic(event.subtype)?.toLowerCase() ?? "";
+      const terminal = safeProviderDiagnostic(event.terminal_reason)?.toLowerCase() ?? "";
+      const errorResult = event.is_error === true
+        || subtype.startsWith("error_")
+        || (terminal.length > 0 && !["success", "completed", "complete"].includes(terminal));
+      if (!errorResult) return undefined;
+      const detail = `${stdout}\n${stderr}`.toLowerCase();
+      if (/maximum budget|max_budget|budget exhausted/.test(detail)) {
+        return { kind: "budget", retryable: false, durationMs };
+      }
+      if (TRANSIENT_FAILURE_PATTERN.test(detail)) {
+        return { kind: "rate-limit", retryable: true, durationMs };
+      }
+      if (/aborted[_ -]?streaming|error[_ -]?during[_ -]?execution|request interrupted|interrupted by user/.test(detail)) {
+        return { kind: "aborted", retryable: true, durationMs };
+      }
+      return { kind: "exit", retryable: false, durationMs };
+    } catch {
+      // Ignore progress lines that are not JSON and continue toward the last result event.
+    }
+  }
+  return undefined;
+}
+
 function providerExitMessage(providerId: string, status: number | null, kind: "budget" | "rate-limit" | "exit", stdout: string, stderr: string): string {
   const detail = providerExitDiagnostic(stdout, stderr);
   const reason = kind === "budget"
@@ -556,6 +590,17 @@ class CommandProviderAdapter implements ProviderAdapter {
               stdout,
               stderr,
               options
+            ));
+            return;
+          }
+          const terminalFailure = successfulCommandTerminalFailure(stdout, stderr, Date.now() - started);
+          if (terminalFailure) {
+            const detail = providerExitDiagnostic(stdout, stderr);
+            reject(new ProviderExecutionError(
+              `provider ${invocation.providerId} returned an error result${detail ? `: ${detail}` : ""}`,
+              stdout,
+              stderr,
+              terminalFailure
             ));
             return;
           }

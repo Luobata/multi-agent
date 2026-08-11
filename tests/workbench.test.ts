@@ -1734,6 +1734,8 @@ describe("Local Agent Workbench", () => {
       "任何验收必须包含真实 e2e/行为验证，禁止仅凭静态检查（读源码/类型/lint）判定通过"
     );
     expect(template.systemPrompt).toContain("严禁仅凭静态检查判定通过；每条结论必须有真实 e2e/行为证据。");
+    expect(template.systemPrompt).toContain("大任务必须按验收域分片");
+    expect(template.systemPrompt).toContain("不重复整库检查");
     expect(template.providerId).toBe("claude-relay-execution");
     expect(template.permissions).toEqual({
       write: "none",
