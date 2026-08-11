@@ -682,11 +682,18 @@ export interface WorkInstanceRecord {
   workflowId: string;
   workflowVersion: number;
   nodeId: string;
+  /** All execution-node turns served by this logical member session. `nodeId` is the active/latest turn. */
+  nodeIds?: string[];
   /** Workflow-local responsibility slot (distinct from Employee identity). */
   roleId?: string;
   kind?: "graph" | "supervisor" | "member" | "gate";
   round?: number;
   parentNodeId?: string;
+  /** Supervisor-managed logical continuity across bounded TODO calls to the same member role/change set. */
+  memberSessionId?: string;
+  memberSessionKey?: string;
+  memberSessionRetained?: boolean;
+  todoId?: string;
   runId: string;
   sessionId?: string;
   providerId: string;

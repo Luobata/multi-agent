@@ -120,6 +120,74 @@ describe("computeInvocationProgress", () => {
     expect(progress.leaderReport.delegations).toBe(2);
   });
 
+  it("surfaces a TODO plan and one retained member session as one progress step", () => {
+    const detail: InvocationDetail = {
+      invocation: invocation({
+        instanceIds: ["work-supervisor-r1", "work-builder-session"],
+        status: "running",
+        phase: "executing"
+      }),
+      instances: [
+        instance({ nodeId: "supervisor-r1", kind: "supervisor", roleId: "supervisor", round: 1, status: "completed", phase: "done" }),
+        instance({
+          nodeId: "wire-caller",
+          nodeIds: ["implement-helper", "wire-caller"],
+          kind: "member",
+          roleId: "builder",
+          round: 3,
+          todoId: "wire-caller",
+          memberSessionId: "member-session-builder-local-helper",
+          status: "running",
+          phase: "provider"
+        })
+      ],
+      run: {
+        id: "run-abc",
+        status: "running",
+        nodes: {
+          "supervisor-r1": {
+            metadata: { kind: "supervisor", round: 1 },
+            status: "passed",
+            output: {
+              action: "plan-todos",
+              summary: "拆成两个连续小任务。",
+              impact: {
+                level: "low",
+                regressionScope: "targeted",
+                affectedAreas: ["src/local-helper.ts"],
+                reasons: ["局部改动"],
+                requiredChecks: ["定向单测"]
+              },
+              todos: [
+                { id: "implement-helper", roleId: "builder", task: "实现 helper", needs: [], workKind: "code" },
+                { id: "wire-caller", roleId: "builder", task: "接入调用方", needs: ["implement-helper"], workKind: "code" }
+              ]
+            }
+          },
+          "wire-caller": { metadata: { kind: "member", round: 3, roleId: "builder" }, status: "running" }
+        }
+      }
+    };
+
+    const progress = computeInvocationProgress(detail);
+
+    expect(progress.leaderReport.entries[0]).toMatchObject({
+      action: "plan-todos",
+      summary: "拆成两个连续小任务。",
+      assignments: [
+        { todoId: "implement-helper", roleId: "builder", task: "实现 helper", workKind: "code" },
+        { todoId: "wire-caller", roleId: "builder", task: "接入调用方", workKind: "code" }
+      ]
+    });
+    expect(progress.leaderReport.delegations).toBe(0);
+    expect(progress.steps[1]).toMatchObject({
+      nodeId: "wire-caller",
+      nodeIds: ["implement-helper", "wire-caller"],
+      todoId: "wire-caller",
+      memberSessionId: "member-session-builder-local-helper"
+    });
+  });
+
   it("degrades gracefully when no run record is available yet", () => {
     const detail: InvocationDetail = {
       invocation: invocation({ status: "queued", phase: "queued" }),

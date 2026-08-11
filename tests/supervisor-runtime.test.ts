@@ -175,9 +175,9 @@ describe("Supervisor flow persistence and materialization", () => {
       managementPolicy: { id: "materialize-policy" },
       members: [{ roleId: "builder", employeeId: "materialized-builder" }]
     });
-    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 5 });
+    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 6 });
     expect(service.listSkills(true).find((skill) => skill.id === "team-orchestration")?.instructions)
-      .toContain("Split oversized validation into two or three explicit assignments");
+      .toContain("first emit plan-todos");
 
     const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Inspect materialization" });
     const manifest = JSON.parse(fs.readFileSync(result.run.manifestPath, "utf8")) as {
@@ -186,17 +186,17 @@ describe("Supervisor flow persistence and materialization", () => {
     };
     expect(manifest.roles.supervisor?.skills.map((skill) => skill.id)).toEqual([
       "lead-method-v1",
-      "team-orchestration-v5"
+      "team-orchestration-v6"
     ]);
     expect(manifest.roles["member-builder"]?.skills.map((skill) => skill.id)).toEqual(["build-method-v1"]);
     expect(manifest.roles.supervisor?.identity.metadata.runtimeSkillInjections).toEqual([{
       skillId: "team-orchestration",
-      version: 5,
+      version: 6,
       reason: "supervisor-runtime"
     }]);
     expect(manifest.roles["member-builder"]?.identity.metadata.runtimeSkillInjections).toBeUndefined();
     expect(manifest.workflows[workflow.id]?.config).toMatchObject({
-      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 5 } },
+      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 6 } },
       members: [{
         roleId: "builder",
         capabilities: ["code.backend"],
@@ -239,7 +239,7 @@ describe("Supervisor flow persistence and materialization", () => {
     if (migrated.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
     expect(migrated.flow).toMatchObject({ version: 1, gates: [] });
     expect(migrated.flow.stages.map((stage) => stage.kind)).toEqual(["supervisor", "delegation-loop", "delivery"]);
-    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 5 });
+    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 6 });
   });
 });
 
@@ -303,6 +303,236 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(result.run.status).toBe("passed");
     expect(JSON.stringify(result.run.output)).not.toContain("lacks required capabilities");
     expect(Object.keys(result.run.nodes)).toContain("worker-r1-1");
+  });
+
+  it("executes bounded TODO shards in one retained member Work Instance and scopes regression from impact", async () => {
+    let supervisorTurn = 0;
+    const builderContexts: Array<Record<string, unknown>> = [];
+    const gateContexts: Array<Record<string, unknown>> = [];
+    const impact = {
+      level: "low",
+      regressionScope: "targeted",
+      affectedAreas: ["src/local-helper.ts"],
+      reasons: ["Only one local helper and its direct caller change; public contracts remain stable."],
+      requiredChecks: ["local-helper focused unit test", "direct caller behavior check"]
+    };
+    const providers: ProviderRegistry = new Map([["todo-session-flow", {
+      id: "todo-session-flow",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const node = invocation.templateContext.node as {
+          metadata?: { kind?: string };
+          with?: Record<string, unknown>;
+        };
+        if (node.metadata?.kind === "gate") {
+          gateContexts.push({ ...(node.with ?? {}) });
+          return {
+            stdout: JSON.stringify({
+              message: "Targeted behavior passed.",
+              e2eEvidence: [{ method: "automation-run", steps: "run the focused helper behavior test", observed: "the direct caller passed" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (role === "member-builder") {
+          builderContexts.push({ ...(node.with ?? {}) });
+          const todoId = String(node.with?.__todoId ?? "");
+          return {
+            stdout: JSON.stringify({ message: `${todoId} completed without executing another TODO.` }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        supervisorTurn += 1;
+        if (supervisorTurn === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Split the local change into two serial, verifiable coding milestones.",
+              impact,
+              todos: [
+                {
+                  id: "implement-helper",
+                  roleId: "builder",
+                  task: "Implement only the local helper and its focused unit behavior.",
+                  needs: [],
+                  workKind: "code",
+                  changeSet: "local-helper",
+                  sessionKey: "builder-local-helper"
+                },
+                {
+                  id: "wire-caller",
+                  roleId: "builder",
+                  task: "Wire only the direct caller to the completed helper; do not repeat helper implementation.",
+                  needs: ["implement-helper"],
+                  workKind: "code",
+                  changeSet: "local-helper",
+                  sessionKey: "builder-local-helper"
+                }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 2) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Run the first ready TODO only.",
+              assignments: [{ todoId: "implement-helper", roleId: "builder" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 3) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Continue the retained builder session with the dependent TODO.",
+              assignments: [{ todoId: "wire-caller", roleId: "builder" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Both TODOs and targeted regression passed.", result: { delivered: true } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("todo-session-provider", { adapter: "todo-session-flow", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "todo-lead",
+      identity: { displayName: "TODO Lead", background: "Plans bounded work.", responsibilities: ["Plan"] },
+      providerId: "todo-session-provider"
+    });
+    await service.createEmployee({
+      id: "todo-builder",
+      identity: { displayName: "TODO Builder", background: "Implements bounded changes.", responsibilities: ["Build"] },
+      capabilities: ["code.backend"],
+      providerId: "todo-session-provider"
+    });
+    await service.createEmployee({
+      id: "todo-tester",
+      identity: { displayName: "TODO Tester", background: "Runs scoped behavior tests.", responsibilities: ["Test"] },
+      capabilities: ["quality.test"],
+      providerId: "todo-session-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message", "e2eEvidence"],
+        properties: {
+          message: { type: "string" },
+          e2eEvidence: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["method", "steps", "observed"],
+              properties: {
+                method: { type: "string" },
+                steps: { type: "string" },
+                observed: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    });
+    await service.createManagementPolicy({
+      id: "todo-session-policy",
+      allowedRoleIds: ["builder", "tester"],
+      instructions: "Plan bounded TODOs and use regression impact to choose the smallest safe test scope.",
+      limits: { maxRounds: 4, maxDelegations: 2, maxParallelDelegations: 1 }
+    });
+    await service.createWorkflow({
+      id: "todo-session-supervision",
+      architecture: "supervisor",
+      supervisor: { employeeId: "todo-lead" },
+      managementPolicy: { id: "todo-session-policy" },
+      members: [
+        { roleId: "builder", employeeId: "todo-builder" },
+        { roleId: "tester", employeeId: "todo-tester" }
+      ],
+      flow: {
+        stages: [
+          { id: "plan", kind: "supervisor", title: "Plan" },
+          { id: "loop", kind: "delegation-loop", title: "Build" },
+          { id: "test", kind: "gate", title: "Targeted test", gateId: "targeted-test" },
+          { id: "delivery", kind: "delivery", title: "Deliver" }
+        ],
+        gates: [{
+          id: "targeted-test",
+          requiredCapability: "quality.test",
+          mode: "before-completion",
+          required: true,
+          instructions: "Validate the recorded regression scope.",
+          fallback: "block"
+        }]
+      }
+    });
+
+    const result = await service.runWorkbenchWorkflow("todo-session-supervision", { message: "Make one local helper change." });
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(result.run.output).toMatchObject({
+      summary: "Both TODOs and targeted regression passed.",
+      dag: {
+        nodes: expect.arrayContaining([
+          expect.objectContaining({ nodeId: "implement-helper", status: "passed" }),
+          expect.objectContaining({ nodeId: "wire-caller", status: "passed" })
+        ])
+      },
+      gates: [expect.objectContaining({ gateId: "targeted-test", status: "passed" })]
+    });
+
+    expect(builderContexts).toHaveLength(2);
+    expect(builderContexts[0]).toMatchObject({
+      __todoId: "implement-helper",
+      __delegatedTask: "Implement only the local helper and its focused unit behavior.",
+      __regressionImpact: impact,
+      __memberSession: { id: "member-session-builder-local-helper", turns: [] }
+    });
+    expect(builderContexts[1]).toMatchObject({
+      __todoId: "wire-caller",
+      __delegatedTask: "Wire only the direct caller to the completed helper; do not repeat helper implementation.",
+      __regressionImpact: impact,
+      __memberSession: {
+        id: "member-session-builder-local-helper",
+        turns: [expect.objectContaining({ todoId: "implement-helper", status: "passed" })]
+      }
+    });
+    expect(String(builderContexts[0]?.__delegatedTask)).not.toContain("Wire only");
+
+    expect(gateContexts).toHaveLength(1);
+    expect(gateContexts[0]).toMatchObject({ __regressionImpact: impact });
+    expect(String(gateContexts[0]?.__delegatedTask)).toContain("Run only changed-path and directly related regression checks");
+    expect(String(gateContexts[0]?.__delegatedTask)).toContain("do not run package-wide or repository-wide suites");
+
+    const builderInstances = service.getActivitySnapshot().instances.filter((candidate) => (
+      candidate.runId === result.run.id && candidate.employeeId === "todo-builder"
+    ));
+    expect(builderInstances).toHaveLength(1);
+    expect(builderInstances[0]).toMatchObject({
+      status: "completed",
+      phase: "done",
+      nodeId: "wire-caller",
+      nodeIds: ["implement-helper", "wire-caller"],
+      memberSessionId: "member-session-builder-local-helper",
+      memberSessionRetained: false,
+      todoId: "wire-caller"
+    });
+    expect(builderInstances[0]?.transitions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "waiting", phase: "waiting-next-todo" }),
+      expect.objectContaining({ status: "queued", phase: "continuing-session" })
+    ]));
   });
 
   it("skips integration for one changeSet and runs it for two independent code changeSets", async () => {
@@ -913,12 +1143,12 @@ describe("Supervisor workflow version tracking", () => {
     const kinds = result.changes.map((change) => `${change.kind}:${change.from}->${change.to}`);
     expect(kinds).toContain("member:1->2");
     expect(kinds).toContain("management-policy:1->2");
-    expect(kinds).toContain("orchestration-skill:5->6");
+    expect(kinds).toContain("orchestration-skill:6->7");
     const refreshed = service.getWorkflow("vt-team");
     if (refreshed.architecture !== "supervisor") throw new Error("expected supervisor workflow");
     expect(refreshed.members[0]!.employeeVersion).toBe(2);
     expect(refreshed.managementPolicy.version).toBe(2);
-    expect(refreshed.orchestrationSkill.version).toBe(6);
+    expect(refreshed.orchestrationSkill.version).toBe(7);
 
     // A second refresh with nothing new reports no change.
     const again = await service.refreshWorkflow("vt-team");

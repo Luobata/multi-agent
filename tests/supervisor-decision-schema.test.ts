@@ -17,20 +17,35 @@ describe("supervisorDecisionSchema", () => {
     expect(schema.oneOf).toBeUndefined();
     expect(schema.anyOf).toBeUndefined();
     const properties = schema.properties as { action: { enum?: string[] } };
-    expect(properties.action.enum).toEqual(["delegate", "request-human-decision", "finish"]);
+    expect(properties.action.enum).toEqual(["plan-todos", "delegate", "request-human-decision", "finish"]);
   });
 
   it("includes satisfy-gate in the action enum and a gateId only when gates exist", () => {
     const withGates = supervisorDecisionSchema(roleIds, ["audit"], 3) as Record<string, unknown>;
     const properties = withGates.properties as { action: { enum?: string[] }; gateId: { enum?: string[] } };
-    expect(properties.action.enum).toEqual(["delegate", "request-human-decision", "satisfy-gate", "finish"]);
+    expect(properties.action.enum).toEqual(["plan-todos", "delegate", "request-human-decision", "satisfy-gate", "finish"]);
     expect(properties.gateId.enum).toEqual(["audit"]);
   });
 
-  it("accepts delegate, satisfy-gate, and finish payloads and rejects an unknown action", () => {
+  it("accepts TODO planning, delegate, satisfy-gate, and finish payloads and rejects an unknown action", () => {
     const schema = supervisorDecisionSchema(roleIds, ["audit"], 2);
     const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
 
+    expect(validate({
+      action: "plan-todos",
+      summary: "Split the change.",
+      impact: {
+        level: "low",
+        regressionScope: "targeted",
+        affectedAreas: ["src/local.ts"],
+        reasons: ["local contract"],
+        requiredChecks: ["focused test"]
+      },
+      todos: [
+        { id: "implement", roleId: "frontend-developer", task: "Implement", needs: [], workKind: "code", sessionKey: "frontend-lane" },
+        { id: "verify", roleId: "test-engineer", task: "Verify", needs: ["implement"], workKind: "test" }
+      ]
+    })).toBe(true);
     expect(validate({ action: "delegate", assignments: [{ roleId: "frontend-developer", task: "build UI" }] })).toBe(true);
     expect(validate({
       action: "request-human-decision",
@@ -50,6 +65,8 @@ describe("supervisorDecisionSchema", () => {
 
     const dagSchema = supervisorDecisionSchema(roleIds, [], 2, ["frontend-build"]);
     const validateDag = new Ajv({ allErrors: true, strict: false }).compile(dagSchema);
+    const dagActions = (dagSchema.properties as { action: { enum: string[] } }).action.enum;
+    expect(dagActions).not.toContain("plan-todos");
     // In DAG mode a delegate assignment names a nodeId + free-form roleId.
     expect(validateDag({ action: "delegate", assignments: [{ nodeId: "frontend-build", roleId: "frontend-developer" }] })).toBe(true);
   });
@@ -59,6 +76,7 @@ describe("supervisorDecisionSchema", () => {
     const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
     // finish without summary/result — the exact malformed shape the repair test relies on.
     expect(validate({ action: "finish" })).toBe(false);
+    expect(validate({ action: "plan-todos", summary: "missing impact and todos" })).toBe(false);
     expect(validate({ action: "delegate" })).toBe(false);
     expect(validate({ action: "request-human-decision", summary: "missing risk and assignments" })).toBe(false);
     expect(validate({ action: "satisfy-gate", gateId: "audit" })).toBe(false);

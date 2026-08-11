@@ -2534,14 +2534,48 @@ export class WorkbenchService {
     if (!employee) throw new Error(`runtime role ${runtimeRole} is not bound to an Employee`);
     const timestamp = now();
     let created = false;
+    let reused = false;
     const instance = await this.store.mutate((state) => {
       const invocation = state.invocations[invocationId];
       if (!invocation) throw new Error(`invocation not found: ${invocationId}`);
       const existing = invocation.instanceIds
         .map((id) => state.workInstances[id])
-        .find((candidate) => candidate?.nodeId === nodeId);
+        .find((candidate) => candidate?.nodeId === nodeId || candidate?.nodeIds?.includes(nodeId));
       if (existing) return existing;
       const metadata = detail?.metadata ?? {};
+      const memberSessionId = typeof metadata.memberSessionId === "string" ? metadata.memberSessionId : undefined;
+      const retained = memberSessionId
+        ? invocation.instanceIds
+            .map((id) => state.workInstances[id])
+            .find((candidate) => (
+              candidate?.memberSessionId === memberSessionId
+              && candidate.status === "waiting"
+              && candidate.phase === "waiting-next-todo"
+            ))
+        : undefined;
+      if (retained) {
+        retained.nodeId = nodeId;
+        retained.nodeIds = [...new Set([...(retained.nodeIds ?? []), nodeId])];
+        retained.round = typeof metadata.round === "number" ? metadata.round : retained.round;
+        retained.parentNodeId = typeof metadata.parentNodeId === "string" ? metadata.parentNodeId : retained.parentNodeId;
+        retained.todoId = typeof metadata.todoId === "string" ? metadata.todoId : undefined;
+        retained.memberSessionRetained = metadata.memberSessionRetained === true;
+        retained.status = "queued";
+        retained.phase = "continuing-session";
+        retained.updatedAt = timestamp;
+        delete retained.completedAt;
+        delete retained.error;
+        delete retained.failure;
+        retained.transitions.push({
+          at: timestamp,
+          status: "queued",
+          phase: "continuing-session",
+          message: retained.todoId ? `继续 TODO ${retained.todoId}` : "继续成员会话"
+        });
+        invocation.updatedAt = timestamp;
+        reused = true;
+        return retained;
+      }
       const next: WorkInstanceRecord = {
         id: `work-${randomUUID()}`,
         invocationId,
@@ -2550,12 +2584,17 @@ export class WorkbenchService {
         workflowId: invocation.executionSnapshot?.workflow.id ?? invocation.target.id,
         workflowVersion: invocation.executionSnapshot?.workflow.version ?? invocation.target.version,
         nodeId,
+        nodeIds: [nodeId],
         roleId: typeof metadata.roleId === "string" ? metadata.roleId : runtimeRole,
         kind: metadata.kind === "supervisor" || metadata.kind === "member" || metadata.kind === "gate"
           ? metadata.kind
           : undefined,
         round: typeof metadata.round === "number" ? metadata.round : undefined,
         parentNodeId: typeof metadata.parentNodeId === "string" ? metadata.parentNodeId : undefined,
+        memberSessionId,
+        memberSessionKey: typeof metadata.memberSessionKey === "string" ? metadata.memberSessionKey : undefined,
+        memberSessionRetained: metadata.memberSessionRetained === true,
+        todoId: typeof metadata.todoId === "string" ? metadata.todoId : undefined,
         runId: invocation.runId,
         sessionId: invocation.sessionId,
         providerId: employee.providerId,
@@ -2573,7 +2612,7 @@ export class WorkbenchService {
       created = true;
       return next;
     });
-    if (created) {
+    if (created || reused) {
       this.emitActivity({ type: "instance.changed", at: timestamp, instance });
       const invocation = this.snapshot().invocations[invocationId];
       if (invocation) this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
@@ -2604,6 +2643,24 @@ export class WorkbenchService {
       return target;
     });
     this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+    if (isInvocationTerminal(status)) {
+      const retainedInstances = this.snapshot().invocations[id]?.instanceIds
+        .map((instanceId) => this.snapshot().workInstances[instanceId])
+        .filter((instance): instance is WorkInstanceRecord => (
+          instance !== undefined
+          && instance.status === "waiting"
+          && instance.phase === "waiting-next-todo"
+        )) ?? [];
+      for (const instance of retainedInstances) {
+        await this.transitionInstance(
+          id,
+          instance.nodeId,
+          status === "completed" ? "completed" : "cancelled",
+          "member-session-closed",
+          "Run 已结束，成员会话已释放。"
+        );
+      }
+    }
     if (isInvocationTerminal(status) && invocation.executionSnapshot?.workflow.architecture === "supervisor") {
       await this.persistSupervisorSessionProgress(id);
     }
@@ -2623,7 +2680,7 @@ export class WorkbenchService {
       const invocation = state.invocations[invocationId];
       const target = invocation?.instanceIds
         .map((id) => state.workInstances[id])
-        .find((candidate) => candidate?.nodeId === nodeId);
+        .find((candidate) => candidate?.nodeId === nodeId || candidate?.nodeIds?.includes(nodeId));
       if (!target) return undefined;
       target.status = status;
       target.phase = phase;
@@ -2692,7 +2749,19 @@ export class WorkbenchService {
         const detail = event.detail as { error?: string } | undefined;
         await this.transitionInstance(invocationId, event.nodeId, "running", "retrying", detail?.error);
       } else if (event.type === "node.passed") {
-        await this.transitionInstance(invocationId, event.nodeId, "completed", "done");
+        const eventNodeId = event.nodeId;
+        const snapshot = this.snapshot();
+        const retained = snapshot.invocations[invocationId]?.instanceIds
+          .map((id) => snapshot.workInstances[id])
+          .find((candidate) => candidate?.nodeId === eventNodeId || candidate?.nodeIds?.includes(eventNodeId))
+          ?.memberSessionRetained === true;
+        await this.transitionInstance(
+          invocationId,
+          eventNodeId,
+          retained ? "waiting" : "completed",
+          retained ? "waiting-next-todo" : "done",
+          retained ? "当前 TODO 已完成，保留成员上下文等待下一分片。" : undefined
+        );
       } else if (event.type === "node.blocked") {
         await this.transitionInstance(invocationId, event.nodeId, "blocked", "done");
       } else if (event.type === "node.failed") {

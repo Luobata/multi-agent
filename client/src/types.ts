@@ -243,10 +243,15 @@ export interface WorkInstanceRecord {
   workflowId: string;
   workflowVersion: number;
   nodeId: string;
+  nodeIds?: string[];
   roleId?: string;
   kind?: "graph" | "supervisor" | "member" | "gate";
   round?: number;
   parentNodeId?: string;
+  memberSessionId?: string;
+  memberSessionKey?: string;
+  memberSessionRetained?: boolean;
+  todoId?: string;
   runId: string;
   sessionId?: string;
   providerId: string;

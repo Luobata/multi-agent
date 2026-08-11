@@ -95,6 +95,7 @@ interface SupervisorWorkflowConfig {
 
 interface SupervisorAssignment {
   nodeId?: string;
+  todoId?: string;
   roleId: string;
   task?: string;
   requiredCapabilities?: string[];
@@ -103,10 +104,58 @@ interface SupervisorAssignment {
   context?: JsonObject;
 }
 
+type RegressionRiskLevel = "low" | "medium" | "high";
+type RegressionScope = "none" | "targeted" | "package" | "full";
+
+interface SupervisorImpactAssessment {
+  level: RegressionRiskLevel;
+  regressionScope: RegressionScope;
+  affectedAreas: string[];
+  reasons: string[];
+  requiredChecks: string[];
+}
+
+interface SupervisorTodo {
+  id: string;
+  roleId: string;
+  task: string;
+  needs: string[];
+  workKind: SupervisorWorkKind;
+  changeSet?: string;
+  sessionKey?: string;
+  requiredCapabilities?: string[];
+  context?: JsonObject;
+}
+
+interface MemberSessionTurn {
+  todoId: string;
+  nodeId: string;
+  task: string;
+  status: NodeRunResult["status"];
+  output: JsonValue;
+  error: string | null;
+}
+
+interface MemberSessionState {
+  id: string;
+  key: string;
+  roleId: string;
+  changeSet?: string;
+  status: "open" | "closed";
+  turns: MemberSessionTurn[];
+}
+
 type SupervisorDecision =
+  | {
+      action: "plan-todos";
+      summary: string;
+      impact: SupervisorImpactAssessment;
+      todos: SupervisorTodo[];
+    }
   | {
       action: "delegate";
       summary?: string;
+      impact?: SupervisorImpactAssessment;
       assignments: SupervisorAssignment[];
     }
   | {
@@ -119,6 +168,7 @@ type SupervisorDecision =
       action: "request-human-decision";
       riskCategory: HumanDecisionRiskCategory;
       summary: string;
+      impact?: SupervisorImpactAssessment;
       assignments: SupervisorAssignment[];
     }
   | {
@@ -680,6 +730,16 @@ function formatSupervisorMermaid(plan: ExecutionPlan): string {
 function decision(value: JsonValue | undefined): SupervisorDecision | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const candidate = value as Record<string, JsonValue>;
+  if (
+    candidate.action === "plan-todos"
+    && typeof candidate.summary === "string"
+    && typeof candidate.impact === "object"
+    && candidate.impact !== null
+    && !Array.isArray(candidate.impact)
+    && Array.isArray(candidate.todos)
+  ) {
+    return candidate as unknown as SupervisorDecision;
+  }
   if (candidate.action === "delegate" && Array.isArray(candidate.assignments)) return candidate as unknown as SupervisorDecision;
   if (
     candidate.action === "request-human-decision"
@@ -701,6 +761,122 @@ function decision(value: JsonValue | undefined): SupervisorDecision | undefined 
     return candidate as unknown as SupervisorDecision;
   }
   return undefined;
+}
+
+function todoNodeKind(workKind: SupervisorWorkKind): import("./supervisorDag.js").SupervisorDagNodeKind {
+  if (workKind === "test") return "test";
+  if (workKind === "audit") return "review";
+  if (workKind === "integration") return "integration";
+  return "task";
+}
+
+function todoDag(todos: SupervisorTodo[]): SupervisorDagConfig {
+  return {
+    nodes: todos.map((todo) => ({
+      nodeId: todo.id,
+      roleId: todo.roleId,
+      needs: [...todo.needs],
+      kind: todoNodeKind(todo.workKind),
+      task: todo.task,
+      requiredCapabilities: [...(todo.requiredCapabilities ?? [])],
+      workKind: todo.workKind,
+      ...(todo.changeSet ? { changeSet: todo.changeSet } : {}),
+      required: true
+    }))
+  };
+}
+
+function dynamicTodoPlanIssues(
+  workflowId: string,
+  todos: SupervisorTodo[],
+  members: ReadonlyMap<string, SupervisorTeamMemberConfig>,
+  maxDelegations: number
+): string[] {
+  const issues = supervisorDagIssues(workflowId, todoDag(todos), new Set(members.keys()));
+  if (todos.length < 2) issues.push("dynamic TODO plan must contain at least two bounded items");
+  if (todos.length > maxDelegations) {
+    issues.push(`dynamic TODO plan has ${todos.length} items but the policy allows only ${maxDelegations} delegations`);
+  }
+  const sessions = new Map<string, SupervisorTodo[]>();
+  for (const todo of todos) {
+    if (!todo.sessionKey) continue;
+    const prior = sessions.get(todo.sessionKey) ?? [];
+    const first = prior[0];
+    if (first && (first.roleId !== todo.roleId || (first.changeSet ?? "") !== (todo.changeSet ?? ""))) {
+      issues.push(`member session ${todo.sessionKey} must keep one roleId and changeSet`);
+    }
+    const previous = prior.at(-1);
+    if (previous && !todo.needs.includes(previous.id)) {
+      issues.push(`TODO ${todo.id} must directly depend on prior member-session TODO ${previous.id}`);
+    }
+    prior.push(todo);
+    sessions.set(todo.sessionKey, prior);
+  }
+  return issues;
+}
+
+function memberSessionSnapshot(session: MemberSessionState | undefined): JsonValue {
+  if (!session) return null;
+  return {
+    id: session.id,
+    key: session.key,
+    roleId: session.roleId,
+    changeSet: session.changeSet ?? null,
+    status: session.status,
+    turns: session.turns.map((turn) => ({ ...turn }))
+  };
+}
+
+const REGRESSION_LEVEL_ORDER: Record<RegressionRiskLevel, number> = { low: 0, medium: 1, high: 2 };
+const REGRESSION_SCOPE_ORDER: Record<RegressionScope, number> = { none: 0, targeted: 1, package: 2, full: 3 };
+
+function mergeRegressionImpacts(impacts: SupervisorImpactAssessment[]): SupervisorImpactAssessment | undefined {
+  if (impacts.length === 0) return undefined;
+  const highestLevel = impacts.reduce((current, impact) => (
+    REGRESSION_LEVEL_ORDER[impact.level] > REGRESSION_LEVEL_ORDER[current] ? impact.level : current
+  ), impacts[0]!.level);
+  const widestScope = impacts.reduce((current, impact) => (
+    REGRESSION_SCOPE_ORDER[impact.regressionScope] > REGRESSION_SCOPE_ORDER[current]
+      ? impact.regressionScope
+      : current
+  ), impacts[0]!.regressionScope);
+  return {
+    level: highestLevel,
+    regressionScope: widestScope,
+    affectedAreas: [...new Set(impacts.flatMap((impact) => impact.affectedAreas))],
+    reasons: [...new Set(impacts.flatMap((impact) => impact.reasons))],
+    requiredChecks: [...new Set(impacts.flatMap((impact) => impact.requiredChecks))]
+  };
+}
+
+function sourceRegressionImpact(context: ArchitectureExecutionContext, sourceNodeIds: string[]): SupervisorImpactAssessment | undefined {
+  const impacts = sourceNodeIds.flatMap((sourceNodeId) => {
+    const source = context.plan.nodes.find((candidate) => candidate.id === sourceNodeId);
+    const impact = source?.with.__regressionImpact;
+    return impact && typeof impact === "object" && !Array.isArray(impact)
+      ? [impact as unknown as SupervisorImpactAssessment]
+      : [];
+  });
+  return mergeRegressionImpacts(impacts);
+}
+
+function scopedGateInstructions(instructions: string, impact: SupervisorImpactAssessment | undefined): string {
+  if (!impact) return instructions;
+  const scopeRule = impact.regressionScope === "full"
+    ? "Full regression is justified by the recorded impact assessment."
+    : impact.regressionScope === "package"
+      ? "Run affected-package regression plus the listed checks; do not widen to repository-wide regression without new contradictory evidence."
+      : impact.regressionScope === "targeted"
+        ? "Run only changed-path and directly related regression checks; do not run package-wide or repository-wide suites without new contradictory evidence."
+        : "Do not repeat automated regression; validate only the explicit no-regression rationale and required checks.";
+  return [
+    instructions,
+    "",
+    "Runtime regression-impact assessment:",
+    JSON.stringify(impact),
+    scopeRule,
+    "If observed evidence requires a wider scope, stop and return the concrete reason to the leader instead of silently expanding the workload."
+  ].join("\n");
 }
 
 function output(
@@ -858,6 +1034,8 @@ async function executeGateActivation(
   }
   const role = context.loaded.manifest.roles[executor.role];
   if (!role) throw new Error(`gate executor runtime role not found: ${executor.role}`);
+  const regressionImpact = sourceRegressionImpact(context, activation.sourceNodeIds);
+  const gateTask = scopedGateInstructions(tracker.gate.instructions, regressionImpact);
   const node: ExecutionPlanNode = {
     id: `gate-${tracker.gate.id}-r${round}-${sequence}`,
     role: executor.role,
@@ -865,11 +1043,14 @@ async function executeGateActivation(
     needs: activation.sourceNodeIds,
     with: {
       __delegatedRoleId: executor.roleId,
-      __delegatedTask: tracker.gate.instructions,
+      __todoId: "",
+      __delegatedTask: gateTask,
+      __memberSession: null,
       __requiredCapabilities: [tracker.gate.requiredCapability],
       __workKind: gateWorkKind(tracker.gate),
       __changeSet: "",
-      __delegatedContext: {},
+      __regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
+      __delegatedContext: regressionImpact ? { regressionImpact: regressionImpact as unknown as JsonValue } : {},
       __supervisorSummary: `Execute required workflow Gate ${tracker.gate.id}.`,
       __gateExecution: {
         gateId: tracker.gate.id,
@@ -877,6 +1058,7 @@ async function executeGateActivation(
         mode: tracker.gate.mode,
         required: tracker.gate.required,
         instructions: tracker.gate.instructions,
+        regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
         activation: activation.key,
         sourceNodeIds: activation.sourceNodeIds
       },
@@ -899,6 +1081,7 @@ async function executeGateActivation(
     mode: tracker.gate.mode,
     required: tracker.gate.required,
     instructions: tracker.gate.instructions,
+    regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
     activation: activation.key,
     sourceNodeIds: activation.sourceNodeIds
   };
@@ -1055,13 +1238,17 @@ function requiredGateIssues(trackers: Map<string, GateTracker>): GateTracker[] {
 async function executeSupervisor(context: ArchitectureExecutionContext): Promise<ArchitectureExecutionResult> {
   const value = planConfig(context.plan);
   const members = new Map(value.members.map((member) => [member.roleId, member]));
-  const dagTrackers = value.flow.dag
+  const hasStaticDag = Boolean(value.flow.dag);
+  let dagTrackers = value.flow.dag
     ? new Map(value.flow.dag.nodes.map((node): [string, SupervisorDagNodeTracker] => [node.nodeId, {
         node,
         status: "pending",
         executions: []
-      }]))
+    }]))
     : undefined;
+  let dynamicTodos: Map<string, SupervisorTodo> | undefined;
+  let regressionImpact: SupervisorImpactAssessment | undefined;
+  const memberSessions = new Map<string, MemberSessionState>();
   const trackers = new Map<string, GateTracker>(value.flow.gates.map((gate): [string, GateTracker] => [gate.id, {
     gate,
     status: "pending",
@@ -1118,6 +1305,63 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         status: "failed",
         output: output("supervisor returned an invalid decision", round, delegationCount, trackers, undefined, dagTrackers)
       };
+    }
+
+    if (next.action === "plan-todos") {
+      if (hasStaticDag) {
+        return {
+          status: "failed",
+          output: output("plan-todos is unavailable because this workflow already declares a static DAG", round, delegationCount, trackers, undefined, dagTrackers)
+        };
+      }
+      if (dynamicTodos) {
+        return {
+          status: "failed",
+          output: output("supervisor attempted to replace an active dynamic TODO plan", round, delegationCount, trackers, undefined, dagTrackers)
+        };
+      }
+      const issues = dynamicTodoPlanIssues(context.plan.workflow, next.todos, members, value.policy.limits.maxDelegations);
+      if (issues.length > 0) {
+        history.push({
+          round,
+          supervisorNodeId: node.id,
+          decision: next as unknown as JsonValue,
+          decisionRejected: issues.join("; ")
+        });
+        await context.emit("supervisor.todos.rejected", node.id, { issues });
+        if (round >= value.policy.limits.maxRounds) {
+          return blocked(`dynamic TODO plan is invalid: ${issues.join("; ")}`, round, delegationCount, trackers, dagTrackers);
+        }
+        latestNodeIds = [node.id];
+        round += 1;
+        continue;
+      }
+      regressionImpact = next.impact;
+      dynamicTodos = new Map(next.todos.map((todo) => [todo.id, todo]));
+      const plannedDag = todoDag(next.todos);
+      dagTrackers = new Map(plannedDag.nodes.map((todo): [string, SupervisorDagNodeTracker] => [todo.nodeId, {
+        node: todo,
+        status: "pending",
+        executions: []
+      }]));
+      history.push({
+        round,
+        supervisorNodeId: node.id,
+        decision: next as unknown as JsonValue,
+        todoPlanAccepted: true
+      });
+      await context.emit("supervisor.todos.planned", node.id, {
+        summary: next.summary,
+        impact: next.impact as unknown as JsonValue,
+        todos: next.todos as unknown as JsonValue
+      });
+      await context.persist();
+      if (round >= value.policy.limits.maxRounds) {
+        return blocked("management policy round limit reached after TODO planning", round, delegationCount, trackers, dagTrackers);
+      }
+      latestNodeIds = [node.id];
+      round += 1;
+      continue;
     }
 
     if (next.action === "request-human-decision") {
@@ -1178,6 +1422,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       next = {
         action: "delegate",
         summary: requested.summary,
+        ...(requested.impact ? { impact: requested.impact } : {}),
         assignments: requested.assignments
       };
     }
@@ -1307,6 +1552,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       };
     }
 
+    if (next.impact) regressionImpact = next.impact;
+
     if (round >= value.policy.limits.maxRounds) {
       return blocked("management policy round limit reached before convergence", round, delegationCount, trackers, dagTrackers);
     }
@@ -1366,36 +1613,47 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       await context.persist();
       return blocked(reason, round, delegationCount, trackers, dagTrackers);
     };
-    const scheduled: Array<{ assignment: SupervisorAssignment; worker: ExecutionPlanNode }> = [];
+    const scheduled: Array<{
+      assignment: SupervisorAssignment;
+      worker: ExecutionPlanNode;
+      memberSession?: MemberSessionState;
+      retainMemberSession: boolean;
+    }> = [];
     const scheduledDagNodes = new Set<string>();
     for (let index = 0; index < next.assignments.length; index += 1) {
       const assignment = next.assignments[index]!;
-      const dagTracker = dagTrackers && typeof assignment.nodeId === "string"
-        ? dagTrackers.get(assignment.nodeId)
+      const requestedFlowNodeId = assignment.nodeId ?? assignment.todoId;
+      const dagTracker = dagTrackers && typeof requestedFlowNodeId === "string"
+        ? dagTrackers.get(requestedFlowNodeId)
         : undefined;
-      if (dagTrackers) {
-        if (typeof assignment.nodeId !== "string" || !assignment.nodeId.trim()) {
-          return dagViolation("supervisor DAG delegation must specify nodeId");
+      const activeDagTrackers = dagTrackers;
+      if (activeDagTrackers) {
+        if (typeof requestedFlowNodeId !== "string" || !requestedFlowNodeId.trim()) {
+          return dagViolation(dynamicTodos
+            ? "dynamic TODO delegation must specify todoId"
+            : "supervisor DAG delegation must specify nodeId");
         }
         if (!dagTracker) {
-          return dagViolation(`supervisor delegated outside the declared DAG: ${assignment.nodeId}`);
+          return dagViolation(hasStaticDag
+            ? `supervisor delegated outside the declared DAG: ${requestedFlowNodeId}`
+            : `supervisor delegated outside the active TODO plan: ${requestedFlowNodeId}`);
         }
-        if (scheduledDagNodes.has(assignment.nodeId)) {
-          return dagViolation(`supervisor delegated DAG node ${assignment.nodeId} more than once in the same round`);
+        if (scheduledDagNodes.has(requestedFlowNodeId)) {
+          return dagViolation(`supervisor delegated planned node ${requestedFlowNodeId} more than once in the same round`);
         }
-        scheduledDagNodes.add(assignment.nodeId);
+        scheduledDagNodes.add(requestedFlowNodeId);
         if (dagTracker.status === "passed") {
-          return dagViolation(`supervisor cannot delegate DAG node ${assignment.nodeId} because it already passed`);
+          return dagViolation(`supervisor cannot delegate planned node ${requestedFlowNodeId} because it already passed`);
         }
         if (assignment.roleId !== dagTracker.node.roleId) {
           return dagViolation(
-            `supervisor delegated DAG node ${assignment.nodeId} to role ${assignment.roleId}; expected ${dagTracker.node.roleId}`
+            `supervisor delegated planned node ${requestedFlowNodeId} to role ${assignment.roleId}; expected ${dagTracker.node.roleId}`
           );
         }
-        const unmetNeeds = dagTracker.node.needs.filter((need) => dagTrackers.get(need)?.status !== "passed");
+        const unmetNeeds = dagTracker.node.needs.filter((need) => activeDagTrackers.get(need)?.status !== "passed");
         if (unmetNeeds.length > 0) {
           return dagViolation(
-            `supervisor delegated DAG node ${assignment.nodeId} before dependencies passed: ${unmetNeeds.map((need) => `${need} (${dagTrackers.get(need)?.status ?? "unknown"})`).join(", ")}`
+            `supervisor delegated planned node ${requestedFlowNodeId} before dependencies passed: ${unmetNeeds.map((need) => `${need} (${activeDagTrackers.get(need)?.status ?? "unknown"})`).join(", ")}`
           );
         }
       }
@@ -1406,12 +1664,12 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       }
       if (dagTracker && assignment.workKind !== undefined && assignment.workKind !== dagTracker.node.workKind) {
         return dagViolation(
-          `supervisor delegated DAG node ${assignment.nodeId} with workKind ${assignment.workKind}; expected ${dagTracker.node.workKind}`
+          `supervisor delegated planned node ${requestedFlowNodeId} with workKind ${assignment.workKind}; expected ${dagTracker.node.workKind}`
         );
       }
       if (dagTracker && assignment.changeSet !== undefined && assignment.changeSet !== dagTracker.node.changeSet) {
         return dagViolation(
-          `supervisor delegated DAG node ${assignment.nodeId} with changeSet ${assignment.changeSet}; expected ${dagTracker.node.changeSet ?? "none"}`
+          `supervisor delegated planned node ${requestedFlowNodeId} with changeSet ${assignment.changeSet}; expected ${dagTracker.node.changeSet ?? "none"}`
         );
       }
       // requiredCapabilities are advisory hints the supervisor may attach; they travel with the
@@ -1423,16 +1681,18 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       ])];
       const role = context.loaded.manifest.roles[member.role];
       if (!role) throw new Error(`supervisor member runtime role not found: ${member.role}`);
-      const delegatedTask = assignment.task?.trim() || dagTracker?.node.task;
+      const plannedTodo = dynamicTodos && requestedFlowNodeId ? dynamicTodos.get(requestedFlowNodeId) : undefined;
+      const delegatedTask = dagTracker?.node.task ?? assignment.task?.trim();
       if (!delegatedTask) {
         return dagTrackers
-          ? dagViolation(`supervisor DAG node ${assignment.nodeId} has no delegated task`)
+          ? dagViolation(`supervisor planned node ${requestedFlowNodeId} has no delegated task`)
           : { status: "failed", output: output("delegate assignment task is missing", round, delegationCount, trackers) };
       }
       const workKind = dagTracker?.node.workKind ?? assignment.workKind ?? "other";
       const changeSet = dagTracker?.node.changeSet ?? assignment.changeSet;
       const effectiveAssignment: SupervisorAssignment = {
         ...assignment,
+        ...(requestedFlowNodeId ? { nodeId: requestedFlowNodeId } : {}),
         task: delegatedTask,
         requiredCapabilities,
         workKind,
@@ -1445,8 +1705,46 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       const dependencyNodeIds = dagTracker
         ? dagTracker.node.needs.map((need) => dagTrackers!.get(need)!.passedExecutionNodeId!)
         : [];
+      let memberSession: MemberSessionState | undefined;
+      let retainMemberSession = false;
+      if (plannedTodo?.sessionKey) {
+        const plannedTrackers = dagTrackers;
+        if (!plannedTrackers) throw new Error("dynamic TODO member session requires active trackers");
+        const existingSession = memberSessions.get(plannedTodo.sessionKey);
+        memberSession = existingSession ?? {
+          id: `member-session-${plannedTodo.sessionKey}`,
+          key: plannedTodo.sessionKey,
+          roleId: plannedTodo.roleId,
+          ...(plannedTodo.changeSet ? { changeSet: plannedTodo.changeSet } : {}),
+          status: "open",
+          turns: []
+        };
+        if (!existingSession) {
+          memberSessions.set(plannedTodo.sessionKey, memberSession);
+          await context.emit("supervisor.member-session.opened", node.id, {
+            memberSessionId: memberSession.id,
+            sessionKey: memberSession.key,
+            roleId: memberSession.roleId,
+            changeSet: memberSession.changeSet ?? null
+          });
+        } else {
+          await context.emit("supervisor.member-session.continued", node.id, {
+            memberSessionId: memberSession.id,
+            sessionKey: memberSession.key,
+            todoId: plannedTodo.id,
+            priorTurns: memberSession.turns.length
+          });
+        }
+        retainMemberSession = [...dynamicTodos!.values()].some((todo) => (
+          todo.id !== plannedTodo.id
+          && todo.sessionKey === plannedTodo.sessionKey
+          && plannedTrackers.get(todo.id)?.status !== "passed"
+        ));
+      }
       scheduled.push({
         assignment: effectiveAssignment,
+        memberSession,
+        retainMemberSession,
         worker: {
           id: workerId,
           role: member.role,
@@ -1454,12 +1752,19 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           needs: [node.id, ...dependencyNodeIds],
           with: {
             __delegatedRoleId: member.roleId,
+            __todoId: plannedTodo?.id ?? "",
             __delegatedTask: delegatedTask,
+            __memberSession: memberSessionSnapshot(memberSession),
             __requiredCapabilities: requiredCapabilities,
             __workKind: workKind,
             __changeSet: changeSet ?? "",
+            __regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
             __gateExecution: null,
-            __delegatedContext: assignment.context ?? {},
+            __delegatedContext: {
+              ...(plannedTodo?.context ?? {}),
+              ...(assignment.context ?? {}),
+              ...(regressionImpact ? { regressionImpact: regressionImpact as unknown as JsonValue } : {})
+            },
             __supervisorSummary: next.summary ?? "",
             __previousAttemptError: ""
           },
@@ -1471,6 +1776,12 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             workKind,
             changeSet: changeSet ?? "",
             requiredCapabilities,
+            ...(plannedTodo ? { todoId: plannedTodo.id } : {}),
+            ...(memberSession ? {
+              memberSessionId: memberSession.id,
+              memberSessionKey: memberSession.key,
+              memberSessionRetained: retainMemberSession
+            } : {}),
             ...(dagTracker ? {
               flowNodeId: dagTracker.node.nodeId,
               flowNodeKind: dagTracker.node.kind,
@@ -1487,6 +1798,31 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       worker,
       result: await context.executeNode(worker, { deadlineAt, retryValidation: true })
     })));
+    for (const record of completed) {
+      const sessionId = typeof record.worker.metadata?.memberSessionId === "string"
+        ? record.worker.metadata.memberSessionId
+        : undefined;
+      if (!sessionId) continue;
+      const session = [...memberSessions.values()].find((candidate) => candidate.id === sessionId);
+      if (!session) continue;
+      session.turns.push({
+        todoId: typeof record.worker.metadata?.todoId === "string" ? record.worker.metadata.todoId : record.worker.id,
+        nodeId: record.worker.id,
+        task: record.assignment.task ?? "",
+        status: record.result.status,
+        output: record.result.output ?? null,
+        error: record.result.error ?? null
+      });
+      if (record.worker.metadata?.memberSessionRetained !== true) {
+        session.status = "closed";
+        await context.emit("supervisor.member-session.closed", record.worker.id, {
+          memberSessionId: session.id,
+          sessionKey: session.key,
+          turns: session.turns.length,
+          finalStatus: record.result.status
+        });
+      }
+    }
     if (dagTrackers) {
       for (const record of completed) {
         const tracker = record.assignment.nodeId ? dagTrackers.get(record.assignment.nodeId) : undefined;

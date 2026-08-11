@@ -43,10 +43,13 @@ export interface InvocationProgress {
 
 export interface InvocationProgressStep {
   nodeId: string;
+  nodeIds?: string[];
   roleId?: string;
   kind?: WorkInstanceRecord["kind"];
   round?: number;
   employeeId: string;
+  todoId?: string;
+  memberSessionId?: string;
   status: WorkInstanceStatus;
   phase: string;
   error?: string;
@@ -69,12 +72,12 @@ export interface LeaderReport {
 
 export interface LeaderReportEntry {
   round: number;
-  /** "delegate" | "satisfy-gate" | "finish" | "unknown". */
+  /** "plan-todos" | "delegate" | "satisfy-gate" | "finish" | "unknown". */
   action: string;
   /** The leader's own summary for the round, when it provided one. */
   summary?: string;
   /** Assignments dispatched this round: which role got what task. */
-  assignments: Array<{ roleId?: string; task?: string; workKind?: string }>;
+  assignments: Array<{ todoId?: string; roleId?: string; task?: string; workKind?: string }>;
   status: WorkInstanceStatus | "pending";
 }
 
@@ -138,10 +141,14 @@ function buildLeaderReport(run: JsonObject | undefined): LeaderReport {
       const round = typeof metadata.round === "number" ? metadata.round : Number(/supervisor-r(\d+)/.exec(nodeId)?.[1] ?? 0);
       const decision = asObject(node.output);
       const action = asString(decision?.action) ?? "unknown";
-      const rawAssignments = Array.isArray(decision?.assignments) ? decision.assignments : [];
+      const rawAssignments = action === "plan-todos" && Array.isArray(decision?.todos)
+        ? decision.todos
+        : Array.isArray(decision?.assignments) ? decision.assignments : [];
       const assignments = rawAssignments.map((entry: JsonValue) => {
         const assignment = asObject(entry) ?? {};
+        const todoId = asString(assignment.todoId) ?? asString(assignment.id);
         return {
+          ...(todoId ? { todoId } : {}),
           roleId: asString(assignment.roleId),
           task: asString(assignment.task),
           workKind: asString(assignment.workKind)
@@ -194,10 +201,13 @@ export function computeInvocationProgress(detail: InvocationDetail): InvocationP
     .sort((left, right) => (metadataRound(left) - metadataRound(right)) || left.createdAt.localeCompare(right.createdAt))
     .map((instance) => ({
       nodeId: instance.nodeId,
+      nodeIds: instance.nodeIds,
       roleId: instance.roleId,
       kind: instance.kind,
       round: instance.round,
       employeeId: instance.employeeId,
+      todoId: instance.todoId,
+      memberSessionId: instance.memberSessionId,
       status: instance.status,
       phase: instance.phase,
       error: instance.error,
