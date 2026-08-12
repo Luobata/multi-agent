@@ -197,34 +197,50 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     const pending = data.requirements.flatMap((requirement) => {
       const advancement = requirement.advancement;
       if (!advancement?.invocationId) return [];
-      const invocation = invocationById.get(advancement.invocationId);
-      if (!invocation) return [];
-      const needsStatusSync = invocation.status !== advancement.status;
+      const currentInvocation = invocationById.get(advancement.invocationId);
+      if (!currentInvocation) return [];
+      // A system/operator retry may intentionally create a fresh Invocation while preserving the
+      // original browser-local requirement family (`source.contextId`). Adopt only a newer member
+      // of that exact family: taskId alone is unsafe because different browser profiles may both
+      // own a local `req-local-1` record.
+      const invocation = (advancement.status === "blocked" || advancement.status === "failed")
+        ? invocations
+            .filter((candidate) => (
+              candidate.id !== currentInvocation.id
+              && candidate.source.project === currentInvocation.source.project
+              && candidate.source.taskId === currentInvocation.source.taskId
+              && candidate.source.contextId === currentInvocation.source.contextId
+              && candidate.createdAt > currentInvocation.createdAt
+            ))
+            .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? currentInvocation
+        : currentInvocation;
+      const needsStatusSync = invocation.id !== advancement.invocationId || invocation.status !== advancement.status;
       const needsAcceptance = invocation.status === "completed"
         && requirement.lane !== "acceptance"
         && requirement.lane !== "merging"
         && requirement.lane !== "done";
       if (!needsStatusSync && !needsAcceptance) return [];
-      return [{ requirement, advancement, invocation }];
+      return [{ requirement, advancement, invocation, needsStatusSync }];
     });
     if (pending.length === 0) return;
     let cancelled = false;
     void (async () => {
       const updatedById = new Map<string, Requirement>();
       const warnings: string[] = [];
-      const results = await Promise.allSettled(pending.map(async ({ requirement, advancement, invocation }) => {
+      const results = await Promise.allSettled(pending.map(async ({ requirement, advancement, invocation, needsStatusSync }) => {
         const config = requirementAdvancementConfig(
           connectedProjects.find((project) => project.id === requirement.projectId)
         );
         let updated = requirement;
-        if (invocation.status !== advancement.status) {
+        if (needsStatusSync) {
           updated = await service.syncRequirementAdvancement(requirement.id, advancement.idempotencyKey, {
             invocationId: invocation.id,
             runId: invocation.runId,
             leaderSessionId: invocation.sessionId,
             status: invocation.status,
             observedAt: invocation.updatedAt,
-            error: invocation.error
+            error: invocation.error,
+            ...(invocation.id !== advancement.invocationId ? { replacesInvocationId: advancement.invocationId } : {})
           }, config?.pollIntervalMs ?? 15_000);
         }
         if (invocation.status !== "completed" || !invocation.runId

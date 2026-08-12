@@ -19,6 +19,8 @@ export interface RequirementInvocationObservation {
   status: InvocationStatus;
   observedAt: string;
   error?: string;
+  /** Explicit terminal Run family handoff validated by the board before replacing an Invocation. */
+  replacesInvocationId?: string;
 }
 
 export type RequirementAdvancementPollAction =
@@ -149,12 +151,15 @@ export function observeAdvancement(
   pollIntervalMs: number
 ): RequirementAdvancement {
   if (advancement.invocationId && advancement.invocationId !== observation.invocationId) {
-    throw new Error("推进观察结果不属于当前需求的 Invocation");
+    const replacesTerminalInvocation = observation.replacesInvocationId === advancement.invocationId
+      && (advancement.status === "blocked" || advancement.status === "failed");
+    if (!replacesTerminalInvocation) throw new Error("推进观察结果不属于当前需求的 Invocation");
   }
   // SSE reconnects and overlapping polls may deliver an older snapshot after a
   // newer one. The local board projection must never regress from running back to
   // awaiting-human-decision (or from terminal to active) because of that race.
   if (advancement.invocationId
+    && advancement.invocationId === observation.invocationId
     && new Date(observation.observedAt).getTime() < new Date(advancement.updatedAt).getTime()) {
     return advancement;
   }

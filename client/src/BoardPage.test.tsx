@@ -646,6 +646,110 @@ describe("BoardPage AI requirement creation", () => {
     expect(container.querySelector<HTMLElement>('section[aria-label^="待验收"]')?.textContent).toContain(requirement.title);
   });
 
+  it("adopts a newer system retry only from the same browser-local requirement family", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "领队协议修复后重跑",
+      summary: "旧 Run 阻塞后由系统新开一轮",
+      priority: "high",
+      rawRequirement: "继续同一条需求",
+      acceptanceCriteria: ["新 Run 通过后自动进入待验收"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-old-blocked",
+      runId: "run-old-blocked",
+      status: "blocked",
+      observedAt: "2026-08-12T04:16:07.000Z"
+    }, config.pollIntervalMs);
+    const family = `requirement-run:${reserved.idempotencyKey}`;
+    const base: Pick<InvocationRecord, "target" | "source" | "phase" | "requestSummary" | "instanceIds" | "transitions"> = {
+      target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench", project: project.id, taskId: requirement.id, contextId: family },
+      phase: "done",
+      requestSummary: requirement.title,
+      instanceIds: [],
+      transitions: []
+    };
+    const oldInvocation: InvocationRecord = {
+      ...base,
+      id: "inv-old-blocked",
+      status: "blocked",
+      runId: "run-old-blocked",
+      createdAt: "2026-08-12T04:04:27.000Z",
+      updatedAt: "2026-08-12T04:16:07.000Z",
+      completedAt: "2026-08-12T04:16:07.000Z"
+    };
+    const newerInvocation: InvocationRecord = {
+      ...base,
+      id: "inv-system-retry",
+      status: "completed",
+      runId: "run-system-retry",
+      createdAt: "2026-08-12T06:00:00.000Z",
+      updatedAt: "2026-08-12T06:30:00.000Z",
+      completedAt: "2026-08-12T06:30:00.000Z"
+    };
+    const unrelatedLocalCollision: InvocationRecord = {
+      ...newerInvocation,
+      id: "inv-other-browser",
+      runId: "run-other-browser",
+      source: { ...newerInvocation.source, contextId: "requirement-run:another-browser-key" },
+      createdAt: "2026-08-12T07:00:00.000Z",
+      updatedAt: "2026-08-12T07:30:00.000Z",
+      completedAt: "2026-08-12T07:30:00.000Z"
+    };
+    const preview: RunMergePreview = {
+      runId: "run-system-retry",
+      status: "awaiting-acceptance",
+      eligible: true,
+      reasons: [],
+      worktreePath: "/repo/.multi-agent/worktrees/run-system-retry",
+      repositoryRoot: "/repo",
+      targetBranch: "main",
+      targetClean: true,
+      changes: { files: [{ status: "M", path: "client/src/BoardPage.tsx" }], fileCount: 1, summary: "1 file", unifiedDiff: { text: "diff", truncated: false, maxBytes: 1024 } },
+      safeGitCommands: [],
+      evidence: {
+        assets: [],
+        structuredE2eCount: 1,
+        acceptedVerdict: true,
+        gates: [
+          { gateId: "quality-test", required: true, status: "passed", requiredCapability: "quality.test", mode: "before-completion" },
+          { gateId: "independent-review", required: true, status: "passed", requiredCapability: "quality.audit", mode: "before-completion" }
+        ]
+      },
+      confirmationToken: "MERGE run-system-retry",
+      discardConfirmationToken: "DISCARD run-system-retry"
+    };
+    fetchMock.mockImplementation((input: RequestInfo) => Promise.resolve({
+      ok: String(input).endsWith("/api/runs/run-system-retry/merge-preview"),
+      status: 200,
+      json: async () => ({ data: preview })
+    }));
+
+    act(() => root.render(<BoardPage
+      spaceId={project.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+      invocations={[oldInvocation, newerInvocation, unrelatedLocalCollision]}
+    />));
+    for (let attempt = 0; attempt < 20 && (await service.getRequirement(requirement.id)).lane !== "acceptance"; attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }
+
+    const adopted = await service.getRequirement(requirement.id);
+    expect(adopted.advancement).toMatchObject({ invocationId: "inv-system-retry", runId: "run-system-retry", status: "completed" });
+    expect(adopted.lane).toBe("acceptance");
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("run-system-retry"), expect.anything());
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("run-other-browser"))).toBe(false);
+  });
+
   it("reconciles an already merged Run to done without repeating the acceptance warning", async () => {
     const service = createDashboardService({
       delayMs: () => 0,
