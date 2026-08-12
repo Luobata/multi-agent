@@ -242,6 +242,7 @@ import {
   type WorkbenchWorkflowDefinition,
   type SupervisorWorkbenchWorkflowDefinition,
   type SupervisorWorkflowCreateInput,
+  type WorkflowEntrancePolicyRefreshResult,
   type WorkflowRefreshResult,
   type WorkflowRefreshChange,
   type WorkflowChangeRequest,
@@ -7020,6 +7021,60 @@ export class WorkbenchService {
     }, { refreshOrchestrationSkill: true });
     if (updated.architecture !== "supervisor") throw new Error("expected supervisor workflow after refresh");
     return { workflow: updated, changed: true, changes };
+  }
+
+  /**
+   * Create a new version of every active Entrance Policy whose leader target still pins an older
+   * version of this Supervisor Workflow. The operation is explicit and version-preserving: policy
+   * history remains auditable, while a second call is idempotent once every reference is current.
+   */
+  async refreshWorkflowEntrancePolicies(id: string): Promise<WorkflowEntrancePolicyRefreshResult> {
+    const workflow = this.getWorkflow(id);
+    if (workflow.architecture !== "supervisor") throw new Error(`workflow ${id} is not a supervisor workflow`);
+    if (workflow.status !== "active") throw new Error(`workflow ${id} is archived; cannot refresh Entrance Policy references`);
+    const stale = this.listEntrancePolicies().filter((policy) => (
+      policy.leader?.workflowId === workflow.id
+      && policy.leader.workflowVersion !== workflow.version
+    ));
+    if (stale.length === 0) {
+      return { workflowId: workflow.id, workflowVersion: workflow.version, changed: false, changes: [] };
+    }
+
+    // Resolve and validate every replacement before mutating persistence, so one invalid policy
+    // cannot leave a partially refreshed group behind.
+    const replacements = stale.map((policy) => ({
+      previous: policy,
+      next: this.normalizeEntrancePolicy({
+        id: policy.id,
+        leader: { workflowId: workflow.id }
+      }, policy)
+    }));
+    await this.store.mutate((state) => {
+      for (const replacement of replacements) {
+        const record = state.entrancePolicies[replacement.previous.id];
+        if (!record) throw new Error(`entrance policy not found: ${replacement.previous.id}`);
+        if (record.current.version !== replacement.previous.version) {
+          throw new Error(`entrance policy ${replacement.previous.id} changed while references were being refreshed; retry`);
+        }
+      }
+      for (const replacement of replacements) {
+        const record = state.entrancePolicies[replacement.previous.id]!;
+        record.current = replacement.next;
+        record.versions.push(replacement.next);
+      }
+    });
+    return {
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      changed: true,
+      changes: replacements.map(({ previous, next }) => ({
+        policyId: previous.id,
+        fromPolicyVersion: previous.version,
+        toPolicyVersion: next.version,
+        fromWorkflowVersion: previous.leader!.workflowVersion,
+        toWorkflowVersion: next.leader!.workflowVersion
+      }))
+    };
   }
 
   private resolveWorkflowEmployees(workflow: WorkbenchWorkflowDefinition): Map<string, EmployeeDefinition> {

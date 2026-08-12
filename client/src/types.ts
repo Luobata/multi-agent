@@ -530,6 +530,19 @@ export type Workflow = GraphWorkflow | SupervisorWorkflow;
 
 export type SupervisorWorkflowUpdatePolicy = "latest" | "locked";
 
+export interface WorkflowEntrancePolicyRefreshResult {
+  workflowId: string;
+  workflowVersion: number;
+  changed: boolean;
+  changes: Array<{
+    policyId: string;
+    fromPolicyVersion: number;
+    toPolicyVersion: number;
+    fromWorkflowVersion: number;
+    toWorkflowVersion: number;
+  }>;
+}
+
 /** A single supervisor-workflow gate mutation. Client mirror of src/workbench/types.ts. */
 export type WorkflowChangeOperation =
   | { kind: "add-gate"; gate: SupervisorGate; rationale: string; risk: string }

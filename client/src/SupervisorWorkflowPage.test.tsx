@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SupervisorWorkflowPage } from "./SupervisorWorkflowPage";
-import type { Bootstrap, Employee, ManagementPolicy, SupervisorWorkflow } from "./types";
+import type { Bootstrap, Employee, EntrancePolicy, ManagementPolicy, SupervisorWorkflow } from "./types";
 
 const timestamp = "2026-08-01T00:00:00.000Z";
 
@@ -79,6 +79,21 @@ const supervisorWorkflow: SupervisorWorkflow = {
   updatedAt: timestamp
 };
 
+const staleEntrancePolicy: EntrancePolicy = {
+  id: "review-entry",
+  version: 4,
+  status: "active",
+  displayName: "评审入口",
+  description: "进入评审领队团队。",
+  direct: { mode: "caller" },
+  specialists: {},
+  leader: { kind: "supervisor-workflow", workflowId: supervisorWorkflow.id, workflowVersion: 1 },
+  rules: [],
+  default: { route: "leader" },
+  createdAt: timestamp,
+  updatedAt: timestamp
+};
+
 const policyRejection = "supervisor member role member-3 is not allowed by management policy review-policy v2";
 
 interface MockResponse {
@@ -97,6 +112,7 @@ describe("SupervisorWorkflowPage editor", () => {
   let notify: ReturnType<typeof vi.fn>;
   let refresh: ReturnType<typeof vi.fn>;
   let patchBehavior: "success" | "reject";
+  let data: Bootstrap;
 
   const fetchMock = vi.fn((input: unknown, init?: RequestInit): Promise<MockResponse> => {
     const url = String(input);
@@ -108,6 +124,20 @@ describe("SupervisorWorkflowPage editor", () => {
     }
     if (url === `/api/workflows/${supervisorWorkflow.id}`) {
       return Promise.resolve(ok({ versions: [supervisorWorkflow] }));
+    }
+    if (url === `/api/workflows/${supervisorWorkflow.id}/entrance-policies/refresh` && init?.method === "POST") {
+      return Promise.resolve(ok({
+        workflowId: supervisorWorkflow.id,
+        workflowVersion: 2,
+        changed: true,
+        changes: [{
+          policyId: staleEntrancePolicy.id,
+          fromPolicyVersion: 4,
+          toPolicyVersion: 5,
+          fromWorkflowVersion: 1,
+          toWorkflowVersion: 2
+        }]
+      }));
     }
     if (url === `/api/management-policies/${managementPolicy.id}`) {
       return Promise.resolve(ok({ policy: managementPolicy, versions: [managementPolicy, managementPolicyV2] }));
@@ -216,7 +246,7 @@ describe("SupervisorWorkflowPage editor", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
-    const data: Bootstrap = {
+    data = {
       providers: [{ id: "mock", definition: { adapter: "mock", model: "deterministic-mock" } }],
       skills: [],
       knowledgeBases: [],
@@ -358,5 +388,30 @@ describe("SupervisorWorkflowPage editor", () => {
     const body = JSON.parse(String(patchCall?.[1]?.body)) as { flow: { gates: Array<{ validatorId?: string }> } };
     expect(body.flow.gates).toHaveLength(1);
     expect(body.flow.gates[0]?.validatorId).toBe("e2e-evidence");
+  });
+
+  it("prompts for stale Entrance Policy references and refreshes every reference with one action", async () => {
+    const currentWorkflow = { ...supervisorWorkflow, version: 2 };
+    data = { ...data, workflows: [currentWorkflow], entrancePolicies: [staleEntrancePolicy] };
+    act(() => root.render(<SupervisorWorkflowPage data={data} refresh={refresh} notify={notify} />));
+    await flush();
+
+    const note = container.querySelector<HTMLElement>(".entrance-reference-stale-note");
+    expect(note?.textContent).toContain("1 条入口策略仍引用旧版团队");
+    expect(note?.textContent).toContain("评审入口");
+    expect(note?.textContent).toContain("当前团队 v2");
+    const button = note?.querySelector<HTMLButtonElement>("button");
+    if (!button) throw new Error("一键刷新入口策略按钮未找到");
+
+    click(button);
+    await flush();
+
+    const call = fetchMock.mock.calls.find(([input, init]) => (
+      String(input) === `/api/workflows/${supervisorWorkflow.id}/entrance-policies/refresh`
+      && init?.method === "POST"
+    ));
+    expect(call).toBeDefined();
+    expect(notify).toHaveBeenCalledWith("已刷新 1 条入口策略到 review-supervisor v2");
+    expect(refresh).toHaveBeenCalled();
   });
 });

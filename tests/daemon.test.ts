@@ -164,6 +164,38 @@ describe("workbench daemon", () => {
     expect(createWorkflow.status).toBe(201);
     const workflow = await createWorkflow.json() as { data: { architecture: string; managementPolicy: { version: number } } };
     expect(workflow.data).toMatchObject({ architecture: "supervisor", managementPolicy: { version: 1 } });
+    const createEntrance = await fetch(`${base}/api/entrance-policies`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "desk-team-entry",
+        displayName: "Desk team entry",
+        leader: { workflowId: "desk-supervisor" },
+        default: { route: "leader" }
+      })
+    });
+    expect(createEntrance.status).toBe(201);
+    expect((await fetch(`${base}/api/workflows/desk-supervisor`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ architecture: "supervisor", description: "A local supervisor team v2." })
+    })).status).toBe(200);
+    const refreshedEntries = await fetch(`${base}/api/workflows/desk-supervisor/entrance-policies/refresh`, { method: "POST" });
+    expect(refreshedEntries.status).toBe(200);
+    expect(await refreshedEntries.json()).toMatchObject({
+      data: {
+        changed: true,
+        workflowId: "desk-supervisor",
+        workflowVersion: 2,
+        changes: [{
+          policyId: "desk-team-entry",
+          fromPolicyVersion: 1,
+          toPolicyVersion: 2,
+          fromWorkflowVersion: 1,
+          toWorkflowVersion: 2
+        }]
+      }
+    });
     const missingMcpRoot = path.join(os.tmpdir(), `missing-mcp-project-${Date.now()}`);
     const rejectedExecutionRoot = await fetch(`${base}/api/workflows/desk-supervisor/run`, {
       method: "POST",

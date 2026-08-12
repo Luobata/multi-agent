@@ -25,7 +25,7 @@ import {
   type DagNodePositions
 } from "./supervisorDag";
 import { activeWorkflowPublications, buildWorkflowSessionPrompts } from "./workflowSessionPrompts";
-import type { Bootstrap, Employee, InvocationRecord, JsonObject, ManagementPolicy, SupervisorDagNodeKind, SupervisorGate, SupervisorWorkflow, SupervisorWorkflowUpdatePolicy, SupervisorWorkKind, Workflow } from "./types";
+import type { Bootstrap, Employee, InvocationRecord, JsonObject, ManagementPolicy, SupervisorDagNodeKind, SupervisorGate, SupervisorWorkflow, SupervisorWorkflowUpdatePolicy, SupervisorWorkKind, Workflow, WorkflowEntrancePolicyRefreshResult } from "./types";
 
 interface PageProps {
   data: Bootstrap;
@@ -449,6 +449,7 @@ export function SupervisorWorkflowPage({ data, refresh, notify }: PageProps) {
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [runInput, setRunInput] = useState("{\n  \"message\": \"请领队组织团队完成这项任务\"\n}");
   const [running, setRunning] = useState(false);
+  const [refreshingEntrancePolicies, setRefreshingEntrancePolicies] = useState(false);
   useEffect(() => {
     if (!selected) { setVersions([]); return; }
     api<{ versions: Workflow[] }>(`/api/workflows/${selected.id}`)
@@ -473,6 +474,13 @@ export function SupervisorWorkflowPage({ data, refresh, notify }: PageProps) {
     if (polLatest !== undefined && polLatest !== selected.managementPolicy.version) stale.push(`策略 ${selected.managementPolicy.id} v${selected.managementPolicy.version}→v${polLatest}`);
     return stale;
   }, [selected, data.employees, data.managementPolicies]);
+  const staleEntrancePolicies = useMemo(() => selected
+    ? (data.entrancePolicies ?? []).filter((entrancePolicy) => (
+        entrancePolicy.status === "active"
+        && entrancePolicy.leader?.workflowId === selected.id
+        && entrancePolicy.leader.workflowVersion !== selected.version
+      ))
+    : [], [selected, data.entrancePolicies]);
   const publications = useMemo(() => selected ? activeWorkflowPublications(selected.id, data.publications) : [], [selected?.id, data.publications]);
   const publication = publications[0];
   const sessionPrompts = useMemo(() => selected ? buildWorkflowSessionPrompts(selected, publication) : undefined, [selected, publication]);
@@ -495,6 +503,21 @@ export function SupervisorWorkflowPage({ data, refresh, notify }: PageProps) {
       await refresh();
     } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
   };
+  const syncEntrancePolicies = async () => {
+    if (!selected || staleEntrancePolicies.length === 0) return;
+    setRefreshingEntrancePolicies(true);
+    try {
+      const result = await api<WorkflowEntrancePolicyRefreshResult>(
+        `/api/workflows/${selected.id}/entrance-policies/refresh`,
+        writeBody({})
+      );
+      notify(result.changed
+        ? `已刷新 ${result.changes.length} 条入口策略到 ${selected.id} v${result.workflowVersion}`
+        : "引用该团队的入口策略已经是最新版本");
+      await refresh();
+    } catch (error) { notify(error instanceof Error ? error.message : String(error), "error"); }
+    finally { setRefreshingEntrancePolicies(false); }
+  };
   const archive = async () => {
     if (!selected) return;
     try { await api(`/api/workflows/${selected.id}/archive`, writeBody({})); notify(`领队团队 ${selected.id} 已归档`); setArchiveOpen(false); await refresh(); }
@@ -505,6 +528,7 @@ export function SupervisorWorkflowPage({ data, refresh, notify }: PageProps) {
     <main className="detail-pane">{!selected ? <EmptyState title="建立第一支领队团队" action={<button className="button primary" disabled={!daemonAvailable || !(data.managementPolicies ?? []).some((item) => item.status === "active")} onClick={() => setEditor("new")}>建立领队团队</button>}>先在管理策略库登记策略，再固定一位领队和多个成员角色；需要固定先后关系时可启用任务 DAG。</EmptyState> : <div className="dossier workflow-dossier">
       <header className="dossier-cover"><div className="file-index"><span>LEAD TEAM WORKFLOW RECORD</span><code>No. {selected.id.toUpperCase()}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">领</div><div><h2>{selected.id}</h2><p>{selected.description}</p></div><Stamp status={selected.status} /></div><div className="dossier-actions"><button className="button primary" disabled={!daemonAvailable || running || selected.status === "archived"} onClick={() => scrollRecordIntoView("run-supervisor-workflow")}>运行团队</button><button className="button secondary" disabled={!daemonAvailable} onClick={() => setEditor("edit")}>修订团队</button><button className="button danger" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => setArchiveOpen(true)}>归档</button></div></header>
       {staleVersions.length > 0 && <div className="policy-upgrade-note workflow-stale-note" role="status"><span><b>{selected.updatePolicy === "latest" ? "已开启版本跟随" : "固定版本已落后"}</b>{selected.updatePolicy === "latest" ? `下次运行会自动使用最新版本（${staleVersions.join("；")}）。点『同步到最新』可立即把记录固定到新版本。` : `上游已更新：${staleVersions.join("；")}。当前锁定版本，点『同步到最新』升级。`}</span><button type="button" className="text-button" disabled={!daemonAvailable || selected.status === "archived"} onClick={() => void syncLatest()}>同步到最新</button></div>}
+      {staleEntrancePolicies.length > 0 && <div className="policy-upgrade-note workflow-stale-note entrance-reference-stale-note" role="status"><span><b>{staleEntrancePolicies.length} 条入口策略仍引用旧版团队</b>{staleEntrancePolicies.map((policy) => `${policy.displayName}（${policy.id} v${policy.version} → 团队 v${policy.leader!.workflowVersion}）`).join("；")}。刷新会为每条策略创建新版本并统一改绑当前团队 v{selected.version}，历史版本保留。</span><button type="button" className="text-button" disabled={!daemonAvailable || selected.status === "archived" || refreshingEntrancePolicies} onClick={() => void syncEntrancePolicies()}>{refreshingEntrancePolicies ? "刷新中…" : `一键刷新 ${staleEntrancePolicies.length} 条`}</button></div>}
       <DossierSection number="01" title="领队与管理策略"><div className="supervisor-control-card"><EmployeeAvatar displayName={manager?.identity.displayName ?? selected.supervisor.employeeId} presentation={manager?.presentation} /><div><span>TEAM LEAD EMPLOYEE</span><strong>{manager?.identity.displayName ?? selected.supervisor.employeeId}</strong><small>{selected.supervisor.employeeId} · 固定 v{selected.supervisor.employeeVersion}</small><code>自动注入 {selected.orchestrationSkill.id} · v{selected.orchestrationSkill.version}</code></div><div className="policy-pin"><span>MANAGEMENT POLICY</span><strong>{policy?.displayName ?? selected.managementPolicy.id}</strong><small>{selected.managementPolicy.id} · 固定 v{selected.managementPolicy.version}{policy && policy.version !== selected.managementPolicy.version ? ` · 最新 v${policy.version}` : ""}</small></div></div></DossierSection>
       <DossierSection number="02" title="成员角色绑定"><div className="node-ledger">{selected.members.map((member, index) => { const employee = data.employees.find((candidate) => candidate.id === member.employeeId); return <article key={member.roleId}><span className="node-number">{String(index + 1).padStart(2, "0")}</span><EmployeeAvatar className="small" displayName={employee?.identity.displayName ?? member.employeeId} presentation={employee?.presentation} /><div><strong>{member.roleId}</strong><span>{member.description}</span></div><code>{employee?.identity.displayName ?? member.employeeId} · v{member.employeeVersion}</code></article>; })}</div></DossierSection>
       <DossierSection number="03" title="固定流程与动态分工"><OrchestrationFlow workflow={selected} data={data} /></DossierSection>

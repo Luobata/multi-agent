@@ -1156,6 +1156,67 @@ describe("Supervisor workflow version tracking", () => {
     expect(again.changes).toEqual([]);
   });
 
+  it("bulk-refreshes every active Entrance Policy pinned to an older team version and preserves history", async () => {
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    await seedTeam(service);
+    await service.createEntrancePolicy({
+      id: "team-entry-one",
+      displayName: "Team entry one",
+      leader: { workflowId: "vt-team" },
+      default: { route: "leader" }
+    });
+    await service.createEntrancePolicy({
+      id: "team-entry-two",
+      displayName: "Team entry two",
+      leader: { workflowId: "vt-team" },
+      default: { route: "leader" }
+    });
+    await service.createEntrancePolicy({
+      id: "direct-entry",
+      displayName: "Direct entry",
+      direct: { mode: "caller" },
+      default: { route: "direct" }
+    });
+    await service.updateWorkflow("vt-team", { architecture: "supervisor", description: "Team v2." });
+    expect(service.getWorkflow("vt-team").version).toBe(2);
+    expect(service.getEntrancePolicy("team-entry-one").leader?.workflowVersion).toBe(1);
+
+    const result = await service.refreshWorkflowEntrancePolicies("vt-team");
+
+    expect(result).toMatchObject({
+      workflowId: "vt-team",
+      workflowVersion: 2,
+      changed: true,
+      changes: expect.arrayContaining([
+        {
+          policyId: "team-entry-one",
+          fromPolicyVersion: 1,
+          toPolicyVersion: 2,
+          fromWorkflowVersion: 1,
+          toWorkflowVersion: 2
+        },
+        {
+          policyId: "team-entry-two",
+          fromPolicyVersion: 1,
+          toPolicyVersion: 2,
+          fromWorkflowVersion: 1,
+          toWorkflowVersion: 2
+        }
+      ])
+    });
+    expect(result.changes).toHaveLength(2);
+    expect(service.getEntrancePolicy("team-entry-one")).toMatchObject({
+      version: 2,
+      leader: { workflowId: "vt-team", workflowVersion: 2 }
+    });
+    expect(service.getEntrancePolicyVersions("team-entry-one").map((policy) => policy.version)).toEqual([2, 1]);
+    expect(service.getEntrancePolicy("direct-entry").version).toBe(1);
+
+    const again = await service.refreshWorkflowEntrancePolicies("vt-team");
+    expect(again).toMatchObject({ changed: false, changes: [] });
+    expect(service.getEntrancePolicy("team-entry-one").version).toBe(2);
+  });
+
   it("blocks a latest run when the newest policy no longer allows a member role", async () => {
     const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
     await seedTeam(service);

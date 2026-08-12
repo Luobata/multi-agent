@@ -201,6 +201,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
         humanDecisionGate: "supervisor-high-risk-v1",
         managementPolicies: "versioned-v1",
         entrancePolicies: "versioned-routing-v1",
+        entrancePolicyReferenceRefresh: "bulk-versioned-v1",
         employeeTemplates: "versioned-static-v1",
         employeeScopes: "version-pinned-v1",
         systemSkills: "read-only-v1",
@@ -735,6 +736,9 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   }));
   app.post("/api/workflows/:id/refresh", asyncRoute(async (request, response) => {
     send(response, await service.refreshWorkflow(routeParam(request, "id")));
+  }));
+  app.post("/api/workflows/:id/entrance-policies/refresh", asyncRoute(async (request, response) => {
+    send(response, await service.refreshWorkflowEntrancePolicies(routeParam(request, "id")));
   }));
   app.get("/api/workflows/:id/plan", asyncRoute(async (request, response) => {
     send(response, await service.planWorkflow(routeParam(request, "id")));

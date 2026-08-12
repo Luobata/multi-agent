@@ -316,6 +316,22 @@ export interface WorkflowRefreshResult {
   changes: WorkflowRefreshChange[];
 }
 
+/** One Entrance Policy version created while re-pinning references to a Supervisor Workflow. */
+export interface WorkflowEntrancePolicyRefreshChange {
+  policyId: string;
+  fromPolicyVersion: number;
+  toPolicyVersion: number;
+  fromWorkflowVersion: number;
+  toWorkflowVersion: number;
+}
+
+export interface WorkflowEntrancePolicyRefreshResult {
+  workflowId: string;
+  workflowVersion: number;
+  changed: boolean;
+  changes: WorkflowEntrancePolicyRefreshChange[];
+}
+
 export type WorkbenchWorkflowDefinition =
   | GraphWorkbenchWorkflowDefinition
   | SupervisorWorkbenchWorkflowDefinition;
