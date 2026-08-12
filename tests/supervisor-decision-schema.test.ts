@@ -1,5 +1,6 @@
 import { Ajv } from "ajv";
 import { describe, expect, it } from "vitest";
+import { supervisorValidationShardIssues } from "../src/architectures/supervisor.js";
 import { supervisorDecisionSchema } from "../src/workbench/materialize.js";
 
 /**
@@ -80,5 +81,35 @@ describe("supervisorDecisionSchema", () => {
     expect(validate({ action: "delegate" })).toBe(false);
     expect(validate({ action: "request-human-decision", summary: "missing risk and assignments" })).toBe(false);
     expect(validate({ action: "satisfy-gate", gateId: "audit" })).toBe(false);
+  });
+});
+
+describe("supervisorValidationShardIssues", () => {
+  const broadImpact = {
+    level: "medium" as const,
+    regressionScope: "package" as const,
+    affectedAreas: ["shared component", "six routes", "offline state", "keyboard behavior"],
+    reasons: ["shared package behavior"],
+    requiredChecks: ["component test", "browser path", "keyboard path", "offline path", "package build"]
+  };
+
+  it("rejects one oversized test Work Instance so the leader must repair the TODO plan", () => {
+    expect(supervisorValidationShardIssues(broadImpact, [
+      { id: "implement", roleId: "engineer", task: "Implement the shared change.", needs: [], workKind: "code" },
+      { id: "test-all", roleId: "tester", task: "Test every route and state.", needs: ["implement"], workKind: "test" }
+    ])).toEqual([
+      expect.stringContaining("split the single test TODO into two or three")
+    ]);
+  });
+
+  it("accepts explicit validation shards and preserves Gate-only plans", () => {
+    expect(supervisorValidationShardIssues(broadImpact, [
+      { id: "implement", roleId: "engineer", task: "Implement the shared change.", needs: [], workKind: "code" },
+      { id: "test-browser", roleId: "tester", task: "Test the main browser path.", needs: ["implement"], workKind: "test" },
+      { id: "test-offline", roleId: "tester", task: "Test offline and build behavior.", needs: ["implement"], workKind: "test" }
+    ])).toEqual([]);
+    expect(supervisorValidationShardIssues(broadImpact, [
+      { id: "implement", roleId: "engineer", task: "Implement and leave validation to configured Gates.", needs: [], workKind: "code" }
+    ])).toEqual([]);
   });
 });

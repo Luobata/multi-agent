@@ -790,7 +790,8 @@ function dynamicTodoPlanIssues(
   workflowId: string,
   todos: SupervisorTodo[],
   members: ReadonlyMap<string, SupervisorTeamMemberConfig>,
-  maxDelegations: number
+  maxDelegations: number,
+  impact: SupervisorImpactAssessment
 ): string[] {
   const issues = supervisorDagIssues(workflowId, todoDag(todos), new Set(members.keys()));
   if (todos.length < 2) issues.push("dynamic TODO plan must contain at least two bounded items");
@@ -812,7 +813,27 @@ function dynamicTodoPlanIssues(
     prior.push(todo);
     sessions.set(todo.sessionKey, prior);
   }
+  issues.push(...supervisorValidationShardIssues(impact, todos));
   return issues;
+}
+
+/**
+ * A single validation TODO is a useful bounded unit for targeted work, but it becomes a
+ * pathological long-lived Work Instance once a package/full assessment already names four or
+ * more independent checks. The orchestration prompt asks the leader to shard that work; this
+ * guard makes the contract fail closed when the provider ignores it. Plans with no explicit test
+ * TODO remain valid because configured quality Gates may own all downstream validation.
+ */
+export function supervisorValidationShardIssues(
+  impact: SupervisorImpactAssessment,
+  todos: SupervisorTodo[]
+): string[] {
+  const testTodos = todos.filter((todo) => todo.workKind === "test");
+  const broadValidation = impact.regressionScope === "package" || impact.regressionScope === "full";
+  if (!broadValidation || impact.requiredChecks.length < 4 || testTodos.length !== 1) return [];
+  return [
+    `oversized validation has ${impact.requiredChecks.length} required checks at ${impact.regressionScope} scope; split the single test TODO into two or three dependency-aware test shards, or omit explicit test TODOs and let configured quality Gates validate the recorded scope`
+  ];
 }
 
 function memberSessionSnapshot(session: MemberSessionState | undefined): JsonValue {
@@ -1320,7 +1341,13 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           output: output("supervisor attempted to replace an active dynamic TODO plan", round, delegationCount, trackers, undefined, dagTrackers)
         };
       }
-      const issues = dynamicTodoPlanIssues(context.plan.workflow, next.todos, members, value.policy.limits.maxDelegations);
+      const issues = dynamicTodoPlanIssues(
+        context.plan.workflow,
+        next.todos,
+        members,
+        value.policy.limits.maxDelegations,
+        next.impact
+      );
       if (issues.length > 0) {
         history.push({
           round,
