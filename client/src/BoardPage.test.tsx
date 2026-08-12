@@ -551,6 +551,86 @@ describe("BoardPage AI requirement creation", () => {
     expect(inbox?.textContent).toContain("旧已规划需求");
   });
 
+  it("renders seven inert lane skeletons until authoritative sources and terminal reconciliation are ready", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "旧缓存中的执行态",
+      summary: "真实 Run 已完成",
+      priority: "high",
+      rawRequirement: "首屏不得显示旧执行态",
+      acceptanceCriteria: ["只在对账完成后显示"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-gated",
+      runId: "run-gated",
+      status: "running",
+      observedAt: "2026-08-12T01:00:00.000Z"
+    }, config.pollIntervalMs);
+    const completed: InvocationRecord = {
+      id: "inv-gated",
+      target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench", taskId: requirement.id },
+      status: "completed",
+      phase: "done",
+      requestSummary: requirement.title,
+      runId: "run-gated",
+      instanceIds: [],
+      createdAt: "2026-08-12T01:00:00.000Z",
+      updatedAt: "2026-08-12T01:00:02.000Z",
+      completedAt: "2026-08-12T01:00:02.000Z",
+      transitions: []
+    };
+    let resolvePreview!: (value: unknown) => void;
+    fetchMock.mockReset().mockReturnValue(new Promise((resolve) => { resolvePreview = resolve; }));
+
+    const go = vi.fn();
+    const notify = vi.fn();
+    const projects = [project];
+    const invocations = [completed];
+    act(() => root.render(<BoardPage spaceId={project.id} go={go} notify={notify} service={service} projects={projects} invocations={invocations} sourceReady={false} />));
+    expect(container.querySelectorAll(".board-lane--loading")).toHaveLength(7);
+    expect(container.textContent).not.toContain(requirement.title);
+    expect(button("手动创建").disabled).toBe(true);
+    expect(button("和 AI 说需求").disabled).toBe(true);
+
+    act(() => root.render(<BoardPage spaceId={project.id} go={go} notify={notify} service={service} projects={projects} invocations={invocations} sourceReady />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(container.querySelectorAll(".board-lane--loading")).toHaveLength(7);
+    expect(container.textContent).not.toContain(requirement.title);
+
+    const preview: RunMergePreview = {
+      runId: "run-gated",
+      status: "awaiting-acceptance",
+      eligible: true,
+      reasons: [],
+      worktreePath: "/repo/.multi-agent/worktrees/run-gated",
+      repositoryRoot: "/repo",
+      targetBranch: "main",
+      targetClean: true,
+      changes: { files: [{ status: "M", path: "client/src/BoardPage.tsx" }], fileCount: 1, summary: "1 file", unifiedDiff: { text: "diff", truncated: false, maxBytes: 1024 } },
+      safeGitCommands: [],
+      evidence: { assets: [], structuredE2eCount: 1, acceptedVerdict: true, gates: [
+        { gateId: "quality-test", required: true, status: "passed", requiredCapability: "quality.test", mode: "before-completion" },
+        { gateId: "independent-review", required: true, status: "passed", requiredCapability: "quality.audit", mode: "before-completion" }
+      ] },
+      confirmationToken: "MERGE run-gated",
+      discardConfirmationToken: "DISCARD run-gated"
+    };
+    await act(async () => {
+      resolvePreview({ ok: true, status: 200, json: async () => ({ data: preview }) });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    expect(container.querySelectorAll(".board-lane--loading")).toHaveLength(0);
+    expect(container.querySelector<HTMLElement>('section[aria-label^="待验收"]')?.textContent).toContain(requirement.title);
+    expect(button("手动创建").disabled).toBe(false);
+  });
+
   it("automatically submits a completed eligible Run to acceptance", async () => {
     const service = createDashboardService({
       delayMs: () => 0,

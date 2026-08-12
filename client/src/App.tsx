@@ -271,6 +271,7 @@ export function App() {
     lastHashByPage.current = rememberNavigationHash(lastHashByPage.current, initial, window.location.hash);
     const update = () => {
       const next = pageFromHash();
+      setSyncing(true);
       lastHashByPage.current = rememberNavigationHash(lastHashByPage.current, next, window.location.hash);
       setRoute(next);
     };
@@ -333,12 +334,13 @@ export function App() {
   // Clicking the already-active tab is an explicit "give me fresh data" gesture.
   const navigate = (next: Page) => {
     if (next === page) { refreshQuietly(); return; }
+    setSyncing(true);
     const target = lastHashByPage.current[next] ?? next;
     window.location.hash = target;
     setRoute(pageFromHash(`#${target}`));
   };
   /** Dashboard 子路由（项目详情 / 项目看板 / 需求详情）只换 hash，由 hashchange 统一收编。 */
-  const go = (hash: string) => { window.location.hash = hash; };
+  const go = (hash: string) => { setSyncing(true); window.location.hash = hash; };
   const invocationRevision = data.activity.invocations.reduce((latest, invocation) => invocation.updatedAt > latest ? invocation.updatedAt : latest, "");
   const activityRevision = data.activity.instances.reduce((latest, instance) => instance.updatedAt > latest ? instance.updatedAt : latest, invocationRevision);
   const awaitingDecisionRevision = data.activity.invocations
@@ -426,6 +428,9 @@ export function App() {
         spaceId={route.spaceId}
         go={go}
         notify={notify}
+        sourceReady={daemon === "online" && !syncing}
+        sourceError={daemon === "offline" ? "最新需求状态同步失败；未展示浏览器中的旧看板缓存。请确认本地运行核心已启动后重试。" : undefined}
+        onRetrySource={refreshQuietly}
         catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")}
         projects={data.projects}
         invocations={data.activity.invocations}

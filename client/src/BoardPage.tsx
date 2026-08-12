@@ -13,6 +13,9 @@ import type { HumanDecisionRequest, InvocationRecord, JsonValue, Project, RunMer
 import "./board-ai.css";
 
 const REQUIREMENT_STEWARD_ROLE_ID = "requirement-steward";
+const EMPTY_PROJECTS: Project[] = [];
+const EMPTY_INVOCATIONS: InvocationRecord[] = [];
+const EMPTY_HUMAN_DECISION_REQUESTS: HumanDecisionRequest[] = [];
 
 interface AgentRequirementDraft {
   title: string;
@@ -124,21 +127,70 @@ function deliveryProgressChip(requirement: Requirement) {
   return <span className="board-evidence-capture" role="status">{labels[requirement.delivery.status]}</span>;
 }
 
-export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", projects: connectedProjects = [], invocations = [], humanDecisionRequests = [], onOpenRun }: {
+export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", sourceReady = true, sourceError, onRetrySource, projects: connectedProjects = EMPTY_PROJECTS, invocations = EMPTY_INVOCATIONS, humanDecisionRequests = EMPTY_HUMAN_DECISION_REQUESTS, onOpenRun }: {
   spaceId?: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
   service?: DashboardService;
   catalogRevision?: string;
+  /** False while the app is fetching the authoritative bootstrap snapshot. */
+  sourceReady?: boolean;
+  sourceError?: string;
+  onRetrySource?: () => void;
   projects?: Project[];
   invocations?: InvocationRecord[];
   humanDecisionRequests?: HumanDecisionRequest[];
   onOpenRun?: (runId: string) => void;
 }) {
   const daemonAvailable = useDaemonAvailable();
+  const reportedAcceptanceWarnings = useRef(new Set<string>());
   const { state, reload, setData } = useServiceData<{ requirements: Requirement[]; nodes: SpaceNode[] }>(
-    async () => ({ requirements: await service.listBoard(spaceId), nodes: await service.listSpaces() }),
-    [service, spaceId, catalogRevision]
+    async () => {
+      const [requirements, nodes] = await Promise.all([service.listBoard(spaceId), service.listSpaces()]);
+      const invocationById = new Map(invocations.map((invocation) => [invocation.id, invocation]));
+      const reconciled = await Promise.all(requirements.map(async (requirement) => {
+        const advancement = requirement.advancement;
+        if (!advancement?.invocationId) return requirement;
+        const invocation = invocationById.get(advancement.invocationId);
+        if (!invocation) return requirement;
+        const config = requirementAdvancementConfig(
+          connectedProjects.find((project) => project.id === requirement.projectId)
+        );
+        let updated = requirement;
+        if (invocation.status !== advancement.status) {
+          updated = await service.syncRequirementAdvancement(requirement.id, advancement.idempotencyKey, {
+            invocationId: invocation.id,
+            runId: invocation.runId,
+            leaderSessionId: invocation.sessionId,
+            status: invocation.status,
+            observedAt: invocation.updatedAt,
+            error: invocation.error
+          }, config?.pollIntervalMs ?? 15_000);
+        }
+        if (invocation.status !== "completed" || !invocation.runId
+          || updated.lane === "acceptance" || updated.lane === "merging" || updated.lane === "done") return updated;
+        const preview = await api<RunMergePreview>(`/api/runs/${encodeURIComponent(invocation.runId)}/merge-preview`);
+        if (preview.status === "merged" || preview.delivery?.status === "merged") {
+          return service.syncRequirementDelivery(requirement.id, invocation.runId, "merged");
+        }
+        if (!preview.eligible) {
+          const warning = `${requirement.code} 已完成，但交付证据尚未满足自动待验收门禁：${preview.reasons.join("；") || "交付预览未就绪"}`;
+          const warningKey = `${requirement.id}:${invocation.runId}:${preview.status}:${warning}`;
+          if (!reportedAcceptanceWarnings.current.has(warningKey)) {
+            reportedAcceptanceWarnings.current.add(warningKey);
+            notify(warning, "error");
+          }
+          return updated;
+        }
+        return service.submitRequirementForAcceptance(
+          requirement.id,
+          acceptanceSnapshotFromPreview(preview, new Date().toISOString())
+        );
+      }));
+      return { requirements: reconciled, nodes };
+    },
+    [service, spaceId, catalogRevision, connectedProjects, invocations, notify],
+    { enabled: sourceReady }
   );
   const [query, setQuery] = useState("");
   const [projectFilter, setProjectFilter] = useState(spaceId ?? "all");
@@ -161,7 +213,6 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   const [agentPhase, setAgentPhase] = useState<"idle" | "waiting" | "clarify" | "draft">("idle");
   const [agentSourceMessages, setAgentSourceMessages] = useState<string[]>([]);
   const [agentError, setAgentError] = useState("");
-  const reportedAcceptanceWarnings = useRef(new Set<string>());
 
   const data = state.status === "ready" ? state.data : undefined;
   const project = data?.nodes.find((node) => node.id === spaceId && node.kind === "project");
@@ -411,7 +462,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       eyebrow="BOARD / SEVEN LANES"
       title={project ? `${project.name} · 需求看板` : "需求看板"}
       description="七列流转；排队中 / 执行中 / 待确认 / 待合入只由真实 Run 自动更新。人工验收后进入串行合入队列；冲突会留在待合入并显示阻塞，由原领队规划取舍、委派工程角色在原 worktree rebase，再经独立重测与原领队复验；只有无法恢复的异常才退回待验收。"
-      actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" disabled={!daemonAvailable || projects.length === 0} title={projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
+      actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" disabled={!daemonAvailable || state.status !== "ready" || projects.length === 0} title={state.status !== "ready" ? "正在同步最新需求数据" : projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" disabled={!daemonAvailable || state.status !== "ready" || projects.length === 0} title={state.status !== "ready" ? "正在同步最新需求数据" : projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
     />
     <OfflineNotice />
     <div className="board-toolbar">
@@ -420,8 +471,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       <SelectControl ariaLabel="筛选优先级" value={priority} options={[{ value: "all", label: "全部优先级" }, { value: "high", label: "高优先级" }, { value: "medium", label: "中优先级" }, { value: "low", label: "低优先级" }]} onChange={(value) => setPriority(value as RequirementPriority | "all")} />
       <SelectControl ariaLabel="筛选异常状态" value={exception} options={[{ value: "all", label: "全部状态" }, { value: "normal", label: "无异常" }, { value: "blocked", label: "阻塞" }, { value: "failed", label: "失败" }, { value: "cancelled", label: "已取消" }]} onChange={(value) => setException(value as typeof exception)} />
     </div>
-    {state.status === "loading" && <SkeletonBlock rows={4} label="正在加载需求看板" />}
-    {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
+    {sourceError && <ErrorBlock message={sourceError} onRetry={onRetrySource ?? reload} />}
+    {!sourceError && state.status === "loading" && <div className="board-scroll" role="status" aria-label="正在加载需求看板"><div className="board-grid board-grid--loading">{VISIBLE_REQUIREMENT_LANES.map((lane) => <section className="board-lane board-lane--loading" key={lane.id} aria-hidden="true"><header className="board-lane-head"><h2>{lane.label}</h2></header><SkeletonBlock rows={3} /></section>)}</div></div>}
+    {!sourceError && state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
     {state.status === "ready" && data && (filtered.length === 0
       ? <EmptyState title={projects.length === 0 ? "还没有可承接需求的项目" : "看板还没有需求"} action={projects.length === 0 ? <button type="button" className="button primary" onClick={() => go("projects")}>前往项目</button> : undefined}><p>{projects.length === 0 ? "只有正式接入且 active 的项目可以创建需求；被动 MCP 记录需要先升级。" : "需求会按列出现在这里；先由产品经理登记第一批需求。"}</p></EmptyState>
       : <div className="board-scroll" role="region" aria-label="需求看板（可横向滚动）" tabIndex={0}>

@@ -2120,6 +2120,8 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
 .board-scroll { overflow-x: auto; padding-bottom: var(--space-3); scrollbar-color: var(--line-strong) transparent; }
 .board-scroll:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .board-grid { min-width: 2160px; display: grid; grid-template-columns: repeat(8, minmax(250px, 1fr)); gap: var(--space-3); align-items: start; }
+.board-grid--loading { grid-template-columns: repeat(7, minmax(250px, 1fr)); }
+.board-lane--loading .dash-skeleton { border: 0; background: transparent; }
 /* B5 · 契约：列容器 radius-2 + 裁切 + 错位小阴影 + 4n 四季身份色 */
 .board-lane { --lane-season: var(--season-spring); min-height: 430px; overflow: hidden; border: var(--rule) solid var(--line-strong); border-radius: var(--radius-2); background: var(--paper-sunken); box-shadow: var(--shadow-paper-small); }
 .board-lane:nth-child(4n + 2) { --lane-season: var(--season-summer); }

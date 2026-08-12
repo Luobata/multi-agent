@@ -1,5 +1,5 @@
 /** 看板各视图共享的加载 / 错误 / 离线 / 撤销反馈骨架。 */
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PropsWithChildren, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PropsWithChildren, type ReactNode } from "react";
 import { Stamp, useDaemonAvailable } from "../components";
 
 export interface LoadState<T> {
@@ -9,22 +9,27 @@ export interface LoadState<T> {
 }
 
 /** 区块级数据加载：序号牌防旧响应覆盖，重试走同一入口。 */
-export function useServiceData<T>(loader: () => Promise<T>, deps: ReadonlyArray<unknown>): { state: LoadState<T>; reload: () => void; setData: (value: T) => void } {
+export function useServiceData<T>(loader: () => Promise<T>, deps: ReadonlyArray<unknown>, options: { enabled?: boolean } = {}): { state: LoadState<T>; reload: () => void; setData: (value: T) => void } {
   const [state, setState] = useState<LoadState<T>>({ status: "loading" });
   const seq = useRef(0);
   const loaderRef = useRef(loader);
+  const enabled = options.enabled ?? true;
   loaderRef.current = loader;
   const reload = useCallback(() => {
     const id = ++seq.current;
     setState({ status: "loading" });
+    if (!enabled) return;
     loaderRef.current()
       .then((data) => { if (id === seq.current) setState({ status: "ready", data }); })
       .catch((error: unknown) => {
         if (id === seq.current) setState({ status: "error", error: error instanceof Error ? error.message : String(error) });
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
-  useEffect(() => { reload(); }, [reload]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [...deps, enabled]);
+  // Close the interaction window before paint when a source revision changes.
+  // This prevents consumers from briefly committing controls backed by the prior revision.
+  useLayoutEffect(() => { reload(); }, [reload]);
   const setData = useCallback((value: T) => setState({ status: "ready", data: value }), []);
   return { state, reload, setData };
 }
