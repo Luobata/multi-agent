@@ -1,6 +1,9 @@
 import { Ajv } from "ajv";
 import { describe, expect, it } from "vitest";
-import { supervisorValidationShardIssues } from "../src/architectures/supervisor.js";
+import {
+  supervisorValidationCheckGroups,
+  supervisorValidationShardIssues
+} from "../src/architectures/supervisor.js";
 import { supervisorDecisionSchema } from "../src/workbench/materialize.js";
 
 /**
@@ -98,7 +101,7 @@ describe("supervisorValidationShardIssues", () => {
       { id: "implement", roleId: "engineer", task: "Implement the shared change.", needs: [], workKind: "code" },
       { id: "test-all", roleId: "tester", task: "Test every route and state.", needs: ["implement"], workKind: "test" }
     ])).toEqual([
-      expect.stringContaining("split the single test TODO into two or three")
+      expect.stringContaining("groups sized from the actual check list")
     ]);
   });
 
@@ -111,5 +114,48 @@ describe("supervisorValidationShardIssues", () => {
     expect(supervisorValidationShardIssues(broadImpact, [
       { id: "implement", roleId: "engineer", task: "Implement and leave validation to configured Gates.", needs: [], workKind: "code" }
     ])).toEqual([]);
+  });
+});
+
+describe("supervisorValidationCheckGroups", () => {
+  const impact = (requiredChecks: string[], validationGroups?: Array<{ id: string; requiredChecks: string[] }>) => ({
+    level: "high" as const,
+    regressionScope: "full" as const,
+    affectedAreas: ["workspace"],
+    reasons: ["cross-package change"],
+    requiredChecks,
+    ...(validationGroups ? { validationGroups } : {})
+  });
+
+  it("derives as many bounded groups as the checklist needs instead of capping the total at three", () => {
+    const requiredChecks = Array.from({ length: 10 }, (_, index) => `check-${index + 1}`);
+    expect(supervisorValidationCheckGroups(impact(requiredChecks))).toEqual([
+      { id: "auto-1", requiredChecks: requiredChecks.slice(0, 2) },
+      { id: "auto-2", requiredChecks: requiredChecks.slice(2, 4) },
+      { id: "auto-3", requiredChecks: requiredChecks.slice(4, 6) },
+      { id: "auto-4", requiredChecks: requiredChecks.slice(6, 8) },
+      { id: "auto-5", requiredChecks: requiredChecks.slice(8, 10) }
+    ]);
+  });
+
+  it("prefers semantic groups chosen by the leader when they cover every check exactly once", () => {
+    const requiredChecks = ["unit-a", "unit-b", "browser-main", "browser-failure", "build"];
+    const validationGroups = [
+      { id: "unit", requiredChecks: ["unit-a", "unit-b"] },
+      { id: "browser", requiredChecks: ["browser-main", "browser-failure"] },
+      { id: "build", requiredChecks: ["build"] }
+    ];
+    expect(supervisorValidationCheckGroups(impact(requiredChecks, validationGroups))).toEqual(validationGroups);
+  });
+
+  it("falls back to dynamic grouping when a leader group misses or duplicates a required check", () => {
+    const requiredChecks = ["unit-a", "unit-b", "browser-main", "build"];
+    expect(supervisorValidationCheckGroups(impact(requiredChecks, [
+      { id: "unit", requiredChecks: ["unit-a", "unit-b"] },
+      { id: "incomplete", requiredChecks: ["unit-b", "browser-main"] }
+    ]))).toEqual([
+      { id: "auto-1", requiredChecks: ["unit-a", "unit-b"] },
+      { id: "auto-2", requiredChecks: ["browser-main", "build"] }
+    ]);
   });
 });

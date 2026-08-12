@@ -175,7 +175,7 @@ describe("Supervisor flow persistence and materialization", () => {
       managementPolicy: { id: "materialize-policy" },
       members: [{ roleId: "builder", employeeId: "materialized-builder" }]
     });
-    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 7 });
+    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 8 });
     expect(service.listSkills(true).find((skill) => skill.id === "team-orchestration")?.instructions)
       .toContain("first emit plan-todos");
 
@@ -186,17 +186,17 @@ describe("Supervisor flow persistence and materialization", () => {
     };
     expect(manifest.roles.supervisor?.skills.map((skill) => skill.id)).toEqual([
       "lead-method-v1",
-      "team-orchestration-v7"
+      "team-orchestration-v8"
     ]);
     expect(manifest.roles["member-builder"]?.skills.map((skill) => skill.id)).toEqual(["build-method-v1"]);
     expect(manifest.roles.supervisor?.identity.metadata.runtimeSkillInjections).toEqual([{
       skillId: "team-orchestration",
-      version: 7,
+      version: 8,
       reason: "supervisor-runtime"
     }]);
     expect(manifest.roles["member-builder"]?.identity.metadata.runtimeSkillInjections).toBeUndefined();
     expect(manifest.workflows[workflow.id]?.config).toMatchObject({
-      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 7 } },
+      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 8 } },
       members: [{
         roleId: "builder",
         capabilities: ["code.backend"],
@@ -239,7 +239,7 @@ describe("Supervisor flow persistence and materialization", () => {
     if (migrated.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
     expect(migrated.flow).toMatchObject({ version: 1, gates: [] });
     expect(migrated.flow.stages.map((stage) => stage.kind)).toEqual(["supervisor", "delegation-loop", "delivery"]);
-    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 7 });
+    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 8 });
   });
 });
 
@@ -593,7 +593,9 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       "client production build",
       "server typecheck",
       "board browser smoke",
-      "requirement detail browser smoke"
+      "requirement detail browser smoke",
+      "office browser smoke",
+      "delivery acceptance smoke"
     ];
     const providers: ProviderRegistry = new Map([["sharded-quality-flow", {
       id: "sharded-quality-flow",
@@ -767,22 +769,24 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
     const testCalls = gateCalls.filter((call) => call.execution.gateId === "quality-test");
     const auditCall = gateCalls.find((call) => call.execution.gateId === "independent-audit");
-    expect(testCalls).toHaveLength(3);
+    expect(testCalls).toHaveLength(4);
     expect(testCalls.map((call) => call.execution.shard)).toEqual([
-      { index: 1, total: 3, requiredChecks: requiredChecks.slice(0, 2) },
-      { index: 2, total: 3, requiredChecks: requiredChecks.slice(2, 4) },
-      { index: 3, total: 3, requiredChecks: requiredChecks.slice(4, 6) }
+      { id: "auto-1", index: 1, total: 4, requiredChecks: requiredChecks.slice(0, 2) },
+      { id: "auto-2", index: 2, total: 4, requiredChecks: requiredChecks.slice(2, 4) },
+      { id: "auto-3", index: 3, total: 4, requiredChecks: requiredChecks.slice(4, 6) },
+      { id: "auto-4", index: 4, total: 4, requiredChecks: requiredChecks.slice(6, 8) }
     ]);
     for (const [index, call] of testCalls.entries()) {
       for (const check of requiredChecks.slice(index * 2, index * 2 + 2)) expect(call.task).toContain(check);
-      expect(call.task).toContain(`Quality Gate shard ${index + 1}/3`);
+      expect(call.task).toContain(`Quality Gate shard ${index + 1}/4`);
     }
     expect(auditCall?.task).toContain("Do not repeat browser or automated regression");
-    expect(auditCall?.needs.filter((nodeId) => nodeId.startsWith("gate-quality-test-"))).toHaveLength(3);
+    expect(auditCall?.needs.filter((nodeId) => nodeId.startsWith("gate-quality-test-"))).toHaveLength(4);
     expect(Object.keys(result.run.nodes)).toEqual(expect.arrayContaining([
       "gate-quality-test-r4-1-s1",
       "gate-quality-test-r4-1-s2",
-      "gate-quality-test-r4-1-s3"
+      "gate-quality-test-r4-1-s3",
+      "gate-quality-test-r4-1-s4"
     ]));
   });
 
@@ -1609,12 +1613,12 @@ describe("Supervisor workflow version tracking", () => {
     const kinds = result.changes.map((change) => `${change.kind}:${change.from}->${change.to}`);
     expect(kinds).toContain("member:1->2");
     expect(kinds).toContain("management-policy:1->2");
-    expect(kinds).toContain("orchestration-skill:7->8");
+    expect(kinds).toContain("orchestration-skill:8->9");
     const refreshed = service.getWorkflow("vt-team");
     if (refreshed.architecture !== "supervisor") throw new Error("expected supervisor workflow");
     expect(refreshed.members[0]!.employeeVersion).toBe(2);
     expect(refreshed.managementPolicy.version).toBe(2);
-    expect(refreshed.orchestrationSkill.version).toBe(8);
+    expect(refreshed.orchestrationSkill.version).toBe(9);
 
     // A second refresh with nothing new reports no change.
     const again = await service.refreshWorkflow("vt-team");

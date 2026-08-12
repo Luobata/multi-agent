@@ -113,6 +113,13 @@ interface SupervisorImpactAssessment {
   affectedAreas: string[];
   reasons: string[];
   requiredChecks: string[];
+  /** Optional semantic grouping proposed by the leader; the runtime validates exact coverage. */
+  validationGroups?: SupervisorValidationGroup[];
+}
+
+interface SupervisorValidationGroup {
+  id: string;
+  requiredChecks: string[];
 }
 
 interface SupervisorTodo {
@@ -832,8 +839,38 @@ export function supervisorValidationShardIssues(
   const broadValidation = impact.regressionScope === "package" || impact.regressionScope === "full";
   if (!broadValidation || impact.requiredChecks.length < 4 || testTodos.length !== 1) return [];
   return [
-    `oversized validation has ${impact.requiredChecks.length} required checks at ${impact.regressionScope} scope; split the single test TODO into two or three dependency-aware test shards, or omit explicit test TODOs and let configured quality Gates validate the recorded scope`
+    `oversized validation has ${impact.requiredChecks.length} required checks at ${impact.regressionScope} scope; split the single test TODO into dependency-aware validation groups sized from the actual check list, or omit explicit test TODOs and let configured quality Gates validate the recorded scope`
   ];
+}
+
+function validLeaderValidationGroups(impact: SupervisorImpactAssessment): SupervisorValidationGroup[] | undefined {
+  const groups = impact.validationGroups;
+  if (!groups || groups.length < 2 || groups.some((group) => group.requiredChecks.length === 0)) return undefined;
+  const required = new Set(impact.requiredChecks);
+  const grouped = groups.flatMap((group) => group.requiredChecks);
+  if (grouped.length !== required.size || new Set(grouped).size !== grouped.length) return undefined;
+  if (grouped.some((check) => !required.has(check))) return undefined;
+  return groups.map((group) => ({ id: group.id, requiredChecks: [...group.requiredChecks] }));
+}
+
+/**
+ * Prefer semantic test domains from the leader when they cover every required check exactly once.
+ * Otherwise derive as many bounded shards as the checklist needs. There is deliberately no fixed
+ * shard-count ceiling: ten checks become five two-check shards, one hundred become fifty.
+ */
+export function supervisorValidationCheckGroups(impact: SupervisorImpactAssessment): SupervisorValidationGroup[] {
+  const leaderGroups = validLeaderValidationGroups(impact);
+  if (leaderGroups) return leaderGroups;
+  const checks = [...new Set(impact.requiredChecks)];
+  const broadValidation = impact.regressionScope === "package" || impact.regressionScope === "full";
+  if (!broadValidation || checks.length < 4) {
+    return checks.length > 0 ? [{ id: "all", requiredChecks: checks }] : [];
+  }
+  const targetChecksPerShard = 2;
+  return Array.from({ length: Math.ceil(checks.length / targetChecksPerShard) }, (_, index) => ({
+    id: `auto-${index + 1}`,
+    requiredChecks: checks.slice(index * targetChecksPerShard, (index + 1) * targetChecksPerShard)
+  }));
 }
 
 function memberSessionSnapshot(session: MemberSessionState | undefined): JsonValue {
@@ -861,12 +898,19 @@ function mergeRegressionImpacts(impacts: SupervisorImpactAssessment[]): Supervis
       ? impact.regressionScope
       : current
   ), impacts[0]!.regressionScope);
+  const requiredChecks = [...new Set(impacts.flatMap((impact) => impact.requiredChecks))];
+  const validationGroups = impacts
+    .map((impact) => impact.validationGroups)
+    .find((groups) => groups && groups.flatMap((group) => group.requiredChecks).length === requiredChecks.length
+      && new Set(groups.flatMap((group) => group.requiredChecks)).size === requiredChecks.length
+      && requiredChecks.every((check) => groups.some((group) => group.requiredChecks.includes(check))));
   return {
     level: highestLevel,
     regressionScope: widestScope,
     affectedAreas: [...new Set(impacts.flatMap((impact) => impact.affectedAreas))],
     reasons: [...new Set(impacts.flatMap((impact) => impact.reasons))],
-    requiredChecks: [...new Set(impacts.flatMap((impact) => impact.requiredChecks))]
+    requiredChecks,
+    ...(validationGroups ? { validationGroups } : {})
   };
 }
 
@@ -1068,21 +1112,14 @@ async function executeGateActivation(
       : [])
   ].join("\n");
   const evidenceNeeds = [...new Set([...activation.sourceNodeIds, ...upstreamEvidenceNodeIds])];
-  const requiredChecks = regressionImpact?.requiredChecks ?? [];
-  const shouldShard = tracker.gate.requiredCapability === "quality.test"
-    && (regressionImpact?.regressionScope === "package" || regressionImpact?.regressionScope === "full")
-    && requiredChecks.length >= 4;
-  const shardCount = shouldShard ? Math.min(3, Math.ceil(requiredChecks.length / 2)) : 1;
-  const checkShards = Array.from({ length: shardCount }, (_, index) => (
-    shouldShard
-      ? requiredChecks.slice(
-          index * Math.ceil(requiredChecks.length / shardCount),
-          (index + 1) * Math.ceil(requiredChecks.length / shardCount)
-        )
-      : []
-  )).filter((checks, index) => index === 0 || checks.length > 0);
-  const nodes = checkShards.map((checks, index): ExecutionPlanNode => {
-    const shard = checkShards.length > 1 ? { index: index + 1, total: checkShards.length, requiredChecks: checks } : undefined;
+  const validationGroups = tracker.gate.requiredCapability === "quality.test" && regressionImpact
+    ? supervisorValidationCheckGroups(regressionImpact)
+    : [];
+  const executionGroups = validationGroups.length > 1 ? validationGroups : [{ id: "all", requiredChecks: [] }];
+  const nodes = executionGroups.map((group, index): ExecutionPlanNode => {
+    const shard = executionGroups.length > 1
+      ? { id: group.id, index: index + 1, total: executionGroups.length, requiredChecks: group.requiredChecks }
+      : undefined;
     const gateTask = shard
       ? [
           baseGateTask,
