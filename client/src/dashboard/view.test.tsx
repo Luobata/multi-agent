@@ -2,7 +2,12 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DashTabs, dashTabId, dashTabPanelId, type DashTab } from "./view";
+import { DashTabs, dashTabId, dashTabPanelId, useServiceData, type DashTab } from "./view";
+
+function DeferredLoader({ enabled, revision, loader }: { enabled: boolean; revision: number; loader: () => Promise<string> }) {
+  const { state } = useServiceData(loader, [revision], { enabled });
+  return <output data-status={state.status}>{state.data}</output>;
+}
 
 const tabs: DashTab[] = [
   { id: "overview", label: "概览" },
@@ -88,5 +93,38 @@ describe("DashTabs", () => {
     expect(disabled.title).toBe("阶段一不开放成员管理");
     act(() => disabled.click());
     expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("useServiceData", () => {
+  let container: HTMLElement;
+  let root: Root;
+
+  beforeEach(() => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("stays loading while disabled and lets the newest request win", async () => {
+    const resolvers: Array<(value: string) => void> = [];
+    const loader = vi.fn(() => new Promise<string>((resolve) => resolvers.push(resolve)));
+    act(() => root.render(<DeferredLoader enabled={false} revision={0} loader={loader} />));
+    expect(container.querySelector("output")?.dataset.status).toBe("loading");
+    expect(loader).not.toHaveBeenCalled();
+
+    act(() => root.render(<DeferredLoader enabled revision={1} loader={loader} />));
+    act(() => root.render(<DeferredLoader enabled revision={2} loader={loader} />));
+    expect(loader).toHaveBeenCalledTimes(2);
+    await act(async () => { resolvers[1]!("latest"); await Promise.resolve(); });
+    expect(container.textContent).toBe("latest");
+    await act(async () => { resolvers[0]!("stale"); await Promise.resolve(); });
+    expect(container.textContent).toBe("latest");
   });
 });
