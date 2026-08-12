@@ -313,9 +313,19 @@ function PolicyEditor({ policy, data, onClose, onSaved, notify }: {
                 ...(pinnedDirectVersion ? { employeeVersion: pinnedDirectVersion } : {})
               };
             })();
-      const samePinnedLeader = Boolean(policy?.leader && policy.leader.workflowId === draft.leaderWorkflowId);
+      const selectedLeader = supervisorWorkflows.find((workflow) => workflow.id === draft.leaderWorkflowId);
+      // Preserve an unchanged pin only while it is already current. Previously, editing any other
+      // policy field copied a stale leader workflowVersion back into the new policy version, so the
+      // form appeared to save successfully while the requirement launch gate remained blocked.
+      // Omitting workflowVersion lets the daemon resolve and pin the selected team's latest version.
+      const sameCurrentPinnedLeader = Boolean(
+        policy?.leader
+        && policy.leader.workflowId === draft.leaderWorkflowId
+        && selectedLeader
+        && policy.leader.workflowVersion === selectedLeader.version
+      );
       const leader = draft.leaderWorkflowId
-        ? { workflowId: draft.leaderWorkflowId, ...(samePinnedLeader ? { workflowVersion: policy?.leader?.workflowVersion } : {}) }
+        ? { workflowId: draft.leaderWorkflowId, ...(sameCurrentPinnedLeader ? { workflowVersion: policy?.leader?.workflowVersion } : {}) }
         : null;
       const common = {
         displayName: draft.displayName.trim(),

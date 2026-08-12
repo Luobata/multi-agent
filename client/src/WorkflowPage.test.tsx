@@ -526,4 +526,43 @@ describe("WorkflowPage async run order", () => {
     expect(body.specialists.graph).toMatchObject({ kind: "graph-workflow", workflowId: workflow.id, workflowVersion: workflow.version });
     expect(body.leader).toMatchObject({ workflowId: supervisorWorkflow.id, workflowVersion: supervisorWorkflow.version });
   });
+
+  it("repins a stale unchanged leader target to the current team version when the policy is revised", async () => {
+    const manager = employee("team-manager", "领队员工");
+    const currentSupervisor = { ...supervisorWorkflow, version: 3 };
+    const stalePolicy = {
+      ...entrancePolicy,
+      leader: { ...entrancePolicy.leader!, workflowVersion: 1 }
+    };
+    act(() => root.render(<WorkflowPage data={bootstrapWith({
+      employees: [manager, employee("mihuhu-frontend-engineer", "米糊糊 · 前端"), employee("xiaomixiang-tester", "小米象 · 测试")],
+      managementPolicies: [managementPolicy],
+      entrancePolicies: [stalePolicy],
+      workflows: [workflow, currentSupervisor]
+    })} refresh={refresh} notify={notify} />));
+    await flush();
+
+    const entranceTab = Array.from(container.querySelectorAll<HTMLButtonElement>(".orchestration-switcher button"))
+      .find((button) => button.textContent?.includes("开始一项工作"));
+    if (!entranceTab) throw new Error("Request Routing tab not found");
+    click(entranceTab);
+    await flush();
+    const editRouting = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.includes("修订分流策略"));
+    if (!editRouting) throw new Error("Request routing edit button not found");
+    click(editRouting);
+    await flush();
+
+    const save = container.querySelector<HTMLButtonElement>(".editor-savebar .button.primary");
+    const form = save?.closest("form");
+    if (!form) throw new Error("Request routing editor form not found");
+    act(() => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    await flush();
+
+    const patchCalls = fetchMock.mock.calls.filter(([input, init]) => (
+      String(input) === `/api/entrance-policies/${entrancePolicy.id}` && init?.method === "PATCH"
+    ));
+    const body = JSON.parse(String(patchCalls.at(-1)?.[1]?.body)) as { leader: Record<string, unknown> };
+    expect(body.leader).toEqual({ workflowId: currentSupervisor.id });
+  });
 });
