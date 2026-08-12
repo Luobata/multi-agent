@@ -49,6 +49,7 @@ describe("multi-project console routes", () => {
     expect(pageFromHash("#spaces/prj-workbench/board")).toEqual({ page: "board", spaceId: "prj-workbench" });
     expect(pageFromHash("#requirements/req%20101")).toEqual({ page: "requirement", requirementId: "req 101" });
     expect(pageFromHash("#runs?run=run%2F101")).toEqual({ page: "runs", runId: "run/101" });
+    expect(pageFromHash("#runs/run-team%201")).toEqual({ page: "runs", runId: "run-team 1" });
     expect(pageFromHash("#requirements/req%20101?section=acceptance")).toEqual({ page: "requirement", requirementId: "req 101", section: "acceptance" });
     expect(pageFromHash("#requirements/req-1?section=unknown")).toEqual({ page: "requirement", requirementId: "req-1" });
   });

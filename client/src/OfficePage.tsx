@@ -16,6 +16,7 @@ import type {
 interface OfficePageProps {
   data: Bootstrap;
   streamStatus: "connecting" | "live" | "reconnecting" | "offline";
+  onOpenRun?: (runId: string) => void;
 }
 
 const activeInstanceStatuses = new Set<WorkInstanceStatus>(["queued", "waiting", "running"]);
@@ -189,7 +190,7 @@ function EmployeeActivityDrawer({ employee, data, clock, onClose }: {
   </div>;
 }
 
-export function OfficePage({ data, streamStatus }: OfficePageProps) {
+export function OfficePage({ data, streamStatus, onOpenRun }: OfficePageProps) {
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string>();
   const [clock, setClock] = useState(() => Date.now());
   const [migrationNotice, setMigrationNotice] = useState("");
@@ -319,7 +320,7 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
 
     <div className="office-layout">
       {studioSupervisors.length > 0 && <section className="office-studio" aria-label="团队作战室">
-        <header className="office-studio-heading"><div><span>TEAM WAR ROOM</span><h2>领队工作室</h2></div><p>{studioSupervisors.length} 个团队在册</p></header>
+        <header className="office-studio-heading"><div><span>TEAM WAR ROOM</span><h2 id="office-studio-heading" tabIndex={-1}>领队工作室</h2></div><p>{studioSupervisors.length} 个团队在册</p></header>
         <div className="studio-grid">
           {studioSupervisors.map((invocation) => {
             const progress = progressById[invocation.id];
@@ -339,14 +340,17 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
             const latestEntry = progress?.leaderReport.entries.at(-1);
             const leaderEmployeeId = invocation.executionSnapshot?.employees[0]?.employeeId;
             const leader = data.employees.find((employee) => employee.id === leaderEmployeeId);
-            return <article key={invocation.id} className={`studio-card studio-card--${tone}`}>
+            const workflowName = invocation.executionSnapshot?.workflow.id ?? invocation.target.id;
+            return <button type="button" key={invocation.id} className={`studio-card studio-card--${tone}`} data-run-id={invocation.runId || undefined} disabled={!invocation.runId} aria-label={invocation.runId ? `查看运行详情：${workflowName}，${invocation.requestSummary}，Run ${invocation.runId}` : `运行卷宗尚未生成：${workflowName}`} onClick={() => invocation.runId && onOpenRun?.(invocation.runId)}>
               <header className="studio-card-head">
                 <div className="studio-card-title"><span title={invocation.executionSnapshot?.workflow.id ?? invocation.target.id}>{invocation.executionSnapshot?.workflow.id ?? invocation.target.id}</span><strong title={invocation.requestSummary}>{invocation.requestSummary}</strong></div>
                 <span className="studio-round">Round {progress?.round ?? invocation.executionSnapshot?.workflow.version ?? 1}</span>
               </header>
+              <div className="studio-card-meta"><span>{sourceName(invocation)}</span>{invocation.source.taskId && <code>需求 · {invocation.source.taskId}</code>}</div>
               <div className={`studio-progress ${tone === "running" ? "studio-progress--live" : ""}`}>
-                <i className="studio-progress-fill" style={{ width: `${Math.round(ratio * 100)}%` }} aria-hidden="true" />
+                <i className="studio-progress-fill" role="progressbar" aria-label="执行进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(ratio * 100)} style={{ width: `${Math.round(ratio * 100)}%` }} />
               </div>
+              <div className="studio-run-id">{invocation.runId ? <>Run ID · <code>{invocation.runId}</code></> : "运行卷宗尚未生成"}</div>
               <div className="studio-progress-legend">
                 <span>{invocation.status === "awaiting-human-decision" ? "待确认" : `${Math.round(ratio * 100)}% 执行进度`}</span>
                 {progress && <span>{progress.tally.completed}/{actionable} 个有效步骤</span>}
@@ -364,7 +368,7 @@ export function OfficePage({ data, streamStatus }: OfficePageProps) {
                 </div>
               </div>
               {progress && progress.leaderReport.gates.length > 0 && <div className="studio-gates">{progress.leaderReport.gates.map((gate) => <span key={gate.gateId} title={`${gate.gateId} · ${gate.status}`} className={`studio-gate studio-gate--${gate.status}`}>{gate.gateId} · {gate.status}</span>)}</div>}
-            </article>;
+            </button>;
           })}
         </div>
       </section>}
