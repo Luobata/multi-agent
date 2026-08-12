@@ -1204,7 +1204,6 @@ async function runCompletionGates(
   sequence: { value: number }
 ): Promise<string[]> {
   const nodeIds: string[] = [];
-  const passedDelegations = delegations.filter((record) => record.result.status === "passed");
   for (const tracker of trackers.values()) {
     if (tracker.gate.mode === "after-each-delegation") {
       for (const activation of tracker.activations.values()) {
@@ -1226,7 +1225,7 @@ async function runCompletionGates(
         };
       }
     } else {
-      const matching = passedDelegations.filter((record) => gateMatchesAssignment(tracker.gate, record.assignment));
+      const matching = completionGateRecords(delegations, tracker.gate);
       const capabilityHasWorkCondition = tracker.gate.requiredCapability === "quality.test"
         || tracker.gate.requiredCapability === "quality.audit"
         || tracker.gate.requiredCapability.startsWith("code.");
@@ -1235,9 +1234,9 @@ async function runCompletionGates(
       if (matching.length > 0 || !capabilityHasWorkCondition || strictQualityGate) {
         activation = {
           key: matching.length > 0
-            ? `completion:${matching.map((record) => record.worker.id).join(",")}`
+            ? `completion:${matching.map(({ key }) => key).join(",")}`
             : strictQualityGate ? "completion:no-code-source" : "completion",
-          sourceNodeIds: matching.map((record) => record.worker.id)
+          sourceNodeIds: matching.map(({ record }) => record.worker.id)
         };
       }
     }
@@ -1254,6 +1253,36 @@ function requiredGateIssues(trackers: Map<string, GateTracker>): GateTracker[] {
   return [...trackers.values()].filter(
     (tracker) => tracker.gate.required && tracker.activations.size > 0 && tracker.status !== "passed"
   );
+}
+
+function completionGateRecords(
+  delegations: DelegationRecord[],
+  gate: SupervisorGateConfig
+): Array<{ key: string; record: DelegationRecord }> {
+  const latest = new Map<string, DelegationRecord>();
+  for (const record of delegations) {
+    if (record.result.status !== "passed" || !gateMatchesAssignment(gate, record.assignment)) continue;
+    const key = record.assignment.changeSet?.trim()
+      || record.assignment.nodeId?.trim()
+      || record.worker.id;
+    latest.set(key, record);
+  }
+  return [...latest.entries()].map(([key, record]) => ({ key, record }));
+}
+
+function invalidateCompletionGatesForRemediation(
+  trackers: Map<string, GateTracker>,
+  assignment: SupervisorAssignment
+): string[] {
+  const invalidated: string[] = [];
+  for (const tracker of trackers.values()) {
+    if (!tracker.gate.required || !gateMatchesAssignment(tracker.gate, assignment)) continue;
+    tracker.passed.clear();
+    tracker.status = "pending";
+    tracker.reason = "code remediation changed the reviewed candidate; rerun this Gate against the latest change-set evidence";
+    invalidated.push(tracker.gate.id);
+  }
+  return invalidated;
 }
 
 async function executeSupervisor(context: ArchitectureExecutionContext): Promise<ArchitectureExecutionResult> {
@@ -1504,6 +1533,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       && dynamicTodos
       && dagTrackers
       && [...dagTrackers.values()].every((tracker) => !tracker.node.required || tracker.status === "passed")
+      && requiredGateIssues(trackers).length === 0
       && next.assignments.some((assignment) => typeof assignment.todoId !== "string" || !assignment.todoId.trim())
     ) {
       const reason = "ignored unplanned delegation after every required dynamic TODO passed";
@@ -1683,6 +1713,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       round += 1;
       return undefined;
     };
+    const remediationRequiredGates = requiredGateIssues(trackers);
+    const invalidatedGateIds = new Set<string>();
     const scheduled: Array<{
       assignment: SupervisorAssignment;
       worker: ExecutionPlanNode;
@@ -1714,8 +1746,22 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           return dagViolation(`supervisor delegated planned node ${requestedFlowNodeId} more than once in the same round`);
         }
         scheduledDagNodes.add(requestedFlowNodeId);
-        if (dagTracker.status === "passed") {
+        const repairingAfterGateFailure = Boolean(
+          dynamicTodos
+          && remediationRequiredGates.length > 0
+          && (dagTracker.node.workKind === "code" || dagTracker.node.workKind === "integration")
+        );
+        if (dagTracker.status === "passed" && !repairingAfterGateFailure) {
           return dagViolation(`supervisor cannot delegate planned node ${requestedFlowNodeId} because it already passed`);
+        }
+        if (dagTracker.status === "passed" && repairingAfterGateFailure) {
+          dagTracker.status = "pending";
+          delete dagTracker.passedExecutionNodeId;
+          for (const gateId of invalidateCompletionGatesForRemediation(trackers, {
+            ...assignment,
+            workKind: dagTracker.node.workKind,
+            ...(dagTracker.node.changeSet ? { changeSet: dagTracker.node.changeSet } : {})
+          })) invalidatedGateIds.add(gateId);
         }
         if (assignment.roleId !== dagTracker.node.roleId) {
           return dagViolation(
@@ -1811,11 +1857,18 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             priorTurns: memberSession.turns.length
           });
         }
-        retainMemberSession = [...dynamicTodos!.values()].some((todo) => (
+        const hasFutureSessionTodo = [...dynamicTodos!.values()].some((todo) => (
           todo.id !== plannedTodo.id
           && todo.sessionKey === plannedTodo.sessionKey
           && plannedTrackers.get(todo.id)?.status !== "passed"
         ));
+        const mayNeedGateRemediation = (workKind === "code" || workKind === "integration")
+          && [...trackers.values()].some((tracker) => (
+            tracker.gate.required
+            && tracker.status !== "passed"
+            && gateMatchesAssignment(tracker.gate, effectiveAssignment)
+          ));
+        retainMemberSession = hasFutureSessionTodo || mayNeedGateRemediation;
       }
       scheduled.push({
         assignment: effectiveAssignment,
@@ -1867,6 +1920,13 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           }
         }
       });
+    }
+    if (invalidatedGateIds.size > 0) {
+      await context.emit("gate.invalidated", node.id, {
+        gateIds: [...invalidatedGateIds],
+        reason: "planned code remediation changed the reviewed candidate"
+      });
+      await context.persist();
     }
     for (const item of scheduled) await context.scheduleNode(item.worker);
     const completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({

@@ -2697,6 +2697,7 @@ export class WorkbenchService {
       target.updatedAt = timestamp;
       if (status === "running") target.startedAt ??= timestamp;
       if (isInstanceTerminal(status)) target.completedAt = timestamp;
+      if (phase === "member-session-closed") target.memberSessionRetained = false;
       if (status === "failed") {
         target.error = message;
         target.failure = failure;

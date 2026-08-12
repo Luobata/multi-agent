@@ -545,7 +545,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(builderInstances).toHaveLength(1);
     expect(builderInstances[0]).toMatchObject({
       status: "completed",
-      phase: "done",
+      phase: "member-session-closed",
       nodeId: "wire-caller",
       nodeIds: ["implement-helper", "wire-caller"],
       memberSessionId: "member-session-builder-local-helper",
@@ -556,6 +556,221 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       expect.objectContaining({ status: "waiting", phase: "waiting-next-todo" }),
       expect.objectContaining({ status: "queued", phase: "continuing-session" })
     ]));
+  });
+
+  it("reopens a passed code TODO after a required Gate blocks and reruns Gates against the repaired change set", async () => {
+    let supervisorTurn = 0;
+    let gateAttempt = 0;
+    const builderContexts: Array<Record<string, unknown>> = [];
+    const providers: ProviderRegistry = new Map([["todo-gate-remediation", {
+      id: "todo-gate-remediation",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const node = invocation.templateContext.node as { metadata?: { kind?: string }; with?: Record<string, unknown> };
+        if (node.metadata?.kind === "gate") {
+          gateAttempt += 1;
+          return {
+            stdout: JSON.stringify({
+              message: gateAttempt === 1 ? "Parent breadcrumb did not leave detail state." : "Repaired parent breadcrumb returned to the list.",
+              verdict: gateAttempt === 1 ? "Block" : "Pass"
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (role === "member-builder") {
+          if (node.with?.__todoId === "implement-navigation") builderContexts.push({ ...(node.with ?? {}) });
+          return {
+            stdout: JSON.stringify({ message: node.with?.__todoId === "inspect-navigation" ? "Navigation inspected." : builderContexts.length === 1 ? "Initial implementation." : "Gate remediation applied." }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        supervisorTurn += 1;
+        if (supervisorTurn === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Plan one bounded implementation TODO.",
+              impact: {
+                level: "low",
+                regressionScope: "targeted",
+                affectedAreas: ["client navigation"],
+                reasons: ["one navigation state transition"],
+                requiredChecks: ["parent breadcrumb behavior"]
+              },
+              todos: [
+                {
+                  id: "inspect-navigation",
+                  roleId: "builder",
+                  task: "Inspect the existing navigation state transition.",
+                  needs: [],
+                  workKind: "discussion"
+                },
+                {
+                  id: "implement-navigation",
+                  roleId: "builder",
+                  task: "Implement the parent breadcrumb navigation state transition.",
+                  needs: ["inspect-navigation"],
+                  workKind: "code",
+                  changeSet: "navigation",
+                  sessionKey: "navigation-builder"
+                }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 2) {
+          return {
+            stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "inspect-navigation", roleId: "builder" }] }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 3) {
+          return {
+            stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "implement-navigation", roleId: "builder" }] }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 4) {
+          return {
+            stdout: JSON.stringify({ action: "finish", summary: "Run the Gate.", result: { delivered: true } }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 5) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Repair the original TODO using the Gate evidence.",
+              assignments: [{ todoId: "implement-navigation", roleId: "builder" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Run the Gate against the repaired candidate.", result: { delivered: true } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("todo-gate-remediation-provider", { adapter: "todo-gate-remediation", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "todo-gate-lead",
+      identity: { displayName: "Lead", background: "Leads.", responsibilities: ["Lead"] },
+      providerId: "todo-gate-remediation-provider"
+    });
+    await service.createEmployee({
+      id: "todo-gate-builder",
+      identity: { displayName: "Builder", background: "Builds.", responsibilities: ["Build"] },
+      capabilities: ["code.frontend"],
+      providerId: "todo-gate-remediation-provider"
+    });
+    await service.createEmployee({
+      id: "todo-gate-auditor",
+      identity: { displayName: "Auditor", background: "Audits.", responsibilities: ["Audit"] },
+      capabilities: ["quality.audit"],
+      providerId: "todo-gate-remediation-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message", "verdict"],
+        properties: { message: { type: "string" }, verdict: { enum: ["Pass", "Block"] } }
+      },
+      verdict: { path: "verdict", pass: ["Pass"], block: ["Block"] }
+    });
+    await service.createManagementPolicy({
+      id: "todo-gate-remediation-policy",
+      allowedRoleIds: ["builder", "auditor"],
+      instructions: "Repair the planned change when a required Gate blocks it.",
+      limits: { maxRounds: 6, maxDelegations: 3, maxParallelDelegations: 1 }
+    });
+    await service.createWorkflow({
+      id: "todo-gate-remediation-workflow",
+      architecture: "supervisor",
+      supervisor: { employeeId: "todo-gate-lead" },
+      managementPolicy: { id: "todo-gate-remediation-policy" },
+      members: [
+        { roleId: "builder", employeeId: "todo-gate-builder" },
+        { roleId: "auditor", employeeId: "todo-gate-auditor" }
+      ],
+      flow: {
+        stages: [
+          { id: "plan", kind: "supervisor", title: "Plan" },
+          { id: "loop", kind: "delegation-loop", title: "Build" },
+          { id: "audit", kind: "gate", title: "Audit", gateId: "audit" },
+          { id: "delivery", kind: "delivery", title: "Deliver" }
+        ],
+        gates: [{
+          id: "audit",
+          requiredCapability: "quality.audit",
+          mode: "before-completion",
+          required: true,
+          instructions: "Verify parent breadcrumb behavior.",
+          fallback: "block"
+        }]
+      }
+    });
+
+    const result = await service.runWorkbenchWorkflow("todo-gate-remediation-workflow", { message: "Fix navigation." });
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(gateAttempt).toBe(2);
+    expect(Object.keys(result.run.nodes)).toEqual(expect.arrayContaining([
+      "implement-navigation",
+      "gate-audit-r4-1",
+      "implement-navigation-retry-2",
+      "gate-audit-r6-2"
+    ]));
+    expect(result.run.output).toMatchObject({
+      gates: [{
+        gateId: "audit",
+        status: "passed",
+        executions: [
+          expect.objectContaining({ status: "blocked", sourceNodeIds: ["implement-navigation"] }),
+          expect.objectContaining({ status: "passed", sourceNodeIds: ["implement-navigation-retry-2"] })
+        ]
+      }],
+      dag: {
+        nodes: expect.arrayContaining([expect.objectContaining({
+          nodeId: "implement-navigation",
+          status: "passed",
+          executions: [
+            expect.objectContaining({ nodeId: "implement-navigation", status: "passed" }),
+            expect.objectContaining({ nodeId: "implement-navigation-retry-2", status: "passed" })
+          ]
+        })])
+      }
+    });
+    expect(builderContexts).toHaveLength(2);
+    expect(builderContexts[0]).toMatchObject({
+      __memberSession: { id: "member-session-navigation-builder", turns: [] }
+    });
+    expect(builderContexts[1]).toMatchObject({
+      __memberSession: {
+        id: "member-session-navigation-builder",
+        turns: [expect.objectContaining({ todoId: "implement-navigation", status: "passed" })]
+      }
+    });
+    const builderInstances = service.getActivitySnapshot().instances.filter((instance) => (
+      instance.runId === result.run.id
+      && instance.employeeId === "todo-gate-builder"
+      && instance.memberSessionId === "member-session-navigation-builder"
+    ));
+    expect(builderInstances).toHaveLength(1);
+    expect(builderInstances[0]).toMatchObject({
+      nodeIds: ["implement-navigation", "implement-navigation-retry-2"],
+      memberSessionRetained: false,
+      phase: "member-session-closed"
+    });
   });
 
   it("skips integration for one changeSet and runs it for two independent code changeSets", async () => {
