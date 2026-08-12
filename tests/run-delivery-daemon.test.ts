@@ -218,27 +218,21 @@ describe("run delivery daemon routes", () => {
     const recoveredResponse = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
     expect(recoveredResponse.status).toBe(200);
     expect(recoveredResponse.json).toMatchObject({ data: { delivery: { evidenceRerun: {
-      status: "failed",
+      status: "passed",
       mediaCount: 1,
-      message: expect.stringContaining("已从原 worktree 恢复 1 项媒体证据")
+      message: expect.stringContaining("无需重复补采")
     } } } });
     expect((recoveredResponse.json as { data: RunMergePreview }).data.evidence.assets.map((candidate) => candidate.name))
       .toContain("001-recovered.png");
 
-    // Recovered files are partial evidence from an interrupted attempt. They remain viewable but
-    // must not suppress the operator's explicit request for a complete replacement capture.
+    // Recovered media remains first-class delivery evidence. The API must agree with the UI and
+    // reject a duplicate capture instead of displaying an action that can never succeed.
     const retriedCapture = await invokeRoute(app, "post", "/api/runs/:id/evidence-rerun", {
       params: { id: runId },
       body: { actor: "daemon-reviewer" }
     });
-    expect(retriedCapture.status).toBe(202);
-    expect(retriedCapture.json).toMatchObject({ data: { evidenceRerun: { status: "queued" } } });
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const capturePreview = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
-      const captureStatus = (capturePreview.json as { data: RunMergePreview }).data.delivery?.evidenceRerun?.status;
-      if (captureStatus !== "queued" && captureStatus !== "running") break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    expect(retriedCapture.status).toBe(400);
+    expect(retriedCapture.json).toMatchObject({ error: { message: expect.stringContaining("已有完整媒体证据") } });
 
     const kept = await invokeRoute(app, "post", "/api/runs/:id/keep", {
       params: { id: runId },

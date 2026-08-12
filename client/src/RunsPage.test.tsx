@@ -557,22 +557,22 @@ describe("RunsPage delivery acceptance", () => {
     }
   });
 
-  it("explains an interrupted capture beside recovered media and lets the operator rerun it", async () => {
+  it("treats recovered media as usable evidence without offering a contradictory rerun", async () => {
     deliveryStatus = "evidence-failed";
     await act(async () => {
       root.render(<RunsPage notify={notify} activityRevision="evidence-failed" />);
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("已保留 2 项");
+    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("媒体证据已恢复，无需重复补采");
+    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("2 项可查看");
     expect(container.querySelector(".run-delivery-evidence-wall")).toBeTruthy();
     const retry = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
       .find((button) => button.textContent === "重新运行 test-engineer 补采");
-    expect(retry?.disabled).toBe(false);
-    await act(async () => { retry?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(retry).toBeUndefined();
     expect(fetchMock.mock.calls.some(([input, init]) => (
       String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST"
-    ))).toBe(true);
+    ))).toBe(false);
   });
 
   it("shows conflict revalidation as a pre-merge stage and keeps the dossier stable while polling", async () => {

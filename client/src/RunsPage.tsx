@@ -370,7 +370,11 @@ function RunDeliveryPanel({
   const evidenceBusy = evidenceRerun?.status === "queued" || evidenceRerun?.status === "running";
   const evidenceFailed = evidenceRerun?.status === "failed";
   const evidenceMissing = preview.evidence.assets.length === 0;
-  const evidenceNeedsAttention = evidenceMissing || evidenceFailed;
+  const evidenceRecovered = !evidenceMissing && Boolean(
+    evidenceRerun?.message?.includes("恢复")
+    || (evidenceFailed && evidenceRerun?.mediaCount)
+  );
+  const evidenceNeedsAttention = evidenceMissing;
   const conflictBusy = conflict && ["resolving", "retesting", "leader-review"].includes(conflictResolution?.status ?? "");
   const actionable = !merged && !discarded && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept" || preview.status === "returned-to-acceptance");
   const canQueueMerge = preview.eligible && !merged && !discarded && !mergeBusy && !evidenceBusy && preview.status !== "conflict";
@@ -406,8 +410,12 @@ function RunDeliveryPanel({
     </div>}
     <div className="run-delivery-evidence">
       <div className="run-delivery-evidence-head"><strong>Evidence wall</strong><span>{preview.evidence.assets.length} 项媒体证据</span></div>
+      {evidenceRecovered && <div className="run-delivery-evidence-attention run-delivery-evidence-attention--recovered" role="status">
+        <div><strong>媒体证据已恢复，无需重复补采</strong><p>{evidenceRerun?.message ?? `daemon 中断了补采过程，但已恢复 ${preview.evidence.assets.length} 项可验收媒体；现有证据继续参与交付门禁。`}</p></div>
+        <Stamp status="passed" label={`${preview.evidence.assets.length} 项可查看`} />
+      </div>}
       {evidenceNeedsAttention && <div className={`run-delivery-evidence-attention${evidenceFailed ? " run-delivery-evidence-attention--interrupted" : ""}`} role="status">
-        <div><strong>{evidenceFailed ? `截图补采未完整结束${preview.evidence.assets.length > 0 ? `，已保留 ${preview.evidence.assets.length} 项` : ""}` : "缺少可查看的截图或录屏"}</strong><p>{evidenceFailed ? (evidenceRerun.message ?? "上一轮补采被中断，现有文件可人工查看，但不代表完整补采已经通过。") : "结构化 E2E 已保留；是否让项目 test-engineer 重新走一遍验收路径并补采真实界面证据？"}</p></div>
+        <div><strong>{evidenceFailed ? "截图补采失败，仍没有可查看媒体" : "缺少可查看的截图或录屏"}</strong><p>{evidenceFailed ? (evidenceRerun.message ?? "上一轮补采未产出媒体证据，可以重新运行独立验收。") : "结构化 E2E 已保留；是否让项目 test-engineer 重新走一遍验收路径并补采真实界面证据？"}</p></div>
         <button type="button" className="button secondary" disabled={!canRerunEvidence} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "test-engineer 补采中…" : evidenceFailed ? "重新运行 test-engineer 补采" : "让 test-engineer 补采证据"}</button>
         {!canRerunEvidence && mergeBusy && <small>当前合入流程正在重测或写入，不能并行启动另一轮补采；若交付退回验收，可在这里直接重跑。</small>}
         {evidenceRerunError && <small className="inline-error" role="alert">{evidenceRerunError}</small>}

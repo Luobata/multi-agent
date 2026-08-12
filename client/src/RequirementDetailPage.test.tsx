@@ -137,6 +137,7 @@ describe("RequirementDetailPage advancement launch", () => {
   afterEach(() => {
     act(() => root.unmount());
     document.body.replaceChildren();
+    vi.unstubAllGlobals();
   });
 
   it("shows a prominent start action, confirms the safe route, then persists one queued Run", async () => {
@@ -293,5 +294,60 @@ describe("RequirementDetailPage advancement launch", () => {
     await act(async () => { button("重新推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(gateway.evaluate).toHaveBeenCalledOnce();
     expect(document.body.textContent).toContain("启动门禁通过");
+  });
+
+  it("shows the exact blocked Run reason and whether test gates were reached in every dossier section", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-12T04:16:07.000Z"), idSeed: () => "req-blocked" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "编排协议阻塞",
+      summary: "需要在详情看见真实原因",
+      priority: "high",
+      rawRequirement: "显示动态 TODO 委派错误",
+      acceptanceCriteria: ["详情直接展示原始阻塞原因和测试状态"]
+    });
+    const config = { entrancePolicyId: entrancePolicy.id, autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-blocked",
+      runId: "run-blocked",
+      status: "blocked",
+      observedAt: "2026-08-12T04:16:07.000Z"
+    }, config.pollIntervalMs);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: {
+          status: "blocked",
+          outcome: { status: "blocked", reason: "dynamic TODO delegation must specify todoId" },
+          leaderReport: { gates: [{ gateId: "quality-test", status: "skipped" }, { gateId: "independent-review", status: "skipped" }] },
+          steps: []
+        }
+      })
+    }));
+    const go = vi.fn();
+
+    act(() => root.render(<RequirementDetailPage
+      requirementId={requirement.id}
+      section="overview"
+      go={go}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+      entrancePolicies={[entrancePolicy]}
+    />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+
+    const callout = container.querySelector(".requirement-blocker-callout");
+    expect(callout?.textContent).toContain("已找到本轮停止原因");
+    expect(callout?.textContent).toContain("领队在动态委派任务时没有指出要推进的 TODO");
+    expect(callout?.textContent).toContain("dynamic TODO delegation must specify todoId");
+    expect(callout?.textContent).toContain("尚未执行：quality-test、independent-review");
+    expect(callout?.textContent).toContain("run-blocked");
+
+    act(() => button("查看阻塞现场与完整证据").click());
+    expect(go).toHaveBeenCalledWith(`requirements/${requirement.id}?section=run`);
   });
 });

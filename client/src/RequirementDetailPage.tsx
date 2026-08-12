@@ -1,6 +1,7 @@
 /** 需求详情：原始需求 / 验收标准 / 任务 DAG / Agent 时间线 / Diff·测试·Review·交付物。
  *  DAG / 时间线 / 资源概览的演示徽标完全由数据 demo 标记驱动。列迁移走目标列 SelectControl。 */
 import { useCallback, useEffect, useState } from "react";
+import { api } from "./api";
 import { DemoBadge, DossierSection, EmptyState, Modal, ReadonlyEvidence, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
 import { isActiveRequirementAdvancement, requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
@@ -15,6 +16,51 @@ import {
   type RequirementAdvancementGateway
 } from "./requirementAdvancement";
 import type { EntrancePolicy, EntrancePolicyDecision, InvocationRecord, ManagementPolicy, Project, Workflow } from "./types";
+
+interface RequirementInvocationProgress {
+  status: string;
+  error?: string;
+  outcome?: { status: string; summary?: string; reason?: string };
+  leaderReport?: { gates?: Array<{ gateId: string; status: string }> };
+  steps?: Array<{ nodeId: string; roleId?: string; status: string; error?: string }>;
+}
+
+interface RequirementBlockerDetail {
+  reason: string;
+  explanation: string;
+  gateSummary?: string;
+}
+
+function explainRequirementBlocker(reason: string): string {
+  if (reason.includes("dynamic TODO delegation must specify todoId")) {
+    return "领队在动态委派任务时没有指出要推进的 TODO；编排器无法安全判断依赖关系，因此在调用开发和测试 Agent 前终止了本轮。";
+  }
+  if (reason.includes("delegated planned node") && reason.includes("changeSet") && reason.includes("expected")) {
+    return "领队委派计划节点时给出了与原计划不一致的改动集；为避免在错误的代码范围继续执行，编排器阻止了本轮。";
+  }
+  if (reason.includes("technical circuit opened")) {
+    return "同一类技术调用连续失败后触发了熔断；系统停止重复派发，等待修复配置或人工重新推进。";
+  }
+  return "本轮 Run 被安全门禁终止；下面保留了运行时给出的原始原因，便于定位配置、委派或测试问题。";
+}
+
+function blockerFromProgress(
+  progress: RequirementInvocationProgress | undefined,
+  fallback?: string
+): RequirementBlockerDetail | undefined {
+  const failedStep = progress?.steps?.findLast((step) => Boolean(step.error));
+  const reason = progress?.outcome?.reason ?? progress?.error ?? failedStep?.error ?? fallback;
+  if (!reason) return undefined;
+  const gates = progress?.leaderReport?.gates ?? [];
+  const skipped = gates.filter((gate) => gate.status === "skipped").map((gate) => gate.gateId);
+  const blocked = gates.filter((gate) => gate.status === "blocked").map((gate) => gate.gateId);
+  const gateSummary = blocked.length > 0
+    ? `阻塞门禁：${blocked.join("、")}`
+    : skipped.length > 0
+      ? `执行在门禁前停止；尚未执行：${skipped.join("、")}`
+      : undefined;
+  return { reason, explanation: explainRequirementBlocker(reason), gateSummary };
+}
 
 function dagStamp(status: DagTaskNode["status"]) {
   if (status === "completed") return <Stamp status="completed" />;
@@ -88,6 +134,8 @@ export function RequirementDetailPage({
   const [evaluatingLaunch, setEvaluatingLaunch] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState("");
+  const [blockerProgress, setBlockerProgress] = useState<RequirementInvocationProgress>();
+  const [blockerProgressLoading, setBlockerProgressLoading] = useState(false);
 
   const detail = state.status === "ready" ? state.data : undefined;
   const project = detail ? projects.find((candidate) => candidate.id === detail.projectId) : undefined;
@@ -102,6 +150,7 @@ export function RequirementDetailPage({
   const blockedStart = detail ? startBlockedReason(detail, Boolean(advancementConfig), Boolean(activePolicy)) : undefined;
   const canRestart = detail?.advancement?.status === "failed" || detail?.advancement?.status === "blocked";
   const awaitingDecision = detail?.advancement?.status === "awaiting-human-decision";
+  const blockerDetail = blockerFromProgress(blockerProgress, detail?.advancement?.error);
   const syncDashboardProjection = useCallback((updated: Requirement) => {
     if (!detail || detail.id !== updated.id) return;
     // The embedded Run already has the new projection. Merge it into the open
@@ -126,6 +175,23 @@ export function RequirementDetailPage({
     });
     return () => { cancelled = true; };
   }, [activeInvocation?.id, activeInvocation?.status, activeInvocation?.updatedAt, advancementConfig?.pollIntervalMs, detail?.advancement?.idempotencyKey, detail?.advancement?.status, detail?.id, service, setData]);
+
+  useEffect(() => {
+    const advancement = detail?.advancement;
+    if (!advancement?.invocationId || (advancement.status !== "blocked" && advancement.status !== "failed")) {
+      setBlockerProgress(undefined);
+      setBlockerProgressLoading(false);
+      return;
+    }
+    let current = true;
+    setBlockerProgress(undefined);
+    setBlockerProgressLoading(true);
+    api<RequirementInvocationProgress>(`/api/invocations/${encodeURIComponent(advancement.invocationId)}/progress`)
+      .then((progress) => { if (current) setBlockerProgress(progress); })
+      .catch(() => undefined)
+      .finally(() => { if (current) setBlockerProgressLoading(false); });
+    return () => { current = false; };
+  }, [detail?.advancement?.invocationId, detail?.advancement?.status]);
 
   const evaluateLaunch = async () => {
     if (!detail || !advancementConfig || blockedStart) return;
@@ -227,6 +293,22 @@ export function RequirementDetailPage({
       {(["overview", "run", "acceptance"] as const).map((item, index) => <button key={item} type="button" aria-current={section === item ? "page" : undefined} className={section === item ? "active" : ""} onClick={() => go(`requirements/${encodeURIComponent(detail.id)}?section=${item}`)}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item === "overview" ? "需求定义" : item === "run" ? "执行与决策" : "验收与合入"}</strong><small>{item === "overview" ? requirementLaneLabel(detail.lane) : item === "run" ? detail.advancement?.runId ? "真实 Run 已绑定" : "等待启动" : detail.evidence.acceptance ? "验收快照已固定" : "等待交付"}</small></button>)}
       {detail.advancement?.runId && <button type="button" className="standalone-run-link" onClick={() => go(`runs?run=${encodeURIComponent(detail.advancement!.runId!)}`)}>独立运行卷宗 ↗</button>}
     </nav>}
+    {state.status === "ready" && detail && (detail.advancement?.status === "blocked" || detail.advancement?.status === "failed") && <section className="requirement-blocker-callout" role="alert" aria-live="polite">
+      <div className="requirement-blocker-callout__head">
+        <Stamp status={detail.advancement.status === "blocked" ? "blocked" : "failed"} label={detail.advancement.status === "blocked" ? "推进阻塞" : "推进失败"} />
+        <strong>{blockerDetail ? "已找到本轮停止原因" : blockerProgressLoading ? "正在读取本轮停止原因…" : "本轮停止原因暂不可用"}</strong>
+      </div>
+      {blockerDetail && <>
+        <p>{blockerDetail.explanation}</p>
+        <dl>
+          <dt>原始原因</dt><dd><code>{blockerDetail.reason}</code></dd>
+          {blockerDetail.gateSummary && <><dt>测试状态</dt><dd>{blockerDetail.gateSummary}</dd></>}
+          {detail.advancement.runId && <><dt>Run</dt><dd><code>{detail.advancement.runId}</code></dd></>}
+        </dl>
+      </>}
+      {!blockerDetail && !blockerProgressLoading && <p>服务暂时无法返回 Run 结果；原 Run 和证据仍完整保留，可打开运行卷宗查看。</p>}
+      {detail.advancement.runId && <button type="button" className="button secondary" onClick={() => go(`requirements/${encodeURIComponent(detail.id)}?section=run`)}>查看阻塞现场与完整证据 →</button>}
+    </section>}
     {state.status === "ready" && detail && (section === "run" || section === "acceptance") && detail.advancement?.runId && <RunsPage mode="embedded" view={section === "acceptance" ? "acceptance" : "all"} focusedRunId={detail.advancement.runId} notify={notify} dashboard={service} onDashboardSync={syncDashboardProjection} />}
     {state.status === "ready" && detail && (section === "run" || section === "acceptance") && !detail.advancement?.runId && <EmptyState title="尚未绑定 Run">开始推进后，完整决策、证据、验收与合入操作会在这里出现。</EmptyState>}
     {state.status === "ready" && detail && section === "overview" && <div className="dash-dossier dash-dossier--overview">

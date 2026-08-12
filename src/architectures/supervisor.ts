@@ -1273,7 +1273,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     : startedAt + value.policy.limits.maxDurationMs;
   const durationExceeded = () => deadlineAt !== undefined && Date.now() >= deadlineAt;
 
-  while (true) {
+  supervisorLoop: while (true) {
     if (durationExceeded()) {
       return blocked("management policy duration limit reached before convergence", round - 1, delegationCount, trackers, dagTrackers);
     }
@@ -1467,6 +1467,34 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       continue;
     }
 
+    // A planned TODO graph is the immutable execution contract. Once all required nodes have
+    // passed, a late ad-hoc delegation (most often a duplicate test assignment without todoId)
+    // cannot add legitimate implementation work. Safely ignore it and advance through the
+    // configured completion Gates instead of consuming another delegation slot or blocking a
+    // successfully completed Run on a leader formatting mistake.
+    if (
+      next.action === "delegate"
+      && dynamicTodos
+      && dagTrackers
+      && [...dagTrackers.values()].every((tracker) => !tracker.node.required || tracker.status === "passed")
+      && next.assignments.some((assignment) => typeof assignment.todoId !== "string" || !assignment.todoId.trim())
+    ) {
+      const reason = "ignored unplanned delegation after every required dynamic TODO passed";
+      history.push({
+        round,
+        supervisorNodeId: node.id,
+        decision: next as unknown as JsonValue,
+        decisionRejected: reason,
+        completionRecovered: true
+      });
+      await context.emit("supervisor.delegation.rejected", node.id, { reason, recoverable: true, advancedToGates: true });
+      next = {
+        action: "finish",
+        summary: "All planned TODOs passed; the runtime ignored an unplanned late delegation and advanced the configured quality Gates.",
+        result: { delivered: true, recoveredFromUnplannedDelegation: true }
+      };
+    }
+
     if (next.action === "finish") {
       if (value.policy.completion.requireDelegation && delegationCount === 0) {
         return blocked(
@@ -1613,6 +1641,21 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       await context.persist();
       return blocked(reason, round, delegationCount, trackers, dagTrackers);
     };
+    const recoverableDagDecision = async (reason: string): Promise<ArchitectureExecutionResult | undefined> => {
+      history.push({
+        round,
+        supervisorNodeId: node.id,
+        decision: next as unknown as JsonValue,
+        decisionRejected: reason
+      });
+      await context.emit("supervisor.delegation.rejected", node.id, { reason, recoverable: true });
+      if (round >= value.policy.limits.maxRounds) {
+        return blocked(reason, round, delegationCount, trackers, dagTrackers);
+      }
+      latestNodeIds = [node.id];
+      round += 1;
+      return undefined;
+    };
     const scheduled: Array<{
       assignment: SupervisorAssignment;
       worker: ExecutionPlanNode;
@@ -1629,9 +1672,11 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       const activeDagTrackers = dagTrackers;
       if (activeDagTrackers) {
         if (typeof requestedFlowNodeId !== "string" || !requestedFlowNodeId.trim()) {
-          return dagViolation(dynamicTodos
+          const rejected = await recoverableDagDecision(dynamicTodos
             ? "dynamic TODO delegation must specify todoId"
             : "supervisor DAG delegation must specify nodeId");
+          if (rejected) return rejected;
+          continue supervisorLoop;
         }
         if (!dagTracker) {
           return dagViolation(hasStaticDag
@@ -1663,14 +1708,18 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         return dagTrackers ? dagViolation(reason) : blocked(reason, round, delegationCount, trackers);
       }
       if (dagTracker && assignment.workKind !== undefined && assignment.workKind !== dagTracker.node.workKind) {
-        return dagViolation(
-          `supervisor delegated planned node ${requestedFlowNodeId} with workKind ${assignment.workKind}; expected ${dagTracker.node.workKind}`
-        );
+        const reason = `supervisor delegated planned node ${requestedFlowNodeId} with workKind ${assignment.workKind}; expected ${dagTracker.node.workKind}`;
+        if (!dynamicTodos) return dagViolation(reason);
+        const rejected = await recoverableDagDecision(reason);
+        if (rejected) return rejected;
+        continue supervisorLoop;
       }
       if (dagTracker && assignment.changeSet !== undefined && assignment.changeSet !== dagTracker.node.changeSet) {
-        return dagViolation(
-          `supervisor delegated planned node ${requestedFlowNodeId} with changeSet ${assignment.changeSet}; expected ${dagTracker.node.changeSet ?? "none"}`
-        );
+        const reason = `supervisor delegated planned node ${requestedFlowNodeId} with changeSet ${assignment.changeSet}; expected ${dagTracker.node.changeSet ?? "none"}`;
+        if (!dynamicTodos) return dagViolation(reason);
+        const rejected = await recoverableDagDecision(reason);
+        if (rejected) return rejected;
+        continue supervisorLoop;
       }
       // requiredCapabilities are advisory hints the supervisor may attach; they travel with the
       // delegation as context but are NOT a hard gate. The supervisor picks who fits from each

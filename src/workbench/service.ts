@@ -7678,11 +7678,11 @@ export class WorkbenchService {
     }
     await updateRunEvidenceRerun(runDir, id, {
       ...current,
-      status: "failed",
+      status: recoveredMediaCount > 0 ? "passed" : "failed",
       updatedAt: now(),
       ...(recoveredMediaCount > 0 ? { mediaCount: recoveredMediaCount } : {}),
       message: recoveredMediaCount > 0
-        ? `daemon 重启中断了上一轮截图补采；已从原 worktree 恢复 ${recoveredMediaCount} 项媒体证据，候选与证据均已保留。`
+        ? `daemon 重启中断了上一轮截图补采；已从原 worktree 恢复 ${recoveredMediaCount} 项媒体证据，现有证据继续参与交付门禁，无需重复补采。`
         : "daemon 重启中断了上一轮截图补采；候选 worktree 与已有证据均已保留，可以重新补采。"
     });
     return true;
@@ -7694,10 +7694,10 @@ export class WorkbenchService {
     const preview = await previewRunMerge(run, runDir);
     if (!preview.worktreePath) throw new Error("该 Run 没有可用于截图验收的 worktree");
     const current = preview.delivery?.evidenceRerun;
-    // A daemon restart can recover partial media while leaving the capture attempt failed.
-    // Those files stay available for manual inspection, but they must not prevent the operator
-    // from requesting one complete, independently verified capture attempt.
-    if (preview.evidence.assets.length > 0 && current?.status !== "failed") {
+    // Media recovered from an interrupted attempt remains first-class delivery evidence. Re-running
+    // the same capture after the evidence gate is already satisfied only creates contradictory UI
+    // and duplicate artifacts, so the operator may retry only while no viewable media exists.
+    if (preview.evidence.assets.length > 0) {
       throw new Error("该 Run 已有完整媒体证据，无需重复补采");
     }
     if (["queued-for-merge", "retesting", "merging", "merged", "discarded"].includes(preview.status)) {

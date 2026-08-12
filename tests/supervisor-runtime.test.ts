@@ -175,7 +175,7 @@ describe("Supervisor flow persistence and materialization", () => {
       managementPolicy: { id: "materialize-policy" },
       members: [{ roleId: "builder", employeeId: "materialized-builder" }]
     });
-    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 6 });
+    expect(workflow.orchestrationSkill).toEqual({ id: "team-orchestration", version: 7 });
     expect(service.listSkills(true).find((skill) => skill.id === "team-orchestration")?.instructions)
       .toContain("first emit plan-todos");
 
@@ -186,17 +186,17 @@ describe("Supervisor flow persistence and materialization", () => {
     };
     expect(manifest.roles.supervisor?.skills.map((skill) => skill.id)).toEqual([
       "lead-method-v1",
-      "team-orchestration-v6"
+      "team-orchestration-v7"
     ]);
     expect(manifest.roles["member-builder"]?.skills.map((skill) => skill.id)).toEqual(["build-method-v1"]);
     expect(manifest.roles.supervisor?.identity.metadata.runtimeSkillInjections).toEqual([{
       skillId: "team-orchestration",
-      version: 6,
+      version: 7,
       reason: "supervisor-runtime"
     }]);
     expect(manifest.roles["member-builder"]?.identity.metadata.runtimeSkillInjections).toBeUndefined();
     expect(manifest.workflows[workflow.id]?.config).toMatchObject({
-      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 6 } },
+      supervisor: { capabilities: ["quality.audit"], skillInjection: { id: "team-orchestration", version: 7 } },
       members: [{
         roleId: "builder",
         capabilities: ["code.backend"],
@@ -239,7 +239,7 @@ describe("Supervisor flow persistence and materialization", () => {
     if (migrated.architecture !== "supervisor") throw new Error("expected Supervisor workflow");
     expect(migrated.flow).toMatchObject({ version: 1, gates: [] });
     expect(migrated.flow.stages.map((stage) => stage.kind)).toEqual(["supervisor", "delegation-loop", "delivery"]);
-    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 6 });
+    expect(migrated.orchestrationSkill).toEqual({ id: "team-orchestration", version: 7 });
   });
 });
 
@@ -392,8 +392,30 @@ describe("Supervisor deterministic capabilities and Gates", () => {
           return {
             stdout: JSON.stringify({
               action: "delegate",
+              summary: "Accidentally override the immutable planned change set.",
+              assignments: [{ todoId: "wire-caller", roleId: "builder", changeSet: "wrong-change-set" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 4) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
               summary: "Continue the retained builder session with the dependent TODO.",
               assignments: [{ todoId: "wire-caller", roleId: "builder" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 5) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Accidentally invent an unplanned test assignment after the TODO plan.",
+              assignments: [{ roleId: "tester", task: "Repeat package tests", workKind: "test" }]
             }),
             stderr: "",
             durationMs: 1
@@ -451,7 +473,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       id: "todo-session-policy",
       allowedRoleIds: ["builder", "tester"],
       instructions: "Plan bounded TODOs and use regression impact to choose the smallest safe test scope.",
-      limits: { maxRounds: 4, maxDelegations: 2, maxParallelDelegations: 1 }
+      limits: { maxRounds: 6, maxDelegations: 2, maxParallelDelegations: 1 }
     });
     await service.createWorkflow({
       id: "todo-session-supervision",
@@ -482,8 +504,9 @@ describe("Supervisor deterministic capabilities and Gates", () => {
 
     const result = await service.runWorkbenchWorkflow("todo-session-supervision", { message: "Make one local helper change." });
     expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(supervisorTurn).toBe(5);
     expect(result.run.output).toMatchObject({
-      summary: "Both TODOs and targeted regression passed.",
+      summary: "All planned TODOs passed; the runtime ignored an unplanned late delegation and advanced the configured quality Gates.",
       dag: {
         nodes: expect.arrayContaining([
           expect.objectContaining({ nodeId: "implement-helper", status: "passed" }),
@@ -1143,12 +1166,12 @@ describe("Supervisor workflow version tracking", () => {
     const kinds = result.changes.map((change) => `${change.kind}:${change.from}->${change.to}`);
     expect(kinds).toContain("member:1->2");
     expect(kinds).toContain("management-policy:1->2");
-    expect(kinds).toContain("orchestration-skill:6->7");
+    expect(kinds).toContain("orchestration-skill:7->8");
     const refreshed = service.getWorkflow("vt-team");
     if (refreshed.architecture !== "supervisor") throw new Error("expected supervisor workflow");
     expect(refreshed.members[0]!.employeeVersion).toBe(2);
     expect(refreshed.managementPolicy.version).toBe(2);
-    expect(refreshed.orchestrationSkill.version).toBe(7);
+    expect(refreshed.orchestrationSkill.version).toBe(8);
 
     // A second refresh with nothing new reports no change.
     const again = await service.refreshWorkflow("vt-team");
