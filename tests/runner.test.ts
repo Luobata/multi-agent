@@ -220,6 +220,59 @@ describe("workflow runtime", () => {
     expect(events).toContain('"phase":"prepare"');
   });
 
+  it("keeps shared node resources exclusive and releases them after execution", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    loaded.manifest.workflows["resource-guarded"] = {
+      architecture: "graph",
+      config: {
+        maxConcurrency: 2,
+        nodes: [
+          { id: "first-browser", role: "product-manager" },
+          { id: "second-browser", role: "designer" }
+        ]
+      }
+    };
+    let activeProviders = 0;
+    let maximumActiveProviders = 0;
+    let tail = Promise.resolve();
+    const events: string[] = [];
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke() {
+        activeProviders += 1;
+        maximumActiveProviders = Math.max(maximumActiveProviders, activeProviders);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        activeProviders -= 1;
+        return {
+          stdout: JSON.stringify({ verdict: "Pass", summary: "reviewed", evidence: ["evidence"], risks: [] }),
+          stderr: "",
+          durationMs: 10
+        };
+      }
+    };
+
+    const result = await runWorkflow(loaded, "resource-guarded", {
+      input,
+      providers: new Map([["command", adapter]]),
+      acquireNodePermit: async () => {
+        const predecessor = tail;
+        let release = () => {};
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        tail = predecessor.then(() => gate);
+        await predecessor;
+        return { release, resources: ["shared-browser"] };
+      },
+      onEvent: (event) => { events.push(event.type); }
+    });
+
+    expect(result.run.status).toBe("passed");
+    expect(maximumActiveProviders).toBe(1);
+    expect(events.filter((event) => event === "node.resources.acquired")).toHaveLength(2);
+    expect(events.filter((event) => event === "node.resources.released")).toHaveLength(2);
+  });
+
   it("starts newly-ready nodes without waiting for an unrelated node in the same compiled wave", async () => {
     const { config, input } = fixture();
     const loaded = loadManifest(config);

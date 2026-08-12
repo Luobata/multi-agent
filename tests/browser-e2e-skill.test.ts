@@ -33,6 +33,7 @@ describe("browser-e2e-validation skill template", () => {
     expect(skill.instructions).toContain("无限重试");
     expect(skill.instructions).toContain("一次只执行一条 Midscene 命令");
     expect(skill.instructions).toContain("同一工作项只建立一个浏览器会话");
+    expect(skill.instructions).toContain("运行时排队独占共享 Midscene 会话");
     expect(skill.instructions).toContain("遇到第一个足以判定验收失败的决定性证据后立即停止");
     expect(skill.instructions).toContain("先运行与 changedFiles 和当前分片验收标准直接相关的定向测试");
     expect(skill.instructions).toContain("才运行整库类型检查、构建或全量测试");

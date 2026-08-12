@@ -54,6 +54,7 @@ import { MemoryStore } from "../memory/store.js";
 import { MemoryRetriever } from "../memory/retriever.js";
 import { MemoryExtractor, summarizerContent, buildRunEvidence, type RunLike, type SummarizeFn } from "../memory/extractor.js";
 import { buildEvidenceRerunRequest, parseOriginalRunRequest } from "./evidenceRerun.js";
+import { employeeRuntimeResources, ExclusiveRuntimeResourceQueue } from "./runtimeResources.js";
 import type { MemoryEvidence, MemoryRecord, MemoryScope, MemorySearchQuery } from "../memory/types.js";
 import type {
   KnowledgeBaseCreateInput,
@@ -1720,6 +1721,7 @@ export class WorkbenchService {
   private readonly evidenceReruns = new Map<string, Promise<void>>();
   private readonly activeMergeRuns = new Map<string, Promise<void>>();
   private readonly mergeBranchQueues = new Map<string, Promise<void>>();
+  private readonly runtimeResources = new ExclusiveRuntimeResourceQueue();
   /**
    * Closes the small race between two callers that dispatch the same durable task cycle at once.
    * The persisted Invocation source remains the source of truth across daemon restarts.
@@ -2845,6 +2847,14 @@ export class WorkbenchService {
           openHumanDecision: workflow.architecture === "supervisor"
             ? (request) => this.openHumanDecisionRequest(invocation, workflow, request)
             : undefined,
+          acquireNodePermit: async (node) => {
+            const employee = employees.get(node.role);
+            if (!employee) throw new Error(`runtime role ${node.role} is not materialized`);
+            const resources = employeeRuntimeResources(employee);
+            if (resources.length === 0) return undefined;
+            const release = await this.runtimeResources.acquire(resources);
+            return { release, resources };
+          },
           prepareNode: async (node) => {
           const employee = employees.get(node.role);
           if (!employee) throw new Error(`runtime role ${node.role} is not materialized`);

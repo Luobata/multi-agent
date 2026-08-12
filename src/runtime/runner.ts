@@ -39,6 +39,17 @@ export interface RunWorkflowOptions {
     node: ExecutionPlanNode;
     artifacts?: Record<string, JsonValue>;
   }>;
+  /**
+   * Acquires process-wide resources needed by a prepared node. The returned
+   * release callback is always invoked, including provider and validation
+   * failures. This keeps shared adapters (for example one visible browser
+   * session) exclusive without turning an Employee identity into a capacity
+   * limit.
+   */
+  acquireNodePermit?: (node: ExecutionPlanNode) => Promise<{
+    release: () => void | Promise<void>;
+    resources?: string[];
+  } | undefined>;
   onEvent?: (event: ObservedRunEvent) => void | Promise<void>;
   /** Opens a durable human-decision request and returns a live waiter for the same Run. */
   openHumanDecision?: (request: RuntimeHumanDecisionRequest) => Promise<{
@@ -468,18 +479,52 @@ export async function runWorkflow(
       });
       return failed;
     }
-    return executeNode(
-      loaded,
-      run,
-      prepared.node,
-      input,
-      store,
-      registry,
-      emit,
-      providerCwd,
-      options.signal,
-      executionOptions
-    );
+    let permit: Awaited<ReturnType<NonNullable<RunWorkflowOptions["acquireNodePermit"]>>> = undefined;
+    try {
+      permit = await options.acquireNodePermit?.(prepared.node);
+      if (permit?.resources?.length) {
+        await emit("node.resources.acquired", prepared.node.id, { resources: permit.resources });
+      }
+      return await executeNode(
+        loaded,
+        run,
+        prepared.node,
+        input,
+        store,
+        registry,
+        emit,
+        providerCwd,
+        options.signal,
+        executionOptions
+      );
+    } catch (error) {
+      if (permit) throw error;
+      const failed: NodeRunResult = {
+        nodeId: prepared.node.id,
+        roleId: nodeRoleId(prepared.node),
+        metadata: prepared.node.metadata,
+        status: "failed",
+        attempts: 0,
+        completedAt: now(),
+        error: error instanceof Error ? error.message : String(error),
+        failure: { category: "preparation", retryable: false }
+      };
+      run.nodes[prepared.node.id] = failed;
+      await store.writeRun(run);
+      await emit("node.failed", prepared.node.id, {
+        error: failed.error ?? "node resource acquisition failed",
+        phase: "resource-acquisition",
+        failure: { category: "preparation", retryable: false }
+      });
+      return failed;
+    } finally {
+      if (permit) {
+        await permit.release();
+        if (permit.resources?.length) {
+          await emit("node.resources.released", prepared.node.id, { resources: permit.resources });
+        }
+      }
+    }
   };
   let executionResult: Awaited<ReturnType<typeof architecture.execute>>;
   try {
