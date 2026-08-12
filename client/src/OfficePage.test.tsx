@@ -362,6 +362,19 @@ describe("OfficePage supervisor studio", () => {
     // 3 completed of 4 total => 75%
     expect(bar?.style.width).toBe("75%");
     expect(container.textContent).toContain("Round 2");
+    const card = container.querySelector<HTMLButtonElement>("button.studio-card");
+    expect(card?.dataset.runId).toBe("run-team-1");
+    expect(card?.querySelectorAll("button, a")).toHaveLength(0);
+    expect(card?.getAttribute("aria-label")).toContain("Run run-team-1");
+    expect(container.querySelector("[role=progressbar]")?.getAttribute("aria-valuenow")).toBe("75");
+  });
+
+  it("opens the exact Run from the single whole-card control", async () => {
+    const onOpenRun = vi.fn();
+    act(() => root.render(<OfficePage data={bootstrap} streamStatus="live" onOpenRun={onOpenRun} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    act(() => container.querySelector<HTMLButtonElement>("button.studio-card")?.click());
+    expect(onOpenRun).toHaveBeenCalledWith("run-team-1");
   });
 
   it("shows human confirmation separately and keeps recovered attempts out of delivery progress", async () => {

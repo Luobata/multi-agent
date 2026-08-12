@@ -536,8 +536,12 @@ describe("Local Agent Workbench", () => {
     expect(single?.project).toBe("demo-project");
     expect(single?.taskId).toBe("req-102");
     expect(single?.trigger).toBe("mcp");
-    const singleDetail = await service.getRun(single!.id) as { taskId?: string; project?: string };
-    expect(singleDetail).toMatchObject({ taskId: "req-102", project: "demo-project" });
+    const singleDetail = await service.getRun(single!.id) as { taskId?: string; project?: string; invocation?: { requestText?: string; requestSummary?: string } };
+    expect(singleDetail).toMatchObject({
+      taskId: "req-102",
+      project: "demo-project",
+      invocation: { requestText: "single task", requestSummary: "single task" }
+    });
     expect(graph?.category).toBe("graph");
     expect(graph?.trigger).toBe("workbench");
   });

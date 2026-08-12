@@ -212,6 +212,8 @@ export interface InvocationRecord {
   status: InvocationStatus;
   phase: string;
   requestSummary: string;
+  requestText?: string;
+  taskDescription?: string;
   runId: string;
   sessionId?: string;
   instanceIds: string[];
@@ -623,6 +625,12 @@ export interface Run {
   trigger?: "workbench" | "http" | "mcp" | "a2a";
   /** Present on listRuns summaries when the correlated invocation carried a requirement task id. */
   taskId?: string;
+  invocation?: {
+    id: string;
+    requestSummary: string;
+    requestText?: string;
+    taskDescription?: string;
+  };
   nodes: Record<string, RunNode>;
   /** Present when the run recorded worktree-isolation evidence (WI-T1/T3). */
   isolation?: { mode: "worktree" | "none"; worktreePath?: string; baseCommit?: string; fallbackReason?: string };

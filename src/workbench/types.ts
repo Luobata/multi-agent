@@ -671,6 +671,10 @@ export interface InvocationRecord {
   status: InvocationStatus;
   phase: string;
   requestSummary: string;
+  /** Original request text when the caller supplied one; optional for legacy persisted invocations. */
+  requestText?: string;
+  /** Caller-supplied task description when distinct from the request text. */
+  taskDescription?: string;
   requestContext?: JsonObject;
   runId: string;
   sessionId?: string;

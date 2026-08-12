@@ -295,6 +295,38 @@ describe("RunsPage focused hash selection", () => {
     expect(container.textContent).toContain("验收与合并");
     expect(container.textContent).not.toContain("运行元数据");
   });
+
+  it("shows a persistent establishing state instead of selecting the first Run", async () => {
+    act(() => root.render(<RunsPage notify={vi.fn()} pendingRunId="run-missing-1" onReturnOffice={vi.fn()} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.textContent).toContain("运行卷宗正在建立");
+    expect(container.textContent).toContain("Run run-missing-1 尚未出现在本地 Run Store");
+    expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
+  });
+});
+
+describe("RunsPage request context", () => {
+  it("renders full request fields and running node placeholders without truncating them", async () => {
+    const fullRun: Run = {
+      ...runs[2], status: "running", invocation: { id: "inv-1", requestSummary: "核对摘要", requestText: "第一行\n第二行完整请求", taskDescription: "完整任务描述" },
+      nodes: { leader: { nodeId: "leader", roleId: "supervisor", status: "running", attempts: 1 } }
+    };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [fullRun] }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: unavailablePreview(fullRun.id) }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: fullRun }) });
+    }));
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container);
+    act(() => root.render(<RunsPage notify={vi.fn()} pendingRunId={fullRun.id} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(container.textContent).toContain("第一行\n第二行完整请求");
+    expect(container.textContent).toContain("完整任务描述");
+    expect(container.textContent).toContain("该节点正在执行，尚无输出");
+    expect(container.querySelector(".run-context-warning")).toBeNull();
+    act(() => root.unmount()); container.remove(); vi.unstubAllGlobals();
+  });
 });
 
 const deliveryRun: Run = {

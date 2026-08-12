@@ -2472,6 +2472,13 @@ export class WorkbenchService {
       status: "queued",
       phase: "queued",
       requestSummary: summarizeInput(options.input),
+      requestText: typeof options.input.message === "string" ? options.input.message : undefined,
+      taskDescription: typeof options.input.taskDescription === "string"
+        ? options.input.taskDescription
+        : typeof options.input.context === "object" && options.input.context !== null && !Array.isArray(options.input.context)
+          && typeof (options.input.context as JsonObject).taskDescription === "string"
+          ? String((options.input.context as JsonObject).taskDescription)
+          : undefined,
       requestContext: typeof options.input.context === "object"
         && options.input.context !== null
         && !Array.isArray(options.input.context)
@@ -7530,7 +7537,17 @@ export class WorkbenchService {
       }
       const invocation = Object.values(this.snapshot().invocations).find((candidate) => candidate.runId === id);
       const enriched = this.classifyRunSummary(run, invocation);
-      return Object.keys(effectiveProfiles).length > 0 ? { ...enriched, effectiveProfiles } : enriched;
+      const invocationContext = invocation ? {
+        id: invocation.id,
+        requestSummary: invocation.requestSummary,
+        ...(invocation.requestText ? { requestText: invocation.requestText } : {}),
+        ...(invocation.taskDescription ? { taskDescription: invocation.taskDescription } : {})
+      } : undefined;
+      return {
+        ...enriched,
+        ...(invocationContext ? { invocation: invocationContext } : {}),
+        ...(Object.keys(effectiveProfiles).length > 0 ? { effectiveProfiles } : {})
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`run not found: ${id}`);
       throw error;

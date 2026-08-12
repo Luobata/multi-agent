@@ -88,7 +88,10 @@ export function pageFromHash(hash = window.location.hash): PageRoute {
     const section = params.get("section");
     return { page: "requirement", requirementId: decodeURIComponent(second), ...(section === "overview" || section === "run" || section === "acceptance" ? { section } : {}) };
   }
-  if (head === "runs") return { page: "runs", ...(params.get("run") ? { runId: params.get("run")! } : {}) };
+  if (head === "runs") {
+    const runId = second ? decodeURIComponent(second) : params.get("run");
+    return { page: "runs", ...(runId ? { runId } : {}) };
+  }
   return TOP_LEVEL_PAGES.includes(head as Page)
     ? { page: head as Page, ...(params.get("item") ? { recordId: params.get("item")! } : {}) }
     : { page: "office" };
@@ -182,6 +185,14 @@ export function App() {
   const [notice, setNotice] = useState<{ message: string; kind: "success" | "error"; retryRefresh?: boolean }>();
   const [commandOpen, setCommandOpen] = useState(false);
   const lastHashByPage = useRef<Partial<Record<Page, string>>>(readNavigationMemory());
+  const [pendingRunId, setPendingRunId] = useState("");
+  const studioOrigin = useRef<{ scrollY: number; cardRunId: string } | undefined>((() => {
+    if (typeof window === "undefined") return undefined;
+    try {
+      const value = window.sessionStorage.getItem("workbench.studioRunOrigin");
+      return value ? JSON.parse(value) as { scrollY: number; cardRunId: string } : undefined;
+    } catch { return undefined; }
+  })());
   const [syncing, setSyncing] = useState(false);
   const [theme, setTheme] = useState<ThemeName>(() => (typeof window === "undefined" ? DEFAULT_THEME : readTheme()));
   useEffect(() => { applyTheme(theme); }, [theme]);
@@ -296,6 +307,18 @@ export function App() {
     };
   }, [page, route.spaceId, route.requirementId, route.runId, route.recordId, route.section]);
   useEffect(() => {
+    if (page !== "office" || !studioOrigin.current) return;
+    const origin = studioOrigin.current;
+    studioOrigin.current = undefined;
+    window.sessionStorage.removeItem("workbench.studioRunOrigin");
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: origin.scrollY, behavior: "auto" });
+      const card = document.querySelector<HTMLElement>(`.studio-card[data-run-id="${origin.cardRunId}"]`);
+      (card ?? document.querySelector<HTMLElement>("#office-studio-heading"))?.focus();
+      if (!card) notify("原运行已移出当前工作室，可在运行卷宗继续查阅。", "success");
+    });
+  }, [page, data.activity.invocations, notify]);
+  useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -379,7 +402,12 @@ export function App() {
       <div className="nav-foot"><span>KG</span><div><strong>Kindergarten Workbench</strong><small>班级在册 · A2A 1.0</small></div></div>
     </nav>
     <DaemonGate status={daemon}><div id="main-content" className="app-content" tabIndex={-1}>
-      {page === "office" && <OfficePage data={data} streamStatus={activityStream} />}
+      {page === "office" && <OfficePage data={data} streamStatus={activityStream} onOpenRun={(runId) => {
+        studioOrigin.current = { scrollY: window.scrollY, cardRunId: runId };
+        window.sessionStorage.setItem("workbench.studioRunOrigin", JSON.stringify(studioOrigin.current));
+        setPendingRunId(runId);
+        window.location.hash = `runs/${encodeURIComponent(runId)}`;
+      }} />}
       {page === "employees" && <EmployeePage data={data} refresh={refresh} notify={notify} focusedEmployeeId={route.recordId} onSelectEmployee={(employeeId) => go(`employees?item=${encodeURIComponent(employeeId)}`)} />}
       {page === "projects" && (daemon === "online"
         ? <ProjectsHubPage data={data} refresh={refresh} go={go} notify={notify} />
@@ -389,8 +417,8 @@ export function App() {
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
-      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} onSelectRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} dashboard={dashboardService} />}
-      {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} />}
+      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} pendingRunId={route.runId ?? pendingRunId} onConsumePending={() => setPendingRunId("")} onSelectRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} dashboard={dashboardService} fromStudio={Boolean(studioOrigin.current && (route.runId ?? pendingRunId))} onReturnOffice={() => { if (studioOrigin.current && window.history.length > 1) window.history.back(); else window.location.hash = "office"; }} />}
+      {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
       {page === "dashboard" && <DashboardPage go={go} />}
       {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} />}
