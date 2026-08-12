@@ -144,9 +144,16 @@ export interface Requirement {
   owner: string;
   advancement?: RequirementAdvancement;
   evidenceCapture?: RequirementEvidenceCapture;
+  delivery?: RequirementDeliveryProgress;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string | null;
+}
+
+export interface RequirementDeliveryProgress {
+  runId: string;
+  status: "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance";
+  updatedAt: string;
 }
 
 export interface RequirementEvidenceCapture {

@@ -855,11 +855,15 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
             ? "acceptance"
             : "merging";
         const nextException = status === "conflict" ? "blocked" : null;
-        if (requirement.lane === lane && requirement.exception === nextException) return requirementSummary(requirement);
+        if (requirement.lane === lane
+          && requirement.exception === nextException
+          && requirement.delivery?.runId === runId
+          && requirement.delivery.status === status) return requirementSummary(requirement);
         const from = requirementLaneLabel(requirement.lane);
         requirement.lane = lane;
         requirement.exception = nextException;
         requirement.updatedAt = touch();
+        requirement.delivery = { runId, status, updatedAt: requirement.updatedAt };
         record(
           status === "merged" ? "完成合入" : status === "conflict" ? "合入冲突" : lane === "acceptance" ? "退回验收" : "进入待合入",
           requirement.code,

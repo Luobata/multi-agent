@@ -111,6 +111,19 @@ function exceptionChip(exception: Requirement["exception"]) {
   return null;
 }
 
+function deliveryProgressChip(requirement: Requirement) {
+  if (requirement.lane !== "merging" || !requirement.delivery) return null;
+  const labels: Record<NonNullable<Requirement["delivery"]>["status"], string> = {
+    "queued-for-merge": "等待串行合入",
+    retesting: "合入前重新验收",
+    merging: "正在写入目标分支",
+    merged: "合入完成",
+    conflict: "冲突处理中",
+    "returned-to-acceptance": "已退回验收"
+  };
+  return <span className="board-evidence-capture" role="status">{labels[requirement.delivery.status]}</span>;
+}
+
 export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", projects: connectedProjects = [], invocations = [], humanDecisionRequests = [], onOpenRun }: {
   spaceId?: string;
   go: (hash: string) => void;
@@ -430,8 +443,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
                         <span className={`board-priority board-priority--${requirement.priority}`}>{REQUIREMENT_PRIORITY_LABELS[requirement.priority]}</span>
                         <span>{requirementOwnerLabel(requirement)}</span>
                         <time>{formatTime(requirement.updatedAt)}</time>
+                        {deliveryProgressChip(requirement)}
                         {(requirement.evidenceCapture?.status === "queued" || requirement.evidenceCapture?.status === "running") && <span className="board-evidence-capture" role="status">验收补采中</span>}
-                        {requirement.evidenceCapture?.status === "failed" && <span className="board-evidence-capture board-evidence-capture--failed" role="status">验收补采失败</span>}
+                        {requirement.evidenceCapture?.status === "failed" && <span className="board-evidence-capture board-evidence-capture--failed" role="status">验收证据待处理{requirement.evidenceCapture.mediaCount ? ` · 已保留 ${requirement.evidenceCapture.mediaCount} 项` : ""}</span>}
                         {exceptionChip(requirement.exception)}
                       </footer>
                     </button>

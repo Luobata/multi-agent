@@ -368,15 +368,19 @@ function RunDeliveryPanel({
   const evidenceRerun = preview.delivery?.evidenceRerun;
   const conflictResolution = preview.delivery?.conflictResolution;
   const evidenceBusy = evidenceRerun?.status === "queued" || evidenceRerun?.status === "running";
+  const evidenceFailed = evidenceRerun?.status === "failed";
+  const evidenceMissing = preview.evidence.assets.length === 0;
+  const evidenceNeedsAttention = evidenceMissing || evidenceFailed;
   const conflictBusy = conflict && ["resolving", "retesting", "leader-review"].includes(conflictResolution?.status ?? "");
   const actionable = !merged && !discarded && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept" || preview.status === "returned-to-acceptance");
   const canQueueMerge = preview.eligible && !merged && !discarded && !mergeBusy && !evidenceBusy && preview.status !== "conflict";
+  const canRerunEvidence = evidenceNeedsAttention && !evidenceBusy && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && !discarded && !merged;
   const diff = preview.changes.unifiedDiff;
   return <div className="run-delivery-panel">
     {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>{conflictResolution?.status === "resolving" ? "原领队正在规划并委派冲突修复" : conflictResolution?.status === "retesting" ? "冲突已解决，正在回跑测试" : conflictResolution?.status === "leader-review" ? "测试已通过，等待原领队放行" : conflictResolution?.status === "failed" ? "AI 冲突处理需要介入" : "目标分支存在合并冲突"}</strong><p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p>{conflictResolution?.leaderPlanRunId && <small>领队计划 Run：<code>{conflictResolution.leaderPlanRunId}</code></small>}{conflictResolution?.executionRoleId && <small>执行角色：<code>{conflictResolution.executionRoleId}</code></small>}{conflictResolution?.resolutionRunId && <small>工程修复 Run：<code>{conflictResolution.resolutionRunId}</code></small>}{conflictResolution?.testRunId && <small>复测 Run：<code>{conflictResolution.testRunId}</code></small>}{conflictResolution?.leaderReviewRunId && <small>领队复验 Run：<code>{conflictResolution.leaderReviewRunId}</code></small>}{conflictResolution?.status === "failed" && <button type="button" className="button secondary" disabled={conflictRetrying} aria-busy={conflictRetrying} onClick={onRetryConflict}>{conflictRetrying ? "正在重新排队…" : "重新让原领队处理冲突"}</button>}{conflictRetryError && <small className="inline-error">{conflictRetryError}</small>}</div>}
     {queued && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>已进入待合入队列</strong><p>{preview.delivery?.message ?? "同一目标分支上的候选会按批准顺序串行处理。"}</p></div>}
-    {retesting && <div className="run-delivery-callout run-delivery-callout--retesting" role="status"><strong>目标分支变化，正在重测</strong><p>{preview.delivery?.message ?? "系统正在临时集成 worktree 上执行独立回归，不会改动真实目标分支。"}</p></div>}
-    {merging && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>重测通过，正在合入</strong><p>{preview.delivery?.message ?? "正在写入已批准的目标分支。"}</p></div>}
+    {retesting && <div className="run-delivery-callout run-delivery-callout--retesting" role="status"><strong>{conflictResolution ? "冲突处理 2/3 · 正在重新验收" : "合入检查 1/2 · 目标变化后正在重测"}</strong><p>{preview.delivery?.message ?? "系统正在隔离环境执行独立回归。"}</p><small>{conflictResolution ? "当前尚未写入目标分支；独立测试通过后还需原领队复验，放行后才会自动合入。" : "当前尚未写入目标分支；独立回归通过后才会进入真正的合入阶段。"}</small></div>}
+    {merging && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>合入处理 3/3 · 正在写入目标分支</strong><p>{preview.delivery?.message ?? "测试与复验已经通过，正在写入已批准的目标分支。"}</p></div>}
     {returned && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>自动合入已退回待验收</strong><p>{preview.delivery?.message ?? "候选 worktree 已保留，请处理异常后重新验收。"}</p></div>}
     {merged && <div className="run-delivery-callout run-delivery-callout--merged"><strong>交付已合并</strong><p>{preview.delivery?.mergeCommit ? <>Merge commit：<code>{preview.delivery.mergeCommit}</code></> : "合并记录已归档。"}</p></div>}
     {kept && <div className="run-delivery-callout run-delivery-callout--kept"><strong>交付已人工保留</strong><p>{preview.delivery?.humanDecision ? <>由 <code>{preview.delivery.humanDecision.actor}</code> 于 {formatTime(preview.delivery.humanDecision.at)} 标记保留；候选 worktree 原样保留，未执行 merge 或 push。{preview.delivery.humanDecision.note ? <> 备注:{preview.delivery.humanDecision.note}</> : null}</> : (preview.delivery?.message ?? "候选 worktree 已保留，未执行 merge 或 push。")}</p></div>}
@@ -402,9 +406,13 @@ function RunDeliveryPanel({
     </div>}
     <div className="run-delivery-evidence">
       <div className="run-delivery-evidence-head"><strong>Evidence wall</strong><span>{preview.evidence.assets.length} 项媒体证据</span></div>
-      {preview.evidence.assets.length === 0
-        ? <div className="run-delivery-evidence-empty"><p>没有可展示的截图或录屏。结构化 E2E 仍会保留，但你可以让独立测试角色补采真实界面证据。</p><button type="button" className="button secondary" disabled={evidenceBusy || mergeBusy || !preview.worktreePath || discarded || merged} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "正在补采截图…" : evidenceRerun?.status === "failed" ? "重新补采验收截图" : "补采验收截图"}</button>{evidenceRerun?.message && <small className={evidenceRerun.status === "failed" ? "inline-error" : ""}>{evidenceRerun.message}</small>}{evidenceRerunError && <small className="inline-error" role="alert">{evidenceRerunError}</small>}</div>
-        : <div className="run-delivery-evidence-wall">{preview.evidence.assets.map((asset) => <RunEvidenceCard key={asset.id} asset={asset} />)}</div>}
+      {evidenceNeedsAttention && <div className={`run-delivery-evidence-attention${evidenceFailed ? " run-delivery-evidence-attention--interrupted" : ""}`} role="status">
+        <div><strong>{evidenceFailed ? `截图补采未完整结束${preview.evidence.assets.length > 0 ? `，已保留 ${preview.evidence.assets.length} 项` : ""}` : "缺少可查看的截图或录屏"}</strong><p>{evidenceFailed ? (evidenceRerun.message ?? "上一轮补采被中断，现有文件可人工查看，但不代表完整补采已经通过。") : "结构化 E2E 已保留；是否让项目 test-engineer 重新走一遍验收路径并补采真实界面证据？"}</p></div>
+        <button type="button" className="button secondary" disabled={!canRerunEvidence} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "test-engineer 补采中…" : evidenceFailed ? "重新运行 test-engineer 补采" : "让 test-engineer 补采证据"}</button>
+        {!canRerunEvidence && mergeBusy && <small>当前合入流程正在重测或写入，不能并行启动另一轮补采；若交付退回验收，可在这里直接重跑。</small>}
+        {evidenceRerunError && <small className="inline-error" role="alert">{evidenceRerunError}</small>}
+      </div>}
+      {preview.evidence.assets.length > 0 && <div className="run-delivery-evidence-wall">{preview.evidence.assets.map((asset) => <RunEvidenceCard key={asset.id} asset={asset} />)}</div>}
     </div>
     {boardSubmitError && <div className="inline-error" role="alert">{boardSubmitError}</div>}
     {(preview.eligible || actionable || canSubmitToBoard) && !discarded && <div className="run-delivery-actions">
@@ -589,6 +597,7 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   const [deciding, setDeciding] = useState(false);
   const [decisionError, setDecisionError] = useState("");
   const [decisionRevision, setDecisionRevision] = useState(0);
+  const detailRunIdRef = useRef("");
   // A deep link should reveal its Run once when the operator enters the dossier.
   // Activity SSE updates also refresh this list; treating every refresh as a new
   // navigation would repeatedly scroll the operator away from the evidence they
@@ -628,9 +637,18 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     scrollRecordIntoView(requestedRunId);
   }, [mode, requestedRunId, runs]);
   useEffect(() => {
-    if (!selectedId) { setDetail(undefined); return; }
+    if (!selectedId) {
+      detailRunIdRef.current = "";
+      setDetail(undefined);
+      return;
+    }
     let current = true;
-    setDetail(undefined);
+    // Clear only when the operator selects another Run. Activity SSE updates refresh the same
+    // dossier in the background; blanking it first changes page height and visibly jumps scroll.
+    if (detailRunIdRef.current !== selectedId) {
+      detailRunIdRef.current = selectedId;
+      setDetail(undefined);
+    }
     api<Run>(`/api/runs/${encodeURIComponent(selectedId)}`)
       .then((value) => { if (current) setDetail(value); })
       .catch((error: unknown) => { if (current) notify(error instanceof Error ? error.message : String(error), "error"); });
@@ -651,7 +669,8 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
       setMergePreview(undefined);
       return;
     }
-    let current = true;
+    // Form state belongs to one selected delivery. Background delivery polling must never reset
+    // an open dossier or its controls.
     setMergePreview(undefined);
     setMergePreviewLoading(true);
     setMergeOpen(false);
@@ -667,6 +686,11 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     setBoardSubmitError("");
     setEvidenceRerunError("");
     setConflictRetryError("");
+  }, [selected?.id]);
+  useEffect(() => {
+    if (!selected?.id) return;
+    let current = true;
+    setMergePreviewLoading(true);
     api<RunMergePreview>(`/api/runs/${encodeURIComponent(selected.id)}/merge-preview`)
       .then((value) => { if (current) setMergePreview(value); })
       .catch((error: unknown) => { if (current) notify(error instanceof Error ? error.message : String(error), "error"); })

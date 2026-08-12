@@ -7693,11 +7693,16 @@ export class WorkbenchService {
     const { run, runDir } = await this.getRunDeliveryContext(id);
     const preview = await previewRunMerge(run, runDir);
     if (!preview.worktreePath) throw new Error("该 Run 没有可用于截图验收的 worktree");
-    if (preview.evidence.assets.length > 0) throw new Error("该 Run 已有媒体证据，无需重复补采");
+    const current = preview.delivery?.evidenceRerun;
+    // A daemon restart can recover partial media while leaving the capture attempt failed.
+    // Those files stay available for manual inspection, but they must not prevent the operator
+    // from requesting one complete, independently verified capture attempt.
+    if (preview.evidence.assets.length > 0 && current?.status !== "failed") {
+      throw new Error("该 Run 已有完整媒体证据，无需重复补采");
+    }
     if (["queued-for-merge", "retesting", "merging", "merged", "discarded"].includes(preview.status)) {
       throw new Error("该交付已进入合入或终态，不能再启动截图补采");
     }
-    const current = preview.delivery?.evidenceRerun;
     if (current?.status === "queued" || current?.status === "running") {
       if (this.evidenceReruns.has(id)) return preview.delivery!;
       await this.recoverInterruptedEvidenceRerun(runDir, id, preview.worktreePath, current);

@@ -346,7 +346,8 @@ describe("RunsPage delivery acceptance", () => {
   let root: Root;
   const fetchMock = vi.fn();
   const notify = vi.fn();
-  let deliveryStatus: "base" | "conflict" | "conflict-failed" | "kept" | "discarded" = "base";
+  let deliveryStatus: "base" | "conflict" | "conflict-failed" | "evidence-failed" | "retesting" | "kept" | "discarded" = "base";
+  let heldMergePreview: Promise<{ ok: boolean; status: number; json: () => Promise<{ data: RunMergePreview }> }> | undefined;
 
   beforeEach(async () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -359,10 +360,12 @@ describe("RunsPage delivery acceptance", () => {
       value(this: HTMLDialogElement) { this.removeAttribute("open"); }
     });
     deliveryStatus = "base";
+    heldMergePreview = undefined;
     fetchMock.mockImplementation((input: RequestInfo, init?: RequestInit) => {
       const url = String(input);
       if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [deliveryRun] }) });
       if (url.endsWith("/merge-preview")) {
+        if (heldMergePreview) return heldMergePreview;
         const preview = deliveryStatus === "conflict" || deliveryStatus === "conflict-failed"
           ? {
             ...eligiblePreview,
@@ -386,6 +389,39 @@ describe("RunsPage delivery acceptance", () => {
               message: "CONFLICT (content): Merge conflict in client/src/RunsPage.tsx"
             }
           }
+          : deliveryStatus === "evidence-failed"
+            ? {
+              ...eligiblePreview,
+              delivery: {
+                runId: deliveryRun.id,
+                status: "awaiting-acceptance" as const,
+                updatedAt: "2026-08-06T06:05:00.000Z",
+                evidenceRerun: {
+                  status: "failed" as const,
+                  actor: "workbench-operator",
+                  requestedAt: "2026-08-06T05:50:00.000Z",
+                  updatedAt: "2026-08-06T06:05:00.000Z",
+                  mediaCount: 2,
+                  message: "daemon 重启中断了补采；已保留 2 项媒体证据。"
+                }
+              }
+            }
+            : deliveryStatus === "retesting"
+              ? {
+                ...eligiblePreview,
+                status: "retesting" as const,
+                delivery: {
+                  runId: deliveryRun.id,
+                  status: "retesting" as const,
+                  updatedAt: "2026-08-06T06:05:00.000Z",
+                  message: "rebase 已完成，正在回跑独立测试。",
+                  conflictResolution: {
+                    status: "retesting" as const,
+                    targetCommit: "target",
+                    updatedAt: "2026-08-06T06:05:00.000Z"
+                  }
+                }
+              }
           : deliveryStatus === "kept"
             ? {
               ...eligiblePreview,
@@ -510,7 +546,7 @@ describe("RunsPage delivery acceptance", () => {
       const dashboard = { syncRequirementEvidenceCapture: vi.fn().mockResolvedValue(projected) } as unknown as DashboardService;
       const onDashboardSync = vi.fn();
       await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} onDashboardSync={onDashboardSync} />); await Promise.resolve(); });
-      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "补采验收截图");
+      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
       expect(rerun).toBeTruthy();
       await act(async () => { rerun?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
       expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
@@ -519,6 +555,49 @@ describe("RunsPage delivery acceptance", () => {
     } finally {
       eligiblePreview.evidence.assets = originalAssets;
     }
+  });
+
+  it("explains an interrupted capture beside recovered media and lets the operator rerun it", async () => {
+    deliveryStatus = "evidence-failed";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="evidence-failed" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("已保留 2 项");
+    expect(container.querySelector(".run-delivery-evidence-wall")).toBeTruthy();
+    const retry = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent === "重新运行 test-engineer 补采");
+    expect(retry?.disabled).toBe(false);
+    await act(async () => { retry?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(fetchMock.mock.calls.some(([input, init]) => (
+      String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST"
+    ))).toBe(true);
+  });
+
+  it("shows conflict revalidation as a pre-merge stage and keeps the dossier stable while polling", async () => {
+    deliveryStatus = "retesting";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="retesting" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.textContent).toContain("冲突处理 2/3 · 正在重新验收");
+    expect(container.textContent).toContain("当前尚未写入目标分支");
+
+    let release!: (value: { ok: boolean; status: number; json: () => Promise<{ data: RunMergePreview }> }) => void;
+    heldMergePreview = new Promise((resolve) => { release = resolve; });
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="poll-in-flight" />);
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("冲突处理 2/3 · 正在重新验收");
+    expect(container.querySelector(".run-delivery-evidence-wall")).toBeTruthy();
+
+    heldMergePreview = undefined;
+    await act(async () => {
+      release({ ok: true, status: 200, json: async () => ({ data: eligiblePreview }) });
+      await Promise.resolve();
+    });
   });
 
   it("lets the operator retry a failed conflict through the original leader workflow", async () => {

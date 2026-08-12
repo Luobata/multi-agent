@@ -225,6 +225,21 @@ describe("run delivery daemon routes", () => {
     expect((recoveredResponse.json as { data: RunMergePreview }).data.evidence.assets.map((candidate) => candidate.name))
       .toContain("001-recovered.png");
 
+    // Recovered files are partial evidence from an interrupted attempt. They remain viewable but
+    // must not suppress the operator's explicit request for a complete replacement capture.
+    const retriedCapture = await invokeRoute(app, "post", "/api/runs/:id/evidence-rerun", {
+      params: { id: runId },
+      body: { actor: "daemon-reviewer" }
+    });
+    expect(retriedCapture.status).toBe(202);
+    expect(retriedCapture.json).toMatchObject({ data: { evidenceRerun: { status: "queued" } } });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const capturePreview = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
+      const captureStatus = (capturePreview.json as { data: RunMergePreview }).data.delivery?.evidenceRerun?.status;
+      if (captureStatus !== "queued" && captureStatus !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
     const kept = await invokeRoute(app, "post", "/api/runs/:id/keep", {
       params: { id: runId },
       body: { actor: "daemon-reviewer", note: "retain while reviewing" }
