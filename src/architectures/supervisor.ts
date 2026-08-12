@@ -1009,10 +1009,11 @@ async function executeGateActivation(
   round: number,
   parentNodeId: string,
   deadlineAt: number | undefined,
-  sequence: number
-): Promise<string | undefined> {
+  sequence: number,
+  upstreamEvidenceNodeIds: string[] = []
+): Promise<string[]> {
   tracker.activations.set(activation.key, activation);
-  if (tracker.passed.has(activation.key)) return undefined;
+  if (tracker.passed.has(activation.key)) return [];
   const sourceRuntimeRoles = new Set(
     activation.sourceNodeIds.flatMap((sourceNodeId) => {
       const source = context.plan.nodes.find((candidate) => candidate.id === sourceNodeId);
@@ -1051,97 +1052,159 @@ async function executeGateActivation(
       reason: tracker.reason
     });
     await context.persist();
-    return undefined;
+    return [];
   }
   const role = context.loaded.manifest.roles[executor.role];
   if (!role) throw new Error(`gate executor runtime role not found: ${executor.role}`);
   const regressionImpact = sourceRegressionImpact(context, activation.sourceNodeIds);
-  const gateTask = scopedGateInstructions(tracker.gate.instructions, regressionImpact);
-  const node: ExecutionPlanNode = {
-    id: `gate-${tracker.gate.id}-r${round}-${sequence}`,
-    role: executor.role,
-    provider: role.provider,
-    needs: activation.sourceNodeIds,
-    with: {
-      __delegatedRoleId: executor.roleId,
-      __todoId: "",
-      __delegatedTask: gateTask,
-      __memberSession: null,
-      __requiredCapabilities: [tracker.gate.requiredCapability],
-      __workKind: gateWorkKind(tracker.gate),
-      __changeSet: "",
-      __regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
-      __delegatedContext: regressionImpact ? { regressionImpact: regressionImpact as unknown as JsonValue } : {},
-      __supervisorSummary: `Execute required workflow Gate ${tracker.gate.id}.`,
-      __gateExecution: {
+  const baseGateTask = [
+    scopedGateInstructions(tracker.gate.instructions, regressionImpact),
+    ...(tracker.gate.requiredCapability === "quality.audit" && upstreamEvidenceNodeIds.length > 0
+      ? [
+          "",
+          "Upstream quality Gate evidence is attached in `needs`.",
+          "Audit the requirement, candidate diff, test scope, and recorded evidence. Do not repeat browser or automated regression that already passed against the same candidate unless you identify a concrete uncovered risk; run only the smallest targeted check needed to resolve that risk."
+        ]
+      : [])
+  ].join("\n");
+  const evidenceNeeds = [...new Set([...activation.sourceNodeIds, ...upstreamEvidenceNodeIds])];
+  const requiredChecks = regressionImpact?.requiredChecks ?? [];
+  const shouldShard = tracker.gate.requiredCapability === "quality.test"
+    && (regressionImpact?.regressionScope === "package" || regressionImpact?.regressionScope === "full")
+    && requiredChecks.length >= 4;
+  const shardCount = shouldShard ? Math.min(3, Math.ceil(requiredChecks.length / 2)) : 1;
+  const checkShards = Array.from({ length: shardCount }, (_, index) => (
+    shouldShard
+      ? requiredChecks.slice(
+          index * Math.ceil(requiredChecks.length / shardCount),
+          (index + 1) * Math.ceil(requiredChecks.length / shardCount)
+        )
+      : []
+  )).filter((checks, index) => index === 0 || checks.length > 0);
+  const nodes = checkShards.map((checks, index): ExecutionPlanNode => {
+    const shard = checkShards.length > 1 ? { index: index + 1, total: checkShards.length, requiredChecks: checks } : undefined;
+    const gateTask = shard
+      ? [
+          baseGateTask,
+          "",
+          `Quality Gate shard ${shard.index}/${shard.total}. Execute only these checks:`,
+          ...shard.requiredChecks.map((check) => `- ${check}`),
+          "Do not execute checks assigned to another shard; return this shard's own reproducible evidence."
+        ].join("\n")
+      : baseGateTask;
+    const node: ExecutionPlanNode = {
+      id: `gate-${tracker.gate.id}-r${round}-${sequence}${shard ? `-s${shard.index}` : ""}`,
+      role: executor.role,
+      provider: role.provider,
+      needs: evidenceNeeds,
+      with: {
+        __delegatedRoleId: executor.roleId,
+        __todoId: "",
+        __delegatedTask: gateTask,
+        __memberSession: null,
+        __requiredCapabilities: [tracker.gate.requiredCapability],
+        __workKind: gateWorkKind(tracker.gate),
+        __changeSet: "",
+        __regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
+        __delegatedContext: {
+          ...(regressionImpact ? { regressionImpact: regressionImpact as unknown as JsonValue } : {}),
+          ...(upstreamEvidenceNodeIds.length > 0 ? { upstreamGateEvidenceNodeIds: upstreamEvidenceNodeIds } : {}),
+          ...(shard ? { gateShard: shard } : {})
+        },
+        __supervisorSummary: `Execute required workflow Gate ${tracker.gate.id}.`,
+        ...supervisorWith(value, round, [], gateSnapshot(new Map([[tracker.gate.id, tracker]])))
+      },
+      metadata: {
+        kind: "gate",
+        roleId: executor.roleId,
+        round,
+        parentNodeId,
         gateId: tracker.gate.id,
         requiredCapability: tracker.gate.requiredCapability,
-        mode: tracker.gate.mode,
-        required: tracker.gate.required,
-        instructions: tracker.gate.instructions,
-        regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
         activation: activation.key,
-        sourceNodeIds: activation.sourceNodeIds
-      },
-      ...supervisorWith(value, round, [], gateSnapshot(new Map([[tracker.gate.id, tracker]])))
-    },
-    metadata: {
-      kind: "gate",
-      roleId: executor.roleId,
-      round,
-      parentNodeId,
+        ...(shard ? { gateShardIndex: shard.index, gateShardTotal: shard.total } : {})
+      }
+    };
+    // supervisorWith supplies a null default; Gate execution must win after common context assembly.
+    node.with.__gateExecution = {
       gateId: tracker.gate.id,
       requiredCapability: tracker.gate.requiredCapability,
-      activation: activation.key
-    }
-  };
-  // supervisorWith supplies a null default; Gate execution must win after the common context is assembled.
-  node.with.__gateExecution = {
-    gateId: tracker.gate.id,
-    requiredCapability: tracker.gate.requiredCapability,
-    mode: tracker.gate.mode,
-    required: tracker.gate.required,
-    instructions: tracker.gate.instructions,
-    regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
-    activation: activation.key,
-    sourceNodeIds: activation.sourceNodeIds
-  };
-  await context.scheduleNode(node);
-  const result = await context.executeNode(node, { dependencyFailure: "observe", deadlineAt });
-  let passed = result.status === "passed";
-  if (passed && executor.roleId === "supervisor") {
-    const gateDecision = decision(result.output);
-    passed = gateDecision?.action === "satisfy-gate" && gateDecision.gateId === tracker.gate.id;
-  }
-  let validatorReason: string | undefined;
-  if (passed) {
-    const validator = resolveGateValidator(tracker.gate);
-    if (validator) {
-      const verdict = validator(tracker.gate, result.output ?? null);
-      if (!verdict.passed) { passed = false; validatorReason = verdict.reason; }
-    }
-  }
-  tracker.executions.push({
-    nodeId: node.id,
-    executorRoleId: executor.roleId,
-    executorRuntimeRole: executor.role,
-    activation: activation.key,
-    sourceNodeIds: activation.sourceNodeIds,
-    status: passed ? "passed" : result.status,
-    evidence: result.output ?? null,
-    error: passed ? null : validatorReason ?? result.error ?? (executor.roleId === "supervisor" ? "supervisor fallback did not return satisfy-gate" : null)
+      mode: tracker.gate.mode,
+      required: tracker.gate.required,
+      instructions: tracker.gate.instructions,
+      regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
+      activation: activation.key,
+      sourceNodeIds: activation.sourceNodeIds,
+      upstreamEvidenceNodeIds,
+      ...(shard ? { shard } : {})
+    };
+    return node;
   });
-  if (passed) tracker.passed.add(activation.key);
-  else tracker.reason = validatorReason ?? `gate ${tracker.gate.id} activation ${activation.key} has not passed`;
+  for (const node of nodes) await context.scheduleNode(node);
+  // Deliberately advance broad validation one bounded shard at a time. This avoids turning one
+  // package-wide request into a provider/resource burst and leaves an individual durable node
+  // checkpoint after every completed shard.
+  const results: Array<{ node: ExecutionPlanNode; result: NodeRunResult }> = [];
+  for (const node of nodes) {
+    results.push({
+      node,
+      result: await context.executeNode(node, { dependencyFailure: "observe", deadlineAt })
+    });
+  }
+  let activationPassed = true;
+  const errors: string[] = [];
+  for (const { node, result } of results) {
+    let passed = result.status === "passed";
+    if (passed && executor.roleId === "supervisor") {
+      const gateDecision = decision(result.output);
+      passed = gateDecision?.action === "satisfy-gate" && gateDecision.gateId === tracker.gate.id;
+    }
+    let validatorReason: string | undefined;
+    if (passed) {
+      const validator = resolveGateValidator(tracker.gate);
+      if (validator) {
+        const verdict = validator(tracker.gate, result.output ?? null);
+        if (!verdict.passed) { passed = false; validatorReason = verdict.reason; }
+      }
+    }
+    const error = passed
+      ? null
+      : validatorReason ?? result.error ?? (executor.roleId === "supervisor" ? "supervisor fallback did not return satisfy-gate" : null);
+    if (!passed) {
+      activationPassed = false;
+      if (error) errors.push(error);
+    }
+    tracker.executions.push({
+      nodeId: node.id,
+      executorRoleId: executor.roleId,
+      executorRuntimeRole: executor.role,
+      activation: activation.key,
+      sourceNodeIds: activation.sourceNodeIds,
+      status: passed ? "passed" : result.status,
+      evidence: result.output ?? null,
+      error
+    });
+    if (nodes.length > 1) {
+      await context.emit(passed ? "gate.shard.passed" : "gate.shard.unsatisfied", node.id, {
+        gateId: tracker.gate.id,
+        activation: activation.key,
+        executorRoleId: executor.roleId,
+        status: result.status
+      });
+    }
+  }
+  if (activationPassed) tracker.passed.add(activation.key);
+  else tracker.reason = errors.join("; ") || `gate ${tracker.gate.id} activation ${activation.key} has not passed`;
   trackerStatus(tracker);
-  await context.emit(passed ? "gate.passed" : "gate.unsatisfied", node.id, {
+  await context.emit(activationPassed ? "gate.passed" : "gate.unsatisfied", nodes.at(-1)?.id, {
     gateId: tracker.gate.id,
     activation: activation.key,
     executorRoleId: executor.roleId,
-    status: result.status
+    status: activationPassed ? "passed" : "blocked",
+    shards: nodes.length
   });
   await context.persist();
-  return node.id;
+  return nodes.map((node) => node.id);
 }
 
 async function runAfterDelegationGates(
@@ -1162,7 +1225,7 @@ async function runAfterDelegationGates(
       const changeSets = codeChangeSetRecords(allDelegations);
       if (changeSets.length < 2) continue;
       const key = `change-sets:${changeSets.map((record) => record.assignment.changeSet!).sort().join(",")}`;
-      const nodeId = await executeGateActivation(
+      const executedNodeIds = await executeGateActivation(
         context,
         value,
         tracker,
@@ -1172,12 +1235,12 @@ async function runAfterDelegationGates(
         deadlineAt,
         ++sequence.value
       );
-      if (nodeId) nodeIds.push(nodeId);
+      nodeIds.push(...executedNodeIds);
       continue;
     }
     for (const record of completed) {
       if (record.result.status !== "passed" || !gateMatchesAssignment(tracker.gate, record.assignment)) continue;
-      const nodeId = await executeGateActivation(
+      const executedNodeIds = await executeGateActivation(
         context,
         value,
         tracker,
@@ -1187,7 +1250,7 @@ async function runAfterDelegationGates(
         deadlineAt,
         ++sequence.value
       );
-      if (nodeId) nodeIds.push(nodeId);
+      nodeIds.push(...executedNodeIds);
     }
   }
   return nodeIds;
@@ -1204,14 +1267,15 @@ async function runCompletionGates(
   sequence: { value: number }
 ): Promise<string[]> {
   const nodeIds: string[] = [];
+  const upstreamEvidenceNodeIds: string[] = [];
   for (const tracker of trackers.values()) {
     if (tracker.gate.mode === "after-each-delegation") {
       for (const activation of tracker.activations.values()) {
         if (tracker.passed.has(activation.key)) continue;
-        const nodeId = await executeGateActivation(
+        const executedNodeIds = await executeGateActivation(
           context, value, tracker, activation, round, parentNodeId, deadlineAt, ++sequence.value
         );
-        if (nodeId) nodeIds.push(nodeId);
+        nodeIds.push(...executedNodeIds);
       }
       continue;
     }
@@ -1241,10 +1305,19 @@ async function runCompletionGates(
       }
     }
     if (!activation) continue;
-    const nodeId = await executeGateActivation(
-      context, value, tracker, activation, round, parentNodeId, deadlineAt, ++sequence.value
+    const executedNodeIds = await executeGateActivation(
+      context,
+      value,
+      tracker,
+      activation,
+      round,
+      parentNodeId,
+      deadlineAt,
+      ++sequence.value,
+      upstreamEvidenceNodeIds
     );
-    if (nodeId) nodeIds.push(nodeId);
+    nodeIds.push(...executedNodeIds);
+    if (tracker.status === "passed") upstreamEvidenceNodeIds.push(...executedNodeIds);
   }
   return nodeIds;
 }

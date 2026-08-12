@@ -29,6 +29,52 @@ afterEach(() => {
 });
 
 describe("workflow runtime", () => {
+  it("resumes a durable Run without repeating successful nodes", async () => {
+    const { config, input } = fixture();
+    const loaded = loadManifest(config);
+    const calls: string[] = [];
+    const adapter: ProviderAdapter = {
+      id: "command",
+      validate: () => [],
+      async invoke(invocation) {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        calls.push(role);
+        const output = role === "chair"
+          ? { verdict: "Pass", summary: "approved", agreements: ["evidence"], disagreements: [], nextActions: [] }
+          : { verdict: "Pass", summary: "reviewed", evidence: ["evidence"], risks: [] };
+        return { stdout: JSON.stringify(output), stderr: "", durationMs: 1 };
+      }
+    };
+    const providers: ProviderRegistry = new Map([["command", adapter]]);
+    const runId = "run-durable-resume-1";
+    const first = await runWorkflow(loaded, "review-council", { runId, input, providers });
+    expect(first.run.status).toBe("passed");
+    expect(calls).toHaveLength(4);
+
+    const runPath = path.join(first.runDir, "run.json");
+    const interrupted = JSON.parse(fs.readFileSync(runPath, "utf8")) as typeof first.run;
+    interrupted.status = "running";
+    delete interrupted.completedAt;
+    const final = interrupted.nodes["final-decision"]!;
+    final.status = "running";
+    delete final.completedAt;
+    delete final.output;
+    fs.writeFileSync(runPath, `${JSON.stringify(interrupted, null, 2)}\n`, "utf8");
+    calls.length = 0;
+
+    const resumed = await runWorkflow(loaded, "review-council", { runId, input, providers, resume: true });
+
+    expect(resumed.run.status).toBe("passed");
+    expect(calls).toEqual(["chair"]);
+    expect(resumed.run.nodes["product-review"]?.attempts).toBe(1);
+    expect(resumed.run.nodes["design-review"]?.attempts).toBe(1);
+    expect(resumed.run.nodes["test-review"]?.attempts).toBe(1);
+    expect(resumed.run.nodes["final-decision"]?.attempts).toBe(2);
+    const events = fs.readFileSync(path.join(resumed.runDir, "events.jsonl"), "utf8");
+    expect(events).toContain('"type":"run.resumed"');
+    expect(events).toContain('"type":"node.replayed"');
+  });
+
   it("runs the bundled council and persists complete evidence", async () => {
     const { config, input } = fixture();
     const result = await runWorkflow(loadManifest(config), "review-council", { input });

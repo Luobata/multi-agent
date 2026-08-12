@@ -191,6 +191,23 @@ describe("App navigation freshness", () => {
     expect(container.textContent).toContain("米糊糊 · 前端");
   });
 
+  it("does not leave the shell syncing when only a detail section changes inside the same page", async () => {
+    window.location.hash = "#requirements/req-local-1?section=overview";
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+    expect(container.textContent).not.toContain("SYNCING · 正在同步最新档案");
+
+    act(() => {
+      window.history.pushState(null, "", "#requirements/req-local-1?section=run");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await flush();
+
+    expect(bootstrapRequests).toHaveLength(1);
+    expect(container.textContent).not.toContain("SYNCING · 正在同步最新档案");
+  });
+
   it("refetches when clicking the already-active tab without moving the hash", async () => {
     act(() => root.render(<App />));
     respond(0, bootstrapWith({}));

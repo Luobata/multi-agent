@@ -266,62 +266,69 @@ describe("Supervisor workflow progress sessions", () => {
     expect(fixture.service.listSessions("durable-leader")).toEqual([]);
   }, 10_000);
 
-  it("keeps an interrupted leader Session readable and continuable after restart with an interruption explanation", async () => {
+  it("automatically resumes an interrupted Run from durable checkpoints after restart", async () => {
     const dataRoot = temporaryRoot();
-    const fixture = await createSupervisorFixture({ blockFirstSupervisor: true, dataRoot });
+    const fixture = await createSupervisorFixture({ dataRoot });
     const receipt = await fixture.service.startWorkbenchWorkflow("durable-supervisor", { message: "会被重启中断的任务" });
-    await fixture.providerStarted;
+    await fixture.service.waitForInvocation(receipt.invocation.id);
 
-    const reopened = await WorkbenchService.open({ dataRoot, providers: fixture.providers });
-    await reopened.recoverInterruptedActivity();
-    const interrupted = reopened.getSession(receipt.leaderSessionId!);
-    expect(interrupted.status).toBe("active");
-    expect(interrupted.messages.at(-1)?.content).toContain("Local runtime restarted before this invocation completed");
-    expect((await reopened.getInvocationDetail(receipt.invocation.id)).invocation).toMatchObject({
-      status: "failed",
-      phase: "interrupted"
-    });
-    const interruptedRun = await reopened.getRun(receipt.runId) as {
-      status: string;
-      error?: string;
-      nodes: Record<string, { status: string; failure?: { category: string; retryable: boolean } }>;
+    // Persist the exact state a process restart can leave behind after the Provider started but
+    // before its terminal event was committed. The original execution is already settled, so the
+    // reopened service is the only writer to this Run Store during the recovery assertion.
+    const statePath = path.join(dataRoot, "state.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      invocations: Record<string, { status: string; phase: string; completedAt?: string; error?: string }>;
+      workInstances: Record<string, { invocationId: string; status: string; phase: string; completedAt?: string; error?: string; failure?: unknown }>;
     };
-    expect(interruptedRun).toMatchObject({
-      status: "failed",
-      error: "Local runtime restarted before this run completed."
-    });
-    expect(Object.values(interruptedRun.nodes).find((node) => node.failure?.category === "interrupted"))
-      .toMatchObject({ status: "failed", failure: { category: "interrupted", retryable: true } });
+    const invocation = state.invocations[receipt.invocation.id]!;
+    invocation.status = "running";
+    invocation.phase = "provider";
+    delete invocation.completedAt;
+    delete invocation.error;
+    const supervisorInstance = Object.values(state.workInstances).find((candidate) => candidate.invocationId === receipt.invocation.id)!;
+    supervisorInstance.status = "running";
+    supervisorInstance.phase = "provider";
+    delete supervisorInstance.completedAt;
+    delete supervisorInstance.error;
+    delete supervisorInstance.failure;
+    fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 
-    // Recovery is idempotent and also repairs historical interrupted Invocation records whose
-    // Run Store was left in the old false-running state by an earlier daemon version.
     const runPath = path.join(dataRoot, "artifacts", "runs", receipt.runId, "run.json");
     const staleRun = JSON.parse(fs.readFileSync(runPath, "utf8")) as {
       status: string;
       completedAt?: string;
       error?: string;
-      nodes: Record<string, { status: string; completedAt?: string; error?: string; failure?: unknown }>;
+      nodes: Record<string, { status: string; completedAt?: string; output?: unknown }>;
     };
     staleRun.status = "running";
     delete staleRun.completedAt;
     delete staleRun.error;
-    const staleNode = Object.values(staleRun.nodes).find((node) => node.status === "failed");
-    if (!staleNode) throw new Error("expected interrupted node");
-    staleNode.status = "running";
-    delete staleNode.completedAt;
-    delete staleNode.error;
-    delete staleNode.failure;
+    staleRun.nodes["supervisor-r1"]!.status = "running";
+    delete staleRun.nodes["supervisor-r1"]!.completedAt;
+    delete staleRun.nodes["supervisor-r1"]!.output;
     fs.writeFileSync(runPath, `${JSON.stringify(staleRun, null, 2)}\n`, "utf8");
+
+    const reopened = await WorkbenchService.open({ dataRoot, providers: fixture.providers });
     await reopened.recoverInterruptedActivity();
-    expect(await reopened.getRun(receipt.runId)).toMatchObject({
-      status: "failed",
-      nodes: expect.objectContaining({
-        "supervisor-r1": expect.objectContaining({
-          status: "failed",
-          failure: { category: "interrupted", retryable: true }
-        })
-      })
+    await reopened.waitForInvocation(receipt.invocation.id);
+    const recovered = reopened.getSession(receipt.leaderSessionId!);
+    expect(recovered.status).toBe("active");
+    expect(recovered.messages.some((message) => message.content.includes("自动续跑"))).toBe(true);
+    expect((await reopened.getInvocationDetail(receipt.invocation.id)).invocation).toMatchObject({
+      status: "completed",
+      phase: "done"
     });
+    const recoveredRun = await reopened.getRun(receipt.runId) as {
+      status: string;
+      nodes: Record<string, { status: string; attempts: number }>;
+    };
+    expect(recoveredRun.status).toBe("passed");
+    expect(recoveredRun.nodes["supervisor-r1"]).toMatchObject({ status: "passed", attempts: 2 });
+
+    // Once terminal, recovery is idempotent and does not invoke the Provider a third time.
+    const callsAfterRecovery = fixture.supervisorCalls();
+    await reopened.recoverInterruptedActivity();
+    expect(fixture.supervisorCalls()).toBe(callsAfterRecovery);
 
     const continued = await reopened.continueWorkflowConversation(receipt.leaderSessionId!, "原运行发生了什么？");
     expect(continued.message).toBe("已在原领队会话中继续回答。");

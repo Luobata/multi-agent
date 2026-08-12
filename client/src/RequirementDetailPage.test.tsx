@@ -194,6 +194,48 @@ describe("RequirementDetailPage advancement launch", () => {
     expect(button("查看 Run 与证据")).toBeTruthy();
   });
 
+  it("refreshes a stale entrance-policy team pin before showing the launch confirmation", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", idSeed: () => "req-stale-policy" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "入口策略自动跟随团队",
+      summary: "避免旧团队版本永久阻塞",
+      priority: "high",
+      rawRequirement: "团队升级后仍可开始推进",
+      acceptanceCriteria: ["启动前自动刷新入口策略引用"]
+    });
+    const staleDecision: EntrancePolicyDecision = {
+      ...decision,
+      target: { kind: "supervisor-workflow", workflowId: workflow.id, workflowVersion: workflow.version - 1 }
+    };
+    const evaluate = vi.fn<RequirementAdvancementGateway["evaluate"]>()
+      .mockResolvedValueOnce(staleDecision)
+      .mockResolvedValueOnce(decision);
+    const refreshWorkflowReferences = vi.fn().mockResolvedValue(undefined);
+    const notify = vi.fn();
+
+    act(() => root.render(<RequirementDetailPage
+      requirementId={requirement.id}
+      go={vi.fn()}
+      notify={notify}
+      service={service}
+      projects={[project]}
+      entrancePolicies={[entrancePolicy]}
+      workflows={[workflow]}
+      managementPolicies={[managementPolicy]}
+      gateway={{ evaluate, dispatch: vi.fn(), refreshWorkflowReferences }}
+    />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    await act(async () => { button("开始推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    expect(refreshWorkflowReferences).toHaveBeenCalledWith(workflow.id);
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain(`${workflow.id} · v${workflow.version}`);
+    expect(document.body.textContent).toContain("启动门禁通过");
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining(`v${workflow.version}`));
+  });
+
   it("keeps lifecycle sections inside one deep-linked requirement dossier", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty", idSeed: () => "req-section" });
     service.syncConnectedProjects([project]);

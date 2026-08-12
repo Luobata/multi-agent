@@ -57,6 +57,12 @@ export interface RunWorkflowOptions {
     decision: Promise<RuntimeHumanDecisionOutcome>;
   }>;
   signal?: AbortSignal;
+  /**
+   * Continue a durable Run after the local daemon restarts. Successful or
+   * deterministically terminal nodes are replayed from Run Store evidence;
+   * only pending/running/retryable-failed work is invoked again.
+   */
+  resume?: boolean;
 }
 
 export interface ObservedRunEvent extends RunEvent {
@@ -226,12 +232,13 @@ async function executeNode(
     return skipped;
   }
 
+  const previousAttempts = run.nodes[node.id]?.attempts ?? 0;
   const result: NodeRunResult = {
     nodeId: node.id,
     roleId: nodeRoleId(node),
     metadata: node.metadata,
     status: "running",
-    attempts: 0,
+    attempts: previousAttempts,
     startedAt: now()
   };
   run.nodes[node.id] = result;
@@ -241,7 +248,8 @@ async function executeNode(
   let lastError: unknown;
   let lastFailure: NodeRunFailure | undefined;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  for (let recoveryAttempt = 1; recoveryAttempt <= maxAttempts; recoveryAttempt += 1) {
+    const attempt = previousAttempts + recoveryAttempt;
     result.attempts = attempt;
     const attemptDir = await store.createAttempt(node.id, attempt);
     result.artifactDir = path.relative(store.runDir, attemptDir).split(path.sep).join("/");
@@ -328,7 +336,7 @@ async function executeNode(
       lastFailure = error instanceof ProviderExecutionError
         ? { category: "provider", kind: error.kind, retryable }
         : { category: "output-validation", retryable };
-      const willRetry = attempt < maxAttempts && retryable;
+      const willRetry = recoveryAttempt < maxAttempts && retryable;
       if (willRetry && validationFailure) {
         node.with = {
           ...node.with,
@@ -382,7 +390,7 @@ export async function runWorkflow(
   const input = options.input ?? {};
   validateInput(loaded, workflowId, input);
   const architectures = options.architectures ?? createDefaultArchitectureRegistry();
-  const plan = compilePlan(loaded, workflowId, architectures);
+  let plan = compilePlan(loaded, workflowId, architectures);
   const architecture = architectures.get(plan.architecture);
   if (!architecture) throw new Error(`architecture adapter not registered: ${plan.architecture}`);
   const providerCwd = path.resolve(options.providerCwd ?? loaded.projectRoot);
@@ -391,40 +399,62 @@ export async function runWorkflow(
     ? path.resolve(options.artifactRoot)
     : path.resolve(loaded.projectRoot, loaded.manifest.artifactRoot ?? ".multi-agent");
   const store = await RunStore.create(artifactRoot, runId);
-  const run: WorkflowRunRecord = {
-    id: runId,
-    workflow: workflowId,
-    architecture: plan.architecture,
-    manifestPath: loaded.manifestPath,
-    artifactDir: store.runDir,
-    status: "running",
-    createdAt: now(),
-    ...(options.isolation ? { isolation: options.isolation } : {}),
-    nodes: Object.fromEntries(
-      plan.nodes.map((node) => [node.id, {
-        nodeId: node.id,
-        roleId: nodeRoleId(node),
-        metadata: node.metadata,
-        status: "pending",
-        attempts: 0
-      }])
-    )
-  };
+  let run: WorkflowRunRecord;
+  if (options.resume) {
+    const [persistedRun, persistedPlan] = await Promise.all([
+      fs.promises.readFile(path.join(store.runDir, "run.json"), "utf8"),
+      fs.promises.readFile(path.join(store.runDir, "plan.json"), "utf8")
+    ]);
+    run = JSON.parse(persistedRun) as WorkflowRunRecord;
+    plan = JSON.parse(persistedPlan) as typeof plan;
+    if (run.id !== runId || run.workflow !== workflowId || run.architecture !== plan.architecture) {
+      throw new Error(`Run ${runId} recovery snapshot does not match workflow ${workflowId}`);
+    }
+    run.status = "running";
+    delete run.completedAt;
+    delete run.error;
+    if (options.isolation) run.isolation = options.isolation;
+  } else {
+    run = {
+      id: runId,
+      workflow: workflowId,
+      architecture: plan.architecture,
+      manifestPath: loaded.manifestPath,
+      artifactDir: store.runDir,
+      status: "running",
+      createdAt: now(),
+      ...(options.isolation ? { isolation: options.isolation } : {}),
+      nodes: Object.fromEntries(
+        plan.nodes.map((node) => [node.id, {
+          nodeId: node.id,
+          roleId: nodeRoleId(node),
+          metadata: node.metadata,
+          status: "pending",
+          attempts: 0
+        }])
+      )
+    };
+  }
   const registry = options.providers ?? createDefaultProviderRegistry();
   const emit = async (type: string, nodeId?: string, detail?: JsonValue): Promise<void> => {
     const event: RunEvent = { at: now(), type, nodeId, detail };
     await store.appendEvent(event);
     await options.onEvent?.({ ...event, runId, workflow: workflowId });
   };
-  await store.writeInput(input);
-  await store.writePlan(plan);
-  for (const [relativePath, value] of Object.entries(options.initialArtifacts ?? {})) {
-    await store.writeArtifact(relativePath, value);
+  if (!options.resume) {
+    await store.writeInput(input);
+    await store.writePlan(plan);
+    for (const [relativePath, value] of Object.entries(options.initialArtifacts ?? {})) {
+      await store.writeArtifact(relativePath, value);
+    }
   }
   await store.writeRun(run);
-  await emit("run.started", undefined, { workflow: workflowId, architecture: plan.architecture });
+  await emit(options.resume ? "run.resumed" : "run.started", undefined, {
+    workflow: workflowId,
+    architecture: plan.architecture
+  });
 
-  const scheduled = new Set<string>();
+  const scheduled = new Set<string>(options.resume ? plan.nodes.map((node) => node.id) : []);
   const scheduleNode = async (node: ExecutionPlanNode): Promise<void> => {
     const existing = plan.nodes.find((candidate) => candidate.id === node.id);
     if (existing && existing.role !== node.role) throw new Error(`execution node ${node.id} is already assigned to role ${existing.role}`);
@@ -453,6 +483,16 @@ export async function runWorkflow(
     node: ExecutionPlanNode,
     executionOptions?: ExecuteNodeOptions
   ): Promise<NodeRunResult> => {
+    const durable = run.nodes[node.id];
+    if (options.resume && durable && (
+      durable.status === "passed"
+      || durable.status === "blocked"
+      || (durable.status === "failed" && durable.failure?.retryable !== true)
+      || durable.status === "skipped"
+    )) {
+      await emit("node.replayed", node.id, { status: durable.status, attempts: durable.attempts });
+      return durable;
+    }
     let prepared: { node: ExecutionPlanNode; artifacts?: Record<string, JsonValue> };
     try {
       prepared = options.prepareNode ? await options.prepareNode(node) : { node };

@@ -14,6 +14,7 @@ import {
 import type { ArchitectureRegistry } from "../architectures/types.js";
 import { listGateValidators as listRegisteredGateValidators } from "../architectures/gateValidators.js";
 import { compilePlan } from "../core/plan.js";
+import { loadManifest } from "../config/loadManifest.js";
 import type {
   JsonObject,
   JsonValue,
@@ -1912,6 +1913,108 @@ export class WorkbenchService {
     await store.appendEvent({ at: timestamp, type: "run.failed", detail: { error: interruption } });
   }
 
+  private workflowForInterruptedRecovery(invocation: InvocationRecord): WorkbenchWorkflowDefinition {
+    if (invocation.target.kind !== "workflow" || !invocation.executionSnapshot) {
+      throw new Error("only pinned Workflow invocations can be recovered");
+    }
+    const workflow = this.getWorkflow(invocation.target.id, invocation.target.version);
+    if (workflow.architecture !== "supervisor") return workflow;
+    const pins = new Map(invocation.executionSnapshot.employees.map((binding) => [binding.roleId, binding]));
+    const supervisor = pins.get("supervisor");
+    if (!supervisor) throw new Error(`Invocation ${invocation.id} has no pinned supervisor`);
+    return {
+      ...workflow,
+      supervisor: { employeeId: supervisor.employeeId, employeeVersion: supervisor.employeeVersion },
+      ...(invocation.executionSnapshot.managementPolicy
+        ? { managementPolicy: invocation.executionSnapshot.managementPolicy }
+        : {}),
+      members: workflow.members.map((member) => {
+        const pin = pins.get(member.roleId);
+        if (!pin) throw new Error(`Invocation ${invocation.id} has no pinned member ${member.roleId}`);
+        return { ...member, employeeId: pin.employeeId, employeeVersion: pin.employeeVersion };
+      })
+    };
+  }
+
+  private async interruptedRecoveryContext(invocation: InvocationRecord): Promise<{
+    workflow: WorkbenchWorkflowDefinition;
+    employees: Map<string, EmployeeDefinition>;
+    input: JsonObject;
+    providerCwd: string;
+    isolation?: WorkflowRunIsolation;
+    manifestPath: string;
+  } | undefined> {
+    if (invocation.target.kind !== "workflow" || !invocation.executionSnapshot) return undefined;
+    if (Object.values(this.snapshot().humanDecisionRequests).some((request) => (
+      request.invocationId === invocation.id && request.status === "pending"
+    ))) return undefined;
+    if (!/^run-[A-Za-z0-9-]+$/.test(invocation.runId)) return undefined;
+    const runDir = path.join(this.store.dataRoot, "artifacts", "runs", invocation.runId);
+    try {
+      const [runValue, inputValue] = await Promise.all([
+        fs.readFile(path.join(runDir, "run.json"), "utf8"),
+        fs.readFile(path.join(runDir, "input.json"), "utf8")
+      ]);
+      const run = JSON.parse(runValue) as WorkflowRunRecord;
+      const input = JSON.parse(inputValue) as unknown;
+      if (run.id !== invocation.runId || run.status !== "running") return undefined;
+      if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+      const generatedRoot = path.resolve(this.store.dataRoot, "generated");
+      const manifestPath = path.resolve(run.manifestPath);
+      const manifestRelative = path.relative(generatedRoot, manifestPath);
+      if (manifestRelative.startsWith("..") || path.isAbsolute(manifestRelative)) return undefined;
+      await fs.access(manifestPath);
+      const workflow = this.workflowForInterruptedRecovery(invocation);
+      const employees = this.resolveWorkflowEmployees(workflow);
+      let providerCwd = (await this.workflowExecutionRoot(invocation.source)) ?? path.resolve(".");
+      if (run.isolation?.mode === "worktree") {
+        if (!run.isolation.worktreePath) return undefined;
+        const worktreePath = path.resolve(run.isolation.worktreePath);
+        if (path.basename(worktreePath) !== invocation.runId || path.basename(path.dirname(worktreePath)) !== "worktrees") {
+          return undefined;
+        }
+        const worktree = await fs.stat(worktreePath);
+        if (!worktree.isDirectory()) return undefined;
+        providerCwd = worktreePath;
+      }
+      return {
+        workflow,
+        employees,
+        input: input as JsonObject,
+        providerCwd,
+        isolation: run.isolation,
+        manifestPath
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private trackRecoveredInvocation(
+    invocation: InvocationRecord,
+    recovery: NonNullable<Awaited<ReturnType<WorkbenchService["interruptedRecoveryContext"]>>>
+  ): void {
+    const execution = this.runTrackedWorkflow(
+      invocation,
+      recovery.workflow,
+      recovery.employees,
+      recovery.input,
+      recovery.providerCwd,
+      {
+        providerCwd: recovery.providerCwd,
+        isolation: recovery.isolation,
+        manifestPath: recovery.manifestPath
+      }
+    );
+    const settled = execution.then(() => undefined, () => undefined);
+    this.backgroundInvocations.set(invocation.id, settled);
+    void settled.finally(() => {
+      if (this.backgroundInvocations.get(invocation.id) === settled) {
+        this.backgroundInvocations.delete(invocation.id);
+      }
+    });
+  }
+
   async recoverInterruptedActivity(): Promise<void> {
     const state = this.snapshot();
     const hasInterrupted = Object.values(state.invocations).some((invocation) => !isInvocationTerminal(invocation.status));
@@ -1920,12 +2023,46 @@ export class WorkbenchService {
       .some((invocation) => invocation.phase === "interrupted" && Boolean(invocation.runId));
     if (!hasInterrupted && !hasPendingDecision && !hasInterruptedRunReference) return;
     const timestamp = now();
+    const recoveries = new Map<string, NonNullable<Awaited<ReturnType<WorkbenchService["interruptedRecoveryContext"]>>>>();
+    for (const invocation of Object.values(state.invocations)) {
+      if (isInvocationTerminal(invocation.status)) continue;
+      const recovery = await this.interruptedRecoveryContext(invocation);
+      if (recovery) recoveries.set(invocation.id, recovery);
+    }
     const voidedDecisionKeys: string[] = [];
     const newlyInterruptedInvocationIds = new Set<string>();
     await this.store.mutate((next) => {
       for (const invocation of Object.values(next.invocations)) {
         if (isInvocationTerminal(invocation.status)) continue;
         newlyInterruptedInvocationIds.add(invocation.id);
+        if (recoveries.has(invocation.id)) {
+          invocation.status = "queued";
+          invocation.phase = "recovering";
+          delete invocation.completedAt;
+          delete invocation.error;
+          invocation.updatedAt = timestamp;
+          invocation.transitions.push({
+            at: timestamp,
+            status: "queued",
+            phase: "recovering",
+            message: "Local runtime restarted; automatically resuming this Run from durable checkpoints."
+          });
+          if (invocation.sessionId) {
+            const session = next.sessions[invocation.sessionId];
+            if (session && !session.messages.some((message) => message.dedupeKey === `supervisor-recovery:${invocation.runId}`)) {
+              session.messages.push({
+                id: randomUUID(),
+                role: "system",
+                content: "本地运行服务已重启；调度器正在从已完成节点和原 Worktree 自动续跑，不会重做已通过的分片。",
+                at: timestamp,
+                dedupeKey: `supervisor-recovery:${invocation.runId}`,
+                runId: invocation.runId
+              });
+              session.updatedAt = timestamp;
+            }
+          }
+          continue;
+        }
         invocation.status = "failed";
         invocation.phase = "interrupted";
         invocation.error = "Local runtime restarted before this invocation completed.";
@@ -1940,6 +2077,22 @@ export class WorkbenchService {
       }
       for (const instance of Object.values(next.workInstances)) {
         if (isInstanceTerminal(instance.status)) continue;
+        if (recoveries.has(instance.invocationId)) {
+          const retained = instance.status === "waiting" && instance.phase === "waiting-next-todo";
+          instance.status = retained ? "waiting" : "queued";
+          instance.phase = retained ? "waiting-next-todo" : "recovering";
+          delete instance.completedAt;
+          delete instance.error;
+          delete instance.failure;
+          instance.updatedAt = timestamp;
+          instance.transitions.push({
+            at: timestamp,
+            status: instance.status,
+            phase: instance.phase,
+            message: retained ? "保留成员会话，等待恢复调度。" : "从持久化节点检查点恢复。"
+          });
+          continue;
+        }
         instance.status = "failed";
         instance.phase = "interrupted";
         instance.error = "Local runtime restarted before this work instance completed.";
@@ -1970,6 +2123,16 @@ export class WorkbenchService {
     }
     const recovered = this.snapshot();
     for (const invocation of Object.values(recovered.invocations)) {
+      const recovery = recoveries.get(invocation.id);
+      if (recovery) {
+        this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
+        for (const instanceId of invocation.instanceIds) {
+          const instance = recovered.workInstances[instanceId];
+          if (instance) this.emitActivity({ type: "instance.changed", at: timestamp, instance });
+        }
+        this.trackRecoveredInvocation(invocation, recovery);
+        continue;
+      }
       if (invocation.phase !== "interrupted") continue;
       await this.reconcileInterruptedRun(invocation.runId, invocation.completedAt ?? timestamp);
       if (!newlyInterruptedInvocationIds.has(invocation.id)) continue;
@@ -2820,23 +2983,39 @@ export class WorkbenchService {
     workflow: WorkbenchWorkflowDefinition,
     employees: Map<string, EmployeeDefinition>,
     input: JsonObject,
-    providerCwd?: string
+    providerCwd?: string,
+    recovery?: { providerCwd: string; isolation?: WorkflowRunIsolation; manifestPath: string }
   ): Promise<RunWorkflowResult> {
-    await this.transitionInvocation(invocation.id, "running", "materializing");
+    await this.transitionInvocation(invocation.id, "running", recovery ? "recovering" : "materializing");
     try {
       const inputTaskTags = (Array.isArray(input.taskTags) ? input.taskTags : [])
         .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
         .map((value) => value.trim());
-      const materialized = await this.materialize(workflow, employees);
+      const materialized = recovery
+        ? {
+            loaded: loadManifest(recovery.manifestPath, {
+              providers: this.providers,
+              architectures: this.architectures
+            }),
+            workflowId: workflow.id
+          }
+        : await this.materialize(workflow, employees);
       // Resolve execution isolation before runWorkflow can schedule or invoke a Provider. Worktree
       // isolation is fail-closed: setup failures terminate the Invocation instead of running code in
       // the caller's original checkout.
-      const { providerCwd: effectiveProviderCwd, isolation, teardownWorktree } =
-        await this.resolveRunIsolation(workflow, invocation.runId, providerCwd, materialized.loaded.projectRoot);
+      const resolvedIsolation = recovery
+        ? {
+            providerCwd: recovery.providerCwd,
+            isolation: recovery.isolation,
+            teardownWorktree: async () => undefined
+          }
+        : await this.resolveRunIsolation(workflow, invocation.runId, providerCwd, materialized.loaded.projectRoot);
+      const { providerCwd: effectiveProviderCwd, isolation, teardownWorktree } = resolvedIsolation;
       try {
         const runResult = await runWorkflow(materialized.loaded, materialized.workflowId, {
           runId: invocation.runId,
           input,
+          resume: Boolean(recovery),
           initialArtifacts: input.conversationEvidence
             ? { "conversation/evidence.json": input.conversationEvidence }
             : undefined,

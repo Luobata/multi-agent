@@ -199,12 +199,24 @@ export function RequirementDetailPage({
     setLaunchError("");
     try {
       const input = buildRequirementAdvancementInput(detail);
-      const decision = await gateway.evaluate(advancementConfig.entrancePolicyId, {
+      const evaluationInput = {
         route: input.route,
         tags: input.tags,
         signals: input.signals,
         source: input.source
-      });
+      };
+      let decision = await gateway.evaluate(advancementConfig.entrancePolicyId, evaluationInput);
+      const evaluatedTarget = decision.target;
+      if (evaluatedTarget.kind === "supervisor-workflow") {
+        const currentWorkflow = workflows.find((workflow) => workflow.id === evaluatedTarget.workflowId);
+        if (currentWorkflow && currentWorkflow.version !== evaluatedTarget.workflowVersion && gateway.refreshWorkflowReferences) {
+          await gateway.refreshWorkflowReferences(evaluatedTarget.workflowId);
+          decision = await gateway.evaluate(advancementConfig.entrancePolicyId, evaluationInput);
+          notify(decision.target.kind === "supervisor-workflow"
+            ? `入口策略已自动刷新到 ${decision.target.workflowId} v${decision.target.workflowVersion}`
+            : "入口策略已自动刷新到最新团队");
+        }
+      }
       setLaunchDecision(decision);
     } catch (error) {
       setLaunchError(error instanceof Error ? error.message : String(error));

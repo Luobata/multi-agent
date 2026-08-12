@@ -26,6 +26,7 @@ export interface RequirementAdvancementReceipt {
 export interface RequirementAdvancementGateway {
   evaluate(policyId: string, input: Omit<RequirementAdvancementInput, "message">): Promise<EntrancePolicyDecision>;
   dispatch(policyId: string, input: RequirementAdvancementInput): Promise<RequirementAdvancementReceipt>;
+  refreshWorkflowReferences?(workflowId: string): Promise<void>;
 }
 
 /** Fail-closed launch checks shown before a real Run is created. */
@@ -145,5 +146,8 @@ export const requirementAdvancementGateway: RequirementAdvancementGateway = {
       throw new Error(`入口策略返回了 ${result.dispatch.kind}，没有创建可监控的异步 Run`);
     }
     return result.dispatch.receipt;
+  },
+  async refreshWorkflowReferences(workflowId) {
+    await api(`/api/workflows/${encodeURIComponent(workflowId)}/entrance-policies/refresh`, { method: "POST" });
   }
 };

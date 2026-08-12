@@ -271,7 +271,6 @@ export function App() {
     lastHashByPage.current = rememberNavigationHash(lastHashByPage.current, initial, window.location.hash);
     const update = () => {
       const next = pageFromHash();
-      setSyncing(true);
       lastHashByPage.current = rememberNavigationHash(lastHashByPage.current, next, window.location.hash);
       setRoute(next);
     };
@@ -340,7 +339,7 @@ export function App() {
     setRoute(pageFromHash(`#${target}`));
   };
   /** Dashboard 子路由（项目详情 / 项目看板 / 需求详情）只换 hash，由 hashchange 统一收编。 */
-  const go = (hash: string) => { setSyncing(true); window.location.hash = hash; };
+  const go = (hash: string) => { window.location.hash = hash; };
   const invocationRevision = data.activity.invocations.reduce((latest, invocation) => invocation.updatedAt > latest ? invocation.updatedAt : latest, "");
   const activityRevision = data.activity.instances.reduce((latest, instance) => instance.updatedAt > latest ? instance.updatedAt : latest, invocationRevision);
   const awaitingDecisionRevision = data.activity.invocations

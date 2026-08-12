@@ -309,6 +309,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     let supervisorTurn = 0;
     const builderContexts: Array<Record<string, unknown>> = [];
     const gateContexts: Array<Record<string, unknown>> = [];
+    const gateNeeds: Array<Record<string, unknown>> = [];
     const impact = {
       level: "low",
       regressionScope: "targeted",
@@ -327,6 +328,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
         };
         if (node.metadata?.kind === "gate") {
           gateContexts.push({ ...(node.with ?? {}) });
+          gateNeeds.push({ ...((invocation.templateContext.needs as Record<string, unknown>) ?? {}) });
           return {
             stdout: JSON.stringify({
               message: "Targeted behavior passed.",
@@ -444,7 +446,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     await service.createEmployee({
       id: "todo-tester",
       identity: { displayName: "TODO Tester", background: "Runs scoped behavior tests.", responsibilities: ["Test"] },
-      capabilities: ["quality.test"],
+      capabilities: ["quality.test", "quality.audit"],
       providerId: "todo-session-provider",
       outputSchema: {
         type: "object",
@@ -489,16 +491,27 @@ describe("Supervisor deterministic capabilities and Gates", () => {
           { id: "plan", kind: "supervisor", title: "Plan" },
           { id: "loop", kind: "delegation-loop", title: "Build" },
           { id: "test", kind: "gate", title: "Targeted test", gateId: "targeted-test" },
+          { id: "audit", kind: "gate", title: "Independent audit", gateId: "independent-audit" },
           { id: "delivery", kind: "delivery", title: "Deliver" }
         ],
-        gates: [{
-          id: "targeted-test",
-          requiredCapability: "quality.test",
-          mode: "before-completion",
-          required: true,
-          instructions: "Validate the recorded regression scope.",
-          fallback: "block"
-        }]
+        gates: [
+          {
+            id: "targeted-test",
+            requiredCapability: "quality.test",
+            mode: "before-completion",
+            required: true,
+            instructions: "Validate the recorded regression scope.",
+            fallback: "block"
+          },
+          {
+            id: "independent-audit",
+            requiredCapability: "quality.audit",
+            mode: "before-completion",
+            required: true,
+            instructions: "Audit the candidate and its test evidence.",
+            fallback: "block"
+          }
+        ]
       }
     });
 
@@ -513,7 +526,10 @@ describe("Supervisor deterministic capabilities and Gates", () => {
           expect.objectContaining({ nodeId: "wire-caller", status: "passed" })
         ])
       },
-      gates: [expect.objectContaining({ gateId: "targeted-test", status: "passed" })]
+      gates: expect.arrayContaining([
+        expect.objectContaining({ gateId: "targeted-test", status: "passed" }),
+        expect.objectContaining({ gateId: "independent-audit", status: "passed" })
+      ])
     });
 
     expect(builderContexts).toHaveLength(2);
@@ -534,10 +550,16 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     });
     expect(String(builderContexts[0]?.__delegatedTask)).not.toContain("Wire only");
 
-    expect(gateContexts).toHaveLength(1);
+    expect(gateContexts).toHaveLength(2);
     expect(gateContexts[0]).toMatchObject({ __regressionImpact: impact });
     expect(String(gateContexts[0]?.__delegatedTask)).toContain("Run only changed-path and directly related regression checks");
     expect(String(gateContexts[0]?.__delegatedTask)).toContain("do not run package-wide or repository-wide suites");
+    expect(String(gateContexts[1]?.__delegatedTask)).toContain("Upstream quality Gate evidence is attached");
+    expect(String(gateContexts[1]?.__delegatedTask)).toContain("Do not repeat browser or automated regression");
+    expect(Object.keys(gateNeeds[1] ?? {})).toEqual(expect.arrayContaining([
+      "wire-caller",
+      expect.stringMatching(/^gate-targeted-test-/)
+    ]));
 
     const builderInstances = service.getActivitySnapshot().instances.filter((candidate) => (
       candidate.runId === result.run.id && candidate.employeeId === "todo-builder"
@@ -555,6 +577,212 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(builderInstances[0]?.transitions).toEqual(expect.arrayContaining([
       expect.objectContaining({ status: "waiting", phase: "waiting-next-todo" }),
       expect.objectContaining({ status: "queued", phase: "continuing-session" })
+    ]));
+  });
+
+  it("splits broad quality checks into bounded Gate shards and feeds every shard to the independent audit", async () => {
+    let supervisorTurn = 0;
+    const gateCalls: Array<{
+      task: string;
+      execution: Record<string, unknown>;
+      needs: string[];
+    }> = [];
+    const requiredChecks = [
+      "client unit tests",
+      "server unit tests",
+      "client production build",
+      "server typecheck",
+      "board browser smoke",
+      "requirement detail browser smoke"
+    ];
+    const providers: ProviderRegistry = new Map([["sharded-quality-flow", {
+      id: "sharded-quality-flow",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const node = invocation.templateContext.node as {
+          metadata?: { kind?: string };
+          with?: Record<string, unknown>;
+        };
+        if (node.metadata?.kind === "gate") {
+          gateCalls.push({
+            task: String(node.with?.__delegatedTask ?? ""),
+            execution: { ...((node.with?.__gateExecution as Record<string, unknown>) ?? {}) },
+            needs: Object.keys((invocation.templateContext.needs as Record<string, unknown>) ?? {})
+          });
+          return {
+            stdout: JSON.stringify({
+              message: "The assigned bounded checks passed.",
+              e2eEvidence: [{ method: "automation-run", steps: "run only the assigned checks", observed: "all assigned checks passed" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (role === "member-builder") {
+          return { stdout: JSON.stringify({ message: "Implementation complete." }), stderr: "", durationMs: 1 };
+        }
+        supervisorTurn += 1;
+        if (supervisorTurn === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Plan one implementation and a bounded package regression.",
+              impact: {
+                level: "high",
+                regressionScope: "package",
+                affectedAreas: ["client", "server"],
+                reasons: ["The change crosses the board and requirement detail surfaces."],
+                requiredChecks
+              },
+              todos: [
+                {
+                  id: "inspect-change",
+                  roleId: "builder",
+                  task: "Inspect the affected surfaces and confirm the bounded change set.",
+                  needs: [],
+                  workKind: "discussion"
+                },
+                {
+                  id: "implement-change",
+                  roleId: "builder",
+                  task: "Implement the bounded cross-surface change.",
+                  needs: ["inspect-change"],
+                  workKind: "code",
+                  changeSet: "workbench"
+                }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 2) {
+          return {
+            stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "inspect-change", roleId: "builder" }] }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 3) {
+          return {
+            stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "implement-change", roleId: "builder" }] }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Implementation ready for quality Gates.", result: { delivered: true } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("sharded-quality-provider", { adapter: "sharded-quality-flow", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "sharded-quality-lead",
+      identity: { displayName: "Lead", background: "Leads.", responsibilities: ["Lead"] },
+      providerId: "sharded-quality-provider"
+    });
+    await service.createEmployee({
+      id: "sharded-quality-builder",
+      identity: { displayName: "Builder", background: "Builds.", responsibilities: ["Build"] },
+      capabilities: ["code.fullstack"],
+      providerId: "sharded-quality-provider"
+    });
+    await service.createEmployee({
+      id: "sharded-quality-tester",
+      identity: { displayName: "Tester", background: "Tests and audits.", responsibilities: ["Test", "Audit"] },
+      capabilities: ["quality.test", "quality.audit"],
+      providerId: "sharded-quality-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message", "e2eEvidence"],
+        properties: {
+          message: { type: "string" },
+          e2eEvidence: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["method", "steps", "observed"],
+              properties: {
+                method: { type: "string" },
+                steps: { type: "string" },
+                observed: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    });
+    await service.createManagementPolicy({
+      id: "sharded-quality-policy",
+      allowedRoleIds: ["builder", "tester"],
+      instructions: "Run bounded quality shards before an evidence-only independent audit.",
+      limits: { maxRounds: 5, maxDelegations: 2, maxParallelDelegations: 1 }
+    });
+    await service.createWorkflow({
+      id: "sharded-quality-workflow",
+      architecture: "supervisor",
+      supervisor: { employeeId: "sharded-quality-lead" },
+      managementPolicy: { id: "sharded-quality-policy" },
+      members: [
+        { roleId: "builder", employeeId: "sharded-quality-builder" },
+        { roleId: "tester", employeeId: "sharded-quality-tester" }
+      ],
+      flow: {
+        stages: [
+          { id: "plan", kind: "supervisor", title: "Plan" },
+          { id: "loop", kind: "delegation-loop", title: "Build" },
+          { id: "test", kind: "gate", title: "Test", gateId: "quality-test" },
+          { id: "audit", kind: "gate", title: "Audit", gateId: "independent-audit" },
+          { id: "delivery", kind: "delivery", title: "Deliver" }
+        ],
+        gates: [
+          {
+            id: "quality-test",
+            requiredCapability: "quality.test",
+            mode: "before-completion",
+            required: true,
+            instructions: "Run the regression assessment.",
+            fallback: "block"
+          },
+          {
+            id: "independent-audit",
+            requiredCapability: "quality.audit",
+            mode: "before-completion",
+            required: true,
+            instructions: "Audit the candidate and existing quality evidence.",
+            fallback: "block"
+          }
+        ]
+      }
+    });
+
+    const result = await service.runWorkbenchWorkflow("sharded-quality-workflow", { message: "Implement and validate the change." });
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    const testCalls = gateCalls.filter((call) => call.execution.gateId === "quality-test");
+    const auditCall = gateCalls.find((call) => call.execution.gateId === "independent-audit");
+    expect(testCalls).toHaveLength(3);
+    expect(testCalls.map((call) => call.execution.shard)).toEqual([
+      { index: 1, total: 3, requiredChecks: requiredChecks.slice(0, 2) },
+      { index: 2, total: 3, requiredChecks: requiredChecks.slice(2, 4) },
+      { index: 3, total: 3, requiredChecks: requiredChecks.slice(4, 6) }
+    ]);
+    for (const [index, call] of testCalls.entries()) {
+      for (const check of requiredChecks.slice(index * 2, index * 2 + 2)) expect(call.task).toContain(check);
+      expect(call.task).toContain(`Quality Gate shard ${index + 1}/3`);
+    }
+    expect(auditCall?.task).toContain("Do not repeat browser or automated regression");
+    expect(auditCall?.needs.filter((nodeId) => nodeId.startsWith("gate-quality-test-"))).toHaveLength(3);
+    expect(Object.keys(result.run.nodes)).toEqual(expect.arrayContaining([
+      "gate-quality-test-r4-1-s1",
+      "gate-quality-test-r4-1-s2",
+      "gate-quality-test-r4-1-s3"
     ]));
   });
 
