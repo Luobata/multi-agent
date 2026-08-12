@@ -9,6 +9,7 @@ coverage/
 .DS_Store
 
 # Test / E2E run artifacts
+.evidence/
 midscene_run/
 .worktrees/
 .claude/worktrees/

@@ -131,6 +131,31 @@ describe("worktree delivery merge gate", () => {
     expect(preview.changes.files).toEqual([{ status: "M", path: "README.md" }]);
   }, 15_000);
 
+  it("bounds large untracked browser reports before rendering the inline diff", async () => {
+    const root = repository();
+    const runId = "run-delivery-large-report-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "feature.txt"), "accepted\n", "utf8");
+    fs.writeFileSync(path.join(worktree!.path, "browser-report.html"), "x".repeat(5 * 1024 * 1024), "utf8");
+    const runDir = artifactDirectory();
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+
+    const preview = await previewRunMerge(run, runDir);
+
+    expect(preview.eligible).toBe(true);
+    expect(preview.reasons).toEqual([]);
+    expect(preview.changes.files).toEqual(expect.arrayContaining([
+      { status: "??", path: "browser-report.html" },
+      { status: "??", path: "feature.txt" }
+    ]));
+    expect(preview.changes.unifiedDiff).toMatchObject({
+      truncated: true,
+      text: expect.stringContaining("browser-report.html")
+    });
+    expect(preview.changes.unifiedDiff.text).toContain("omitted from inline preview");
+  }, 15_000);
+
   it("keeps preview read-only and merges only after the exact run confirmation", async () => {
     const root = repository();
     const runId = "run-delivery-preview-1";

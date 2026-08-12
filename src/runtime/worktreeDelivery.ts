@@ -9,6 +9,7 @@ const RUN_ID_PATTERN = /^run-[A-Za-z0-9-]+$/;
 const DELIVERY_FILE = "delivery.json";
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_UNIFIED_DIFF_BYTES = 256 * 1024;
+const MAX_UNTRACKED_DIFF_FILE_BYTES = 128 * 1024;
 const MAX_UNTRACKED_DIFF_FILES = 100;
 const MAX_EVIDENCE_FILES = 2_000;
 const MAX_EVIDENCE_DEPTH = 10;
@@ -579,6 +580,25 @@ async function readUnifiedDiff(
     .split("\0")
     .filter(Boolean);
   for (const file of untracked.slice(0, MAX_UNTRACKED_DIFF_FILES)) {
+    const absolutePath = path.resolve(worktreePath, file);
+    const relativePath = path.relative(worktreePath, absolutePath);
+    if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+      throw new Error(`untracked diff path escapes worktree: ${file}`);
+    }
+    const stat = await fs.lstat(absolutePath);
+    // Browser reports can contain several megabytes of embedded screenshots. Asking Git to
+    // render the full no-index diff before truncating it can exceed child_process.maxBuffer and
+    // incorrectly make an otherwise healthy delivery ineligible. Keep the file visible in the
+    // preview, but bound expansion before invoking Git.
+    if (!stat.isFile() || stat.size > MAX_UNTRACKED_DIFF_FILE_BYTES) {
+      chunks.push([
+        `diff --git a/${file} b/${file}`,
+        "new file omitted from inline preview",
+        `[${stat.size} bytes; inspect the worktree for full contents]`
+      ].join("\n"));
+      truncated = true;
+      continue;
+    }
     const diff = await runGit(worktreePath, [
       "diff", "--no-index", "--no-ext-diff", "--no-color", "--unified=3", "--", "/dev/null", file
     ]);
