@@ -10,6 +10,7 @@ coverage/
 
 # Test / E2E run artifacts
 .evidence/
+/seed.tmp.mts
 midscene_run/
 .worktrees/
 .claude/worktrees/
