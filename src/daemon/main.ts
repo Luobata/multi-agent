@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { WorkbenchService } from "../workbench/service.js";
-import { startDaemon } from "./server.js";
+import { startRecoveredDaemon } from "./startup.js";
 
 const program = new Command();
 program
@@ -18,8 +18,7 @@ program
     const port = Number(options.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be an integer from 1 to 65535");
     const service = await WorkbenchService.open({ dataRoot: options.dataRoot });
-    await startDaemon(service, { host: options.host, port, staticDir: options.staticDir });
-    await service.recoverInterruptedActivity();
+    await startRecoveredDaemon(service, { host: options.host, port, staticDir: options.staticDir });
     const urlHost = options.host.includes(":") && !options.host.startsWith("[") ? `[${options.host}]` : options.host;
     process.stdout.write(`Local Agent Workbench: http://${urlHost}:${port}\n`);
     process.stdout.write(`Data root: ${service.store.dataRoot}\n`);
