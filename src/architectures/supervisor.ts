@@ -1116,6 +1116,15 @@ async function executeGateActivation(
     ? supervisorValidationCheckGroups(regressionImpact)
     : [];
   const executionGroups = validationGroups.length > 1 ? validationGroups : [{ id: "all", requiredChecks: [] }];
+  const gateMemberSession: MemberSessionState | undefined = executionGroups.length > 1
+    ? {
+        id: `member-session-gate-${tracker.gate.id}-r${round}-${sequence}`,
+        key: `gate-${tracker.gate.id}-r${round}-${sequence}`,
+        roleId: executor.roleId,
+        status: "open",
+        turns: []
+      }
+    : undefined;
   const nodes = executionGroups.map((group, index): ExecutionPlanNode => {
     const shard = executionGroups.length > 1
       ? { id: group.id, index: index + 1, total: executionGroups.length, requiredChecks: group.requiredChecks }
@@ -1138,7 +1147,8 @@ async function executeGateActivation(
         __delegatedRoleId: executor.roleId,
         __todoId: "",
         __delegatedTask: gateTask,
-        __memberSession: null,
+        // Filled immediately before this serial shard executes so it includes every prior turn.
+        __memberSession: gateMemberSession ? memberSessionSnapshot(gateMemberSession) : null,
         __requiredCapabilities: [tracker.gate.requiredCapability],
         __workKind: gateWorkKind(tracker.gate),
         __changeSet: "",
@@ -1159,7 +1169,13 @@ async function executeGateActivation(
         gateId: tracker.gate.id,
         requiredCapability: tracker.gate.requiredCapability,
         activation: activation.key,
-        ...(shard ? { gateShardIndex: shard.index, gateShardTotal: shard.total } : {})
+        ...(shard ? { gateShardIndex: shard.index, gateShardTotal: shard.total } : {}),
+        ...(gateMemberSession ? {
+          todoId: group.id,
+          memberSessionId: gateMemberSession.id,
+          memberSessionKey: gateMemberSession.key,
+          memberSessionRetained: index < executionGroups.length - 1
+        } : {})
       }
     };
     // supervisorWith supplies a null default; Gate execution must win after common context assembly.
@@ -1177,16 +1193,44 @@ async function executeGateActivation(
     };
     return node;
   });
-  for (const node of nodes) await context.scheduleNode(node);
   // Deliberately advance broad validation one bounded shard at a time. This avoids turning one
   // package-wide request into a provider/resource burst and leaves an individual durable node
-  // checkpoint after every completed shard.
+  // checkpoint after every completed shard. The same logical member Session is retained between
+  // shards, so the tester receives the prior bounded evidence instead of being recreated cold.
   const results: Array<{ node: ExecutionPlanNode; result: NodeRunResult }> = [];
-  for (const node of nodes) {
-    results.push({
-      node,
-      result: await context.executeNode(node, { dependencyFailure: "observe", deadlineAt })
-    });
+  for (const [index, node] of nodes.entries()) {
+    if (gateMemberSession) {
+      node.with.__memberSession = memberSessionSnapshot(gateMemberSession);
+      await context.emit(index === 0 ? "supervisor.member-session.opened" : "supervisor.member-session.continued", node.id, {
+        memberSessionId: gateMemberSession.id,
+        sessionKey: gateMemberSession.key,
+        roleId: gateMemberSession.roleId,
+        todoId: executionGroups[index]!.id,
+        priorTurns: gateMemberSession.turns.length
+      });
+    }
+    await context.scheduleNode(node);
+    const result = await context.executeNode(node, { dependencyFailure: "observe", deadlineAt });
+    results.push({ node, result });
+    if (gateMemberSession) {
+      gateMemberSession.turns.push({
+        todoId: executionGroups[index]!.id,
+        nodeId: node.id,
+        task: String(node.with.__delegatedTask ?? ""),
+        status: result.status,
+        output: result.output ?? null,
+        error: result.error ?? null
+      });
+      if (index === nodes.length - 1) {
+        gateMemberSession.status = "closed";
+        await context.emit("supervisor.member-session.closed", node.id, {
+          memberSessionId: gateMemberSession.id,
+          sessionKey: gateMemberSession.key,
+          turns: gateMemberSession.turns.length,
+          finalStatus: result.status
+        });
+      }
+    }
   }
   let activationPassed = true;
   const errors: string[] = [];
