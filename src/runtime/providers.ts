@@ -196,6 +196,27 @@ function providerTimeoutPolicy(definition: ProviderTimeoutDefinition): {
   };
 }
 
+/**
+ * Some streaming CLIs emit transport retry / rate-limit telemetry while no model work is
+ * progressing. Those records must remain in the raw Provider evidence, but treating them as
+ * activity lets an upstream retry loop keep a Run alive forever. Unknown and ordinary output
+ * remain progress by default so generic command Providers keep their existing semantics.
+ */
+export function providerChunkSignalsProgress(chunk: string): boolean {
+  const lines = chunk.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines.some((line) => {
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (event.type === "system" && event.subtype === "api_retry") return false;
+      if (event.type === "rate_limit_event") return false;
+      return true;
+    } catch {
+      return true;
+    }
+  });
+}
+
 function monitorProviderProcess(
   invocation: ProviderInvocation,
   definition: ProviderTimeoutDefinition,
@@ -272,8 +293,9 @@ function monitorProviderProcess(
     noteOutput(stream, chunk) {
       const timestamp = Date.now();
       const chunkBytes = Buffer.byteLength(chunk);
-      lastOutputAt = timestamp;
       totalBytes += chunkBytes;
+      if (!providerChunkSignalsProgress(chunk)) return;
+      lastOutputAt = timestamp;
       resetIdleTimer();
       if (lastProgressEventAt === 0 || timestamp - lastProgressEventAt >= PROGRESS_EVENT_INTERVAL_MS) {
         lastProgressEventAt = timestamp;

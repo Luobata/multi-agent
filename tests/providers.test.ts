@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ProviderExecutionError } from "../src/core/errors.js";
-import { buildCodexInvocationArgs, createDefaultProviderRegistry, providerExitDiagnostic, providerSpawnEnvironment, registerProviderAdapter } from "../src/runtime/providers.js";
+import { buildCodexInvocationArgs, createDefaultProviderRegistry, providerChunkSignalsProgress, providerExitDiagnostic, providerSpawnEnvironment, registerProviderAdapter } from "../src/runtime/providers.js";
 
 describe("provider adapters", () => {
   it("prepends the daemon Node directory so env-based Codex launchers work without a shell profile", () => {
@@ -268,6 +268,37 @@ describe("provider adapters", () => {
     expect(failure).toMatchObject({ kind: "idle-timeout", retryable: false });
     expect(progress).toContain("long-running");
     expect(progress).toContain("idle-timeout");
+  });
+
+  it("does not let upstream retry telemetry keep an idle Provider alive", async () => {
+    expect(providerChunkSignalsProgress(`${JSON.stringify({ type: "system", subtype: "api_retry", attempt: 2 })}\n`)).toBe(false);
+    expect(providerChunkSignalsProgress(`${JSON.stringify({ type: "rate_limit_event", utilization: 1 })}\n`)).toBe(false);
+    expect(providerChunkSignalsProgress(`${JSON.stringify({ type: "assistant", message: { content: [] } })}\n`)).toBe(true);
+    expect(providerChunkSignalsProgress("plain command progress")).toBe(true);
+
+    const adapter = createDefaultProviderRegistry().get("command")!;
+    const progress: string[] = [];
+    const retryEvent = JSON.stringify({ type: "system", subtype: "api_retry", attempt: 1 });
+    const failure = await adapter.invoke({
+      providerId: "retry-loop-command",
+      definition: {
+        adapter: "command",
+        command: process.execPath,
+        args: ["-e", `setInterval(() => process.stdout.write(${JSON.stringify(retryEvent)} + String.fromCharCode(10)), 20)`],
+        timeoutMs: 30,
+        idleTimeoutMs: 90,
+        hardTimeoutMs: 500
+      },
+      cwd: process.cwd(),
+      prompt: "unused",
+      templateContext: {},
+      onProgress: (event) => { progress.push(event.kind); }
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProviderExecutionError);
+    expect(failure).toMatchObject({ kind: "idle-timeout", retryable: false });
+    expect(progress).toContain("idle-timeout");
+    expect(progress).not.toContain("output");
   });
 
   it("settles an idle timeout when a dead CLI leaves an inherited output pipe open", async () => {
