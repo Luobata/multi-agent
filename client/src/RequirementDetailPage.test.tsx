@@ -255,6 +255,39 @@ describe("RequirementDetailPage advancement launch", () => {
     expect(go).toHaveBeenCalledWith(`requirements/${requirement.id}?section=acceptance`);
   });
 
+  it("pins the acceptance section and standalone dossier to the fixed acceptance Run", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T03:00:00.000Z"), idSeed: () => "req-fixed-run" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id, title: "固定验收卷宗", summary: "验收与后续推进分离", priority: "high",
+      rawRequirement: "固定验收 Run", acceptanceCriteria: ["验收区不漂移"]
+    });
+    const config = { entrancePolicyId: entrancePolicy.id, autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-new", runId: "run-new", status: "completed", observedAt: "2026-08-10T03:00:01.000Z"
+    }, config.pollIntervalMs);
+    await service.submitRequirementForAcceptance(requirement.id, {
+      runId: "run-accepted", eligible: true, diffFiles: ["client/src/App.tsx"], structuredE2eCount: 1, mediaCount: 0,
+      capturedAt: "2026-08-10T03:00:02.000Z",
+      testGate: { gateId: "test", status: "passed" }, reviewGate: { gateId: "audit", status: "passed" },
+      source: { kind: "worktree", worktreePath: "/tmp/run-accepted" }
+    });
+    const go = vi.fn();
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    act(() => root.render(<RequirementDetailPage requirementId={requirement.id} section="acceptance" go={go} notify={vi.fn()} service={service} projects={[project]} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(container.textContent).toContain("验收 Run 与最新推进 Run 不同");
+    expect(container.textContent).toContain("run-accepted");
+    expect(container.textContent).toContain("run-new");
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/api/runs/run-accepted"))).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/api/runs/run-new"))).toBe(false);
+    act(() => button("独立运行卷宗").click());
+    expect(go).toHaveBeenCalledWith("runs?run=run-accepted");
+  });
+
   it("explains the pending decision and opens the exact Run as the primary action", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T02:00:00.000Z"), idSeed: () => "req-confirm" });
     service.syncConnectedProjects([project]);

@@ -700,7 +700,22 @@ describe("RunsPage delivery acceptance", () => {
     expect(dashboard.submitRequirementForAcceptance).toHaveBeenCalledWith("req-104", expect.objectContaining({
       runId: deliveryRun.id, eligible: true, diffFiles: ["client/src/RunsPage.tsx"]
     }));
+    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "补登记该需求到待验收")).toBe(false);
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/merge-queue"))).toBe(false);
+  });
+
+  it("hides the duplicate acceptance submission when the requirement already binds this Run", async () => {
+    const dashboard = {
+      getRequirement: vi.fn().mockResolvedValue({ evidence: { acceptance: { runId: deliveryRun.id, capturedAt: "2026-08-06T06:00:00.000Z" } } }),
+      submitRequirementForAcceptance: vi.fn()
+    } as unknown as DashboardService;
+    await act(async () => {
+      root.render(<RunsPage notify={notify} dashboard={dashboard} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "提交该需求到待验收")).toBe(false);
+    expect(dashboard.submitRequirementForAcceptance).not.toHaveBeenCalled();
   });
 
   it("navigates to a different bound acceptance Run without starting a cross-Run evidence rerun", async () => {
@@ -739,6 +754,9 @@ describe("RunsPage delivery acceptance", () => {
       await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} />); await Promise.resolve(); });
       const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
       expect(rerun?.disabled).toBe(false);
+      expect(container.querySelector(".run-delivery-evidence-summary")?.textContent).toContain("结构化 E2E：1 条");
+      expect(container.querySelector(".run-delivery-evidence-summary")?.textContent).toContain("test passed；review passed");
+      expect(container.querySelector(".run-delivery-evidence-summary")?.textContent).toContain("媒体 0 项不等于无验收证据");
       await act(async () => { rerun?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
       expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith(`/api/runs/${deliveryRun.id}/evidence-rerun`) && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
       expect(dashboard.syncRequirementEvidenceCapture).toHaveBeenCalledWith("req-104", deliveryRun.id, expect.objectContaining({ status: "queued" }));
@@ -825,22 +843,27 @@ describe("RunsPage delivery acceptance", () => {
     }
   });
 
-  it("treats recovered media as usable evidence without offering a contradictory rerun", async () => {
+  it("keeps partial media visible and allows another rerun after a failed capture", async () => {
     deliveryStatus = "evidence-failed";
+    const dashboard = {
+      getRequirement: vi.fn().mockResolvedValue({ evidence: { acceptance: { runId: deliveryRun.id } } }),
+      syncRequirementEvidenceCapture: vi.fn().mockResolvedValue({ id: "req-104" })
+    } as unknown as DashboardService;
     await act(async () => {
-      root.render(<RunsPage notify={notify} activityRevision="evidence-failed" />);
+      root.render(<RunsPage notify={notify} dashboard={dashboard} activityRevision="evidence-failed" />);
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("媒体证据已恢复，无需重复补采");
-    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("2 项可查看");
+    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("截图补采失败，已保留部分媒体");
+    expect(container.querySelector(".run-delivery-evidence-attention")?.textContent).toContain("已有媒体历史会保留");
     expect(container.querySelector(".run-delivery-evidence-wall")).toBeTruthy();
     const retry = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
       .find((button) => button.textContent === "重新运行 test-engineer 补采");
-    expect(retry).toBeUndefined();
+    expect(retry?.disabled).toBe(false);
+    await act(async () => { retry?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(fetchMock.mock.calls.some(([input, init]) => (
       String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST"
-    ))).toBe(false);
+    ))).toBe(true);
   });
 
   it("does not project a queued rerun superseded by the fixed acceptance snapshot", async () => {
@@ -921,6 +944,28 @@ describe("RunsPage delivery acceptance", () => {
     };
     expect(isRunAcceptanceReady(preview)).toBe(true);
     expect(acceptanceSnapshotFromPreview(preview, "2026-08-14T05:30:00.000Z").eligible).toBe(true);
+  });
+
+  it("shows a disabled merge action with the server blocker when acceptance is ready but merge is ineligible", async () => {
+    const dirtyPreview: RunMergePreview = {
+      ...eligiblePreview,
+      status: "not-ready",
+      eligible: false,
+      targetClean: false,
+      reasons: ["目标仓库存在未提交改动，请先处理后再合并。"]
+    };
+    heldMergePreview = Promise.resolve({ ok: true, status: 200, json: async () => ({ data: dirtyPreview }) });
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="dirty-target" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const merge = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent === "批准并加入待合入");
+    expect(merge?.disabled).toBe(true);
+    expect(container.textContent).toContain("暂不可合入：目标仓库存在未提交改动，请先处理后再合并。");
+    await act(async () => { merge?.click(); await Promise.resolve(); });
+    expect(document.querySelector('[aria-label="批准并加入待合入"]')).toBeFalsy();
   });
 
   it("does not bypass a product or evidence blocker when merge is also unavailable", () => {

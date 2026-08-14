@@ -8375,21 +8375,28 @@ export class WorkbenchService {
   async requestRunEvidenceRerun(id: string, input: { actor: string }): Promise<RunDeliveryRecord> {
     const actor = requireText(input.actor, "evidence rerun actor");
     const { run, runDir } = await this.getRunDeliveryContext(id);
-    const preview = await previewRunMerge(run, runDir);
-    if (!preview.worktreePath) throw new Error("该 Run 没有可用于截图验收的 worktree");
-    const current = preview.delivery?.evidenceRerun;
-    // Media recovered from an interrupted attempt remains first-class delivery evidence. Re-running
-    // the same capture after the evidence gate is already satisfied only creates contradictory UI
-    // and duplicate artifacts, so the operator may retry only while no viewable media exists.
-    if (preview.evidence.assets.length > 0) {
-      throw new Error("该 Run 已有完整媒体证据，无需重复补采");
-    }
+    let preview = await previewRunMerge(run, runDir);
+    const worktreePath = preview.worktreePath;
+    if (!worktreePath) throw new Error("该 Run 没有可用于截图验收的 worktree");
+    let current = preview.delivery?.evidenceRerun;
     if (["queued-for-merge", "retesting", "merging", "merged", "discarded"].includes(preview.status)) {
       throw new Error("该交付已进入合入或终态，不能再启动截图补采");
     }
+    const conflictBusy = preview.status === "conflict"
+      && ["resolving", "retesting", "leader-review"].includes(preview.delivery?.conflictResolution?.status ?? "");
+    if (conflictBusy) throw new Error("冲突处理正在进行，不能并行启动截图补采");
     if (current?.status === "queued" || current?.status === "running") {
       if (this.evidenceReruns.has(id)) return preview.delivery!;
-      await this.recoverInterruptedEvidenceRerun(runDir, id, preview.worktreePath, current);
+      if (await this.recoverInterruptedEvidenceRerun(runDir, id, worktreePath, current)) {
+        preview = await previewRunMerge(run, runDir);
+        current = preview.delivery?.evidenceRerun;
+        if (current?.status === "passed") return preview.delivery!;
+      }
+    }
+    // A failed attempt may leave useful partial media. Keep that history and allow a new capture;
+    // all other runs with viewable media already have complete evidence and must not duplicate it.
+    if (preview.evidence.assets.length > 0 && current?.status !== "failed") {
+      throw new Error("该 Run 已有完整媒体证据，无需重复补采");
     }
     const requestedAt = now();
     const queued = await updateRunEvidenceRerun(runDir, id, {
@@ -8402,7 +8409,6 @@ export class WorkbenchService {
     const invocation = this.invocationForRun(id);
     const projectId = invocation?.source.project;
     const taskId = invocation?.source.taskId;
-    const worktreePath = preview.worktreePath;
     const originalRequest = await this.originalRequestForRun(runDir);
     const stagingRoot = path.join(worktreePath, ".multi-agent", "evidence-rerun", `${id}-${randomUUID()}`);
     const job = (async () => {

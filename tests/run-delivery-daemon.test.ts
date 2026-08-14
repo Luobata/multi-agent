@@ -215,6 +215,15 @@ describe("run delivery daemon routes", () => {
     );
     fs.mkdirSync(interruptedStaging, { recursive: true });
     fs.writeFileSync(path.join(interruptedStaging, "recovered.png"), png);
+    const recoveredPost = await invokeRoute(app, "post", "/api/runs/:id/evidence-rerun", {
+      params: { id: runId }, body: { actor: "daemon-reviewer" }
+    });
+    expect(recoveredPost.status).toBe(202);
+    expect(recoveredPost.json).toMatchObject({ data: { evidenceRerun: {
+      status: "passed",
+      mediaCount: 1,
+      message: expect.stringContaining("无需重复补采")
+    } } });
     const recoveredResponse = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
     expect(recoveredResponse.status).toBe(200);
     expect(recoveredResponse.json).toMatchObject({ data: { delivery: { evidenceRerun: {
@@ -233,6 +242,42 @@ describe("run delivery daemon routes", () => {
     });
     expect(retriedCapture.status).toBe(400);
     expect(retriedCapture.json).toMatchObject({ error: { message: expect.stringContaining("已有完整媒体证据") } });
+
+    for (const conflictStatus of ["resolving", "retesting", "leader-review"]) {
+      fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
+        runId, status: "conflict", updatedAt: "2026-08-11T06:03:50.000Z",
+        evidenceRerun: {
+          status: "failed", actor: "workbench-operator", requestedAt: "2026-08-11T06:03:35.535Z",
+          updatedAt: "2026-08-11T06:03:50.000Z", mediaCount: 1, message: "补采失败；已保留部分媒体。"
+        },
+        conflictResolution: { status: conflictStatus, actor: "daemon-reviewer", requestedAt: "2026-08-11T06:03:45.000Z", updatedAt: "2026-08-11T06:03:50.000Z" }
+      }, null, 2)}\n`, "utf8");
+      const conflictCapture = await invokeRoute(app, "post", "/api/runs/:id/evidence-rerun", {
+        params: { id: runId }, body: { actor: "daemon-reviewer" }
+      });
+      expect(conflictCapture.status).toBe(400);
+      expect(conflictCapture.json).toMatchObject({ error: { message: expect.stringContaining("冲突处理正在进行") } });
+    }
+
+    fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
+      runId, status: "awaiting-acceptance", updatedAt: "2026-08-11T06:04:00.000Z",
+      evidenceRerun: {
+        status: "failed", actor: "workbench-operator", requestedAt: "2026-08-11T06:03:35.535Z",
+        updatedAt: "2026-08-11T06:04:00.000Z", mediaCount: 1, message: "补采失败；已保留部分媒体。"
+      }
+    }, null, 2)}\n`, "utf8");
+    const retriedPartialCapture = await invokeRoute(app, "post", "/api/runs/:id/evidence-rerun", {
+      params: { id: runId }, body: { actor: "daemon-reviewer" }
+    });
+    expect(retriedPartialCapture.status).toBe(202);
+    expect(retriedPartialCapture.json).toMatchObject({ data: { evidenceRerun: { status: "queued" } } });
+    expect(fs.existsSync(path.join(runDir, "evidence-reruns", "recovered-2026-08-11T06-03-35-535Z-1", "001-recovered.png"))).toBe(true);
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const latest = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
+      const status = (latest.json as { data: RunMergePreview }).data.delivery?.evidenceRerun?.status;
+      if (status !== "queued" && status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
 
     const kept = await invokeRoute(app, "post", "/api/runs/:id/keep", {
       params: { id: runId },

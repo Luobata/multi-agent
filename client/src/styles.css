@@ -4120,6 +4120,8 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
 .run-delivery-evidence { display: grid; gap: var(--space-3); }
 .run-delivery-evidence-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-3); }
 .run-delivery-evidence-head span, .run-delivery-evidence-empty { margin: 0; color: var(--ink-3); font-size: var(--text-xs); }
+.run-delivery-evidence-summary { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--line); background: var(--paper-sunken); color: var(--ink-2); font-size: var(--text-xs); }
+.run-delivery-evidence-summary strong { color: var(--seal-green); }
 .run-delivery-evidence-empty { display: grid; justify-items: start; gap: var(--space-2); padding: var(--space-3); border: 1px dashed var(--line-strong); background: var(--paper-sunken); }
 .run-delivery-evidence-empty p, .run-delivery-evidence-empty small { margin: 0; }
 .run-delivery-evidence-attention { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); padding: var(--space-3); border: 1px dashed var(--seal-amber); background: var(--seal-amber-bg); }

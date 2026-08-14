@@ -378,14 +378,19 @@ function RunDeliveryPanel({
   const evidenceBusy = evidenceRerun?.status === "queued" || evidenceRerun?.status === "running";
   const evidenceFailed = evidenceRerun?.status === "failed";
   const evidenceMissing = preview.evidence.assets.length === 0;
-  const evidenceRecovered = !evidenceMissing && Boolean(
-    evidenceRerun?.message?.includes("恢复")
-    || (evidenceFailed && evidenceRerun?.mediaCount)
-  );
-  const evidenceNeedsAttention = evidenceMissing;
+  const evidenceRecovered = !evidenceMissing
+    && evidenceRerun?.status === "passed"
+    && Boolean(evidenceRerun.message?.includes("恢复"));
+  const evidenceNeedsAttention = evidenceMissing || evidenceFailed;
   const conflictBusy = conflict && ["resolving", "retesting", "leader-review"].includes(conflictResolution?.status ?? "");
   const actionable = !merged && !discarded && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept" || preview.status === "returned-to-acceptance");
   const canQueueMerge = preview.eligible && !merged && !discarded && !mergeBusy && !evidenceBusy && preview.status !== "conflict";
+  const showMergeAction = isRunAcceptanceReady(preview) && !merged && !discarded && !mergeBusy && preview.status !== "conflict";
+  const mergeDisabledReason = !preview.eligible
+    ? (preview.reasons[0] ?? "服务端合入门禁暂未通过，请处理阻塞后重试。")
+    : evidenceBusy
+      ? "验收证据正在更新，完成前不能加入待合入。"
+      : undefined;
   const isAcceptanceRun = !taskId || Boolean(acceptanceRunId && acceptanceRunId === preview.runId);
   const canRerunEvidence = evidenceNeedsAttention && !acceptanceBindingLoading && isAcceptanceRun && !evidenceBusy && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && !discarded && !merged;
   const evidenceDisabledReason = acceptanceBindingLoading
@@ -439,13 +444,20 @@ function RunDeliveryPanel({
       <ul>{preview.safeGitCommands.map((command) => <li key={command}><code>{command}</code><CopyButton value={command} label="复制" /></li>)}</ul>
     </div>}
     <div className="run-delivery-evidence">
-      <div className="run-delivery-evidence-head"><strong>Evidence wall</strong><span>{preview.evidence.assets.length} 项媒体证据</span></div>
+      <div className="run-delivery-evidence-head"><strong>Evidence wall</strong><span>{preview.evidence.assets.length} 项媒体证据 · {preview.evidence.structuredE2eCount} 条结构化 E2E</span></div>
+      <div className="run-delivery-evidence-summary" role="status">
+        <span>结构化 E2E：{preview.evidence.structuredE2eCount} 条</span>
+        <span>Required Gates：{preview.evidence.gates.filter((gate) => gate.required).length > 0
+          ? preview.evidence.gates.filter((gate) => gate.required).map((gate) => `${gate.gateId} ${gate.status}`).join("；")
+          : "未声明"}</span>
+        {evidenceMissing && (preview.evidence.structuredE2eCount > 0 || preview.evidence.gates.some((gate) => gate.required)) && <strong>媒体 0 项不等于无验收证据</strong>}
+      </div>
       {evidenceRecovered && <div className="run-delivery-evidence-attention run-delivery-evidence-attention--recovered" role="status">
         <div><strong>媒体证据已恢复，无需重复补采</strong><p>{evidenceRerun?.message ?? `daemon 中断了补采过程，但已恢复 ${preview.evidence.assets.length} 项可验收媒体；现有证据继续参与交付门禁。`}</p></div>
         <Stamp status="passed" label={`${preview.evidence.assets.length} 项可查看`} />
       </div>}
       {evidenceNeedsAttention && <div className={`run-delivery-evidence-attention${evidenceFailed ? " run-delivery-evidence-attention--interrupted" : ""}`} role="status">
-        <div><strong>{evidenceFailed ? "截图补采失败，仍没有可查看媒体" : "缺少可查看的截图或录屏"}</strong><p>{evidenceFailed ? (evidenceRerun.message ?? "上一轮补采未产出媒体证据，可以重新运行独立验收。") : "结构化 E2E 已保留；是否让项目 test-engineer 重新走一遍验收路径并补采真实界面证据？"}</p></div>
+        <div><strong>{evidenceFailed ? (evidenceMissing ? "截图补采失败，仍没有可查看媒体" : "截图补采失败，已保留部分媒体") : "缺少可查看的截图或录屏"}</strong><p>{evidenceFailed ? `${evidenceRerun.message ?? "上一轮补采未完整完成。"} 可以再次补采；已有媒体历史会保留。` : "结构化 E2E 已保留；媒体 0 项不等于无验收证据。是否让项目 test-engineer 重新走一遍验收路径并补采真实界面证据？"}</p></div>
         {!acceptanceBindingLoading && acceptanceRunId && !isAcceptanceRun
           ? <button type="button" className="button secondary" onClick={onOpenAcceptanceRun}>打开该需求绑定的验收 Run →</button>
           : <button type="button" className="button secondary" disabled={!canRerunEvidence} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "test-engineer 补采中…" : evidenceFailed ? "重新运行 test-engineer 补采" : "让 test-engineer 补采证据"}</button>}
@@ -455,11 +467,12 @@ function RunDeliveryPanel({
       {preview.evidence.assets.length > 0 && <div className="run-delivery-evidence-wall">{preview.evidence.assets.map((asset) => <RunEvidenceCard key={asset.id} asset={asset} />)}</div>}
     </div>
     {boardSubmitError && <div className="inline-error" role="alert">{boardSubmitError}</div>}
-    {(preview.eligible || actionable || canSubmitToBoard) && !discarded && <div className="run-delivery-actions">
+    {(showMergeAction || actionable || canSubmitToBoard) && !discarded && <div className="run-delivery-actions">
       {canSubmitToBoard && <button type="button" className="button secondary" disabled={boardSubmitting} aria-busy={boardSubmitting} onClick={onSubmitToBoard} title={taskId ? `写入看板需求 ${taskId} 的验收快照并迁移到待验收` : undefined}>{boardSubmitting ? "提交中…" : merged ? "补登记该需求到待验收" : "提交该需求到待验收"}</button>}
       {actionable && <button type="button" className="button danger" onClick={onOpenDiscard}>丢弃候选结果</button>}
       {actionable && <button type="button" className="button secondary" onClick={onOpenKeep}>人工保留</button>}
-      {canQueueMerge && <button type="button" className="button primary" onClick={onOpenMerge}>批准并加入待合入</button>}
+      {showMergeAction && <button type="button" className="button primary" disabled={!canQueueMerge} aria-describedby={!canQueueMerge && mergeDisabledReason ? "run-merge-disabled-reason" : undefined} onClick={onOpenMerge}>批准并加入待合入</button>}
+      {showMergeAction && !canQueueMerge && mergeDisabledReason && <small id="run-merge-disabled-reason" role="note">暂不可合入：{mergeDisabledReason}</small>}
     </div>}
   </div>;
 }
@@ -1031,6 +1044,7 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     try {
       const snapshot = acceptanceSnapshotFromPreview(mergePreview, new Date().toISOString());
       const updated = await dashboard.submitRequirementForAcceptance(selected.taskId, snapshot);
+      setAcceptanceBinding({ taskId: selected.taskId, runId: snapshot.runId, capturedAt: snapshot.capturedAt });
       onDashboardSyncRef.current?.(updated);
       notify(`${updated.code} 已提交到待验收；Run ${snapshot.runId} 验收快照已固定。`, "success");
     } catch (error) {
@@ -1056,6 +1070,9 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     && selected?.taskId
     && mergePreview
     && isRunAcceptanceReady(mergePreview)
+    && !acceptanceBindingLoading
+    && acceptanceBindingError !== selected.taskId
+    && acceptanceRunId !== selected.id
     && !["queued-for-merge", "retesting", "merging", "discarded"].includes(mergePreview.status)
   );
   const profileEntries = Object.entries(selected?.effectiveProfiles ?? {});

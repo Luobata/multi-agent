@@ -3,6 +3,7 @@ dist/
 .multi-agent/
 .hallmark/
 .omc/
+.ai-review/
 coverage/
 *.tgz
 *.log
