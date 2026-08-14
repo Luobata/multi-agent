@@ -17,3 +17,4 @@ midscene_run/
 playwright-report/
 test-results/
 .vitest/
+.vite-cache/

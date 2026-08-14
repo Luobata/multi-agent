@@ -10,6 +10,7 @@ connector:
     sourceRoots: [src, client]
     requirementAdvancement:
       entrancePolicyId: default-task-entrance-policy
+      candidateUrl: http://127.0.0.1:4319
       polling:
         # 人工按钮与未来轮询器复用同一幂等推进协议；首期只开放人工启动。
         enabled: false
@@ -154,7 +155,7 @@ roles:
     outputSchema:
       type: object
       additionalProperties: false
-      required: [verdict, summary, e2eEvidence]
+      required: [verdict, summary, e2eEvidence, risks]
       properties:
         verdict:
           enum: [pass, block]

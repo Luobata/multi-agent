@@ -26,6 +26,7 @@ import type {
   WorkflowRunRecord,
   WorkflowRunIsolation
 } from "../core/types.js";
+import { ExecutionBudget, type CapabilityBroker, type ExecutionBudgetLimits, type ExecutionBudgetSnapshot } from "../runtime/governance.js";
 import {
   configurationPlanHash,
   configurationReviewHash,
@@ -53,6 +54,21 @@ import { RestrictedKnowledgeUrlFetcher } from "../knowledge/urlFetcher.js";
 import { webpageToKnowledgeDocuments } from "../knowledge/urlImport.js";
 import { MemoryStore } from "../memory/store.js";
 import { MemoryRetriever } from "../memory/retriever.js";
+import {
+  applyBundleToState,
+  doctorReport,
+  exportBundle,
+  previewBundle,
+  readBackup,
+  receiptFor,
+  retentionPreview,
+  safeBackupName,
+  writeBackup,
+  type BundleConflictMode,
+  type BundleMode,
+  type PortableBundle,
+  type RetentionPolicy
+} from "./operations.js";
 import { MemoryExtractor, summarizerContent, buildRunEvidence, type RunLike, type SummarizeFn } from "../memory/extractor.js";
 import { buildEvidenceRerunRequest, parseOriginalRunRequest } from "./evidenceRerun.js";
 import { employeeRuntimeResources, ExclusiveRuntimeResourceQueue } from "./runtimeResources.js";
@@ -100,7 +116,8 @@ import { createDefaultProviderRegistry, type ProviderRegistry } from "../runtime
 import { RunStore } from "../runtime/artifacts.js";
 import { isSystemManagedProviderId } from "../runtime/systemProviders.js";
 import { runWorkflow, type ObservedRunEvent, type RunWorkflowResult } from "../runtime/runner.js";
-import { createRunWorktree, removeRunWorktree, worktreeHasChanges } from "../runtime/worktree.js";
+import { createInheritedRunWorktree, createRunWorktree, removeRunWorktree, worktreeHasChanges } from "../runtime/worktree.js";
+import { candidateWorkspaceSnapshot } from "../runtime/candidateRevision.js";
 import {
   acceptRebasedRunSource,
   beginManagedRunRebase,
@@ -1634,6 +1651,34 @@ function knowledgeGrantReviewId(
   return `grant-review-${digest}`;
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+}
+
+function workflowStartFingerprint(
+  workflowId: string,
+  input: JsonObject,
+  source: InvocationSource,
+  options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string }
+): string {
+  const { idempotencyKey: _idempotencyKey, ...sourceWithoutKey } = source;
+  const canonical = canonicalJson({
+    schemaVersion: 1,
+    workflowId,
+    input,
+    source: sourceWithoutKey,
+    workflowVersion: options.workflowVersion ?? null,
+    entrance: options.entrance ?? null,
+    providerCwd: options.providerCwd ?? null
+  });
+  return `v1:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
 function knowledgeGrantReviewItem(
   subject: KnowledgeGrantReviewItem["subject"],
   grant: KnowledgeProfileGrant,
@@ -1708,6 +1753,8 @@ export interface WorkbenchServiceOptions {
   architectures?: ArchitectureRegistry;
   knowledgeUrlFetcher?: Pick<RestrictedKnowledgeUrlFetcher, "fetch">;
   larkDocumentFetcher?: LarkDocumentFetcher;
+  capabilityBroker?: CapabilityBroker;
+  executionBudget?: ExecutionBudgetLimits;
 }
 
 export class WorkbenchService {
@@ -1716,9 +1763,11 @@ export class WorkbenchService {
   readonly knowledge: KnowledgeRuntime;
   readonly knowledgeUrlFetcher: Pick<RestrictedKnowledgeUrlFetcher, "fetch">;
   readonly larkDocumentFetcher: LarkDocumentFetcher;
+  private readonly capabilityBroker?: CapabilityBroker;
+  private readonly executionBudget?: ExecutionBudgetLimits;
   private readonly activityListeners = new Set<(event: ActivityEvent) => void>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
-  private readonly backgroundInvocations = new Map<string, Promise<void>>();
+  private readonly backgroundInvocations = new Map<string, { promise: Promise<void>; controller: AbortController; epoch: number }>();
   private readonly evidenceReruns = new Map<string, Promise<void>>();
   private readonly activeMergeRuns = new Map<string, Promise<void>>();
   private readonly mergeBranchQueues = new Map<string, Promise<void>>();
@@ -1727,7 +1776,10 @@ export class WorkbenchService {
    * Closes the small race between two callers that dispatch the same durable task cycle at once.
    * The persisted Invocation source remains the source of truth across daemon restarts.
    */
-  private readonly idempotentWorkflowStarts = new Map<string, Promise<InvocationStartResult>>();
+  private readonly idempotentWorkflowStarts = new Map<string, {
+    fingerprint: string;
+    receipt: Promise<InvocationStartResult>;
+  }>();
   private readonly humanDecisionWaiters = new Map<string, {
     promise: Promise<RuntimeHumanDecisionOutcome>;
     resolve: (outcome: RuntimeHumanDecisionOutcome) => void;
@@ -1747,6 +1799,8 @@ export class WorkbenchService {
     this.knowledge = knowledge;
     this.knowledgeUrlFetcher = options.knowledgeUrlFetcher ?? new RestrictedKnowledgeUrlFetcher();
     this.larkDocumentFetcher = options.larkDocumentFetcher ?? new LarkCliDocumentFetcher();
+    this.capabilityBroker = options.capabilityBroker;
+    this.executionBudget = options.executionBudget;
   }
 
   static defaultDataRoot(): string {
@@ -1924,7 +1978,11 @@ export class WorkbenchService {
     if (!supervisor) throw new Error(`Invocation ${invocation.id} has no pinned supervisor`);
     return {
       ...workflow,
-      supervisor: { employeeId: supervisor.employeeId, employeeVersion: supervisor.employeeVersion },
+      supervisor: {
+        ...workflow.supervisor,
+        employeeId: supervisor.employeeId,
+        employeeVersion: supervisor.employeeVersion
+      },
       ...(invocation.executionSnapshot.managementPolicy
         ? { managementPolicy: invocation.executionSnapshot.managementPolicy }
         : {}),
@@ -1934,6 +1992,35 @@ export class WorkbenchService {
         return { ...member, employeeId: pin.employeeId, employeeVersion: pin.employeeVersion };
       })
     };
+  }
+
+  private resolveRecoveryEmployees(
+    workflow: WorkbenchWorkflowDefinition,
+    invocation: InvocationRecord
+  ): Map<string, EmployeeDefinition> {
+    if (workflow.architecture !== "supervisor") return this.resolveWorkflowEmployees(workflow);
+    const pins = new Map(invocation.executionSnapshot?.employees.map((pin) => [pin.roleId, pin]) ?? []);
+    const employees = new Map<string, EmployeeDefinition>();
+    const resolve = (roleId: string, runtimeRoleId: string, employeeId: string, employeeVersionValue: number) => {
+      const assignment = pins.get(roleId)?.assignment;
+      const employee = assignment
+        ? this.resolveProjectEmployee(
+            assignment.projectId,
+            assignment.roleId,
+            assignment.projectVersion,
+            assignment.projectBindingVersion
+          ).employee
+        : this.getEmployee(employeeId, employeeVersionValue);
+      if (employee.id !== employeeId || employee.version !== employeeVersionValue) {
+        throw new Error(`Invocation ${invocation.id} project assignment for ${roleId} does not match its pinned Employee`);
+      }
+      employees.set(runtimeRoleId, employee);
+    };
+    resolve("supervisor", SUPERVISOR_RUNTIME_ROLE_ID, workflow.supervisor.employeeId, workflow.supervisor.employeeVersion);
+    for (const member of workflow.members) {
+      resolve(member.roleId, supervisorMemberRuntimeRoleId(member.roleId), member.employeeId, member.employeeVersion);
+    }
+    return employees;
   }
 
   private async interruptedRecoveryContext(invocation: InvocationRecord): Promise<{
@@ -1965,7 +2052,7 @@ export class WorkbenchService {
       if (manifestRelative.startsWith("..") || path.isAbsolute(manifestRelative)) return undefined;
       await fs.access(manifestPath);
       const workflow = this.workflowForInterruptedRecovery(invocation);
-      const employees = this.resolveWorkflowEmployees(workflow);
+      const employees = this.resolveRecoveryEmployees(workflow, invocation);
       let providerCwd = (await this.workflowExecutionRoot(invocation.source)) ?? path.resolve(".");
       if (run.isolation?.mode === "worktree") {
         if (!run.isolation.worktreePath) return undefined;
@@ -1994,6 +2081,7 @@ export class WorkbenchService {
     invocation: InvocationRecord,
     recovery: NonNullable<Awaited<ReturnType<WorkbenchService["interruptedRecoveryContext"]>>>
   ): void {
+    const controller = new AbortController();
     const execution = this.runTrackedWorkflow(
       invocation,
       recovery.workflow,
@@ -2004,12 +2092,14 @@ export class WorkbenchService {
         providerCwd: recovery.providerCwd,
         isolation: recovery.isolation,
         manifestPath: recovery.manifestPath
-      }
+      },
+      controller.signal
     );
     const settled = execution.then(() => undefined, () => undefined);
-    this.backgroundInvocations.set(invocation.id, settled);
+    const tracked = { promise: settled, controller, epoch: invocation.cancellation?.epoch ?? 0 };
+    this.backgroundInvocations.set(invocation.id, tracked);
     void settled.finally(() => {
-      if (this.backgroundInvocations.get(invocation.id) === settled) {
+      if (this.backgroundInvocations.get(invocation.id) === tracked) {
         this.backgroundInvocations.delete(invocation.id);
       }
     });
@@ -2228,9 +2318,14 @@ export class WorkbenchService {
     }
     const risks = new Set(["dependency-install", "data-migration", "scope-expansion", "irreversible-other"]);
     if (!risks.has(input.riskCategory)) throw new Error(`unsupported human decision risk category: ${input.riskCategory}`);
-    if (input.proposedAction.action !== "delegate" || !Array.isArray(input.proposedAction.assignments)
-      || input.proposedAction.assignments.length === 0) {
-      throw new Error("human decision proposedAction must be a delegate action with assignments");
+    const delegated = input.proposedAction.action === "delegate"
+      && Array.isArray(input.proposedAction.assignments)
+      && input.proposedAction.assignments.length > 0;
+    const sideEffect = input.proposedAction.action === "authorize-side-effect"
+      && typeof input.proposedAction.intent === "object"
+      && input.proposedAction.intent !== null;
+    if (!delegated && !sideEffect) {
+      throw new Error("human decision proposedAction must describe delegated assignments or a Provider side-effect intent");
     }
     if (JSON.stringify(input.proposedAction).length > 65_536) {
       throw new Error("human decision proposedAction must not exceed 65536 JSON characters");
@@ -2246,8 +2341,8 @@ export class WorkbenchService {
       if (!invocation) throw new Error(`invocation not found: ${input.invocationId}`);
       const snapshot = invocation.executionSnapshot?.workflow;
       if (
-        invocation.runId !== input.runId
-        || snapshot?.architecture !== "supervisor"
+        !snapshot
+        || invocation.runId !== input.runId
         || snapshot.id !== input.workflowId
         || snapshot.version !== input.workflowVersion
       ) {
@@ -2259,8 +2354,9 @@ export class WorkbenchService {
       const supervisorInstance = invocation.instanceIds
         .map((instanceId) => state.workInstances[instanceId])
         .find((instance) => instance?.nodeId === input.supervisorNodeId);
-      if (supervisorInstance?.kind !== "supervisor" || supervisorInstance.round !== input.round) {
-        throw new Error("human decision request does not match the pinned Supervisor node/round");
+      if (!supervisorInstance
+        || (delegated && (supervisorInstance.kind !== "supervisor" || supervisorInstance.round !== input.round))) {
+        throw new Error("human decision request does not match the pinned execution node/round");
       }
       const next: HumanDecisionRequest = {
         id: `human-decision-${randomUUID()}`,
@@ -2309,6 +2405,18 @@ export class WorkbenchService {
     if (decidedBy.length > 240) throw new Error("human decision actor must not exceed 240 characters");
     const comment = input.comment?.trim() || undefined;
     if (comment && comment.length > 4_000) throw new Error("human decision comment must not exceed 4000 characters");
+    const candidateUrl = input.candidateUrl?.trim() || undefined;
+    if (candidateUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(candidateUrl);
+      } catch {
+        throw new Error("human decision candidateUrl must be a valid HTTP(S) URL");
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error("human decision candidateUrl must be a valid HTTP(S) URL");
+      }
+    }
     const timestamp = now();
     let invocationAfter: InvocationRecord | undefined;
     const request = await this.store.mutate((state) => {
@@ -2330,6 +2438,7 @@ export class WorkbenchService {
       target.status = input.decision === "approve" ? "approved" : "rejected";
       target.decidedBy = decidedBy;
       target.comment = comment;
+      target.candidateUrl = candidateUrl;
       target.updatedAt = timestamp;
       target.decidedAt = timestamp;
       invocation.status = "running";
@@ -2350,7 +2459,8 @@ export class WorkbenchService {
       requestId: request.id,
       decision: request.status === "approved" ? "approved" : "rejected",
       ...(request.decidedBy ? { decidedBy: request.decidedBy } : {}),
-      ...(request.comment ? { comment: request.comment } : {})
+      ...(request.comment ? { comment: request.comment } : {}),
+      ...(request.candidateUrl ? { candidateUrl: request.candidateUrl } : {})
     });
     return request;
   }
@@ -2396,7 +2506,8 @@ export class WorkbenchService {
         requestId: latest.id,
         decision: latest.status,
         ...(latest.decidedBy ? { decidedBy: latest.decidedBy } : {}),
-        ...(latest.comment ? { comment: latest.comment } : {})
+        ...(latest.comment ? { comment: latest.comment } : {}),
+        ...(latest.candidateUrl ? { candidateUrl: latest.candidateUrl } : {})
       });
     } else if (latest.status === "voided") {
       waiter.reject(new Error(`human decision request ${latest.id} was voided`));
@@ -2410,8 +2521,84 @@ export class WorkbenchService {
   }
 
   async waitForInvocation(id: string): Promise<InvocationDetail> {
-    await this.backgroundInvocations.get(id);
+    await this.backgroundInvocations.get(id)?.promise;
     return this.getInvocationDetail(id);
+  }
+
+  async requestCancellation(id: string, input: { actor: string; reason?: string; graceMs?: number }): Promise<InvocationRecord> {
+    const actor = requireText(input.actor, "cancellation actor");
+    const reason = input.reason?.trim() || undefined;
+    const current = this.snapshot().invocations[id];
+    if (!current) throw new Error(`invocation not found: ${id}`);
+    if (isInvocationTerminal(current.status)) return current;
+    const timestamp = now();
+    const requested = await this.store.mutate((state) => {
+      const target = state.invocations[id];
+      if (!target) throw new Error(`invocation not found: ${id}`);
+      if (isInvocationTerminal(target.status) || target.status === "cancellation-requested") return target;
+      const epoch = (target.cancellation?.epoch ?? 0) + 1;
+      target.cancellation = { actor, reason, epoch, requestedAt: timestamp };
+      target.status = "cancellation-requested";
+      target.phase = "cancellation-requested";
+      target.updatedAt = timestamp;
+      target.transitions.push({ at: timestamp, status: "cancellation-requested", phase: "cancellation-requested", message: reason });
+      for (const instanceId of target.instanceIds) {
+        const instance = state.workInstances[instanceId];
+        if (instance && !isInstanceTerminal(instance.status)) {
+          instance.status = "cancellation-requested";
+          instance.phase = "cancellation-requested";
+          instance.updatedAt = timestamp;
+          instance.transitions.push({ at: timestamp, status: "cancellation-requested", phase: "cancellation-requested", message: reason });
+        }
+      }
+      for (const request of Object.values(state.humanDecisionRequests)) {
+        if (request.invocationId === id && request.status === "pending") {
+          request.status = "voided";
+          request.updatedAt = timestamp;
+        }
+      }
+      return target;
+    });
+    this.emitActivity({ type: "invocation.changed", at: timestamp, invocation: requested });
+    const tracked = this.backgroundInvocations.get(id);
+    tracked?.controller.abort(new Error(reason ?? `invocation ${id} cancelled`));
+    const graceMs = Math.max(0, Math.min(input.graceMs ?? 250, 5_000));
+    if (tracked && graceMs > 0) {
+      await Promise.race([tracked.promise, new Promise<void>((resolve) => setTimeout(resolve, graceMs))]);
+    }
+    const acknowledgedAt = now();
+    const cancelled = await this.store.mutate((state) => {
+      const target = state.invocations[id];
+      if (!target) throw new Error(`invocation not found: ${id}`);
+      if (isInvocationTerminal(target.status)) return target;
+      target.status = "cancelled";
+      target.phase = "cancelled";
+      target.updatedAt = acknowledgedAt;
+      target.completedAt = acknowledgedAt;
+      if (target.cancellation) target.cancellation.acknowledgedAt = acknowledgedAt;
+      target.transitions.push({ at: acknowledgedAt, status: "cancelled", phase: "cancelled", message: reason });
+      for (const instanceId of target.instanceIds) {
+        const instance = state.workInstances[instanceId];
+        if (instance && !isInstanceTerminal(instance.status)) {
+          instance.status = "cancelled";
+          instance.phase = "cancelled";
+          instance.updatedAt = acknowledgedAt;
+          instance.completedAt = acknowledgedAt;
+          instance.transitions.push({ at: acknowledgedAt, status: "cancelled", phase: "cancelled", message: reason });
+        }
+      }
+      return target;
+    });
+    this.emitActivity({ type: "invocation.changed", at: acknowledgedAt, invocation: cancelled });
+    return cancelled;
+  }
+
+  async requestCancellationByTaskId(taskId: string, input: { actor: string; reason?: string }): Promise<InvocationRecord> {
+    const invocation = Object.values(this.snapshot().invocations)
+      .filter((candidate) => candidate.source.taskId === taskId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+    if (!invocation) throw new Error(`invocation not found for external task: ${taskId}`);
+    return this.requestCancellation(invocation.id, input);
   }
 
   /** Aggregated caller-facing progress (overall status, per-step tally, leader narrative) for one invocation. */
@@ -2440,7 +2627,16 @@ export class WorkbenchService {
       terminal: progress.terminal,
       reason: progress.terminal ? "terminal" : changed ? "changed" : heartbeat ? "heartbeat" : "changed",
       progressReport: formatInvocationProgressReport(progress, changed),
-      progress
+      progress,
+      event: {
+        sequence: Number(nextCursor.slice(nextCursor.lastIndexOf(":") + 1)) || 0,
+        cursor: nextCursor,
+        source: "invocation",
+        phase: progress.phase,
+        metrics: { steps: progress.steps.length, completed: progress.tally.completed, failed: progress.tally.failed },
+        heartbeat: !changed && heartbeat,
+        terminal: progress.terminal
+      }
     };
   }
 
@@ -2552,6 +2748,8 @@ export class WorkbenchService {
     sessionId?: string;
     createLeaderSession?: boolean;
     entrance?: EntrancePolicyExecutionSnapshot;
+    assignments?: Map<string, NonNullable<EmployeeSession["assignment"]>>;
+    idempotencyFingerprint?: string;
   }): Promise<InvocationRecord> {
     const timestamp = now();
     const runId = runIdentifier();
@@ -2562,6 +2760,7 @@ export class WorkbenchService {
           id: randomUUID(),
           employeeId: options.workflow.supervisor.employeeId,
           employeeVersion: options.workflow.supervisor.employeeVersion,
+          assignment: options.assignments?.get("supervisor"),
           title: summarizeInput(options.input).slice(0, 72),
           status: "active",
           context: typeof options.input.context === "object"
@@ -2649,10 +2848,20 @@ export class WorkbenchService {
         && !Array.isArray(options.input.context)
         ? options.input.context as JsonObject
         : undefined,
+      idempotencyFingerprint: options.idempotencyFingerprint,
       runId,
       sessionId,
       instanceIds: instances.map((instance) => instance.id),
       executionSnapshot: {
+        ...(options.source.publicationId ? (() => {
+          const publication = this.getPublication(options.source.publicationId!);
+          return { publication: {
+            id: publication.id,
+            publicationVersion: publication.version,
+            targetVersion: options.target.version,
+            releaseChannel: publication.releaseChannel ?? "pinned"
+          } };
+        })() : {}),
         workflow: {
           id: options.workflow.id,
           version: options.workflow.version,
@@ -2666,18 +2875,21 @@ export class WorkbenchService {
           ? options.workflow.nodes.map((node) => ({
               roleId: node.id,
               employeeId: node.employeeId,
-              employeeVersion: node.employeeVersion ?? options.employees.get(node.employeeId)!.version
+              employeeVersion: node.employeeVersion ?? options.employees.get(node.employeeId)!.version,
+              assignment: options.assignments?.get(node.id)
             }))
           : [
               {
                 roleId: "supervisor",
                 employeeId: options.workflow.supervisor.employeeId,
-                employeeVersion: options.workflow.supervisor.employeeVersion
+                employeeVersion: options.workflow.supervisor.employeeVersion,
+                assignment: options.assignments?.get("supervisor")
               },
               ...options.workflow.members.map((member) => ({
                 roleId: member.roleId,
                 employeeId: member.employeeId,
-                employeeVersion: member.employeeVersion
+                employeeVersion: member.employeeVersion,
+                assignment: options.assignments?.get(member.roleId)
               }))
             ]
       },
@@ -2803,6 +3015,8 @@ export class WorkbenchService {
     const invocation = await this.store.mutate((state) => {
       const target = state.invocations[id];
       if (!target) throw new Error(`invocation not found: ${id}`);
+      if ((target.status === "cancellation-requested" || target.status === "cancelled")
+        && status !== "cancellation-requested" && status !== "cancelled") return target;
       target.status = status;
       target.phase = phase;
       target.updatedAt = timestamp;
@@ -2984,7 +3198,8 @@ export class WorkbenchService {
     employees: Map<string, EmployeeDefinition>,
     input: JsonObject,
     providerCwd?: string,
-    recovery?: { providerCwd: string; isolation?: WorkflowRunIsolation; manifestPath: string }
+    recovery?: { providerCwd: string; isolation?: WorkflowRunIsolation; manifestPath: string },
+    signal?: AbortSignal
   ): Promise<RunWorkflowResult> {
     await this.transitionInvocation(invocation.id, "running", recovery ? "recovering" : "materializing");
     try {
@@ -3009,7 +3224,7 @@ export class WorkbenchService {
             isolation: recovery.isolation,
             teardownWorktree: async () => undefined
           }
-        : await this.resolveRunIsolation(workflow, invocation.runId, providerCwd, materialized.loaded.projectRoot);
+        : await this.resolveRunIsolation(workflow, invocation, providerCwd, materialized.loaded.projectRoot);
       const { providerCwd: effectiveProviderCwd, isolation, teardownWorktree } = resolvedIsolation;
       try {
         const runResult = await runWorkflow(materialized.loaded, materialized.workflowId, {
@@ -3024,9 +3239,11 @@ export class WorkbenchService {
           artifactRoot: path.join(this.store.dataRoot, "artifacts"),
           providerCwd: effectiveProviderCwd,
           isolation,
-          openHumanDecision: workflow.architecture === "supervisor"
-            ? (request) => this.openHumanDecisionRequest(invocation, workflow, request)
-            : undefined,
+          signal,
+          capabilityBroker: this.capabilityBroker,
+          budget: this.executionBudget ? new ExecutionBudget(this.executionBudget) : undefined,
+          openHumanDecision: (request) => this.openHumanDecisionRequest(invocation, workflow, request),
+          getCancellationEpoch: () => this.snapshot().invocations[invocation.id]?.cancellation?.epoch ?? 0,
           acquireNodePermit: async (node) => {
             const employee = employees.get(node.role);
             if (!employee) throw new Error(`runtime role ${node.role} is not materialized`);
@@ -3049,10 +3266,17 @@ export class WorkbenchService {
               : JSON.stringify(input);
           const preparationState = this.snapshot();
           const taskTags = [...new Set([...inputTaskTags, ...nodeTaskTags])];
+          const snapshotRoleId = node.role === SUPERVISOR_RUNTIME_ROLE_ID
+            ? "supervisor"
+            : workflow.architecture === "supervisor"
+              ? workflow.members.find((member) => supervisorMemberRuntimeRoleId(member.roleId) === node.role)?.roleId
+              : node.id;
+          const assignment = invocation.executionSnapshot?.employees
+            .find((binding) => binding.roleId === snapshotRoleId)?.assignment;
           const knowledge = await this.knowledge.prepare(preparationState, employee, {
             request,
-            projectId: invocation.source.project,
-            projectRoleId: invocation.source.projectRole,
+            projectId: assignment?.projectId ?? invocation.source.project,
+            projectRoleId: assignment?.roleId ?? invocation.source.projectRole,
             taskTags
           });
           const effectiveProfile = compileEffectiveExecutionProfile({
@@ -3062,7 +3286,8 @@ export class WorkbenchService {
             nodeId: node.id,
             request,
             taskTags,
-            knowledge
+            knowledge,
+            assignment
           });
           return {
             node: {
@@ -3099,6 +3324,9 @@ export class WorkbenchService {
         await teardownWorktree();
       }
     } catch (error) {
+      if (signal?.aborted || this.snapshot().invocations[invocation.id]?.status === "cancellation-requested") {
+        return Promise.reject(error);
+      }
       await this.failInvocationActivity(invocation.id, error);
       throw error;
     }
@@ -3114,7 +3342,7 @@ export class WorkbenchService {
    */
   private async resolveRunIsolation(
     workflow: WorkbenchWorkflowDefinition,
-    runId: string,
+    invocation: InvocationRecord,
     providerCwd: string | undefined,
     projectRoot: string
   ): Promise<{
@@ -3136,12 +3364,80 @@ export class WorkbenchService {
       return { providerCwd, isolation: { mode: "none" }, teardownWorktree: noTeardown };
     }
     const repoRoot = providerCwd ?? projectRoot;
+    let continuationRejected: WorkflowRunIsolation["continuationRejected"];
     try {
-      const worktree = await createRunWorktree(repoRoot, runId);
+      const predecessor = invocation.source.project && invocation.source.taskId
+        ? Object.values(this.snapshot().invocations)
+            .filter((candidate) => candidate.id !== invocation.id
+              && candidate.target.kind === "workflow"
+              && candidate.target.id === workflow.id
+              && candidate.source.project === invocation.source.project
+              && candidate.source.taskId === invocation.source.taskId
+              && isInvocationTerminal(candidate.status))
+            .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]
+        : undefined;
+      if (predecessor) {
+        try {
+          const predecessorRun = await this.getRun(predecessor.runId) as WorkflowRunRecord;
+          const predecessorIsolation = predecessorRun.isolation;
+          if (predecessorIsolation?.mode !== "worktree" || !predecessorIsolation.worktreePath || !predecessorIsolation.baseCommit) {
+            throw new Error("predecessor has no preserved managed candidate worktree");
+          }
+          const delivery = await fs.readFile(
+            path.join(this.store.dataRoot, "artifacts", "runs", predecessor.runId, "delivery.json"),
+            "utf8"
+          ).then((value) => JSON.parse(value) as { status?: string }).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return undefined;
+            throw error;
+          });
+          if (delivery?.status === "merged" || delivery?.status === "discarded") {
+            throw new Error(`predecessor delivery is already ${delivery.status}`);
+          }
+          if (!(await worktreeHasChanges(predecessorIsolation.worktreePath, predecessorIsolation.baseCommit))) {
+            throw new Error("predecessor worktree has no candidate changes to inherit");
+          }
+          const predecessorSnapshot = await candidateWorkspaceSnapshot(predecessorIsolation.worktreePath);
+          const worktree = await createInheritedRunWorktree({
+            repoRoot,
+            runId: invocation.runId,
+            predecessorWorktreePath: predecessorIsolation.worktreePath,
+            predecessorBaseCommit: predecessorIsolation.baseCommit
+          });
+          return {
+            providerCwd: worktree.path,
+            isolation: {
+              mode: "worktree",
+              worktreePath: worktree.path,
+              baseCommit: worktree.baseCommit,
+              continuation: {
+                fromRunId: predecessor.runId,
+                candidateRevision: predecessorSnapshot.revision,
+                changedFiles: worktree.changedFiles
+              }
+            },
+            teardownWorktree: async () => {
+              try {
+                if (await worktreeHasChanges(worktree.path, worktree.baseCommit)) return;
+                await removeRunWorktree(repoRoot, worktree.path);
+              } catch (error) {
+                console.warn(`worktree cleanup skipped for ${worktree.path}: ${errorMessage(error)}`);
+              }
+            }
+          };
+        } catch (error) {
+          continuationRejected = { fromRunId: predecessor.runId, reason: errorMessage(error) };
+        }
+      }
+      const worktree = await createRunWorktree(repoRoot, invocation.runId);
       if (!worktree) throw new Error(`worktree isolation requires a Git execution root: ${repoRoot}`);
       return {
         providerCwd: worktree.path,
-        isolation: { mode: "worktree", worktreePath: worktree.path, baseCommit: worktree.baseCommit },
+        isolation: {
+          mode: "worktree",
+          worktreePath: worktree.path,
+          baseCommit: worktree.baseCommit,
+          ...(continuationRejected ? { continuationRejected } : {})
+        },
         teardownWorktree: async () => {
           // A changed worktree is the candidate delivery and must survive the Run for explicit
           // human acceptance. Inspection failure also preserves it: cleanup must never destroy
@@ -5938,13 +6234,17 @@ export class WorkbenchService {
     if (session && !jsonEqual(session.context, input.context)) {
       throw new Error(`session ${session.id} belongs to another structured invocation context`);
     }
+    if (session?.assignment && options.assignment && !jsonEqual(session.assignment, options.assignment)) {
+      throw new Error(`session ${session.id} belongs to another project assignment`);
+    }
+    const effectiveAssignment = options.assignment ?? session?.assignment;
     if (!session) {
       const timestamp = now();
       session = {
         id: randomUUID(),
         employeeId: employee.id,
         employeeVersion: employee.version,
-        assignment: options.assignment,
+        assignment: effectiveAssignment,
         title: input.message.trim().slice(0, 72),
         status: "active",
         context: input.context,
@@ -5982,7 +6282,8 @@ export class WorkbenchService {
         ...(promptEvidence ? { conversationEvidence: promptEvidence } : {})
       },
       sessionId: session.id,
-      entrance: options.entrance
+      entrance: options.entrance,
+      ...(effectiveAssignment ? { assignments: new Map([["respond", effectiveAssignment]]) } : {})
     });
     const sessionId = session.id;
     return this.inSessionQueue(sessionId, async () => {
@@ -6053,6 +6354,17 @@ export class WorkbenchService {
     });
   }
 
+  private rejectRegisteredProjectEmployeeBypass(source: InvocationSource): void {
+    const projectId = source.project?.trim();
+    if (!projectId) return;
+    const project = this.snapshot().projects[projectId]?.current;
+    if (!project) return;
+    if (project.status === "active") {
+      throw new Error(`project ${projectId} is registered; invoke its Employee through invokeProjectRole`);
+    }
+    throw new Error(`project ${projectId} is archived and cannot be used as an invocation scope`);
+  }
+
   async invokeEmployee(
     employeeId: string,
     input: EmployeeInvocationInput,
@@ -6060,6 +6372,7 @@ export class WorkbenchService {
     options: { providerCwd?: string } = {}
   ): Promise<EmployeeInvocationResult> {
     requireText(input.message, "message");
+    this.rejectRegisteredProjectEmployeeBypass(source);
     const current = this.getEmployee(employeeId);
     if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
     // 自动型系统员工守卫已下沉到 invokeResolvedEmployee 汇聚点，此处不再重复。
@@ -6079,10 +6392,11 @@ export class WorkbenchService {
     employeeVersionValue: number,
     input: EmployeeInvocationInput,
     source: InvocationSource,
-    entrance: EntrancePolicyExecutionSnapshot,
+    entrance: EntrancePolicyExecutionSnapshot | undefined,
     providerCwd?: string
   ): Promise<EmployeeInvocationResult> {
     requireText(input.message, "message");
+    this.rejectRegisteredProjectEmployeeBypass(source);
     const current = this.getEmployee(employeeId);
     if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
     const scopedProjectId = internalProjectId(current);
@@ -6141,7 +6455,27 @@ export class WorkbenchService {
     }
     const current = this.getEmployee(session.employeeId);
     if (current.status !== "active") throw new Error(`employee ${session.employeeId} is archived`);
-    const employee = this.getEmployee(session.employeeId, session.employeeVersion);
+    const resolvedAssignment = session.assignment
+      ? this.resolveProjectEmployee(
+          session.assignment.projectId,
+          session.assignment.roleId,
+          session.assignment.projectVersion,
+          session.assignment.projectBindingVersion
+        )
+      : undefined;
+    const employee = resolvedAssignment?.employee ?? this.getEmployee(session.employeeId, session.employeeVersion);
+    if (employee.id !== session.employeeId || employee.version !== session.employeeVersion) {
+      throw new Error(`leader session ${session.id} project assignment does not match the pinned Supervisor Employee`);
+    }
+    const continuationSource: InvocationSource = session.assignment
+      ? {
+          ...originalInvocation.source,
+          ...source,
+          project: session.assignment.projectId,
+          projectRole: session.assignment.roleId,
+          projectBindingVersion: session.assignment.projectBindingVersion
+        }
+      : { ...originalInvocation.source, ...source };
     return this.invokeResolvedEmployee({
       employee,
       input: {
@@ -6149,9 +6483,10 @@ export class WorkbenchService {
         context: session.context,
         ...(continuation.attachments ? { attachments: continuation.attachments } : {})
       },
-      source: { ...originalInvocation.source, ...source },
+      source: continuationSource,
       session,
-      providerCwd: await this.validatedProviderCwd(options.providerCwd),
+      assignment: session.assignment,
+      providerCwd: resolvedAssignment?.project.rootPath ?? await this.validatedProviderCwd(options.providerCwd),
       workflow: {
         id: `leader-session-${supervisor.workflowId}`,
         version: supervisor.workflowVersion,
@@ -6724,7 +7059,7 @@ export class WorkbenchService {
     options: { providerCwd?: string } = {}
   ): Promise<EntrancePolicyDispatchResult> {
     const parsed = parseEntrancePolicyDispatchInput(input);
-    const { message: dispatchMessage, sessionId, ...evaluationInput } = parsed;
+    const { message: dispatchMessage, sessionId, candidateUrl, ...evaluationInput } = parsed;
     const decision = this.evaluateEntrancePolicy(id, evaluationInput);
     if (decision.target.kind === "caller") {
       return { decision, dispatch: { kind: "return-to-caller", invocationCreated: false } };
@@ -6756,7 +7091,7 @@ export class WorkbenchService {
     }
     const receipt = await this.startWorkbenchWorkflow(
       decision.target.workflowId,
-      { message },
+      { message, ...(candidateUrl ? { candidateUrl } : {}) },
       parsed.source,
       { workflowVersion: decision.target.workflowVersion, entrance, providerCwd: options.providerCwd }
     );
@@ -6844,7 +7179,7 @@ export class WorkbenchService {
       limits,
       failure: { workerFailure },
       completion: {
-        requireDelegation: input.completion?.requireDelegation ?? current?.completion.requireDelegation ?? false,
+        requireDelegation: input.completion?.requireDelegation ?? current?.completion.requireDelegation ?? true,
         requireAllDelegationsSuccessful:
           input.completion?.requireAllDelegationsSuccessful
           ?? current?.completion.requireAllDelegationsSuccessful
@@ -6987,6 +7322,11 @@ export class WorkbenchService {
       maxConcurrency: Math.max(1, Math.min(32, input.maxConcurrency ?? current?.maxConcurrency ?? 4)),
       failFast: input.failFast ?? current?.failFast ?? false,
       inputSchema: input.inputSchema ?? current?.inputSchema,
+      workflowOutputSchema: input.workflowOutputSchema ?? current?.workflowOutputSchema,
+      workflowOutputSchemaVersion: input.workflowOutputSchemaVersion ?? current?.workflowOutputSchemaVersion,
+      workflowOutputSchemaDigest: (input.workflowOutputSchema ?? current?.workflowOutputSchema)
+        ? createHash("sha256").update(canonicalJson(input.workflowOutputSchema ?? current!.workflowOutputSchema)).digest("hex")
+        : undefined,
       presentation: positions ? { positions } : undefined,
       createdAt: current?.createdAt ?? timestamp,
       updatedAt: timestamp
@@ -7042,7 +7382,8 @@ export class WorkbenchService {
         roleId,
         description: requireText(member.description ?? `Delegated ${roleId} work.`, `supervisor member ${roleId} description`),
         employeeId: employee.id,
-        employeeVersion: employee.version
+        employeeVersion: employee.version,
+        ...(member.projectRoleId ? { projectRoleId: requireId(member.projectRoleId, `supervisor member ${roleId} project role id`) } : {})
       };
     });
     if (members.length === 0) throw new Error("supervisor workflow members must not be empty");
@@ -7061,7 +7402,13 @@ export class WorkbenchService {
       architecture: "supervisor",
       updatePolicy: input.updatePolicy ?? current?.updatePolicy ?? "latest",
       description: input.description?.trim() || `Supervisor workflow ${id}`,
-      supervisor: { employeeId: supervisor.id, employeeVersion: supervisor.version },
+      supervisor: {
+        employeeId: supervisor.id,
+        employeeVersion: supervisor.version,
+        ...(input.supervisor.projectRoleId
+          ? { projectRoleId: requireId(input.supervisor.projectRoleId, "supervisor project role id") }
+          : {})
+      },
       orchestrationSkill: current && !options.refreshOrchestrationSkill ? current.orchestrationSkill : {
         id: "team-orchestration",
         version: orchestrationSkill.version
@@ -7069,7 +7416,14 @@ export class WorkbenchService {
       managementPolicy: { id: policy.id, version: policy.version },
       members,
       flow,
+      policyPackRef: input.policyPackRef ?? current?.policyPackRef ?? { id: "software-delivery", version: 1 },
+      separationOfDuties: input.separationOfDuties ?? current?.separationOfDuties,
       inputSchema: input.inputSchema ?? current?.inputSchema,
+      workflowOutputSchema: input.workflowOutputSchema ?? current?.workflowOutputSchema,
+      workflowOutputSchemaVersion: input.workflowOutputSchemaVersion ?? current?.workflowOutputSchemaVersion,
+      workflowOutputSchemaDigest: (input.workflowOutputSchema ?? current?.workflowOutputSchema)
+        ? createHash("sha256").update(canonicalJson(input.workflowOutputSchema ?? current!.workflowOutputSchema)).digest("hex")
+        : undefined,
       presentation: positions ? { positions } : undefined,
       createdAt: current?.createdAt ?? timestamp,
       updatedAt: timestamp
@@ -7211,9 +7565,17 @@ export class WorkbenchService {
 
     const updated = await this.updateWorkflow(id, {
       architecture: "supervisor",
-      supervisor: { employeeId: current.supervisor.employeeId },
+      supervisor: {
+        employeeId: current.supervisor.employeeId,
+        projectRoleId: current.supervisor.projectRoleId
+      },
       managementPolicy: { id: current.managementPolicy.id },
-      members: current.members.map((member) => ({ roleId: member.roleId, description: member.description, employeeId: member.employeeId }))
+      members: current.members.map((member) => ({
+        roleId: member.roleId,
+        description: member.description,
+        employeeId: member.employeeId,
+        projectRoleId: member.projectRoleId
+      }))
       // flow omitted → normalizeSupervisorFlow inherits the current flow unchanged.
     }, { refreshOrchestrationSkill: true });
     if (updated.architecture !== "supervisor") throw new Error("expected supervisor workflow after refresh");
@@ -7300,8 +7662,63 @@ export class WorkbenchService {
     return employees;
   }
 
-  private async validateWorkflow(workflow: WorkbenchWorkflowDefinition): Promise<void> {
-    const materialized = await this.materialize(workflow, this.resolveWorkflowEmployees(workflow));
+  private resolveProjectScopedSupervisorWorkflow(
+    workflow: SupervisorWorkbenchWorkflowDefinition,
+    source: InvocationSource
+  ): {
+    workflow: SupervisorWorkbenchWorkflowDefinition;
+    employees: Map<string, EmployeeDefinition>;
+    assignments: Map<string, NonNullable<EmployeeSession["assignment"]>>;
+    source: InvocationSource;
+  } | undefined {
+    const projectId = source.project?.trim();
+    if (!projectId) return undefined;
+    const currentProject = this.snapshot().projects[projectId]?.current;
+    if (!currentProject) return undefined;
+    if (currentProject.status !== "active") {
+      throw new Error(`project ${projectId} is archived and cannot be used as an invocation scope`);
+    }
+    const binding = this.getProjectBinding(projectId, source.projectBindingVersion);
+    const projectVersion = binding.projectVersion;
+    const assignments = new Map<string, NonNullable<EmployeeSession["assignment"]>>();
+    const employees = new Map<string, EmployeeDefinition>();
+    const resolve = (logicalRoleId: string, runtimeRoleId: string, projectRoleId: string | undefined) => {
+      if (!projectRoleId) {
+        throw new Error(`project-scoped Supervisor role ${logicalRoleId} must declare projectRoleId`);
+      }
+      const resolved = this.resolveProjectEmployee(projectId, projectRoleId, projectVersion, binding.version);
+      assignments.set(logicalRoleId, {
+        projectId,
+        projectVersion: resolved.project.version,
+        projectBindingVersion: resolved.binding.version,
+        roleId: projectRoleId
+      });
+      employees.set(runtimeRoleId, resolved.employee);
+      return resolved.employee;
+    };
+    const supervisor = resolve("supervisor", SUPERVISOR_RUNTIME_ROLE_ID, workflow.supervisor.projectRoleId);
+    const members = workflow.members.map((member) => {
+      const employee = resolve(member.roleId, supervisorMemberRuntimeRoleId(member.roleId), member.projectRoleId);
+      return { ...member, employeeId: employee.id, employeeVersion: employee.version };
+    });
+    const effectiveWorkflow: SupervisorWorkbenchWorkflowDefinition = {
+      ...workflow,
+      supervisor: { ...workflow.supervisor, employeeId: supervisor.id, employeeVersion: supervisor.version },
+      members
+    };
+    return {
+      workflow: effectiveWorkflow,
+      employees,
+      assignments,
+      source: { ...source, project: projectId, projectBindingVersion: binding.version }
+    };
+  }
+
+  private async validateWorkflow(
+    workflow: WorkbenchWorkflowDefinition,
+    employees: Map<string, EmployeeDefinition> = this.resolveWorkflowEmployees(workflow)
+  ): Promise<void> {
+    const materialized = await this.materialize(workflow, employees);
     compilePlan(materialized.loaded, materialized.workflowId, this.architectures);
   }
 
@@ -7350,7 +7767,7 @@ export class WorkbenchService {
     }
     return {
       ...workflow,
-      supervisor: { employeeId: workflow.supervisor.employeeId, employeeVersion: supervisorRecord.current.version },
+      supervisor: { ...workflow.supervisor, employeeVersion: supervisorRecord.current.version },
       orchestrationSkill: { id: workflow.orchestrationSkill.id, version: skillRecord.version },
       managementPolicy: { id: latestPolicy.id, version: latestPolicy.version },
       members: workflow.members.map((member) => {
@@ -7364,7 +7781,7 @@ export class WorkbenchService {
     id: string,
     input: JsonObject,
     source: InvocationSource,
-    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; createLeaderSession?: boolean } = {}
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; createLeaderSession?: boolean; idempotencyFingerprint?: string } = {}
   ): Promise<{
     invocation: InvocationRecord;
     workflow: WorkbenchWorkflowDefinition;
@@ -7374,7 +7791,7 @@ export class WorkbenchService {
     if (currentWorkflow.status !== "active") throw new Error(`workflow ${id} is archived`);
     // "latest" workflows re-resolve their pinned versions to newest before the run; a specific
     // workflowVersion pin (e.g. from an entrance policy) opts out and runs exactly as recorded.
-    const workflow = options.workflowVersion === undefined
+    let workflow = options.workflowVersion === undefined
       ? this.resolveWorkflowForRun(this.getWorkflow(id))
       : this.getWorkflow(id, options.workflowVersion);
     if (workflow.status !== "active") throw new Error(`workflow ${id} v${workflow.version} is archived`);
@@ -7385,15 +7802,25 @@ export class WorkbenchService {
       }
       this.getManagementPolicy(workflow.managementPolicy.id, workflow.managementPolicy.version);
     }
+    const registeredProjectId = source.project?.trim();
+    if (workflow.architecture === "graph" && registeredProjectId && this.snapshot().projects[registeredProjectId]) {
+      throw new Error(
+        `project ${registeredProjectId} is registered; a Graph Workflow cannot bypass Project Role assignments`
+      );
+    }
     // Revalidate the exact run-time pins before creating an Invocation. This is especially
     // important for updatePolicy=latest: a newly worktree-isolated policy must not make an older
     // workflow executable until its mandatory quality.test and quality.audit Gates are present.
-    await this.validateWorkflow(workflow);
-    const employees = this.resolveWorkflowEmployees(workflow);
+    const projectScoped = workflow.architecture === "supervisor"
+      ? this.resolveProjectScopedSupervisorWorkflow(workflow, source)
+      : undefined;
+    if (projectScoped) workflow = projectScoped.workflow;
+    const employees = projectScoped?.employees ?? this.resolveWorkflowEmployees(workflow);
+    await this.validateWorkflow(workflow, employees);
     for (const employee of employees.values()) {
       if (this.getEmployee(employee.id).status !== "active") throw new Error(`employee ${employee.id} is archived`);
       const scopedProjectId = internalProjectId(employee);
-      if (scopedProjectId) {
+      if (scopedProjectId && !projectScoped) {
         throw new Error(
           `employee ${employee.id} is internal to project ${scopedProjectId} and cannot run in a global workflow`
         );
@@ -7401,12 +7828,14 @@ export class WorkbenchService {
     }
     const invocation = await this.createInvocationActivity({
       target: { kind: "workflow", id: workflow.id, version: workflow.version },
-      source,
+      source: projectScoped?.source ?? source,
       workflow,
       employees,
       input,
       createLeaderSession: options.createLeaderSession,
-      entrance: options.entrance
+      entrance: options.entrance,
+      idempotencyFingerprint: options.idempotencyFingerprint,
+      ...(projectScoped ? { assignments: projectScoped.assignments } : {})
     });
     return { invocation, workflow, employees };
   }
@@ -7425,7 +7854,7 @@ export class WorkbenchService {
         initialCursor,
         defaultTimeoutMs: WORKFLOW_PROGRESS_DEFAULT_TIMEOUT_MS,
         maxTimeoutMs: WORKFLOW_PROGRESS_MAX_TIMEOUT_MS,
-        instructions: "启动后立即用 initialCursor 循环调用 wait_workflow_progress；非终态不要结束当前回合，每次变化或心跳都向用户汇报，终态交付最终摘要。"
+        instructions: "启动后立即用 initialCursor 循环调用 wait_workflow_progress；非终态不要结束当前回合。仅 changed/terminal 结果进入模型或向用户复述；heartbeat 只用于 transport keepalive。"
       }
     };
   }
@@ -7434,18 +7863,21 @@ export class WorkbenchService {
     id: string,
     input: JsonObject = {},
     source: InvocationSource = { kind: "workbench" },
-    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
+    options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string; idempotencyFingerprint?: string } = {}
   ): Promise<InvocationStartResult> {
     const providerCwd = await this.workflowExecutionRoot(source, options.providerCwd);
     const prepared = await this.prepareWorkbenchWorkflowInvocation(id, input, source, {
       ...options,
-      createLeaderSession: true
+      createLeaderSession: true,
+      idempotencyFingerprint: options.idempotencyFingerprint
     });
-    const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
+    const controller = new AbortController();
+    const execution = this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd, undefined, controller.signal);
     const settled = execution.then(() => undefined, () => undefined);
-    this.backgroundInvocations.set(prepared.invocation.id, settled);
+    const tracked = { promise: settled, controller, epoch: 0 };
+    this.backgroundInvocations.set(prepared.invocation.id, tracked);
     void settled.finally(() => {
-      if (this.backgroundInvocations.get(prepared.invocation.id) === settled) {
+      if (this.backgroundInvocations.get(prepared.invocation.id) === tracked) {
         this.backgroundInvocations.delete(prepared.invocation.id);
       }
     });
@@ -7460,6 +7892,7 @@ export class WorkbenchService {
   ): Promise<InvocationStartResult> {
     const idempotencyKey = source.idempotencyKey?.trim();
     if (!idempotencyKey) return this.startWorkbenchWorkflowOnce(id, input, source, options);
+    const fingerprint = workflowStartFingerprint(id, input, { ...source, idempotencyKey }, options);
 
     const existing = Object.values(this.snapshot().invocations)
       .find((candidate) => candidate.source.idempotencyKey === idempotencyKey);
@@ -7470,17 +7903,33 @@ export class WorkbenchService {
         || existing.source.project !== source.project) {
         throw new Error(`idempotency key ${idempotencyKey} is already bound to another workflow Invocation`);
       }
+      if (!existing.idempotencyFingerprint) {
+        throw new Error(
+          `idempotency key ${idempotencyKey} belongs to a legacy workflow Invocation without a request fingerprint; use a new key`
+        );
+      }
+      if (existing.idempotencyFingerprint !== fingerprint) {
+        throw new Error(`idempotency key ${idempotencyKey} is already bound to a different workflow start request`);
+      }
       return this.workflowInvocationReceipt(existing);
     }
 
     const pending = this.idempotentWorkflowStarts.get(idempotencyKey);
-    if (pending) return pending;
-    const started = this.startWorkbenchWorkflowOnce(id, input, { ...source, idempotencyKey }, options);
-    this.idempotentWorkflowStarts.set(idempotencyKey, started);
+    if (pending) {
+      if (pending.fingerprint !== fingerprint) {
+        throw new Error(`idempotency key ${idempotencyKey} is already starting a different workflow request`);
+      }
+      return pending.receipt;
+    }
+    const started = this.startWorkbenchWorkflowOnce(id, input, { ...source, idempotencyKey }, {
+      ...options,
+      idempotencyFingerprint: fingerprint
+    });
+    this.idempotentWorkflowStarts.set(idempotencyKey, { fingerprint, receipt: started });
     try {
       return await started;
     } finally {
-      if (this.idempotentWorkflowStarts.get(idempotencyKey) === started) {
+      if (this.idempotentWorkflowStarts.get(idempotencyKey)?.receipt === started) {
         this.idempotentWorkflowStarts.delete(idempotencyKey);
       }
     }
@@ -7502,11 +7951,12 @@ export class WorkbenchService {
     if (publication.target.kind !== "workflow") {
       throw new Error(`publication ${id} targets an Employee; use invoke_publication instead`);
     }
+    const target = this.resolvePublicationTarget(publication);
     return this.startWorkbenchWorkflow(
-      publication.target.id,
+      target.id,
       input,
       { ...source, publicationId: id },
-      options
+      { ...options, workflowVersion: target.version }
     );
   }
 
@@ -7543,7 +7993,17 @@ export class WorkbenchService {
   getPublication(id: string): PublicationDefinition {
     const publication = this.snapshot().publications[id];
     if (!publication) throw new Error(`publication not found: ${id}`);
-    return publication;
+    return { ...publication, releaseChannel: publication.releaseChannel ?? "pinned" };
+  }
+
+  private resolvePublicationTarget(publication: PublicationDefinition): { kind: "employee" | "workflow"; id: string; version: number } {
+    const current = publication.target.kind === "employee"
+      ? this.getEmployee(publication.target.id)
+      : this.getWorkflow(publication.target.id);
+    const version = publication.releaseChannel === "floating"
+      ? current.version
+      : publication.target.targetVersion ?? current.version;
+    return { kind: publication.target.kind, id: publication.target.id, version };
   }
 
   async createPublication(input: {
@@ -7551,6 +8011,7 @@ export class WorkbenchService {
     name: string;
     description?: string;
     target: PublicationDefinition["target"];
+    releaseChannel?: PublicationDefinition["releaseChannel"];
   }): Promise<PublicationDefinition> {
     requireId(input.id, "publication id");
     const target = input.target.kind === "employee" ? this.getEmployee(input.target.id) : this.getWorkflow(input.target.id);
@@ -7578,12 +8039,40 @@ export class WorkbenchService {
         status: "active",
         name: requireText(input.name, "publication name"),
         description: input.description?.trim() || `${input.target.kind} ${input.target.id}`,
-        target: input.target,
+        target: { ...input.target, targetVersion: input.target.targetVersion ?? target.version },
+        releaseChannel: input.releaseChannel ?? "pinned",
         createdAt: timestamp,
         updatedAt: timestamp
       };
       state.publications[input.id] = publication;
       return publication;
+    });
+  }
+
+  async updatePublication(id: string, input: {
+    name?: string;
+    description?: string;
+    target?: PublicationDefinition["target"];
+    releaseChannel?: PublicationDefinition["releaseChannel"];
+  }): Promise<PublicationDefinition> {
+    const current = this.getPublication(id);
+    if (current.releaseChannel === "locked") throw new Error(`publication ${id} is locked`);
+    const requested = input.target ?? current.target;
+    const target = requested.kind === "employee" ? this.getEmployee(requested.id) : this.getWorkflow(requested.id);
+    if (target.status !== "active") throw new Error(`${requested.kind} ${requested.id} is archived`);
+    const updated: PublicationDefinition = {
+      ...current,
+      version: current.version + 1,
+      name: input.name === undefined ? current.name : requireText(input.name, "publication name"),
+      description: input.description?.trim() || current.description,
+      target: { ...requested, targetVersion: requested.targetVersion ?? target.version },
+      releaseChannel: input.releaseChannel ?? current.releaseChannel,
+      updatedAt: now()
+    };
+    return this.store.mutate((state) => {
+      if (!state.publications[id]) throw new Error(`publication not found: ${id}`);
+      state.publications[id] = updated;
+      return updated;
     });
   }
 
@@ -7630,49 +8119,37 @@ export class WorkbenchService {
     const publication = this.getPublication(id);
     if (publication.status !== "active") throw new Error(`publication ${id} is archived`);
     const publicationSource: InvocationSource = { ...source, publicationId: id };
-    if (publication.target.kind === "employee") {
+    const target = this.resolvePublicationTarget(publication);
+    if (target.kind === "employee") {
       const message = typeof input.message === "string" ? input.message : JSON.stringify(input);
-      return this.invokeEmployee(publication.target.id, {
+      return this.invokePinnedEmployee(target.id, target.version, {
         message,
-        sessionId: this.sessionForExternalContext(publication.target.id, publicationSource),
+        sessionId: this.sessionForExternalContext(target.id, publicationSource),
         ...(typeof input.context === "object" && input.context !== null && !Array.isArray(input.context)
           ? { context: input.context as JsonObject }
           : {}),
         ...(input.attachments !== undefined
           ? { attachments: input.attachments as unknown as EmployeeInvocationInput["attachments"] }
           : {})
-      }, publicationSource, options);
+      }, publicationSource, undefined, options.providerCwd);
     }
-    return this.runWorkbenchWorkflow(publication.target.id, input, publicationSource, options);
+    const prepared = await this.prepareWorkbenchWorkflowInvocation(target.id, input, publicationSource, { workflowVersion: target.version });
+    const providerCwd = await this.workflowExecutionRoot(publicationSource, options.providerCwd);
+    return this.runTrackedWorkflow(prepared.invocation, prepared.workflow, prepared.employees, input, providerCwd);
   }
 
   async listRuns(limit = 50): Promise<unknown[]> {
     const runsRoot = path.join(this.store.dataRoot, "artifacts", "runs");
-    let entries: string[];
-    try {
-      entries = await fs.readdir(runsRoot);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
-    }
-    const records = await Promise.all(
-      entries.map(async (entry) => {
-        try {
-          return JSON.parse(await fs.readFile(path.join(runsRoot, entry, "run.json"), "utf8")) as unknown;
-        } catch {
-          return undefined;
-        }
-      })
-    );
+    const records = await RunStore.listIndexed(runsRoot);
     const invocationsByRunId = new Map<string, InvocationRecord>();
     for (const invocation of Object.values(this.snapshot().invocations)) {
       invocationsByRunId.set(invocation.runId, invocation);
     }
     return records
-      .filter((record): record is Record<string, unknown> => Boolean(record))
+      .filter((record): record is WorkflowRunRecord => Boolean(record))
       .sort((left, right) => String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? "")))
       .slice(0, Math.max(1, Math.min(200, limit)))
-      .map((record) => this.classifyRunSummary(record, invocationsByRunId.get(String(record.id ?? ""))));
+      .map((record) => this.classifyRunSummary(record as unknown as Record<string, unknown>, invocationsByRunId.get(record.id)));
   }
 
   private classifyRunSummary(
@@ -8438,5 +8915,123 @@ export class WorkbenchService {
   }> {
     const { runDir } = await this.getRunDeliveryContext(id);
     return resolveRunEvidenceAsset(runDir, id, assetId);
+  }
+
+  exportPortableBundle(modes: BundleMode[]): PortableBundle {
+    if (!modes.length) throw new Error("at least one bundle mode is required");
+    return exportBundle(this.snapshot(), modes);
+  }
+
+  previewPortableBundle(bundle: unknown, conflict: BundleConflictMode = "skip") {
+    return previewBundle(this.snapshot(), bundle, conflict);
+  }
+
+  async applyPortableBundle(bundle: PortableBundle, conflict: BundleConflictMode = "skip", confirmation?: string) {
+    return this.store.mutate(state => applyBundleToState(state, bundle, conflict, confirmation));
+  }
+
+  doctor() { return doctorReport(this.store.dataRoot, this.snapshot()); }
+
+  async getRunReceipt(id: string) {
+    const run = await this.getRun(id) as Record<string, unknown>;
+    const invocation = Object.values(this.snapshot().invocations).find(item => item.runId === id);
+    const runDir = path.join(this.store.dataRoot, "artifacts", "runs", id);
+    let runManifest: { budget?: ExecutionBudgetSnapshot; checkpointRevision?: number } = {};
+    try {
+      runManifest = JSON.parse(await fs.readFile(path.join(runDir, "run-manifest.json"), "utf8")) as typeof runManifest;
+    } catch { /* legacy Run without a manifest */ }
+    const receipt = receiptFor(
+      { ...run, ...(runManifest.budget ? { budget: runManifest.budget } : {}) },
+      invocation as unknown as Record<string, unknown> | undefined
+    );
+    const definitions = [
+      ["run", "run.json"], ["events", "events.jsonl"], ["checkpoint", "checkpoint.json"],
+      ["context", "context.json"], ["preflight", "preflight.json"], ["output-validation", "output-validation.json"]
+    ] as const;
+    const evidence = await Promise.all(definitions.map(async ([kind, relativePath]) => {
+      try { const info = await fs.stat(path.join(runDir, relativePath)); return { kind, status: "available", sizeBytes: info.size, link: `/api/runs/${encodeURIComponent(id)}${kind === "run" ? "" : `#${kind}`}` }; }
+      catch { return { kind, status: "unavailable" }; }
+    }));
+    const nodeEntries = await fs.readdir(path.join(runDir, "nodes"), { recursive: true }).catch(() => [] as string[]);
+    for (const relative of nodeEntries.filter(value => /(?:system-prompt|request-prompt|prompt|raw-output|result)\.(?:md|txt|json)$/.test(String(value)))) {
+      evidence.push({ kind: `attempt:${String(relative)}`, status: "available", link: `/api/runs/${encodeURIComponent(id)}#attempts` } as never);
+    }
+    return {
+      ...receipt,
+      ...(runManifest.checkpointRevision !== undefined ? { checkpointRevision: runManifest.checkpointRevision } : {}),
+      ...(invocation?.executionSnapshot?.publication
+        ? { publicationVersion: invocation.executionSnapshot.publication.publicationVersion, targetVersion: invocation.executionSnapshot.publication.targetVersion }
+        : {}),
+      evidence
+    };
+  }
+
+  previewRetention(policy: RetentionPolicy) { return retentionPreview(this.store.dataRoot, this.snapshot(), policy); }
+
+  async applyRetention(policy: RetentionPolicy, confirmation: string) {
+    const preview = await this.previewRetention(policy);
+    if (confirmation !== preview.token) throw new Error(`confirmation token required: ${preview.token}`);
+    const ids = new Set(preview.candidates.map(item => item.invocationId));
+    const runIds = preview.candidates.flatMap(item => item.runId ? [item.runId] : []);
+    await this.store.mutate(state => {
+      for (const id of ids) {
+        const current = state.invocations[id];
+        if (!current || ["queued", "running", "cancellation-requested", "awaiting-human", "awaiting-human-decision"].includes(current.status)) throw new Error(`retention candidate changed or is protected: ${id}`);
+        delete state.invocations[id];
+      }
+    });
+    if (policy.preserveRunEvidence === false) for (const runId of runIds) {
+      if (!/^run-[A-Za-z0-9-]+$/.test(runId)) throw new Error(`unsafe run id in retention preview: ${runId}`);
+      await fs.rm(path.join(this.store.dataRoot, "artifacts", "runs", runId), { recursive: true, force: true });
+    }
+    return { deleted: ids.size, preservedEvidence: policy.preserveRunEvidence !== false, estimatedBytes: preview.estimatedBytes };
+  }
+
+  backup(target: string, allowedRoot?: string) { return writeBackup(this.store.dataRoot, this.snapshot(), target, allowedRoot); }
+
+  backupRoot() { return path.join(this.store.dataRoot, "backups"); }
+  backupForBrowser(backupId: string) { const name = safeBackupName(backupId); return this.backup(path.join(this.backupRoot(), name), this.backupRoot()); }
+  previewRestoreForBrowser(backupId: string) { const name = safeBackupName(backupId); return this.previewRestore(path.join(this.backupRoot(), name), this.backupRoot()); }
+  restoreForBrowser(backupId: string, conflict: BundleConflictMode, confirmation?: string) { const name = safeBackupName(backupId); return this.restore(path.join(this.backupRoot(), name), this.backupRoot(), conflict, confirmation); }
+
+  async previewRestore(target: string, allowedRoot: string) {
+    const backup = await readBackup(target, allowedRoot);
+    const bundle = exportBundle(backup.state, ["employee", "project", "workflow", "publication", "run-evidence"]);
+    return { ...this.previewPortableBundle(bundle, "skip"), digest: backup.digest, path: backup.path };
+  }
+
+  async restore(target: string, allowedRoot: string, conflict: BundleConflictMode, confirmation?: string) {
+    const backup = await readBackup(target, allowedRoot);
+    const bundle = exportBundle(backup.state, ["employee", "project", "workflow", "publication", "run-evidence"]);
+    const preview = this.previewPortableBundle(bundle, conflict);
+    if (!preview.valid) throw new Error("backup cannot be restored");
+    if (preview.confirmationToken && confirmation !== preview.confirmationToken) throw new Error(`confirmation token required: ${preview.confirmationToken}`);
+    if (conflict === "skip") return { created: 0, replaced: 0, skipped: preview.diff.length };
+    return this.store.mutate(state => {
+      const replacement = structuredClone(backup.state);
+      for (const key of Object.keys(state) as Array<keyof typeof state>) delete state[key];
+      Object.assign(state, replacement);
+      return { created: 0, replaced: preview.diff.length, skipped: 0 };
+    });
+  }
+
+  async reset(input: { scopes: Array<"registry" | "config" | "run-evidence">; backupDigest: string; backupPath: string; allowedRoot: string; confirmation: string }) {
+    const scopes = [...new Set(input.scopes)];
+    const expected = `RESET-${scopes.sort().join("-").toUpperCase()}`;
+    if (!input.backupDigest || !/^[a-f0-9]{64}$/.test(input.backupDigest)) throw new Error("a valid backup receipt digest is required");
+    const backup = await readBackup(input.backupPath, input.allowedRoot);
+    if (backup.digest !== input.backupDigest) throw new Error("backup receipt digest does not match the confirmed backup");
+    if (input.confirmation !== expected) throw new Error(`confirmation token required: ${expected}`);
+    return this.store.mutate(state => {
+      if (scopes.includes("registry")) { state.employees = {}; state.employeeTemplates = {}; state.workflows = {}; state.publications = {}; state.projects = {}; state.projectBindings = {}; }
+      if (scopes.includes("config")) { state.configurationProposals = {}; state.entrancePolicies = {}; state.managementPolicies = {}; }
+      if (scopes.includes("run-evidence")) { state.invocations = {}; state.workInstances = {}; }
+      return { reset: scopes, runEvidencePreserved: !scopes.includes("run-evidence") };
+    });
+  }
+
+  resetForBrowser(input: { scopes: Array<"registry" | "config" | "run-evidence">; backupDigest: string; backupId: string; confirmation: string }) {
+    const name = safeBackupName(input.backupId);
+    return this.reset({ ...input, backupPath: path.join(this.backupRoot(), name), allowedRoot: this.backupRoot() });
   }
 }

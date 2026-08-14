@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { JsonObject, LoadedManifest, MultiAgentManifest, RoleDefinition, SkillDefinition } from "../core/types.js";
+import type { JsonObject, JsonValue, LoadedManifest, MultiAgentManifest, RoleDefinition, SkillDefinition } from "../core/types.js";
 import { loadManifest } from "../config/loadManifest.js";
 import type { ProviderRegistry } from "../runtime/providers.js";
 import type { ArchitectureRegistry } from "../architectures/types.js";
@@ -13,6 +13,7 @@ import type {
   WorkbenchState,
   WorkbenchWorkflowDefinition
 } from "./types.js";
+import { compilePolicyPack, legacySupervisorPolicyPack } from "../policies/registry.js";
 
 export const SUPERVISOR_RUNTIME_ROLE_ID = "supervisor";
 
@@ -24,11 +25,13 @@ export function supervisorDecisionSchema(
   roleIds: string[],
   gateIds: string[],
   maxParallelDelegations: number,
-  dagNodeIds?: string[]
+  dagNodeIds?: string[],
+  maxDelegations = 64
 ): JsonObject {
   const dagMode = dagNodeIds !== undefined;
+  const canPlanTodos = !dagMode && maxDelegations >= 2;
   const actions = [
-    ...(dagMode ? [] : ["plan-todos"]),
+    ...(canPlanTodos ? ["plan-todos"] : []),
     "delegate",
     "request-human-decision",
     ...(gateIds.length > 0 ? ["satisfy-gate"] : []),
@@ -53,7 +56,8 @@ export function supervisorDecisionSchema(
           required: ["id", "requiredChecks"],
           properties: {
             id: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
-            requiredChecks: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } }
+            requiredChecks: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } },
+            impactedFiles: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } }
           }
         }
       }
@@ -73,10 +77,10 @@ export function supervisorDecisionSchema(
         enum: ["dependency-install", "data-migration", "scope-expansion", "irreversible-other"]
       },
       impact: impactSchema,
-      todos: {
+      ...(canPlanTodos ? { todos: {
         type: "array",
         minItems: 2,
-        maxItems: 64,
+        maxItems: maxDelegations,
         items: {
           type: "object",
           additionalProperties: false,
@@ -86,6 +90,23 @@ export function supervisorDecisionSchema(
             roleId: { type: "string", enum: roleIds },
             task: { type: "string", minLength: 1, maxLength: 4000 },
             needs: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } },
+            needsWhen: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["nodeId", "statuses"],
+                properties: {
+                  nodeId: { type: "string", minLength: 1 },
+                  statuses: {
+                    type: "array",
+                    minItems: 1,
+                    uniqueItems: true,
+                    items: { enum: ["passed", "blocked", "failed", "skipped", "terminal"] }
+                  }
+                }
+              }
+            },
             workKind: { enum: ["discussion", "code", "test", "audit", "integration", "other"] },
             changeSet: { type: "string", minLength: 1 },
             sessionKey: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
@@ -97,7 +118,7 @@ export function supervisorDecisionSchema(
             context: { type: "object" }
           }
         }
-      },
+      } } : {}),
       assignments: {
         type: "array",
         minItems: 1,
@@ -134,7 +155,7 @@ export function supervisorDecisionSchema(
     // Per-action required fields, enforced schema-side so a malformed decision fails validation
     // (and triggers the runtime repair attempt) instead of silently passing the flat object.
     allOf: [
-      ...(!dagMode ? [{
+      ...(canPlanTodos ? [{
         if: { properties: { action: { const: "plan-todos" } } },
         then: { required: ["summary", "impact", "todos"] }
       }] : []),
@@ -240,10 +261,10 @@ function requestTemplateFor(
       : "Choose who fits each task from the member profiles below — weigh their responsibilities and skill summaries; capability tags are coarse hints, not hard requirements, and are never matched by exact string. For work that needs more than one bounded milestone, first return action \"plan-todos\" with a dependency-ordered TODO plan and a structured regression-impact assessment. Do not paste the whole requirement into every TODO. On later rounds delegate only ready todoId values; the runtime supplies the stored bounded task. Give sequential TODOs for the same role and change set one stable sessionKey so their logical Work Instance and prior evidence remain available until the last TODO in that session completes. Small one-step work may delegate directly, but still include impact when code changes are involved. Never schedule a test, audit, merge, or integration task in parallel with implementation that must exist first; delegate downstream verification only after prerequisite evidence is available. A blocked result is evidence: do not repeat the same assignment until prerequisite evidence changes, and finish with a disclosed risk when policy and required Gates allow it.";
     const decisionContract = workflow.flow.dag
       ? "In DAG mode every delegate assignment must name its declared nodeId and matching roleId; delegate only ready nodes whose dependencies passed."
-      : "In dynamic mode, use action \"plan-todos\" before multi-step work. After the runtime accepts the plan, delegate ready items by todoId and matching roleId; omit task so the immutable planned task is used.";
-    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself. ${sequencingRules}\n\nBefore delegating dependency installation, data migration, scope expansion, or another irreversible action, use action \"request-human-decision\" with the exact proposed assignments, a riskCategory, and a concise summary. The runtime will pause before scheduling those assignments. After rejection, use the human comment in the prior ledger to replan; never repeat the rejected action unchanged.\n\nRegression impact must be evidence-based: low = local behavior with stable contracts and targeted checks; medium = package/shared-state changes needing package regression; high = cross-package contracts, persistence/migration, security, concurrency, or target-branch integration needing broad/full regression. Never choose full regression by habit. For package/full scopes, you may add validationGroups that group every requiredChecks entry exactly once by semantic test domain. There is no fixed group-count target: choose as many bounded groups as the actual checks require. If omitted or invalid, the runtime derives groups from checklist size without a fixed maximum.\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\n${dagSection}Management policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nMember role slots with their profiles (responsibilities, skill summaries, capability hints) — pick the best-fit member per task:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, Gate, and human-decision ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-decision validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nReturn exactly one JSON decision matching the supplied output schema. ${decisionContract} Use action \"plan-todos\" for multi-step dynamic work, action \"delegate\" with one or more ready assignments, \"request-human-decision\" before any high-risk assignment, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
+      : "In dynamic mode, use action \"plan-todos\" before multi-step work. After the runtime accepts the plan, never emit plan-todos again: delegate ready items by todoId and matching roleId, and omit task so the immutable planned task is used. Human approval cannot add, replace, or reassign an accepted TODO: each proposed assignment must use an existing todoId with its original roleId and workKind. If a required Gate blocks after a code or integration TODO passed, delegate that existing todoId to its original role to reopen it for remediation (including a no-code confirmation followed by finish) instead of adding a TODO or assigning it across roles. For conditional repair, plan only the original validation TODO and one repair TODO whose needs includes that validation and whose needsWhen accepts blocked/failed. After repair passes, rerun the original validation todoId; do not create a separate retest TODO that remains downstream of the blocked validation.";
+    return `${employee.requestPrompt.trim()}\n\n## Supervisor control contract\n\nYou are the workflow supervisor. Decide the next action; do not perform a member's specialist task yourself. ${sequencingRules}\n\nBefore delegating dependency installation, data migration, scope expansion, or another irreversible action, use action \"request-human-decision\" with the exact proposed assignments, a riskCategory, and a concise summary. The runtime will pause before scheduling those assignments. After rejection, use the human comment in the prior ledger to replan; never repeat the rejected action unchanged.\n\nRegression impact must be evidence-based: low = local behavior with stable contracts and targeted checks; medium = package/shared-state changes needing package regression; high = cross-package contracts, persistence/migration, security, concurrency, or target-branch integration needing broad/full regression. Never choose full regression by habit. For package/full scopes, you may add validationGroups that group every requiredChecks entry exactly once by semantic test domain. There is no fixed group-count target: choose as many bounded groups as the actual checks require. When a group has exact repository-relative file coverage, include impactedFiles; the runtime may then reuse that shard only when later changed files provably do not overlap. If omitted or invalid, the runtime derives groups from checklist size without a fixed maximum.\n\nFixed flow and Gates (hard requirements are enforced by the runtime):\n{{node.with.__supervisorFlow}}\n\n${dagSection}Management policy (hard limits are enforced by the runtime):\n{{node.with.__managementPolicy}}\n\nMember role slots with their profiles (responsibilities, skill summaries, capability hints) — pick the best-fit member per task:\n{{node.with.__supervisorTeam}}\n\nCurrent round:\n{{node.with.__supervisorRound}}\n\nCurrent Gate state:\n{{node.with.__supervisorGates}}\n\nGate execution request, when this node is acting as an allowed supervisor fallback:\n{{node.with.__gateExecution}}\n\nPrior decision, delegation, Gate, and human-decision ledger:\n{{node.with.__supervisorHistory}}\n\nLatest delegated evidence:\n{{needs}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-decision validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nReturn exactly one JSON decision matching the supplied output schema. ${decisionContract} Use action \"plan-todos\" for multi-step dynamic work, action \"delegate\" with one or more ready assignments, \"request-human-decision\" before any high-risk assignment, action \"satisfy-gate\" only for the requested Gate fallback, or action \"finish\" with the final result.\n`;
   }
-  return `${employee.requestPrompt.trim()}\n\n## Delegation from the workflow supervisor\n\nYour workflow-local role slot:\n{{node.with.__delegatedRoleId}}\n\nDelegated TODO:\n{{node.with.__todoId}}\n\nDelegated task:\n{{node.with.__delegatedTask}}\n\nPersistent member session (prior bounded TODO turns for this same role/change set):\n{{node.with.__memberSession}}\n\nRequired capabilities:\n{{node.with.__requiredCapabilities}}\n\nWork kind and change set:\n{{node.with.__workKind}} / {{node.with.__changeSet}}\n\nRegression impact and permitted validation scope:\n{{node.with.__regressionImpact}}\n\nGate execution request, when present:\n{{node.with.__gateExecution}}\n\nDelegated context:\n{{node.with.__delegatedContext}}\n\nSupervisor summary:\n{{node.with.__supervisorSummary}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-output validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nWork only on the current bounded TODO. Use the persistent member-session evidence instead of rediscovering completed TODOs, and do not execute future TODOs early. Return the requested specialist result using your normal output contract. When a previous validation error is present, correct only the response shape and preserve the task evidence.\n`;
+  return `${employee.requestPrompt.trim()}\n\n## Delegation from the workflow supervisor\n\nYour workflow-local role slot:\n{{node.with.__delegatedRoleId}}\n\nDelegated TODO:\n{{node.with.__todoId}}\n\nDelegated task:\n{{node.with.__delegatedTask}}\n\nDependency evidence from prerequisite TODOs and upstream Gates:\n{{needs}}\n\nPersistent member session (prior bounded TODO turns for this same role/change set):\n{{node.with.__memberSession}}\n\nRequired capabilities:\n{{node.with.__requiredCapabilities}}\n\nWork kind and change set:\n{{node.with.__workKind}} / {{node.with.__changeSet}}\n\nRegression impact and permitted validation scope:\n{{node.with.__regressionImpact}}\n\nGate execution request, when present:\n{{node.with.__gateExecution}}\n\nDelegated context:\n{{node.with.__delegatedContext}}\n\nSupervisor summary:\n{{node.with.__supervisorSummary}}\n\nKnowledge evidence:\n{{node.with.__knowledgeEvidence}}\n\nOriginal workflow input:\n{{input}}\n\nPrevious structured-output validation error, when this is a repair attempt:\n{{node.with.__previousAttemptError}}\n\nWork only on the current bounded TODO. Use the dependency and persistent member-session evidence instead of rediscovering completed TODOs, and do not execute future TODOs early. Return the requested specialist result using your normal output contract. When a previous validation error is present, correct only the response shape and preserve the task evidence.\n`;
 }
 
 export async function materializeWorkflow(options: MaterializeOptions): Promise<MaterializedWorkflow> {
@@ -256,6 +277,9 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
   const supervisorWorkflow = options.workflow.architecture === "supervisor" ? options.workflow : undefined;
   const supervisorPolicy = supervisorWorkflow
     ? policyVersion(options.state, supervisorWorkflow)
+    : undefined;
+  const effectivePolicyPack = supervisorWorkflow
+    ? (supervisorWorkflow.policyPackRef ? compilePolicyPack(supervisorWorkflow.policyPackRef) : legacySupervisorPolicyPack())
     : undefined;
   const orchestrationSkill = supervisorWorkflow
     ? skillVersion(options.state, supervisorWorkflow.orchestrationSkill.id, supervisorWorkflow.orchestrationSkill.version)
@@ -318,7 +342,8 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
             supervisorWorkflow!.members.map((member) => member.roleId),
             supervisorWorkflow!.flow.gates.map((gate) => gate.id),
             supervisorPolicy!.limits.maxParallelDelegations,
-            supervisorWorkflow!.flow.dag?.nodes.map((node) => node.nodeId)
+            supervisorWorkflow!.flow.dag?.nodes.map((node) => node.nodeId),
+            supervisorPolicy!.limits.maxDelegations
           )
         : employee.outputSchema
     );
@@ -386,6 +411,8 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
     : {
         supervisor: {
           role: SUPERVISOR_RUNTIME_ROLE_ID,
+          employeeId: supervisorWorkflow!.supervisor.employeeId,
+          principalId: supervisorWorkflow!.supervisor.employeeId,
           capabilities: [...options.employees.get(SUPERVISOR_RUNTIME_ROLE_ID)!.capabilities],
           skillInjection: {
             id: orchestrationSkill!.id,
@@ -409,21 +436,26 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
           return {
             roleId: member.roleId,
             role: supervisorMemberRuntimeRoleId(member.roleId),
+            employeeId: member.employeeId,
+            principalId: member.employeeId,
             description: member.description,
             capabilities: [...memberEmployee.capabilities],
             responsibilities: profile.responsibilities,
             skillSummaries: profile.skillSummaries
           };
         }),
+        ...(effectivePolicyPack ? { effectivePolicyPack: effectivePolicyPack as unknown as JsonObject } : {}),
+        ...(supervisorWorkflow!.separationOfDuties ? { separationOfDuties: supervisorWorkflow!.separationOfDuties as unknown as JsonObject } : {}),
         flow: {
           version: supervisorWorkflow!.flow.version,
           stages: supervisorWorkflow!.flow.stages.map((stage) => ({ ...stage })),
           gates: supervisorWorkflow!.flow.gates.map((gate) => ({ ...gate })),
           ...(supervisorWorkflow!.flow.dag ? {
             dag: {
-              nodes: supervisorWorkflow!.flow.dag.nodes.map((node) => ({
+              nodes: supervisorWorkflow!.flow.dag.nodes.map(({ needsWhen, ...node }) => ({
                 ...node,
-                needs: [...node.needs]
+                needs: [...node.needs],
+                ...(needsWhen ? { needsWhen: needsWhen.map((condition) => ({ nodeId: condition.nodeId, statuses: [...condition.statuses] })) as JsonValue } : {})
               }))
             }
           } : {})
@@ -441,6 +473,9 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
         architecture: options.workflow.architecture,
         description: options.workflow.description,
         inputSchema: options.workflow.inputSchema ? `schemas/${safeId(options.workflow.id)}-input.schema.json` : undefined,
+        outputSchema: options.workflow.workflowOutputSchema ? `schemas/${safeId(options.workflow.id)}-output.schema.json` : undefined,
+        outputSchemaVersion: options.workflow.workflowOutputSchemaVersion ?? 1,
+        outputSchemaDigest: options.workflow.workflowOutputSchemaDigest,
         config: workflowConfig
       }
     }
@@ -449,6 +484,12 @@ export async function materializeWorkflow(options: MaterializeOptions): Promise<
     await writeJson(
       path.join(bundleDir, `schemas/${safeId(options.workflow.id)}-input.schema.json`),
       options.workflow.inputSchema
+    );
+  }
+  if (options.workflow.workflowOutputSchema) {
+    await writeJson(
+      path.join(bundleDir, `schemas/${safeId(options.workflow.id)}-output.schema.json`),
+      options.workflow.workflowOutputSchema
     );
   }
   const manifestPath = path.join(bundleDir, "multi-agent.json");

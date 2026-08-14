@@ -39,6 +39,7 @@ interface MemberDraft {
   roleId: string;
   description: string;
   employeeId: string;
+  projectRoleId: string;
 }
 
 let memberDraftKeyCounter = 0;
@@ -47,8 +48,8 @@ function nextMemberDraftKey(): string {
   return `member-draft-${memberDraftKeyCounter}`;
 }
 
-function newMemberDraft(roleId: string, description: string, employeeId: string): MemberDraft {
-  return { key: nextMemberDraftKey(), roleId, description, employeeId };
+function newMemberDraft(roleId: string, description: string, employeeId: string, projectRoleId = ""): MemberDraft {
+  return { key: nextMemberDraftKey(), roleId, description, employeeId, projectRoleId };
 }
 
 /** 把服务端英文校验错误翻译为可读的中文摘要；原始信息仍完整保留在详情里。 */
@@ -68,6 +69,7 @@ interface SupervisorDraft {
   description: string;
   updatePolicy: SupervisorWorkflowUpdatePolicy;
   supervisorEmployeeId: string;
+  supervisorProjectRoleId: string;
   policyId: string;
   policyVersion: number;
   members: MemberDraft[];
@@ -102,12 +104,18 @@ function memberDrafts(policy: ManagementPolicy | undefined, employees: Employee[
 
 function supervisorDraft(workflow: SupervisorWorkflow | undefined, employees: Employee[], policies: ManagementPolicy[]): SupervisorDraft {
   const firstPolicy = policies.find((policy) => policy.status === "active");
-  const existing = workflow?.members.map((member) => newMemberDraft(member.roleId, member.description, member.employeeId)) ?? [];
+  const existing = workflow?.members.map((member) => newMemberDraft(
+    member.roleId,
+    member.description,
+    member.employeeId,
+    member.projectRoleId
+  )) ?? [];
   return {
     id: workflow?.id ?? "",
     description: workflow?.description ?? "",
     updatePolicy: workflow?.updatePolicy ?? "latest",
     supervisorEmployeeId: workflow?.supervisor.employeeId ?? employees[0]?.id ?? "",
+    supervisorProjectRoleId: workflow?.supervisor.projectRoleId ?? "",
     policyId: workflow?.managementPolicy.id ?? firstPolicy?.id ?? "",
     policyVersion: workflow?.managementPolicy.version ?? firstPolicy?.version ?? 1,
     members: workflow ? existing : memberDrafts(firstPolicy, employees, existing),
@@ -155,6 +163,25 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
 }) {
   const employees = data.employees.filter((employee) => employee.status === "active");
   const policies = (data.managementPolicies ?? []).filter((policy) => policy.status === "active");
+  const knownProjectRoleIds = [...new Set(
+    data.projects
+      .filter((project) => project.status === "active")
+      .flatMap((project) => project.roles.map((role) => role.id))
+  )].sort();
+  const projectRoleOptions = (current: string) => [
+    { value: "", label: "不映射项目 Role", description: "仅作为全局团队运行" },
+    ...(current && !knownProjectRoleIds.includes(current)
+      ? [{ value: current, label: `${current} · 历史`, description: "当前活动项目未声明此 Role" }]
+      : []),
+    ...knownProjectRoleIds.map((roleId) => ({
+      value: roleId,
+      label: roleId,
+      description: data.projects
+        .filter((project) => project.status === "active" && project.roles.some((role) => role.id === roleId))
+        .map((project) => project.name)
+        .join("、")
+    }))
+  ];
   const daemonAvailable = useDaemonAvailable();
   const [draft, setDraft] = useState(() => supervisorDraft(workflow, employees, policies));
   const [saving, setSaving] = useState(false);
@@ -255,7 +282,8 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
       dagNodes: current.dagNodes.map((node, nodeIndex) => ({
         ...node,
         nodeId: nodeIndex === index ? nodeId : node.nodeId,
-        needs: node.needs.map((need) => need === oldId ? nodeId : need)
+        needs: node.needs.map((need) => need === oldId ? nodeId : need),
+        needsWhen: node.needsWhen?.map((condition) => ({ ...condition, nodeId: condition.nodeId === oldId ? nodeId : condition.nodeId }))
       }))
     };
   });
@@ -268,14 +296,15 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
       positions,
       dagNodes: current.dagNodes
         .filter((_, nodeIndex) => nodeIndex !== index)
-        .map((node) => ({ ...node, needs: node.needs.filter((need) => need !== removedId) }))
+        .map((node) => ({ ...node, needs: node.needs.filter((need) => need !== removedId), needsWhen: node.needsWhen?.filter((condition) => condition.nodeId !== removedId) }))
     };
   });
   const toggleDagNeed = (index: number, need: string) => setDraft((current) => ({
     ...current,
     dagNodes: current.dagNodes.map((node, nodeIndex) => nodeIndex !== index ? node : {
       ...node,
-      needs: node.needs.includes(need) ? node.needs.filter((candidate) => candidate !== need) : [...node.needs, need]
+      needs: node.needs.includes(need) ? node.needs.filter((candidate) => candidate !== need) : [...node.needs, need],
+      needsWhen: node.needs.includes(need) ? node.needsWhen?.filter((condition) => condition.nodeId !== need) : node.needsWhen
     })
   }));
   const addDagNode = () => {
@@ -351,12 +380,16 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
         architecture: "supervisor",
         updatePolicy: draft.updatePolicy,
         description: draft.description.trim(),
-        supervisor: { employeeId: draft.supervisorEmployeeId },
+        supervisor: {
+          employeeId: draft.supervisorEmployeeId,
+          projectRoleId: draft.supervisorProjectRoleId.trim() || undefined
+        },
         managementPolicy: { id: draft.policyId, version: Number(draft.policyVersion) },
         members: draft.members.map((member) => ({
           roleId: member.roleId.trim(),
           description: member.description.trim(),
-          employeeId: member.employeeId
+          employeeId: member.employeeId,
+          projectRoleId: member.projectRoleId.trim() || undefined
         })),
         flow: buildSupervisorFlowPayload(draft.gates, dagPayload),
         ...(dagPayload ? { presentation: { positions: resolveDagPositions(dagPayload.nodes, draft.positions) } } : {}),
@@ -380,6 +413,7 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
           <Field label="Workflow ID"><input required pattern="[a-z][a-z0-9-]*" disabled={Boolean(workflow)} value={draft.id} onChange={(event) => setDraft({ ...draft, id: event.target.value })} /></Field>
           <Field label="说明"><input required value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></Field>
           <Field label="领队 Employee"><SelectControl ariaLabel="选择领队 Employee" value={draft.supervisorEmployeeId} invalid={!draft.supervisorEmployeeId} options={[{ value: "", label: "选择领队", disabled: true }, ...employees.map((employee) => ({ value: employee.id, label: employee.identity.displayName, description: `${employee.providerId} · v${employee.version}` }))]} onChange={(supervisorEmployeeId) => setDraft({ ...draft, supervisorEmployeeId })} /></Field>
+          <Field label="项目领队 Role（可选）" hint="项目内运行时必须选择；实际 Employee、Skill、知识与权限由项目 Binding 决定。"><SelectControl ariaLabel="选择项目领队 Role" value={draft.supervisorProjectRoleId} options={projectRoleOptions(draft.supervisorProjectRoleId)} onChange={(supervisorProjectRoleId) => setDraft({ ...draft, supervisorProjectRoleId })} /></Field>
         </div><label className={`switch-line workflow-update-policy ${draft.updatePolicy === "latest" ? "is-latest" : "is-locked"}`}><span><b>版本跟随</b><small>{draft.updatePolicy === "latest" ? "跟随最新：每次运行自动使用领队、成员、管理策略的最新版本。" : "锁定版本：固定当前版本，编辑上游后需手动『同步到最新』。"}</small></span><strong className="switch-state-label" aria-hidden="true">{draft.updatePolicy === "latest" ? "跟随最新" : "锁定版本"}</strong><SwitchControl checked={draft.updatePolicy === "latest"} ariaLabel="是否跟随最新版本" onChange={(latest) => setDraft({ ...draft, updatePolicy: latest ? "latest" : "locked" })} /></label></section>
         <section className="workflow-contract"><div className="section-kicker"><b>02</b><span>固定管理策略版本</span></div><div className="form-grid workflow-basics-grid">
           <Field label="管理策略"><SelectControl ariaLabel="选择管理策略" value={draft.policyId} invalid={!draft.policyId} options={[{ value: "", label: policies.length ? "选择策略" : "暂无活动策略", disabled: true }, ...policies.map((policy) => ({ value: policy.id, label: policy.displayName, description: `${policy.id} · 当前 v${policy.version}` }))]} onChange={selectPolicy} /></Field>
@@ -389,6 +423,7 @@ function SupervisorEditor({ workflow, data, onClose, onSaved, notify }: {
           <Field label="角色槽 ID" hint="仅可从管理策略声明的角色槽中选择。"><SelectControl ariaLabel={`选择成员 ${index + 1} 的角色槽`} value={member.roleId.trim()} invalid={Boolean(pinnedPolicy && member.roleId.trim() && !pinnedPolicy.allowedRoleIds.includes(member.roleId.trim()))} errorMessage={pinnedPolicy && member.roleId.trim() && !pinnedPolicy.allowedRoleIds.includes(member.roleId.trim()) ? "该角色槽不符合当前管理策略，请改选。" : undefined} options={roleSlotOptions(member)} onChange={(roleId) => setMember(index, { roleId })} /></Field>
           <Field label="职责"><input required value={member.description} onChange={(event) => setMember(index, { description: event.target.value })} /></Field>
           <Field label="Employee"><SelectControl ariaLabel={`为 ${member.roleId || "成员"} 选择 Employee`} value={member.employeeId} invalid={!member.employeeId} options={[{ value: "", label: "选择员工", disabled: true }, ...employees.map((employee) => ({ value: employee.id, label: employee.identity.displayName, description: `v${employee.version}` }))]} onChange={(employeeId) => setMember(index, { employeeId })} /></Field>
+          <Field label="项目 Role（可选）" hint="项目内运行时，该角色槽通过此 Role 解析 Binding。"><SelectControl ariaLabel={`为 ${member.roleId || "成员"} 选择项目 Role`} value={member.projectRoleId} options={projectRoleOptions(member.projectRoleId)} onChange={(projectRoleId) => setMember(index, { projectRoleId })} /></Field>
           <button type="button" className="text-button danger-text" disabled={draft.members.length === 1} onClick={() => setDraft({ ...draft, members: draft.members.filter((_, memberIndex) => memberIndex !== index) })}>移除</button>
         </article>)}</div>{policyRoleIssues.length > 0 && <div className="member-policy-errors" role="alert"><strong>角色槽不符合当前管理策略</strong>{policyRoleIssues.map((issue) => <span key={issue}>{issue}</span>)}</div>}<button type="button" className="button secondary" disabled={pinnedPolicy ? !nextAvailableRoleId : false} title={pinnedPolicy && !nextAvailableRoleId ? "策略声明的角色槽已全部添加" : undefined} onClick={() => setDraft({ ...draft, members: [...draft.members, newMemberDraft(pinnedPolicy ? nextAvailableRoleId : `member-${draft.members.length + 1}`, "执行领队派发的专业任务。", employees[0]?.id ?? "")] })}><UtilityIcon name="add" />添加角色槽</button></section>
         <section className="workflow-contract"><div className="section-kicker"><b>04</b><span>固定流程与交付门禁</span></div><div className="flow-editor-intro"><strong>领队只在动态分工区自由拆解；这些 Gate 是流程的硬边界。</strong><p>需要能力只是提示：领队按成员画像挑选执行者，不绑定测试员、审计员等固定角色名。没有合适成员时可由领队兜底。</p></div><div className="gate-editor-list">{draft.gates.map((gate, index) => <article key={`${gate.id}-${index}`}>

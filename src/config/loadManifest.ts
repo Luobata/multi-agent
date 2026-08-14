@@ -153,6 +153,13 @@ function semanticIssues(
         issues
       );
     }
+    if (workflow.outputSchema) {
+      ensureJsonSchema(
+        ensureReadableFile(projectRoot, workflow.outputSchema, `workflow ${workflowId} outputSchema`, issues),
+        `workflow ${workflowId} outputSchema`,
+        issues
+      );
+    }
     const adapter = architectures.get(workflow.architecture);
     if (!adapter) issues.push(`workflow ${workflowId} references unregistered architecture ${workflow.architecture}`);
     else issues.push(...adapter.validate({ manifest, workflowId, workflow }));

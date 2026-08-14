@@ -18,6 +18,14 @@ afterEach(() => {
 });
 
 describe("project descriptor", () => {
+  it("loads the repository-owned requirement candidate URL", async () => {
+    const project = await loadProjectDescriptor({ rootPath: path.resolve(".") });
+    expect(project.connector?.config?.requirementAdvancement).toMatchObject({
+      entrancePolicyId: "default-task-entrance-policy",
+      candidateUrl: "http://127.0.0.1:4319"
+    });
+  });
+
   it("scaffolds a valid starter descriptor after explicit MCP onboarding", async () => {
     const root = temporaryProject();
 
@@ -174,7 +182,7 @@ describe("project descriptor", () => {
       fs.readFileSync(path.resolve("templates/workbench/cart-fe-workflow-review.project.yaml"), "utf8")
     ) as { roles: Record<string, { outputSchema?: any }> };
     const tester = descriptor.roles.tester;
-    expect(tester?.outputSchema?.required).toEqual(["verdict", "summary", "e2eEvidence"]);
+    expect(tester?.outputSchema?.required).toEqual(["verdict", "summary", "e2eEvidence", "risks"]);
     expect(tester?.outputSchema?.properties?.e2eEvidence?.items?.properties?.method?.enum)
       .toEqual(["browser", "http-behavior", "automation-run"]);
   });
@@ -301,7 +309,7 @@ describe("project descriptor", () => {
     ]));
 
     const testEngineer = project.roles.find((role) => role.id === "test-engineer");
-    expect(testEngineer?.outputSchema?.required).toEqual(["verdict", "summary", "e2eEvidence"]);
+    expect(testEngineer?.outputSchema?.required).toEqual(["verdict", "summary", "e2eEvidence", "risks"]);
     expect((testEngineer?.outputSchema?.properties as any)?.e2eEvidence?.items?.properties?.method?.enum)
       .toEqual(["browser", "http-behavior", "automation-run"]);
 

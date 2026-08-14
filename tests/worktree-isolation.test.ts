@@ -208,7 +208,21 @@ describe("runTrackedWorkflow worktree isolation", () => {
       scope: "repository",
       rootPath: providerCwd,
       descriptorPath: path.join(providerCwd, "multi-agent.project.yaml"),
-      roles: [{ id: "developer" }]
+      roles: [{ id: "manager" }, { id: "researcher" }, { id: "tester" }, { id: "auditor" }]
+    });
+    await service.saveProjectBinding("requirement-source-project", { roles: [
+      { roleId: "manager", employeeId: "iso-manager" },
+      { roleId: "researcher", employeeId: "iso-researcher" },
+      { roleId: "tester", employeeId: "iso-tester" },
+      { roleId: "auditor", employeeId: "iso-auditor" }
+    ] });
+    await service.updateWorkflow(workflow.id, {
+      supervisor: { employeeId: "iso-manager", projectRoleId: "manager" },
+      members: [
+        { roleId: "researcher", employeeId: "iso-researcher", projectRoleId: "researcher" },
+        { roleId: "tester", employeeId: "iso-tester", projectRoleId: "tester" },
+        { roleId: "auditor", employeeId: "iso-auditor", projectRoleId: "auditor" }
+      ]
     });
     await service.createEntrancePolicy({
       id: "requirement-source-entrance",
@@ -287,6 +301,23 @@ describe("runTrackedWorkflow worktree isolation", () => {
       ["-C", worktreePath as string, "diff", "--name-only", result.run.isolation!.baseCommit!, "HEAD", "--"],
       { encoding: "utf8" }
     )).toContain("delivery-feature.txt");
+  });
+
+  it("inherits a prior terminal candidate for the same project task and records explicit lineage", async () => {
+    const { service, workflow, providerCwd } = await isolationFixture("git", { writeChange: true });
+    const source = { kind: "workbench" as const, project: "continuation-project", taskId: "REQ-42" };
+    const first = await service.runWorkbenchWorkflow(workflow.id, { message: "first cycle" }, source, { providerCwd });
+    const second = await service.runWorkbenchWorkflow(workflow.id, { message: "second cycle" }, source, { providerCwd });
+    expect(second.run.isolation).toMatchObject({
+      mode: "worktree",
+      continuation: {
+        fromRunId: first.run.id,
+        candidateRevision: expect.stringMatching(/^sha256:/),
+        changedFiles: ["delivery-feature.txt"]
+      }
+    });
+    expect(fs.readFileSync(path.join(second.run.isolation!.worktreePath!, "delivery-feature.txt"), "utf8"))
+      .toBe("candidate delivery\n");
   });
 
   it("fails closed before Provider execution when the execution root is not a Git repository", async () => {

@@ -36,7 +36,7 @@ function policyDraft(policy?: ManagementPolicy): PolicyDraft {
     maxParallelDelegations: policy?.limits.maxParallelDelegations ?? 3,
     maxDurationSeconds: Math.round((policy?.limits.maxDurationMs ?? 600_000) / 1000),
     workerFailure: policy?.failure.workerFailure ?? "observe-and-replan",
-    requireDelegation: policy?.completion.requireDelegation ?? false,
+    requireDelegation: policy?.completion.requireDelegation ?? true,
     requireAllDelegationsSuccessful: policy?.completion.requireAllDelegationsSuccessful ?? false
   };
 }

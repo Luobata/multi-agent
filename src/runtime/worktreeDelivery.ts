@@ -105,8 +105,10 @@ export interface RunMergePreview {
   status: "not-ready" | DeliveryStatus;
   eligible: boolean;
   reasons: string[];
+  acceptanceReadiness: { ready: boolean; reasons: string[] };
   worktreePath?: string;
   repositoryRoot?: string;
+  commitAnchor?: { baseCommit: string; sourceCommit: string; mergeCommit: string };
   sourceBranch?: string;
   sourceCommit?: string;
   targetBranch?: string;
@@ -131,6 +133,57 @@ export interface RunMergePreview {
   confirmationToken: string;
   discardConfirmationToken: string;
   delivery?: RunDeliveryRecord;
+}
+
+const FULL_COMMIT = /^[0-9a-f]{40}$/;
+
+async function mergedCommitEvidence(
+  run: WorkflowRunRecord,
+  delivery: RunDeliveryRecord,
+  worktreePath: string
+): Promise<{
+  repositoryRoot: string;
+  anchor: { baseCommit: string; sourceCommit: string; mergeCommit: string };
+  changes: Array<{ status: string; path: string }>;
+  summary: string;
+  unifiedDiff: { text: string; truncated: boolean; maxBytes: number };
+}> {
+  const expected = path.resolve(path.dirname(path.dirname(worktreePath)), "..");
+  if (path.resolve(expected, ".multi-agent", "worktrees", run.id) !== path.resolve(worktreePath)) {
+    throw new Error("历史 worktree 路径不是该 Run 的受管路径");
+  }
+  const repositoryRoot = await fs.realpath(expected);
+  const anchor = {
+    baseCommit: delivery.baseCommit ?? "",
+    sourceCommit: delivery.sourceCommit ?? "",
+    mergeCommit: delivery.mergeCommit ?? ""
+  };
+  for (const [name, commit] of Object.entries(anchor)) {
+    if (!FULL_COMMIT.test(commit)) throw new Error(`${name} 不是完整 commit`);
+    const resolved = await git(repositoryRoot, ["rev-parse", "--verify", `${commit}^{commit}`]);
+    if (resolved !== commit) throw new Error(`${name} 在仓库中不可解析`);
+  }
+  for (const [ancestor, descendant, message] of [
+    [anchor.baseCommit, anchor.sourceCommit, "source commit 不包含 base commit"],
+    [anchor.sourceCommit, anchor.mergeCommit, "merge commit 不包含 source commit"]
+  ] as const) {
+    if ((await runGit(repositoryRoot, ["merge-base", "--is-ancestor", ancestor, descendant])).code !== 0) {
+      throw new Error(message);
+    }
+  }
+  const raw = await git(repositoryRoot, ["diff", "--name-status", anchor.baseCommit, anchor.sourceCommit, "--"]);
+  const changes = raw.split("\n").filter(Boolean).map((line) => {
+    const [status = "?", ...parts] = line.split("\t");
+    return { status, path: parts.at(-1) ?? "" };
+  });
+  if (changes.length === 0) throw new Error("原始交付 diff 为空");
+  return {
+    repositoryRoot,
+    anchor,
+    changes,
+    summary: await git(repositoryRoot, ["diff", "--stat", anchor.baseCommit, anchor.sourceCommit, "--"]),
+    unifiedDiff: await readUnifiedDiff(repositoryRoot, anchor.baseCommit, anchor.sourceCommit)
+  };
 }
 
 export interface RunMergeResult {
@@ -566,17 +619,18 @@ function truncateUtf8(value: string, maxBytes: number): { text: string; truncate
 
 async function readUnifiedDiff(
   worktreePath: string,
-  baseCommit?: string
+  baseCommit?: string,
+  sourceCommit?: string
 ): Promise<{ text: string; truncated: boolean; maxBytes: number }> {
   const tracked = await runGit(worktreePath, [
-    "diff", "--no-ext-diff", "--no-color", "--unified=3", baseCommit ?? "HEAD", "--"
+    "diff", "--no-ext-diff", "--no-color", "--unified=3", baseCommit ?? "HEAD", ...(sourceCommit ? [sourceCommit] : []), "--"
   ]);
   if (tracked.code !== 0) {
     throw new Error(tracked.stderr.trim() || tracked.stdout.trim() || "git diff failed");
   }
   const chunks = [tracked.stdout];
   let truncated = false;
-  const untracked = (await git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]))
+  const untracked = sourceCommit ? [] : (await git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]))
     .split("\0")
     .filter(Boolean);
   for (const file of untracked.slice(0, MAX_UNTRACKED_DIFF_FILES)) {
@@ -695,6 +749,7 @@ export async function previewRunMerge(
 ): Promise<RunMergePreview> {
   assertRunId(run.id);
   const reasons: string[] = [];
+  const acceptanceReasons: string[] = [];
   const delivery = await readRunDelivery(runDir);
   const assets = await discoverRunEvidenceAssets(runDir, run.id);
   const structuredValues: JsonValue[] = [run.output ?? null, ...Object.values(run.nodes).map((node) => node.output ?? null)];
@@ -721,13 +776,15 @@ export async function previewRunMerge(
     && gate.status === "passed"
   ));
 
-  if (run.status !== "passed") reasons.push("Run 尚未通过，不能进入合并验收。");
-  if (!gatesPassed) reasons.push("一个或多个 required Gate 尚未通过；acceptedVerdict 不能替代 Gate。");
-  if (!qualityTestPassed) reasons.push("缺少通过的 before-completion required quality.test Gate。");
-  if (!qualityAuditPassed) reasons.push("缺少通过的 before-completion required quality.audit Gate。");
-  if (assets.length === 0 && structured.e2eCount === 0) reasons.push("缺少截图、录屏或结构化 E2E 验收证据。");
+  if (run.status !== "passed") { reasons.push("Run 尚未通过，不能进入合并验收。"); acceptanceReasons.push("Run 尚未通过。"); }
+  if (!gatesPassed) { reasons.push("一个或多个 required Gate 尚未通过；acceptedVerdict 不能替代 Gate。"); acceptanceReasons.push("一个或多个 required Gate 尚未通过。"); }
+  if (!qualityTestPassed) { reasons.push("缺少通过的 before-completion required quality.test Gate。"); acceptanceReasons.push("缺少通过的 before-completion required quality.test Gate。"); }
+  if (!qualityAuditPassed) { reasons.push("缺少通过的 before-completion required quality.audit Gate。"); acceptanceReasons.push("缺少通过的 before-completion required quality.audit Gate。"); }
+  if (assets.length === 0 && structured.e2eCount === 0) { reasons.push("缺少截图、录屏或结构化 E2E 验收证据。"); acceptanceReasons.push("缺少截图、录屏或结构化 E2E 验收证据。"); }
   if (delivery?.status === "merged") reasons.push("该交付已经合并。");
   if (delivery?.status === "discarded") reasons.push("该交付已经丢弃，不能再次交付。");
+  if (delivery?.status !== "merged" || delivery.runId !== run.id) acceptanceReasons.push("缺少与当前 Run 精确匹配的 merged 交付记录。");
+  if (delivery?.status === "merged" && (!delivery.baseCommit || !delivery.sourceCommit || !delivery.mergeCommit)) acceptanceReasons.push("merged 交付记录缺少 baseCommit、sourceCommit 或 mergeCommit。");
 
   let repositoryRoot: string | undefined;
   let targetBranch: string | undefined;
@@ -736,24 +793,29 @@ export async function previewRunMerge(
   let summary = "";
   let unifiedDiff = { text: "", truncated: false, maxBytes: MAX_UNIFIED_DIFF_BYTES };
   let safeGitCommands: string[] = [];
+  let commitAnchor: { baseCommit: string; sourceCommit: string; mergeCommit: string } | undefined;
   const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
   if (!worktreePath) {
     reasons.push("该 Run 没有可交付的 worktree。");
-  } else if (delivery?.status !== "merged" && delivery?.status !== "discarded") {
+    acceptanceReasons.push("该 Run 没有可验证的受管 worktree。");
+  } else if (delivery?.status !== "discarded") {
     try {
       repositoryRoot = await registeredRepositoryRoot(worktreePath, run.id);
-      targetBranch = await git(repositoryRoot, ["branch", "--show-current"]);
+      const historicalSource = delivery?.status === "merged" ? delivery.sourceCommit : undefined;
+      targetBranch = delivery?.status === "merged" ? delivery.targetBranch : await git(repositoryRoot, ["branch", "--show-current"]);
       if (!targetBranch) reasons.push("目标仓库当前不在命名分支上。");
-      const targetStatus = await git(repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
-      targetClean = targetStatus.length === 0;
-      if (!targetClean) reasons.push("目标仓库存在未提交改动，请先处理后再合并。");
+      if (delivery?.status !== "merged") {
+        const targetStatus = await git(repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+        targetClean = targetStatus.length === 0;
+        if (!targetClean) reasons.push("目标仓库存在未提交改动，请先处理后再合并。");
+      }
       const baseCommit = delivery?.baseCommit ?? run.isolation?.baseCommit;
       safeGitCommands = safeGitInspectionCommands(repositoryRoot, worktreePath, baseCommit);
-      const workingChanges = parsePorcelain(
+      const workingChanges = historicalSource ? [] : parsePorcelain(
         await git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"])
       );
       const committedChanges = baseCommit
-        ? (await git(worktreePath, ["diff", "--name-status", baseCommit, "HEAD", "--"]))
+        ? (await git(worktreePath, ["diff", "--name-status", baseCommit, historicalSource ?? "HEAD", "--"]))
           .split("\n").filter(Boolean).map((line) => {
           const [status = "?", ...parts] = line.split("\t");
           return { status, path: parts.at(-1) ?? "" };
@@ -763,16 +825,34 @@ export async function previewRunMerge(
       for (const change of workingChanges) changesByPath.set(change.path, change);
       changes = [...changesByPath.values()];
       summary = baseCommit
-        ? await git(worktreePath, ["diff", "--stat", baseCommit, "HEAD", "--"])
+        ? await git(worktreePath, ["diff", "--stat", baseCommit, historicalSource ?? "HEAD", "--"])
         : await git(worktreePath, ["diff", "--stat", "HEAD", "--"]);
       if (workingChanges.length > 0) {
         summary = [summary, `${workingChanges.length} 个未提交或未跟踪文件`].filter(Boolean).join("\n");
       }
-      unifiedDiff = await readUnifiedDiff(worktreePath, baseCommit);
+      unifiedDiff = await readUnifiedDiff(worktreePath, baseCommit, historicalSource);
       if (changes.length === 0) reasons.push("worktree 没有可合并的代码变更。");
+      if (delivery?.status === "merged" && !unifiedDiff.text.trim()) acceptanceReasons.push("原始交付 diff 为空。");
     } catch (error) {
+      if (delivery?.status === "merged") {
+        try {
+          const evidence = await mergedCommitEvidence(run, delivery, worktreePath);
+          repositoryRoot = evidence.repositoryRoot;
+          commitAnchor = evidence.anchor;
+          changes = evidence.changes;
+          summary = evidence.summary;
+          unifiedDiff = evidence.unifiedDiff;
+          safeGitCommands = [];
+        } catch (anchorError) {
+          acceptanceReasons.push(`已合并提交证据不可验证：${anchorError instanceof Error ? anchorError.message : String(anchorError)}`);
+        }
+      } else {
+        acceptanceReasons.push(`受管 worktree 不可验证：${error instanceof Error ? error.message : String(error)}`);
+      }
       reasons.push(`worktree 不可用：${error instanceof Error ? error.message : String(error)}`);
     }
+  } else {
+    acceptanceReasons.push("该交付已经丢弃。");
   }
 
   const status = delivery?.status ?? (reasons.length === 0 ? "awaiting-acceptance" : "not-ready");
@@ -781,8 +861,10 @@ export async function previewRunMerge(
     status,
     eligible: reasons.length === 0,
     reasons,
+    acceptanceReadiness: { ready: acceptanceReasons.length === 0, reasons: acceptanceReasons },
     ...(worktreePath ? { worktreePath } : {}),
     ...(repositoryRoot ? { repositoryRoot } : {}),
+    ...(commitAnchor ? { commitAnchor } : {}),
     ...(delivery?.sourceBranch ? { sourceBranch: delivery.sourceBranch } : {}),
     ...(delivery?.sourceCommit ? { sourceCommit: delivery.sourceCommit } : {}),
     ...(targetBranch ? { targetBranch } : delivery?.targetBranch ? { targetBranch: delivery.targetBranch } : {}),

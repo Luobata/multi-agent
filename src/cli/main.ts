@@ -180,6 +180,36 @@ program
   });
 
 const workbench = program.command("workbench").description("Manage the local Employee registry and workbench daemon");
+
+const bundle = workbench.command("bundle").description("Export, validate, preview, and import portable Workbench bundles");
+bundle.command("export")
+  .requiredOption("--modes <modes>", "comma-separated employee,project,workflow,publication,run-evidence modes")
+  .option("--output <file>", "write bundle JSON to a file")
+  .action(async (options: { modes: string; output?: string }) => {
+    const result = (await workbenchService()).exportPortableBundle(options.modes.split(",").map(value => value.trim()).filter(Boolean) as never);
+    const output = `${JSON.stringify(result, null, 2)}\n`;
+    if (options.output) fs.writeFileSync(path.resolve(options.output), output, { flag: "wx" }); else process.stdout.write(output);
+  });
+bundle.command("preview")
+  .argument("<file>", "bundle JSON")
+  .option("--replace", "preview explicit replacement")
+  .action(async (file: string, options: { replace?: boolean }) => { process.stdout.write(`${JSON.stringify((await workbenchService()).previewPortableBundle(readJsonFile(file), options.replace ? "replace" : "skip"), null, 2)}\n`); });
+bundle.command("import")
+  .argument("<file>", "bundle JSON")
+  .option("--replace", "replace conflicting records")
+  .option("--confirmation <token>", "confirmation token from preview")
+  .action(async (file: string, options: { replace?: boolean; confirmation?: string }) => { process.stdout.write(`${JSON.stringify(await (await workbenchService()).applyPortableBundle(readJsonFile(file), options.replace ? "replace" : "skip", options.confirmation), null, 2)}\n`); });
+
+workbench.command("doctor")
+  .option("--json", "machine-readable JSON")
+  .action(async () => {
+    const report = await (await workbenchService()).doctor();
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (report.overall === "blocked") process.exitCode = 2;
+  });
+
+const workbenchRun = workbench.command("run").description("Inspect durable Run records");
+workbenchRun.command("get").argument("<id>").action(async (id: string) => { process.stdout.write(`${JSON.stringify(await (await workbenchService()).getRunReceipt(id), null, 2)}\n`); });
 const employee = workbench.command("employee").description("Create, inspect, invoke, clone, and archive Employees");
 
 employee

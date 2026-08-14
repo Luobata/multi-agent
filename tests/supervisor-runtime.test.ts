@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { formatPlanMermaid, formatPlanText } from "../src/core/plan.js";
 import type { ProviderRegistry } from "../src/runtime/providers.js";
 import { WorkbenchService } from "../src/workbench/service.js";
@@ -181,7 +181,7 @@ describe("Supervisor flow persistence and materialization", () => {
 
     const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Inspect materialization" });
     const manifest = JSON.parse(fs.readFileSync(result.run.manifestPath, "utf8")) as {
-      roles: Record<string, { skills: Array<{ id: string }>; identity: { metadata: Record<string, unknown> } }>;
+      roles: Record<string, { requestTemplate: string; skills: Array<{ id: string }>; identity: { metadata: Record<string, unknown> } }>;
       workflows: Record<string, { config: Record<string, unknown> }>;
     };
     expect(manifest.roles.supervisor?.skills.map((skill) => skill.id)).toEqual([
@@ -189,6 +189,18 @@ describe("Supervisor flow persistence and materialization", () => {
       "team-orchestration-v9"
     ]);
     expect(manifest.roles["member-builder"]?.skills.map((skill) => skill.id)).toEqual(["build-method-v1"]);
+    const supervisorRequest = fs.readFileSync(
+      path.join(path.dirname(result.run.manifestPath), manifest.roles.supervisor!.requestTemplate),
+      "utf8"
+    );
+    expect(supervisorRequest).toContain("Human approval cannot add, replace, or reassign an accepted TODO");
+    expect(supervisorRequest).toContain("delegate that existing todoId to its original role");
+    const memberRequest = fs.readFileSync(
+      path.join(path.dirname(result.run.manifestPath), manifest.roles["member-builder"]!.requestTemplate),
+      "utf8"
+    );
+    expect(memberRequest).toContain("Dependency evidence from prerequisite TODOs and upstream Gates:");
+    expect(memberRequest).toContain("{{needs}}");
     expect(manifest.roles.supervisor?.identity.metadata.runtimeSkillInjections).toEqual([{
       skillId: "team-orchestration",
       version: 9,
@@ -244,6 +256,268 @@ describe("Supervisor flow persistence and materialization", () => {
 });
 
 describe("Supervisor deterministic capabilities and Gates", () => {
+  it("recovers inside the Supervisor runtime before persisting an invalid human-decision reassignment", async () => {
+    let supervisorTurn = 0;
+    let recoveryHistory: unknown;
+    const providers: ProviderRegistry = new Map([["human-decision-plan-recovery", {
+      id: "human-decision-plan-recovery",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role !== "supervisor") {
+          return {
+            stdout: JSON.stringify({ message: role === "member-engineer" ? "Implemented the breadcrumb navigation." : "Verified the breadcrumb navigation." }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        supervisorTurn += 1;
+        const node = invocation.templateContext.node as { with?: Record<string, unknown> };
+        if (supervisorTurn === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Plan implementation and its dependent verification.",
+              impact: {
+                level: "low",
+                regressionScope: "targeted",
+                affectedAreas: ["breadcrumb navigation"],
+                reasons: ["The change is isolated to one navigation component."],
+                requiredChecks: ["breadcrumb navigation regression"]
+              },
+              todos: [
+                { id: "impl-breadcrumb-nav", roleId: "engineer", task: "Implement breadcrumb navigation.", needs: [], workKind: "code" },
+                { id: "verify-breadcrumb-nav", roleId: "test-engineer", task: "Verify breadcrumb navigation.", needs: ["impl-breadcrumb-nav"], workKind: "test" }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 2) {
+          return {
+            stdout: JSON.stringify({
+              action: "request-human-decision",
+              riskCategory: "scope-expansion",
+              summary: "Incorrectly reassign the implementation TODO to testing.",
+              assignments: [{ todoId: "impl-breadcrumb-nav", roleId: "test-engineer", workKind: "test" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 3) {
+          recoveryHistory = node.with?.__supervisorHistory;
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Keep the accepted TODO assignment unchanged.",
+              assignments: [{ todoId: "impl-breadcrumb-nav", roleId: "engineer", workKind: "code" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 4) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Run the dependent verification.",
+              assignments: [{ todoId: "verify-breadcrumb-nav", roleId: "test-engineer", workKind: "test" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "The legal implementation action converged.", result: { delivered: true } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    const humanDecisionControlPlane = vi.spyOn(
+      service as unknown as Record<"openHumanDecisionRequest", (...args: never[]) => never>,
+      "openHumanDecisionRequest"
+    );
+    await service.putProvider("human-decision-plan-provider", { adapter: "human-decision-plan-recovery", outputProtocol: "json" });
+    for (const [id, capabilities] of [
+      ["plan-lead", []],
+      ["plan-engineer", ["code.frontend"]],
+      ["plan-tester", ["quality.test"]]
+    ] as const) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Supervisor recovery fixture.", responsibilities: ["Work"] },
+        capabilities: [...capabilities],
+        providerId: "human-decision-plan-provider"
+      });
+    }
+    await service.createManagementPolicy({
+      id: "human-decision-plan-policy",
+      allowedRoleIds: ["engineer", "test-engineer"],
+      instructions: "Preserve accepted dynamic TODO assignments.",
+      limits: { maxRounds: 6, maxDelegations: 4, maxParallelDelegations: 1 }
+    });
+    await service.createWorkflow({
+      id: "human-decision-plan-supervision",
+      architecture: "supervisor",
+      supervisor: { employeeId: "plan-lead" },
+      managementPolicy: { id: "human-decision-plan-policy" },
+      members: [
+        { roleId: "engineer", employeeId: "plan-engineer" },
+        { roleId: "test-engineer", employeeId: "plan-tester" }
+      ]
+    });
+
+    const result = await service.runWorkbenchWorkflow("human-decision-plan-supervision", { message: "Implement the breadcrumb navigation." });
+
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(supervisorTurn).toBe(5);
+    expect(humanDecisionControlPlane).toHaveBeenCalledTimes(0);
+    expect(service.listHumanDecisionRequests()).toHaveLength(0);
+    expect(recoveryHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        round: 2,
+        decisionRejected: expect.stringContaining("todoId impl-breadcrumb-nav uses role test-engineer; expected engineer")
+      })
+    ]));
+    expect(String(JSON.stringify(recoveryHistory))).toContain("uses workKind test; expected code");
+    expect(Object.keys(result.run.nodes)).toContain("impl-breadcrumb-nav");
+    expect(result.run.output).toMatchObject({ rounds: 5, delegations: 2 });
+  });
+
+  it("recovers when a todoId is delegated before any dynamic TODO plan was accepted", async () => {
+    let supervisorTurn = 0;
+    const providers: ProviderRegistry = new Map([["unplanned-todo-recovery", {
+      id: "unplanned-todo-recovery",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role !== "supervisor") {
+          return { stdout: JSON.stringify({ message: "Completed the explicit fallback task." }), stderr: "", durationMs: 1 };
+        }
+        supervisorTurn += 1;
+        if (supervisorTurn === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Incorrectly assume a TODO plan exists.",
+              assignments: [{ todoId: "missing-plan", roleId: "builder-one" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 2) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Recover with an explicit unplanned task.",
+              assignments: [{ roleId: "builder-one", task: "Complete one explicit task.", workKind: "discussion" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "Recovered and completed.", result: { delivered: true } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("unplanned-todo-provider", { adapter: "unplanned-todo-recovery", outputProtocol: "json" });
+    await createTeam(service, "unplanned-todo-provider");
+    await service.createWorkflow({
+      id: "unplanned-todo-supervision",
+      architecture: "supervisor",
+      supervisor: { employeeId: "lead" },
+      managementPolicy: { id: "delivery-policy" },
+      members: [{ roleId: "builder-one", employeeId: "builder-one" }]
+    });
+
+    const result = await service.runWorkbenchWorkflow("unplanned-todo-supervision", { message: "Recover safely." });
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(supervisorTurn).toBe(3);
+    expect(result.run.output).toMatchObject({ rounds: 3, delegations: 1 });
+    expect(Object.keys(result.run.nodes)).toContain("builder-one-r2-1");
+    expect(JSON.stringify(result.run.output)).not.toContain("delegate assignment task is missing");
+  });
+
+  it("rejects unsupported required checks at the dynamic plan entry and accepts a repaired exact grouping", async () => {
+    let supervisorTurn = 0;
+    let rejectedHistory: unknown;
+    const providers: ProviderRegistry = new Map([["plan-check-configuration", {
+      id: "plan-check-configuration",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role !== "supervisor") {
+          return { stdout: JSON.stringify({ message: "Bounded TODO completed." }), stderr: "", durationMs: 1 };
+        }
+        supervisorTurn += 1;
+        const node = invocation.templateContext.node as { with?: Record<string, unknown> };
+        const plan = (includeLint: boolean) => ({
+          action: "plan-todos",
+          summary: "Plan implementation and declared checks.",
+          impact: {
+            level: "medium",
+            regressionScope: "package",
+            affectedAreas: ["src"],
+            reasons: ["The package contract changes."],
+            requiredChecks: ["test", "typecheck", ...(includeLint ? ["lint"] : [])],
+            validationGroups: [
+              { id: "tests", requiredChecks: ["test"] },
+              { id: "types", requiredChecks: ["typecheck"] },
+              ...(includeLint ? [{ id: "lint", requiredChecks: ["lint"] }] : [])
+            ]
+          },
+          todos: [
+            { id: "implement", roleId: "builder-one", task: "Implement the bounded change.", needs: [], workKind: "code" },
+            { id: "verify", roleId: "builder-two", task: "Verify the bounded change.", needs: ["implement"], workKind: "test" }
+          ]
+        });
+        if (supervisorTurn === 1) return { stdout: JSON.stringify(plan(true)), stderr: "", durationMs: 1 };
+        if (supervisorTurn === 2) {
+          rejectedHistory = node.with?.__supervisorHistory;
+          return { stdout: JSON.stringify(plan(false)), stderr: "", durationMs: 1 };
+        }
+        if (supervisorTurn === 3) return { stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "implement", roleId: "builder-one" }] }), stderr: "", durationMs: 1 };
+        if (supervisorTurn === 4) return { stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "verify", roleId: "builder-two" }] }), stderr: "", durationMs: 1 };
+        return { stdout: JSON.stringify({ action: "finish", summary: "Repaired plan completed.", result: { delivered: true } }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("plan-check-provider", { adapter: "plan-check-configuration", outputProtocol: "json" });
+    await createTeam(service, "plan-check-provider");
+    await service.createWorkflow({
+      id: "plan-check-supervision",
+      architecture: "supervisor",
+      supervisor: { employeeId: "lead" },
+      managementPolicy: { id: "delivery-policy" },
+      members: [
+        { roleId: "builder-one", employeeId: "builder-one" },
+        { roleId: "builder-two", employeeId: "builder-two" }
+      ]
+    });
+    const providerCwd = temporaryRoot();
+    fs.writeFileSync(path.join(providerCwd, "package.json"), JSON.stringify({ scripts: { test: "vitest", typecheck: "tsc" } }));
+    const result = await service.runWorkbenchWorkflow(
+      "plan-check-supervision",
+      { message: "Validate the dynamic plan before execution." },
+      { kind: "workbench" },
+      { providerCwd }
+    );
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(rejectedHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ decisionRejected: expect.stringContaining("unsupported required check: lint") })
+    ]));
+    expect(Object.keys(result.run.nodes)).toEqual(expect.arrayContaining(["implement", "verify"]));
+  });
+
   it("delegates to the selected member even when its capability tags do not match the advisory requirement", async () => {
     // Capability tags are advisory hints, not a hard gate: the supervisor picks who fits and the
     // runtime delegates regardless of tag mismatch. (Previously this mismatch hard-blocked the run.)
@@ -580,6 +854,488 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     ]));
   });
 
+  it("runs a conditional repair from blocked evidence before retrying the original validation TODO", async () => {
+    let supervisorTurn = 0;
+    let validationAttempt = 0;
+    let gateAttempt = 0;
+    const validationNeeds: Array<Record<string, unknown>> = [];
+    const validationTasks: string[] = [];
+    const validationContexts: Array<Record<string, unknown>> = [];
+    const repairNeeds: Array<Record<string, unknown>> = [];
+    const repairTasks: string[] = [];
+    const repairContexts: Array<Record<string, unknown>> = [];
+    const providers: ProviderRegistry = new Map([["conditional-repair-flow", {
+      id: "conditional-repair-flow",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const node = invocation.templateContext.node as { metadata?: { kind?: string }; with?: Record<string, unknown> };
+        if (node.metadata?.kind === "gate") {
+          gateAttempt += 1;
+          return {
+            stdout: JSON.stringify({
+              message: gateAttempt === 1 ? "The behavioral evidence is incomplete." : "The remediated evidence is complete.",
+              verdict: gateAttempt === 1 ? "Block" : "Pass"
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (role === "member-tester") {
+          validationNeeds.push({ ...((invocation.templateContext.needs as Record<string, unknown>) ?? {}) });
+          validationTasks.push(String(node.with?.__delegatedTask ?? ""));
+          validationContexts.push({ ...((node.with?.__delegatedContext as Record<string, unknown>) ?? {}) });
+          validationAttempt += 1;
+          const blockedValidation = validationAttempt <= 2;
+          return {
+            stdout: JSON.stringify({
+              message: validationAttempt === 1
+                ? "The contract is broken."
+                : validationAttempt === 2
+                  ? "The first repair is incomplete."
+                  : "The repaired contract passes.",
+              verdict: blockedValidation ? "Block" : "Pass"
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (role === "member-engineer") {
+          repairNeeds.push({ ...((invocation.templateContext.needs as Record<string, unknown>) ?? {}) });
+          repairTasks.push(String(node.with?.__delegatedTask ?? ""));
+          repairContexts.push({ ...((node.with?.__delegatedContext as Record<string, unknown>) ?? {}) });
+          return {
+            stdout: JSON.stringify({ message: "Repaired the contract using the blocked validation evidence." }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        supervisorTurn += 1;
+        if (supervisorTurn === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Validate once, repair only on failure, then rerun the same validation TODO.",
+              impact: {
+                level: "low",
+                regressionScope: "targeted",
+                affectedAreas: ["contract"],
+                reasons: ["bounded contract repair"],
+                requiredChecks: ["contract validation"]
+              },
+              todos: [
+                {
+                  id: "validate-contract",
+                  roleId: "tester",
+                  task: "Validate the contract.",
+                  needs: [],
+                  workKind: "test"
+                },
+                {
+                  id: "repair-contract",
+                  roleId: "engineer",
+                  task: "Repair the contract from the validation evidence.",
+                  needs: ["validate-contract"],
+                  needsWhen: [{ nodeId: "validate-contract", statuses: ["blocked", "failed"] }],
+                  workKind: "code",
+                  changeSet: "contract"
+                }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 2 || supervisorTurn === 3) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: supervisorTurn === 2 ? "Run validation." : "Prematurely retry validation.",
+              assignments: [{ todoId: "validate-contract", roleId: "tester" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 4) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Run the ready conditional repair.",
+              assignments: [{ todoId: "repair-contract", roleId: "engineer" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 5) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Repair passed; rerun the original validation TODO.",
+              assignments: [{ todoId: "validate-contract", roleId: "tester" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 6) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Fresh blocked validation evidence reopens the conditional repair.",
+              assignments: [{ todoId: "repair-contract", roleId: "engineer" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 7) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Second repair passed; rerun validation again.",
+              assignments: [{ todoId: "validate-contract", roleId: "tester" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 8) {
+          return {
+            stdout: JSON.stringify({ action: "finish", summary: "Run the required Gate.", result: { delivered: true } }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 9) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Incorrectly try to append a Gate remediation TODO.",
+              impact: {
+                level: "low",
+                regressionScope: "targeted",
+                affectedAreas: ["contract"],
+                reasons: ["Gate remediation"],
+                requiredChecks: ["contract validation"]
+              },
+              todos: [
+                { id: "new-remediation", roleId: "engineer", task: "Repair the Gate.", needs: [], workKind: "code" },
+                { id: "new-validation", roleId: "tester", task: "Validate the repair.", needs: ["new-remediation"], workKind: "test" }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 10) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Reopen the conditional repair using the blocking Gate evidence.",
+              assignments: [{ todoId: "repair-contract", roleId: "engineer" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 11) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              summary: "Gate remediation changed the candidate; rerun the original validation TODO.",
+              assignments: [{ todoId: "validate-contract", roleId: "tester" }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "The remediated contract is verified.", result: { delivered: true } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("conditional-repair-provider", { adapter: "conditional-repair-flow", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "conditional-lead",
+      identity: { displayName: "Lead", background: "Leads.", responsibilities: ["Lead"] },
+      providerId: "conditional-repair-provider"
+    });
+    await service.createEmployee({
+      id: "conditional-tester",
+      identity: { displayName: "Tester", background: "Tests.", responsibilities: ["Test"] },
+      capabilities: ["quality.audit"],
+      providerId: "conditional-repair-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message", "verdict"],
+        properties: { message: { type: "string" }, verdict: { enum: ["Pass", "Block"] } }
+      },
+      verdict: { path: "verdict", pass: ["Pass"], block: ["Block"] }
+    });
+    await service.createEmployee({
+      id: "conditional-engineer",
+      identity: { displayName: "Engineer", background: "Repairs.", responsibilities: ["Repair"] },
+      providerId: "conditional-repair-provider"
+    });
+    await service.createManagementPolicy({
+      id: "conditional-repair-policy",
+      allowedRoleIds: ["tester", "engineer"],
+      instructions: "Repair a failed validation before retrying it.",
+      limits: { maxRounds: 12, maxDelegations: 7, maxParallelDelegations: 1 }
+    });
+    await service.createWorkflow({
+      id: "conditional-repair-supervision",
+      architecture: "supervisor",
+      supervisor: { employeeId: "conditional-lead" },
+      managementPolicy: { id: "conditional-repair-policy" },
+      members: [
+        { roleId: "tester", employeeId: "conditional-tester" },
+        { roleId: "engineer", employeeId: "conditional-engineer" }
+      ],
+      flow: {
+        stages: [
+          { id: "plan", kind: "supervisor", title: "Plan" },
+          { id: "loop", kind: "delegation-loop", title: "Repair" },
+          { id: "audit", kind: "gate", title: "Audit", gateId: "audit" },
+          { id: "delivery", kind: "delivery", title: "Deliver" }
+        ],
+        gates: [{
+          id: "audit",
+          requiredCapability: "quality.audit",
+          mode: "before-completion",
+          required: true,
+          instructions: "Verify the complete conditional repair behavior.",
+          fallback: "block"
+        }]
+      }
+    });
+
+    const result = await service.runWorkbenchWorkflow("conditional-repair-supervision", { message: "Repair the contract." });
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(supervisorTurn).toBe(12);
+    expect(validationAttempt).toBe(4);
+    expect(gateAttempt).toBe(2);
+    expect(repairNeeds).toHaveLength(3);
+    expect(repairTasks[0]).not.toContain("Required Gate remediation activation");
+    expect(repairTasks[1]).not.toContain("Required Gate remediation activation");
+    expect(repairTasks[2]).toContain("Required Gate remediation activation");
+    expect(repairTasks[2]).toContain("supersedes the original needsWhen trigger wording");
+    expect(repairContexts[2]).toMatchObject({
+      gateRemediation: {
+        gateIds: ["audit"],
+        evidenceNodeIds: ["gate-audit-r8-1"],
+        supersedesInitialNeedsWhen: true
+      }
+    });
+    expect(repairNeeds[2]).toMatchObject({
+      "gate-audit-r8-1": {
+        status: "blocked",
+        output: { message: "The behavioral evidence is incomplete.", verdict: "Block" }
+      }
+    });
+    expect(repairNeeds[0]).toMatchObject({
+      "validate-contract": {
+        status: "blocked",
+        output: { message: "The contract is broken.", verdict: "Block" }
+      }
+    });
+    expect(repairNeeds[1]).toMatchObject({
+      "validate-contract-retry-2": {
+        status: "blocked",
+        output: { message: "The first repair is incomplete.", verdict: "Block" }
+      }
+    });
+    expect(validationTasks[3]).toContain("Candidate revalidation activation");
+    expect(validationContexts[3]).toMatchObject({
+      candidateRevalidation: {
+        evidenceNodeIds: ["repair-contract-retry-3"],
+        supersedesPassedResult: true
+      }
+    });
+    expect(validationNeeds[3]).toMatchObject({
+      "repair-contract-retry-3": {
+        status: "passed",
+        output: { message: "Repaired the contract using the blocked validation evidence." }
+      }
+    });
+    expect(Object.keys(result.run.nodes)).toEqual(expect.arrayContaining([
+      "validate-contract",
+      "repair-contract",
+      "validate-contract-retry-2",
+      "repair-contract-retry-2",
+      "validate-contract-retry-3",
+      "repair-contract-retry-3",
+      "validate-contract-retry-4"
+    ]));
+    expect(result.run.output).toMatchObject({
+      delegations: 7,
+      gates: [expect.objectContaining({ gateId: "audit", status: "passed" })],
+      dag: { nodes: expect.arrayContaining([
+        expect.objectContaining({
+          nodeId: "validate-contract",
+          status: "passed",
+          executions: [
+            expect.objectContaining({ status: "blocked" }),
+            expect.objectContaining({ status: "blocked" }),
+            expect.objectContaining({
+              status: "passed",
+              candidateNodeIds: ["repair-contract-retry-2"]
+            }),
+            expect.objectContaining({
+              status: "passed",
+              candidateNodeIds: ["repair-contract-retry-3"]
+            })
+          ]
+        }),
+        expect.objectContaining({
+          nodeId: "repair-contract",
+          status: "passed",
+          executions: [
+            expect.objectContaining({ nodeId: "repair-contract", status: "passed" }),
+            expect.objectContaining({ nodeId: "repair-contract-retry-2", status: "passed" }),
+            expect.objectContaining({ nodeId: "repair-contract-retry-3", status: "passed" })
+          ]
+        })
+      ]) }
+    });
+  });
+
+  it("skips a failure-only repair when the original validation passes", async () => {
+    let supervisorTurn = 0;
+    let repairCalls = 0;
+    let skipObserverCalls = 0;
+    const providers: ProviderRegistry = new Map([["conditional-skip-flow", {
+      id: "conditional-skip-flow",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role === "member-tester") {
+          return { stdout: JSON.stringify({ message: "The contract passes.", verdict: "Pass" }), stderr: "", durationMs: 1 };
+        }
+        if (role === "member-engineer") {
+          const todoId = String((invocation.templateContext.node as { with?: Record<string, unknown> }).with?.__todoId ?? "");
+          if (todoId === "repair-contract") repairCalls += 1;
+          else skipObserverCalls += 1;
+          return { stdout: JSON.stringify({ message: todoId === "repair-contract" ? "Unexpected repair." : "Recorded the converged skipped branch." }), stderr: "", durationMs: 1 };
+        }
+        supervisorTurn += 1;
+        if (supervisorTurn === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Repair only if validation fails.",
+              impact: {
+                level: "low",
+                regressionScope: "targeted",
+                affectedAreas: ["contract"],
+                reasons: ["bounded validation"],
+                requiredChecks: ["contract validation"]
+              },
+              todos: [
+                { id: "validate-contract", roleId: "tester", task: "Validate the contract.", needs: [], workKind: "test" },
+                {
+                  id: "repair-contract",
+                  roleId: "engineer",
+                  task: "Repair only a failed contract.",
+                  needs: ["validate-contract"],
+                  needsWhen: [{ nodeId: "validate-contract", statuses: ["blocked", "failed"] }],
+                  workKind: "code"
+                },
+                {
+                  id: "record-skipped-repair",
+                  roleId: "engineer",
+                  task: "Record that no repair was required.",
+                  needs: ["repair-contract"],
+                  needsWhen: [{ nodeId: "repair-contract", statuses: ["skipped"] }],
+                  workKind: "discussion"
+                }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 2) {
+          return {
+            stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "validate-contract", roleId: "tester" }] }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (supervisorTurn === 3) {
+          return {
+            stdout: JSON.stringify({ action: "delegate", assignments: [{ todoId: "record-skipped-repair", roleId: "engineer" }] }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        return {
+          stdout: JSON.stringify({ action: "finish", summary: "No repair was needed.", result: { delivered: true } }),
+          stderr: "",
+          durationMs: 1
+        };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("conditional-skip-provider", { adapter: "conditional-skip-flow", outputProtocol: "json" });
+    for (const [id, responsibilities] of [
+      ["skip-lead", ["Lead"]],
+      ["skip-tester", ["Test"]],
+      ["skip-engineer", ["Repair"]]
+    ] as const) {
+      await service.createEmployee({
+        id,
+        identity: { displayName: id, background: "Conditional branch test.", responsibilities: [...responsibilities] },
+        providerId: "conditional-skip-provider",
+        ...(id === "skip-tester" ? {
+          outputSchema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["message", "verdict"],
+            properties: { message: { type: "string" }, verdict: { enum: ["Pass", "Block"] } }
+          },
+          verdict: { path: "verdict", pass: ["Pass"], block: ["Block"] }
+        } : {})
+      });
+    }
+    await service.createManagementPolicy({
+      id: "conditional-skip-policy",
+      allowedRoleIds: ["tester", "engineer"],
+      instructions: "Skip unnecessary repairs.",
+      limits: { maxRounds: 5, maxDelegations: 3, maxParallelDelegations: 1 }
+    });
+    await service.createWorkflow({
+      id: "conditional-skip-supervision",
+      architecture: "supervisor",
+      supervisor: { employeeId: "skip-lead" },
+      managementPolicy: { id: "conditional-skip-policy" },
+      members: [
+        { roleId: "tester", employeeId: "skip-tester" },
+        { roleId: "engineer", employeeId: "skip-engineer" }
+      ]
+    });
+
+    const result = await service.runWorkbenchWorkflow("conditional-skip-supervision", { message: "Validate the contract." });
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(repairCalls).toBe(0);
+    expect(skipObserverCalls).toBe(1);
+    expect(result.run.output).toMatchObject({
+      delegations: 2,
+      dag: { nodes: expect.arrayContaining([
+        expect.objectContaining({ nodeId: "validate-contract", status: "passed" }),
+        expect.objectContaining({ nodeId: "repair-contract", status: "skipped", ready: false }),
+        expect.objectContaining({ nodeId: "record-skipped-repair", status: "passed" })
+      ]) }
+    });
+    expect(result.run.nodes["repair-contract"]).toBeUndefined();
+  });
+
   it("splits broad quality checks into bounded Gate shards and feeds every shard to the independent audit", async () => {
     let supervisorTurn = 0;
     const gateCalls: Array<{
@@ -767,10 +1523,13 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       }
     });
 
-    const result = await service.runWorkbenchWorkflow("sharded-quality-workflow", { message: "Implement and validate the change." });
+    const result = await service.runWorkbenchWorkflow("sharded-quality-workflow", {
+      message: "Implement and validate the change.",
+      candidateUrl: "http://127.0.0.1:4319/#candidate"
+    });
     expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
     const testCalls = gateCalls.filter((call) => call.execution.gateId === "quality-test");
-    const auditCall = gateCalls.find((call) => call.execution.gateId === "independent-audit");
+    const auditCalls = gateCalls.filter((call) => call.execution.gateId === "independent-audit");
     expect(testCalls).toHaveLength(4);
     expect(testCalls.map((call) => call.execution.shard)).toEqual([
       { id: "auto-1", index: 1, total: 4, requiredChecks: requiredChecks.slice(0, 2) },
@@ -786,14 +1545,35 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     for (const [index, call] of testCalls.entries()) {
       for (const check of requiredChecks.slice(index * 2, index * 2 + 2)) expect(call.task).toContain(check);
       expect(call.task).toContain(`Quality Gate shard ${index + 1}/4`);
+      expect(call.task).toContain("Approved candidate URL: http://127.0.0.1:4319/#candidate");
+      expect(call.task).not.toContain("Approved candidate URL: http://127.0.0.1:4318");
+      expect(call.execution).toMatchObject({
+        candidateUrl: "http://127.0.0.1:4319/#candidate",
+        candidateUrlSource: "workflow-input-or-human-approval"
+      });
     }
-    expect(auditCall?.task).toContain("Do not repeat browser or automated regression");
-    expect(auditCall?.needs.filter((nodeId) => nodeId.startsWith("gate-quality-test-"))).toHaveLength(4);
+    expect(auditCalls).toHaveLength(4);
+    expect(auditCalls.map((call) => call.execution.shard)).toEqual([
+      { id: "auto-1", index: 1, total: 4, requiredChecks: requiredChecks.slice(0, 2) },
+      { id: "auto-2", index: 2, total: 4, requiredChecks: requiredChecks.slice(2, 4) },
+      { id: "auto-3", index: 3, total: 4, requiredChecks: requiredChecks.slice(4, 6) },
+      { id: "auto-4", index: 4, total: 4, requiredChecks: requiredChecks.slice(6, 8) }
+    ]);
+    expect(auditCalls.map((call) => (call.memberSession?.turns as unknown[] | undefined)?.length)).toEqual([0, 1, 2, 3]);
+    for (const [index, call] of auditCalls.entries()) {
+      expect(call.task).toContain("Do not repeat browser or automated regression");
+      expect(call.task).toContain(`Quality Gate shard ${index + 1}/4`);
+      expect(call.needs.filter((nodeId) => nodeId.startsWith("gate-quality-test-"))).toHaveLength(4);
+    }
     expect(Object.keys(result.run.nodes)).toEqual(expect.arrayContaining([
       "gate-quality-test-r4-1-s1",
       "gate-quality-test-r4-1-s2",
       "gate-quality-test-r4-1-s3",
-      "gate-quality-test-r4-1-s4"
+      "gate-quality-test-r4-1-s4",
+      "gate-independent-audit-r4-2-s1",
+      "gate-independent-audit-r4-2-s2",
+      "gate-independent-audit-r4-2-s3",
+      "gate-independent-audit-r4-2-s4"
     ]));
     const testInstances = service.getActivitySnapshot().instances.filter((candidate) => (
       candidate.runId === result.run.id
@@ -816,6 +1596,23 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       expect.objectContaining({ status: "waiting", phase: "waiting-next-todo" }),
       expect.objectContaining({ status: "queued", phase: "continuing-session" })
     ]));
+    const auditInstances = service.getActivitySnapshot().instances.filter((candidate) => (
+      candidate.runId === result.run.id
+      && candidate.employeeId === "sharded-quality-tester"
+      && candidate.memberSessionId?.startsWith("member-session-gate-independent-audit-")
+    ));
+    expect(auditInstances).toHaveLength(1);
+    expect(auditInstances[0]).toMatchObject({
+      status: "completed",
+      nodeIds: [
+        "gate-independent-audit-r4-2-s1",
+        "gate-independent-audit-r4-2-s2",
+        "gate-independent-audit-r4-2-s3",
+        "gate-independent-audit-r4-2-s4"
+      ],
+      memberSessionRetained: false,
+      todoId: "auto-4"
+    });
   });
 
   it("reopens a passed code TODO after a required Gate blocks and reruns Gates against the repaired change set", async () => {
@@ -1119,7 +1916,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(Object.keys(multiple.run.nodes)).toContain("gate-integration-r2-1");
   });
 
-  it("routes an applicable required Gate to the supervisor fallback instead of blocking on a capability tag", async () => {
+  it("honors supervisor and block Gate fallbacks instead of silently routing to an unqualified member", async () => {
     // No member advertises quality.test, but the gate's fallback is "supervisor": capability tags are
     // hints, not a hard gate, so the gate routes to the supervisor rather than blocking. (Previously
     // this hard-blocked with "no eligible member or supervisor fallback".)
@@ -1131,12 +1928,15 @@ describe("Supervisor deterministic capabilities and Gates", () => {
         const role = (invocation.templateContext.role as { id: string }).id;
         const round = Number(node.with?.__supervisorRound ?? 0);
         if (node.metadata?.kind === "gate") {
+          const message = String((invocation.templateContext.input as { message?: string }).message ?? "");
           return {
             stdout: JSON.stringify({
               action: "satisfy-gate",
               gateId: node.with?.__gateExecution?.gateId,
               summary: "Supervisor covered the test gate.",
-              evidence: { tested: true }
+              evidence: message === "Build without evidence"
+                ? {}
+                : { e2eEvidence: [{ method: "http-behavior", steps: "call the endpoint", observed: "received 200" }] }
             }),
             stderr: "",
             durationMs: 1
@@ -1196,9 +1996,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
           required: true,
           instructions: "Test the code change.",
           fallback: "supervisor",
-          // This test exercises capability-tag routing/fallback, not e2e evidence. Disable the
-          // quality.test default validator here so the fallback's non-e2e evidence still passes.
-          validatorId: "none"
+          validatorId: "e2e-evidence"
         }]
       }
     });
@@ -1209,10 +2007,66 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       gates: [{
         gateId: "test",
         status: "passed",
-        executions: [expect.objectContaining({ executorRoleId: "supervisor", status: "passed" })]
+        executions: [expect.objectContaining({
+          executorRoleId: "supervisor",
+          status: "passed",
+          evidence: {
+            e2eEvidence: [{ method: "http-behavior", steps: "call the endpoint", observed: "received 200" }]
+          }
+        })]
       }]
     });
     expect(JSON.stringify(result.run.output)).not.toContain("no eligible member");
+
+    const rejected = await service.runWorkbenchWorkflow("missing-gate-supervision", { message: "Build without evidence" });
+    expect(rejected.run.status).toBe("blocked");
+    const rejectedGate = (rejected.run.output as { gates: Array<{
+      gateId: string;
+      status: string;
+      executions: Array<{ executorRoleId: string; status: string }>;
+    }> }).gates[0]!;
+    expect(rejectedGate).toMatchObject({ gateId: "test", status: "blocked" });
+    expect(rejectedGate.executions.length).toBeGreaterThan(0);
+    expect(rejectedGate.executions.every((execution) =>
+      execution.executorRoleId === "supervisor" && execution.status !== "passed"
+    )).toBe(true);
+    expect(JSON.stringify(rejected.run.output)).toContain("至少一条真实 e2e 证据");
+
+    await service.createWorkflow({
+      id: "missing-gate-block",
+      architecture: "supervisor",
+      supervisor: { employeeId: "missing-gate-lead" },
+      managementPolicy: { id: "missing-gate-policy" },
+      members: [{ roleId: "builder", employeeId: "missing-gate-builder" }],
+      flow: {
+        stages: [
+          { id: "plan", kind: "supervisor", title: "Plan" },
+          { id: "loop", kind: "delegation-loop", title: "Build" },
+          { id: "test", kind: "gate", title: "Test", gateId: "test" },
+          { id: "delivery", kind: "delivery", title: "Deliver" }
+        ],
+        gates: [{
+          id: "test",
+          requiredCapability: "quality.test",
+          mode: "before-completion",
+          required: true,
+          instructions: "Test the code change.",
+          fallback: "block",
+          validatorId: "none"
+        }]
+      }
+    });
+
+    const blockedResult = await service.runWorkbenchWorkflow("missing-gate-block", { message: "Build" });
+    expect(blockedResult.run.status).toBe("blocked");
+    expect(blockedResult.run.output).toMatchObject({
+      gates: [{
+        gateId: "test",
+        status: "blocked",
+        executions: [expect.objectContaining({ executorRoleId: "none", status: "blocked" })]
+      }]
+    });
+    expect(JSON.stringify(blockedResult.run.output)).toContain("no eligible member or supervisor fallback");
   });
 
   it("runs after-each code Gates only for matching work and permits a capable supervisor fallback", async () => {
@@ -1316,6 +2170,7 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     // must carry at least one real e2e evidence entry. A tester member advertises quality.test, so it
     // is the hinted gate executor. One workflow, two runs keyed by the input message — the block
     // variant omits e2eEvidence (rejected), the pass variant supplies it (accepted).
+    let auditCalls = 0;
     const providers: ProviderRegistry = new Map([["e2e-gate", {
       id: "e2e-gate",
       validate: () => [],
@@ -1325,6 +2180,11 @@ describe("Supervisor deterministic capabilities and Gates", () => {
         const round = Number(node.with?.__supervisorRound ?? 0);
         const message = String((invocation.templateContext.input as { message?: string }).message ?? "");
         if (node.metadata?.kind === "gate") {
+          const gate = (node.with as { __gateExecution?: { requiredCapability?: string } } | undefined)?.__gateExecution;
+          if (gate?.requiredCapability === "quality.audit") {
+            auditCalls += 1;
+            return { stdout: JSON.stringify({ message: "Independent audit passed." }), stderr: "", durationMs: 1 };
+          }
           // The tester runs the gate. Only the pass variant returns real e2e evidence.
           return message === "with-e2e"
             ? {
@@ -1394,9 +2254,21 @@ describe("Supervisor deterministic capabilities and Gates", () => {
         }
       }
     });
+    await service.createEmployee({
+      id: "e2e-auditor",
+      identity: { displayName: "Auditor", background: "Audits independently.", responsibilities: ["Audit"] },
+      capabilities: ["quality.audit"],
+      providerId: "e2e-gate-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message"],
+        properties: { message: { type: "string" } }
+      }
+    });
     await service.createManagementPolicy({
       id: "e2e-gate-policy",
-      allowedRoleIds: ["builder", "tester"],
+      allowedRoleIds: ["builder", "tester", "auditor"],
       instructions: "Deliver only after the e2e gate passes.",
       limits: { maxRounds: 2 }
     });
@@ -1407,13 +2279,15 @@ describe("Supervisor deterministic capabilities and Gates", () => {
       managementPolicy: { id: "e2e-gate-policy" },
       members: [
         { roleId: "builder", employeeId: "e2e-builder" },
-        { roleId: "tester", employeeId: "e2e-tester" }
+        { roleId: "tester", employeeId: "e2e-tester" },
+        { roleId: "auditor", employeeId: "e2e-auditor" }
       ],
       flow: {
         stages: [
           { id: "plan", kind: "supervisor", title: "Plan" },
           { id: "loop", kind: "delegation-loop", title: "Build" },
           { id: "e2e", kind: "gate", title: "E2E", gateId: "e2e" },
+          { id: "audit", kind: "gate", title: "Audit", gateId: "audit" },
           { id: "delivery", kind: "delivery", title: "Deliver" }
         ],
         gates: [{
@@ -1422,6 +2296,13 @@ describe("Supervisor deterministic capabilities and Gates", () => {
           mode: "before-completion",
           required: true,
           instructions: "Run the end-to-end test suite and report real evidence.",
+          fallback: "block"
+        }, {
+          id: "audit",
+          requiredCapability: "quality.audit",
+          mode: "before-completion",
+          required: true,
+          instructions: "Audit only after quality.test passes.",
           fallback: "block"
         }]
       }
@@ -1434,12 +2315,15 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     const blockedGate = blockedGates.find((gate) => gate.gateId === "e2e");
     expect(blockedGate?.status).not.toBe("passed");
     expect(String(blockedGate?.reason)).toMatch(/e2e/i);
+    expect(auditCalls).toBe(0);
 
     // Pass variant: real e2e evidence present → gate passes and no longer blocks the run.
     const passedRun = await service.runWorkbenchWorkflow("e2e-gate-supervision", { message: "with-e2e" });
     expect(passedRun.run.status).toBe("passed");
     const passedGates = (passedRun.run.output as { gates: Array<{ gateId: string; status: string }> }).gates;
     expect(passedGates.find((gate) => gate.gateId === "e2e")?.status).toBe("passed");
+    expect(passedGates.find((gate) => gate.gateId === "audit")?.status).toBe("passed");
+    expect(auditCalls).toBeGreaterThan(0);
   });
 
   it("retries an unsatisfied required Gate after finish interception and preserves both evidence attempts", async () => {

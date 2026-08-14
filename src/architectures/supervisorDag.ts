@@ -11,12 +11,25 @@ export type SupervisorDagNodeKind =
   | "delivery"
   | "other";
 export type SupervisorDagWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
+export type SupervisorDagDependencyStatus = Exclude<NodeRunStatus, "pending" | "running"> | "terminal";
+const SUPERVISOR_DAG_DEPENDENCY_STATUSES = new Set<SupervisorDagDependencyStatus>([
+  "passed",
+  "blocked",
+  "failed",
+  "skipped",
+  "terminal"
+]);
+export interface SupervisorDagNeedCondition {
+  nodeId: string;
+  statuses: SupervisorDagDependencyStatus[];
+}
 
 export interface SupervisorDagNodeConfig {
   nodeId: string;
   roleId: string;
   roleRef?: string;
   needs: string[];
+  needsWhen?: SupervisorDagNeedCondition[];
   kind: SupervisorDagNodeKind;
   task: string;
   requiredCapabilities: string[];
@@ -34,6 +47,8 @@ export interface SupervisorDagExecutionRecord {
   status: NodeRunStatus;
   output: JsonValue;
   error: string | null;
+  dependencyNodeIds?: string[];
+  candidateNodeIds?: string[];
 }
 
 export interface SupervisorDagNodeTracker {
@@ -50,6 +65,7 @@ export function normalizeSupervisorDagConfig(dag: SupervisorDagConfig | undefine
       ...node,
       roleId: node.roleId ?? node.roleRef ?? "",
       needs: [...node.needs],
+      ...(node.needsWhen ? { needsWhen: node.needsWhen.map((condition) => ({ nodeId: condition.nodeId, statuses: [...condition.statuses] })) } : {}),
       requiredCapabilities: [...(node.requiredCapabilities ?? [])],
       workKind: node.workKind ?? supervisorDagWorkKind(node.kind),
       required: node.required ?? true
@@ -78,6 +94,25 @@ export function supervisorDagIssues(
     }
     if (new Set(node.needs).size !== node.needs.length) {
       issues.push(`workflow ${workflowId} supervisor dag node ${node.nodeId} has duplicate needs`);
+    }
+    if (node.needsWhen) {
+      const conditionIds = node.needsWhen.map((condition) => condition.nodeId);
+      if (new Set(conditionIds).size !== conditionIds.length) issues.push(`workflow ${workflowId} supervisor dag node ${node.nodeId} has duplicate needsWhen nodes`);
+      for (const condition of node.needsWhen) {
+        if (!node.needs.includes(condition.nodeId)) issues.push(`workflow ${workflowId} supervisor dag node ${node.nodeId} needsWhen ${condition.nodeId} must reference a needs node`);
+        if (!Array.isArray(condition.statuses) || condition.statuses.length === 0) {
+          issues.push(`workflow ${workflowId} supervisor dag node ${node.nodeId} needsWhen ${condition.nodeId} statuses must not be empty`);
+          continue;
+        }
+        if (new Set(condition.statuses).size !== condition.statuses.length) {
+          issues.push(`workflow ${workflowId} supervisor dag node ${node.nodeId} needsWhen ${condition.nodeId} has duplicate statuses`);
+        }
+        for (const status of condition.statuses) {
+          if (!SUPERVISOR_DAG_DEPENDENCY_STATUSES.has(status)) {
+            issues.push(`workflow ${workflowId} supervisor dag node ${node.nodeId} needsWhen ${condition.nodeId} has unsupported status ${String(status)}`);
+          }
+        }
+      }
     }
     byId.set(node.nodeId, node);
   }
@@ -114,6 +149,10 @@ export function supervisorDagSnapshot(trackers: Map<string, SupervisorDagNodeTra
       nodeId: tracker.node.nodeId,
       roleId: tracker.node.roleId,
       needs: tracker.node.needs,
+      ...(tracker.node.needsWhen ? { needsWhen: tracker.node.needsWhen.map((condition) => ({
+        nodeId: condition.nodeId,
+        statuses: [...condition.statuses]
+      })) } : {}),
       kind: tracker.node.kind,
       task: tracker.node.task,
       requiredCapabilities: tracker.node.requiredCapabilities,
@@ -121,11 +160,59 @@ export function supervisorDagSnapshot(trackers: Map<string, SupervisorDagNodeTra
       changeSet: tracker.node.changeSet ?? null,
       required: tracker.node.required,
       status: tracker.status,
-      ready: tracker.status !== "passed"
-        && tracker.node.needs.every((need) => trackers.get(need)?.status === "passed"),
+      ready: tracker.status !== "skipped" && (
+        (tracker.status !== "passed" && supervisorDagNodeReady(tracker.node, trackers))
+        || (tracker.status === "passed" && supervisorDagHasFreshDependencyEvidence(tracker, trackers))
+        || (tracker.status === "passed" && supervisorDagHasFreshCandidateEvidence(tracker, trackers))
+      ),
       executions: tracker.executions.map((execution) => ({ ...execution }))
     }))
   };
+}
+
+export function supervisorDagDependencyMatches(node: SupervisorDagNodeConfig, dependencyId: string, status: NodeRunStatus): boolean {
+  const condition = node.needsWhen?.find((candidate) => candidate.nodeId === dependencyId);
+  if (!condition) return status === "passed";
+  if (status === "pending" || status === "running") return false;
+  return condition.statuses.includes(status) || condition.statuses.includes("terminal");
+}
+
+export function supervisorDagNodeReady(node: SupervisorDagNodeConfig, trackers: ReadonlyMap<string, SupervisorDagNodeTracker>): boolean {
+  return node.needs.every((need) => supervisorDagDependencyMatches(node, need, trackers.get(need)?.status ?? "pending"));
+}
+
+export function supervisorDagHasFreshDependencyEvidence(
+  tracker: SupervisorDagNodeTracker,
+  trackers: ReadonlyMap<string, SupervisorDagNodeTracker>
+): boolean {
+  if (!tracker.node.needsWhen?.length || !supervisorDagNodeReady(tracker.node, trackers)) return false;
+  const consumedDependencyNodeIds = tracker.executions.at(-1)?.dependencyNodeIds;
+  if (!consumedDependencyNodeIds || consumedDependencyNodeIds.length !== tracker.node.needs.length) return false;
+  const latestDependencyNodeIds = tracker.node.needs.map((need) => trackers.get(need)?.executions.at(-1)?.nodeId);
+  if (latestDependencyNodeIds.some((nodeId) => !nodeId)) return false;
+  return latestDependencyNodeIds.some((nodeId, index) => nodeId !== consumedDependencyNodeIds[index]);
+}
+
+export function supervisorDagCandidateEvidenceNodeIds(
+  trackers: ReadonlyMap<string, SupervisorDagNodeTracker>
+): string[] {
+  return [...trackers.values()].flatMap((candidate) => {
+    if (candidate.node.workKind !== "code" && candidate.node.workKind !== "integration") return [];
+    if (candidate.status !== "passed") return [];
+    const latestExecution = candidate.executions.at(-1);
+    return latestExecution?.status === "passed" ? [latestExecution.nodeId] : [];
+  });
+}
+
+export function supervisorDagHasFreshCandidateEvidence(
+  tracker: SupervisorDagNodeTracker,
+  trackers: ReadonlyMap<string, SupervisorDagNodeTracker>
+): boolean {
+  if (tracker.node.workKind !== "test" && tracker.node.workKind !== "audit") return false;
+  const consumedCandidateNodeIds = tracker.executions.at(-1)?.candidateNodeIds;
+  if (!consumedCandidateNodeIds) return false;
+  return supervisorDagCandidateEvidenceNodeIds(trackers)
+    .some((nodeId) => !consumedCandidateNodeIds.includes(nodeId));
 }
 
 export function supervisorDagWorkKind(kind: SupervisorDagNodeKind): SupervisorDagWorkKind {

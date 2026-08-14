@@ -39,6 +39,10 @@ describe("e2eEvidenceValidator", () => {
   it("passes with at least one real-method evidence entry", () => {
     expect(v(g, { e2eEvidence: [{ method: "browser", steps: "open page", observed: "cta works" }] }).passed).toBe(true);
   });
+  it("requires non-empty steps and observed fields", () => {
+    expect(v(g, { e2eEvidence: [{ method: "browser", steps: "", observed: "rendered" }] }).passed).toBe(false);
+    expect(v(g, { e2eEvidence: [{ method: "browser", steps: "open page", observed: "  " }] }).passed).toBe(false);
+  });
 });
 
 describe("listGateValidators", () => {

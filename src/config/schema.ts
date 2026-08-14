@@ -119,6 +119,9 @@ export const manifestSchema = {
           architecture: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
           description: { type: "string" },
           inputSchema: { type: "string", minLength: 1 },
+          outputSchema: { type: "string", minLength: 1 },
+          outputSchemaVersion: { type: "integer", minimum: 1 },
+          outputSchemaDigest: { type: "string", pattern: "^[a-f0-9]{64}$" },
           config: { type: "object" }
         }
       }

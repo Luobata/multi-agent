@@ -67,7 +67,7 @@ roles:
     outputSchema:
       type: object
       additionalProperties: false
-      required: [verdict, summary, e2eEvidence]
+      required: [verdict, summary, e2eEvidence, risks]
       properties:
         verdict:
           enum: [pass, block]

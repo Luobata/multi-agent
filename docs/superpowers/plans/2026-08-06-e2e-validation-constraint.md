@@ -361,7 +361,7 @@ Reuse the file's mock-provider response mechanism (the same one Task 2 used). Ke
 In `templates/workbench/xiaomixiang-tester.employee.json`:
 - Append to `identity.constraints`: `"任何验收必须包含真实 e2e/行为验证，禁止仅凭静态检查（读源码/类型/lint）判定通过"`.
 - Append to `systemPrompt` a sentence: `严禁仅凭静态检查判定通过；每条结论必须有真实 e2e/行为证据。`
-- Replace `outputSchema` with the e2e-shaped schema (verbatim from the spec §Layer 1b): required `verdict`/`summary`/`e2eEvidence`; `e2eEvidence` `minItems:1` with items requiring `method ∈ {browser,http-behavior,automation-run}`, `steps`, `observed`; optional `risks`.
+- Replace `outputSchema` with the e2e-shaped schema (verbatim from the spec §Layer 1b): require `verdict`/`summary`/`e2eEvidence`/`risks` so strict structured-output Providers accept the contract; `e2eEvidence` uses `minItems:1` with items requiring `method ∈ {browser,http-behavior,automation-run}`, `steps`, and `observed`.
 - Add `verdict`: `{ "path": "/verdict", "pass": ["pass"], "block": ["block"] }`.
 - Update `requestPrompt` to instruct returning `verdict/summary/e2eEvidence/risks` (it already mentions e2eCoverage; align the wording to the new fields).
 

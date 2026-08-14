@@ -14,6 +14,7 @@ import type {
   ProjectProfile,
   Requirement,
   RequirementAdvancement,
+  RequirementAdvancementStatus,
   RequirementDetail,
   RequirementEvidenceCapture,
   RequirementLane,
@@ -22,7 +23,14 @@ import type {
   SpaceNode
 } from "./types";
 import { REQUIREMENT_LANES, requirementLaneLabel } from "./types";
-import type { PassiveProjectAccess, Project as ConnectedProject } from "../types";
+import type {
+  Employee,
+  KnowledgeProfile,
+  PassiveProjectAccess,
+  Project as ConnectedProject,
+  ProjectBinding,
+  Skill
+} from "../types";
 import {
   advancementLane,
   isActiveRequirementAdvancement,
@@ -45,7 +53,15 @@ export function acceptanceSnapshotGaps(snapshot: RunAcceptanceSnapshot | undefin
   const gaps: string[] = [];
   if (typeof snapshot.runId !== "string" || !snapshot.runId.trim()) gaps.push("Run ID");
   if (snapshot.eligible !== true) gaps.push("交付门禁 eligible");
-  if (typeof snapshot.worktreePath !== "string" || !snapshot.worktreePath.trim()) gaps.push("候选 worktree 路径");
+  if (snapshot.source?.kind === "merged-commits") {
+    if (!snapshot.source.repositoryRoot.trim()) gaps.push("Git 仓库根目录");
+    for (const [label, value] of [["base commit", snapshot.source.baseCommit], ["source commit", snapshot.source.sourceCommit], ["merge commit", snapshot.source.mergeCommit]]) {
+      if (!/^[0-9a-f]{40}$/.test(value)) gaps.push(label);
+    }
+  } else {
+    const worktreePath = snapshot.source?.kind === "worktree" ? snapshot.source.worktreePath : snapshot.worktreePath;
+    if (typeof worktreePath !== "string" || !worktreePath.trim()) gaps.push("候选 worktree 路径");
+  }
   if (!snapshot.testGate || snapshot.testGate.status !== "passed") gaps.push("quality.test 门禁通过");
   if (!snapshot.reviewGate || snapshot.reviewGate.status !== "passed") gaps.push("quality.audit 门禁通过");
   if (!(snapshot.mediaCount > 0) && !(snapshot.structuredE2eCount > 0)) gaps.push("截图、录屏或结构化 E2E 证据");
@@ -55,7 +71,11 @@ export function acceptanceSnapshotGaps(snapshot: RunAcceptanceSnapshot | undefin
 
 export interface DashboardService {
   /** Project 是事实源；MCP observed 是接入证据，Folder / 收藏 / 排序只是目录 UI 覆盖层。 */
-  syncConnectedProjects(projects: ConnectedProject[], passiveAccesses?: PassiveProjectAccess[]): void;
+  syncConnectedProjects(
+    projects: ConnectedProject[],
+    passiveAccesses?: PassiveProjectAccess[],
+    catalog?: ProjectCatalogSnapshot
+  ): void;
   getDashboardSummary(): Promise<DashboardSummary>;
   listSpaces(): Promise<SpaceNode[]>;
   createFolder(input: { parentId: string | null; name: string }): Promise<FolderNode>;
@@ -97,6 +117,13 @@ export interface DashboardService {
   bindRepository(input: { projectId: string; label: string; path: string; defaultBranch?: string }): Promise<ManagedProject>;
   listArchive(): Promise<ArchiveRecord[]>;
   getSettingsSnapshot(): Promise<SettingsSnapshot>;
+}
+
+export interface ProjectCatalogSnapshot {
+  projectBindings: ProjectBinding[];
+  employees: Employee[];
+  skills: Skill[];
+  knowledgeProfiles: KnowledgeProfile[];
 }
 
 export interface DashboardServiceOptions {
@@ -222,6 +249,16 @@ function persistedStore(storage: DashboardServiceOptions["storage"]): Store | un
   }
 }
 
+const ADVANCEMENT_LOCKED_LANES = new Set<RequirementLane>(["acceptance", "merging", "done"]);
+
+/**
+ * Advancement observations describe the execution cycle, not a request to
+ * reopen a later delivery lifecycle. A new cycle must be reserved explicitly.
+ */
+function projectAdvancementLane(status: RequirementAdvancementStatus, current: RequirementLane): RequirementLane {
+  return ADVANCEMENT_LOCKED_LANES.has(current) ? current : advancementLane(status, current);
+}
+
 export function createDashboardService(options: DashboardServiceOptions = {}): DashboardService {
   const delayMs = options.delayMs ?? (() => 80 + Math.floor(Math.random() * 121));
   const now = options.now ?? (() => new Date());
@@ -275,7 +312,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
     if (latestAdvancement) {
       canonical.advancement = { ...latestAdvancement };
-      canonical.lane = advancementLane(latestAdvancement.status, canonical.lane);
+      canonical.lane = projectAdvancementLane(latestAdvancement.status, canonical.lane);
       canonical.updatedAt = [canonical.updatedAt, latestAdvancement.updatedAt].sort().at(-1)!;
       canonical.exception = latestAdvancement.status === "blocked"
         ? "blocked"
@@ -299,7 +336,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   // already-waiting Run leaves the execution lane immediately after reload.
   for (const requirement of store.requirements) {
     if (!requirement.advancement) continue;
-    const reconciledLane = advancementLane(requirement.advancement.status, requirement.lane);
+    const reconciledLane = projectAdvancementLane(requirement.advancement.status, requirement.lane);
     if (reconciledLane === requirement.lane) continue;
     requirement.lane = reconciledLane;
     repairedPersistedData = true;
@@ -328,6 +365,13 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   if (repairedPersistedData) persist();
   let connectedProjectIds: Set<string> | null = null;
   let connectedCatalogIds = new Set<string>();
+  let connectedProjectsById = new Map<string, ConnectedProject>();
+  let projectCatalog: ProjectCatalogSnapshot = {
+    projectBindings: [],
+    employees: [],
+    skills: [],
+    knowledgeProfiles: []
+  };
   let catalogSeedRemapped = false;
 
   const respond = <T>(produce: () => T): Promise<T> =>
@@ -392,7 +436,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
   };
 
   return {
-    syncConnectedProjects(projects, passiveAccesses = []) {
+    syncConnectedProjects(projects, passiveAccesses = [], catalog) {
       const previousProjects = store.nodes.filter((node): node is ManagedProject => node.kind === "project");
       const previousById = new Map(previousProjects.map((project) => [project.id, project]));
       const previousMcpProjects = store.nodes.filter((node): node is McpObservedProject => node.kind === "mcp-observed");
@@ -401,6 +445,13 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       const active = projects.filter((project) => project.status === "active");
       connectedProjectIds = new Set(active.map((project) => project.id));
       connectedCatalogIds = new Set(projects.map((project) => project.id));
+      connectedProjectsById = new Map(projects.map((project) => [project.id, project]));
+      projectCatalog = catalog ?? {
+        projectBindings: [],
+        employees: [],
+        skills: [],
+        knowledgeProfiles: []
+      };
 
       // 首次接入真实目录时，把演示需求稳定映射到真实 active Project；
       // 后续刷新不再改写用户已经选择过的 projectId。
@@ -758,7 +809,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
           ...observeAdvancement(requirement.advancement, observation, pollIntervalMs),
           ...(observation.leaderSessionId ? { leaderSessionId: observation.leaderSessionId } : {})
         };
-        requirement.lane = advancementLane(requirement.advancement.status, requirement.lane);
+        requirement.lane = projectAdvancementLane(requirement.advancement.status, requirement.lane);
         requirement.exception = requirement.advancement.status === "blocked"
           ? "blocked"
           : requirement.advancement.status === "failed"
@@ -817,7 +868,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         const fixed: RunAcceptanceSnapshot = {
           ...snapshot,
           runId: snapshot.runId.trim(),
-          worktreePath: snapshot.worktreePath.trim(),
+          ...(snapshot.worktreePath ? { worktreePath: snapshot.worktreePath.trim() } : {}),
           diffFiles: snapshot.diffFiles.map((file) => String(file)),
           capturedAt: snapshot.capturedAt?.trim() || touch()
         };
@@ -825,7 +876,9 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
           ...requirement.evidence,
           diffSummary: `Run ${fixed.runId} · ${fixed.diffFiles.length} 个文件：${fixed.diffFiles.join("、")}`,
           testReport: `quality.test Gate「${fixed.testGate!.gateId}」passed；结构化 E2E ${fixed.structuredE2eCount} 条。`,
-          reviewNotes: `quality.audit Gate「${fixed.reviewGate!.gateId}」passed；媒体证据 ${fixed.mediaCount} 项；候选 worktree ${fixed.worktreePath}。`,
+          reviewNotes: fixed.source?.kind === "merged-commits"
+            ? `quality.audit Gate「${fixed.reviewGate!.gateId}」passed；媒体证据 ${fixed.mediaCount} 项；已合并提交证据 base/source/merge ${fixed.source.baseCommit}/${fixed.source.sourceCommit}/${fixed.source.mergeCommit}。`
+            : `quality.audit Gate「${fixed.reviewGate!.gateId}」passed；媒体证据 ${fixed.mediaCount} 项；候选 worktree ${fixed.source?.kind === "worktree" ? fixed.source.worktreePath : fixed.worktreePath}。`,
           acceptance: fixed
         };
         const from = requirementLaneLabel(requirement.lane);
@@ -876,10 +929,20 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       return respond(() => {
         const requirement = store.requirements.find((candidate) => candidate.id === requirementId);
         if (!requirement || requirement.archivedAt) throw failure("没有找到这条需求", "请回到需求看板重新选择", "未写入任何变更");
-        const acceptedRunId = requirement.evidence.acceptance?.runId;
-        if (!acceptedRunId || acceptedRunId !== runId) throw failure("补采状态与已固定的验收 Run 不一致", "请从该需求绑定的运行卷宗重新补采", "需求列和验收快照均未改变");
+        const acceptance = requirement.evidence.acceptance;
+        if (!acceptance || acceptance.runId !== runId) throw failure("补采状态与已固定的验收 Run 不一致", "请从该需求绑定的运行卷宗重新补采", "需求列和验收快照均未改变");
+        const observationTime = new Date(observation.updatedAt).getTime();
+        const acceptanceTime = new Date(acceptance.capturedAt).getTime();
+        // The fixed acceptance snapshot is a lifecycle watermark. A retained daemon
+        // observation at or before it has already been superseded and must not move
+        // an accepted requirement back into execution.
+        if (Number.isFinite(observationTime)
+          && Number.isFinite(acceptanceTime)
+          && observationTime <= acceptanceTime) {
+          return requirementSummary(requirement);
+        }
         if (requirement.evidenceCapture
-          && new Date(observation.updatedAt).getTime() < new Date(requirement.evidenceCapture.updatedAt).getTime()) {
+          && observationTime < new Date(requirement.evidenceCapture.updatedAt).getTime()) {
           return requirementSummary(requirement);
         }
         const lifecycleLocked = requirement.lane === "merging" || requirement.lane === "done";
@@ -941,21 +1004,76 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
       return respond(() => {
         const node = findNode(id);
         if (!node || node.kind !== "project") throw failure("没有找到这个项目", "请回到项目页重新选择", "其它项目配置未受影响");
+        const declaredProject = connectedProjectsById.get(id);
+        const currentBinding = projectCatalog.projectBindings
+          .filter((candidate) => candidate.projectId === id && candidate.projectVersion === declaredProject?.version)
+          .sort((left, right) => right.version - left.version)[0];
+        const roleBindings = new Map((currentBinding?.roles ?? []).map((binding) => [binding.roleId, binding]));
+        const employees = new Map(projectCatalog.employees.map((employee) => [employee.id, employee]));
+        const skillCatalog = new Map(projectCatalog.skills.map((skill) => [skill.id, skill]));
+        const knowledgeCatalog = new Map(projectCatalog.knowledgeProfiles.map((profile) => [profile.id, profile]));
+        const roles = declaredProject?.roles ?? [];
+        const members = roles.map((role) => {
+          const roleBinding = roleBindings.get(role.id);
+          const employee = roleBinding ? employees.get(roleBinding.employeeId) : undefined;
+          return roleBinding
+            ? {
+                id: `${role.id}:${roleBinding.employeeId}:v${roleBinding.employeeVersion}`,
+                roleId: role.id,
+                name: employee?.identity.displayName ?? `${roleBinding.employeeId} · v${roleBinding.employeeVersion}`,
+                role: role.displayName,
+                status: "active" as const
+              }
+            : {
+                id: `${role.id}:unassigned`,
+                roleId: role.id,
+                name: "未分派员工",
+                role: role.displayName,
+                status: "pending" as const
+              };
+        });
+        const skillRows = new Map<string, { id: string; name: string; source: string }>();
+        for (const role of roles) {
+          for (const skillId of role.requiredSkills) {
+            skillRows.set(skillId, { id: skillId, name: skillCatalog.get(skillId)?.displayName ?? skillId, source: `${role.displayName} · 契约必需` });
+          }
+          for (const skillId of role.optionalSkills) {
+            if (!skillRows.has(skillId)) skillRows.set(skillId, { id: skillId, name: skillCatalog.get(skillId)?.displayName ?? skillId, source: `${role.displayName} · 契约可选` });
+          }
+          const roleBinding = roleBindings.get(role.id);
+          for (const binding of roleBinding?.skills ?? []) {
+            const skillId = typeof binding === "string" ? binding : binding.id;
+            skillRows.set(skillId, { id: skillId, name: skillCatalog.get(skillId)?.displayName ?? skillId, source: `${role.displayName} · 任用关系` });
+          }
+        }
+        const knowledgeRows = new Map<string, ProjectProfile["knowledge"][number]>();
+        for (const role of roles) {
+          const profileIds = new Set([
+            ...(role.knowledgeProfileIds ?? []),
+            ...(roleBindings.get(role.id)?.knowledgeProfileIds ?? [])
+          ]);
+          for (const profileId of profileIds) {
+            const profile = knowledgeCatalog.get(profileId);
+            knowledgeRows.set(profileId, {
+              id: profileId,
+              title: profile?.displayName ?? profileId,
+              kind: "knowledge-base",
+              updatedAt: profile?.updatedAt ?? node.updatedAt
+            });
+          }
+        }
+        const assignedRoles = roles.filter((role) => roleBindings.has(role.id)).length;
         return {
           project: copyNode(node) as ManagedProject,
-          members: [
-            { id: "member-lead", name: "小米汪", role: "产品领队", status: "active" },
-            { id: "member-fe", name: "米糊糊", role: "前端开发", status: "active" },
-            { id: "member-qa", name: "小米象", role: "独立测试", status: "active" }
-          ],
-          skills: [
-            { id: "skill-react", name: "React / TypeScript", source: "项目绑定" },
-            { id: "skill-ui", name: "交互状态与无障碍", source: "角色能力" }
-          ],
-          knowledge: [
-            { id: "kb-product", title: "产品范围与验收口径", kind: "document", updatedAt: at(8, 9) },
-            { id: "kb-architecture", title: "Workbench 架构边界", kind: "knowledge-base", updatedAt: at(7, 16) }
-          ]
+          assignment: {
+            ...(currentBinding ? { bindingVersion: currentBinding.version } : {}),
+            assignedRoles,
+            totalRoles: roles.length,
+            ready: roles.length > 0 && assignedRoles === roles.length
+          },
+          members,
+          skills: [...skillRows.values()],
+          knowledge: [...knowledgeRows.values()]
         } satisfies ProjectProfile;
       });
     },

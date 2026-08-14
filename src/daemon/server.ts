@@ -72,7 +72,8 @@ function humanDecisionRequestDecision(value: unknown): HumanDecisionRequestDecis
   return {
     decision: body.decision as "approve" | "reject",
     decidedBy: typeof body.decidedBy === "string" ? body.decidedBy : "local-owner",
-    comment: typeof body.comment === "string" ? body.comment : undefined
+    comment: typeof body.comment === "string" ? body.comment : undefined,
+    candidateUrl: typeof body.candidateUrl === "string" ? body.candidateUrl : undefined
   };
 }
 
@@ -155,6 +156,11 @@ export async function sendRunEvidenceAsset(
 export interface DaemonAppOptions {
   baseUrl?: string;
   staticDir?: string;
+  allowedHosts?: string[];
+  allowedOrigins?: string[];
+  capabilityToken?: string;
+  rateLimit?: { windowMs: number; max: number };
+  auditSink?: (event: { at: string; method: string; path: string; actor?: string }) => Promise<void>;
 }
 
 export function createDaemonApp(service: WorkbenchService, options: DaemonAppOptions = {}): Express {
@@ -163,9 +169,49 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   const a2aHandlers = new Map<string, { version: number; handler: ReturnType<typeof jsonRpcHandler> }>();
 
   app.disable("x-powered-by");
+  const allowedHosts = new Set(options.allowedHosts ?? ["127.0.0.1", "localhost", "[::1]"]);
+  const allowedOrigins = new Set(options.allowedOrigins ?? [new URL(baseUrl).origin]);
+  const rate = options.rateLimit ?? { windowMs: 60_000, max: 600 };
+  const buckets = new Map<string, { since: number; count: number }>();
+  app.use((request, response, next) => {
+    const hostHeader = request.headers.host ?? "";
+    const host = hostHeader.startsWith("[") ? hostHeader.slice(0, hostHeader.indexOf("]") + 1) : (hostHeader.split(":")[0] ?? "");
+    if (!allowedHosts.has(host)) {
+      response.status(403).json({ error: { message: "request Host is not allowed" } });
+      return;
+    }
+    const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
+    if (origin && !allowedOrigins.has(origin)) {
+      response.status(403).json({ error: { message: "request Origin is not allowed" } });
+      return;
+    }
+    const key = request.ip || "local";
+    const timestamp = Date.now();
+    const bucket = buckets.get(key);
+    const nextBucket = !bucket || timestamp - bucket.since >= rate.windowMs
+      ? { since: timestamp, count: 1 }
+      : { since: bucket.since, count: bucket.count + 1 };
+    buckets.set(key, nextBucket);
+    if (nextBucket.count > rate.max) {
+      response.status(429).json({ error: { message: "rate limit exceeded" } });
+      return;
+    }
+    next();
+  });
   // 20 MiB of decoded images expands to roughly 26.7 MiB as base64. Domain validation in the
   // WorkbenchService enforces the tighter decoded limits after this transport-level ceiling.
   app.use("/api", express.json({ limit: "30mb" }));
+  app.use("/api", asyncRoute(async (request, response, next) => {
+    if (["GET", "HEAD", "OPTIONS"].includes(request.method)) { next(); return; }
+    if (options.capabilityToken && request.headers["x-multi-agent-capability"] !== options.capabilityToken) {
+      response.status(403).json({ error: { message: "missing or invalid capability token" } });
+      return;
+    }
+    if (options.auditSink) {
+      await options.auditSink({ at: new Date().toISOString(), method: request.method, path: request.path, actor: headerText(request, "x-multi-agent-caller") });
+    }
+    next();
+  }));
   app.use("/api", (request, _response, next) => {
     const mcpRoot = headerText(request, "x-multi-agent-mcp-root", 4096);
     if (!mcpRoot) {
@@ -242,6 +288,14 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   });
   app.get("/api/invocations/:id", asyncRoute(async (request, response) => {
     send(response, await service.getInvocationDetail(routeParam(request, "id")));
+  }));
+  app.post("/api/invocations/:id/cancel", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "cancellation input");
+    send(response, await service.requestCancellation(routeParam(request, "id"), {
+      actor: typeof body.actor === "string" ? body.actor : "local-http-owner",
+      reason: typeof body.reason === "string" ? body.reason : undefined,
+      graceMs: typeof body.graceMs === "number" ? body.graceMs : undefined
+    }));
   }));
   app.get("/api/invocations/:id/progress", asyncRoute(async (request, response) => {
     send(response, await service.getInvocationProgress(routeParam(request, "id")));
@@ -958,6 +1012,46 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.get("/api/runs/:id", asyncRoute(async (request, response) => {
     send(response, await service.getRun(routeParam(request, "id")));
   }));
+  app.get("/api/runs/:id/receipt", asyncRoute(async (request, response) => {
+    send(response, await service.getRunReceipt(routeParam(request, "id")));
+  }));
+
+  app.get("/api/doctor", asyncRoute(async (_request, response) => send(response, await service.doctor())));
+  app.post("/api/bundles/export", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "bundle export input");
+    if (!Array.isArray(body.modes)) throw new Error("bundle modes are required");
+    send(response, service.exportPortableBundle(body.modes as never));
+  }));
+  app.post("/api/bundles/preview", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "bundle preview input");
+    send(response, service.previewPortableBundle(body.bundle, body.conflict === "replace" ? "replace" : "skip"));
+  }));
+  app.post("/api/bundles/apply", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "bundle apply input");
+    send(response, await service.applyPortableBundle(body.bundle as never, body.conflict === "replace" ? "replace" : "skip", typeof body.confirmation === "string" ? body.confirmation : undefined));
+  }));
+  app.post("/api/retention/preview", asyncRoute(async (request, response) => send(response, await service.previewRetention(jsonObject(request.body ?? {}, "retention policy")))));
+  app.post("/api/retention/apply", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "retention apply input");
+    if (typeof body.confirmation !== "string") throw new Error("retention confirmation is required");
+    send(response, await service.applyRetention((body.policy ?? {}) as never, body.confirmation));
+  }));
+  app.post("/api/backups/export", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "backup export input");
+    if (typeof body.backupId !== "string") throw new Error("backupId is required");
+    send(response, await service.backupForBrowser(body.backupId));
+  }));
+  app.post("/api/backups/restore-preview", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "restore preview input");
+    if (typeof body.backupId !== "string") throw new Error("backupId is required");
+    send(response, await service.previewRestoreForBrowser(body.backupId));
+  }));
+  app.post("/api/backups/restore", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "restore input");
+    if (typeof body.backupId !== "string") throw new Error("backupId is required");
+    send(response, await service.restoreForBrowser(body.backupId, body.conflict === "replace" ? "replace" : "skip", typeof body.confirmation === "string" ? body.confirmation : undefined));
+  }));
+  app.post("/api/reset", asyncRoute(async (request, response) => send(response, await service.resetForBrowser(jsonObject(request.body ?? {}, "reset input") as never))));
 
   app.post("/api/memory/search", asyncRoute(async (request, response) => {
     const body = (request.body ?? {}) as {
@@ -1099,13 +1193,25 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
 export interface StartDaemonOptions extends DaemonAppOptions {
   host?: string;
   port?: number;
+  tls?: { cert: string; key: string };
+  authn?: unknown;
+  authz?: unknown;
+  tenantIsolation?: unknown;
+  trustedProxy?: unknown;
 }
 
 export async function startDaemon(service: WorkbenchService, options: StartDaemonOptions = {}): Promise<Server> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4318;
   if (!["127.0.0.1", "::1", "localhost"].includes(host)) {
-    throw new Error("v1 daemon is loopback-only");
+    const missing = [
+      ["TLS", options.tls], ["authn", options.authn], ["authz", options.authz],
+      ["tenant isolation", options.tenantIsolation], ["rate limit", options.rateLimit],
+      ["audit sink", options.auditSink], ["trusted proxy", options.trustedProxy],
+      ["Origin allowlist", options.allowedOrigins?.length]
+    ].filter((entry) => !entry[1]).map((entry) => entry[0]);
+    if (missing.length > 0) throw new Error(`non-loopback daemon requires all security controls; missing: ${missing.join(", ")}`);
+    throw new Error("non-loopback TLS listener is not available in this daemon build");
   }
   const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   const app = createDaemonApp(service, {

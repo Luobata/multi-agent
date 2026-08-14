@@ -290,6 +290,7 @@ describe("Employee e2e-evidence output-contract toggle", () => {
 
       const schema = fieldTextarea(container, "输出 JSON Schema");
       expect(schema?.value).toContain("\"e2eEvidence\"");
+      expect(JSON.parse(schema?.value ?? "{}").required).toEqual(["verdict", "summary", "e2eEvidence", "risks"]);
       expect(fieldInput(container, "Verdict JSON path")?.value).toBe("/verdict");
       expect(fieldInput(container, "Pass 值")?.value).toBe("pass");
       expect(fieldInput(container, "Block 值")?.value).toBe("block");

@@ -80,6 +80,65 @@ async function fixture(options: { knowledgeUrlFetcher?: { fetch: (url: string) =
 }
 
 describe("workbench daemon", () => {
+  it("serves same-origin browser assets while rejecting cross-origin requests", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-daemon-origin-"));
+    directories.push(root);
+    fs.writeFileSync(path.join(root, "app.js"), "globalThis.__workbenchLoaded = true;\n", "utf8");
+    const service = await WorkbenchService.open({ dataRoot: path.join(root, "data") });
+    const app = createDaemonApp(service, { baseUrl: "http://127.0.0.1:4318", staticDir: root });
+    const server = app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      server.once("listening", resolve);
+      server.once("error", reject);
+    });
+    servers.push(server);
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    const sameOrigin = await fetch(`${base}/app.js`, { headers: { origin: "http://127.0.0.1:4318" } });
+    expect(sameOrigin.status).toBe(200);
+    expect(await sameOrigin.text()).toContain("__workbenchLoaded");
+
+    const crossOrigin = await fetch(`${base}/app.js`, { headers: { origin: "https://attacker.example" } });
+    expect(crossOrigin.status).toBe(403);
+    await expect(crossOrigin.json()).resolves.toEqual({ error: { message: "request Origin is not allowed" } });
+
+    const sameOriginPost = await fetch(`${base}/api/bundles/export`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://127.0.0.1:4318" },
+      body: JSON.stringify({ modes: ["employee"] })
+    });
+    expect(sameOriginPost.status).toBe(200);
+    await expect(sameOriginPost.json()).resolves.toMatchObject({ data: { mode: ["employee"] } });
+
+    const secured = createDaemonApp(service, {
+      baseUrl: "http://127.0.0.1:4318",
+      staticDir: root,
+      capabilityToken: "test-capability"
+    }).listen(0, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      secured.once("listening", resolve);
+      secured.once("error", reject);
+    });
+    servers.push(secured);
+    const securedBase = `http://127.0.0.1:${(secured.address() as AddressInfo).port}`;
+    const missingCapability = await fetch(`${securedBase}/api/bundles/export`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://127.0.0.1:4318" },
+      body: JSON.stringify({ modes: ["employee"] })
+    });
+    expect(missingCapability.status).toBe(403);
+    const authorized = await fetch(`${securedBase}/api/bundles/export`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "http://127.0.0.1:4318",
+        "x-multi-agent-capability": "test-capability"
+      },
+      body: JSON.stringify({ modes: ["employee"] })
+    });
+    expect(authorized.status).toBe(200);
+  });
+
   it("hosts a target project's conversation through another compatible assigned project role", async () => {
     const { base, service } = await fixture();
     const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-conversation-target-"));
@@ -142,7 +201,8 @@ describe("workbench daemon", () => {
         displayName: "Desk Supervision",
         description: "Coordinate one desk role.",
         allowedRoleIds: ["reviewer"],
-        instructions: "Delegate when needed, then finish with evidence."
+        instructions: "Delegate when needed, then finish with evidence.",
+        completion: { requireDelegation: false }
       })
     });
     expect(createPolicy.status).toBe(201);

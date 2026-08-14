@@ -99,10 +99,23 @@ function normalizeSupervisorDag(
       throw new Error(`supervisor dag node ${nodeId} has unsupported workKind ${String(workKind)}`);
     }
     const changeSet = candidate.changeSet?.trim();
+    const needsWhen = candidate.needsWhen?.map((condition, conditionIndex) => {
+      const conditionNodeId = id(condition.nodeId, `supervisor dag node ${nodeId} needsWhen ${conditionIndex + 1} nodeId`);
+      if (!needs.includes(conditionNodeId)) throw new Error(`supervisor dag node ${nodeId} needsWhen ${conditionNodeId} must reference a needs node`);
+      if (!Array.isArray(condition.statuses) || condition.statuses.length === 0) throw new Error(`supervisor dag node ${nodeId} needsWhen ${conditionNodeId} statuses must not be empty`);
+      const allowed = new Set(["passed", "blocked", "failed", "skipped", "terminal"]);
+      if (condition.statuses.some((status) => !allowed.has(status))) throw new Error(`supervisor dag node ${nodeId} needsWhen ${conditionNodeId} has unsupported status`);
+      if (new Set(condition.statuses).size !== condition.statuses.length) throw new Error(`supervisor dag node ${nodeId} needsWhen ${conditionNodeId} has duplicate statuses`);
+      return { nodeId: conditionNodeId, statuses: [...condition.statuses] };
+    });
+    if (needsWhen && new Set(needsWhen.map((condition) => condition.nodeId)).size !== needsWhen.length) {
+      throw new Error(`supervisor dag node ${nodeId} has duplicate needsWhen nodes`);
+    }
     return {
       nodeId,
       roleId,
       needs,
+      ...(needsWhen ? { needsWhen } : {}),
       kind: candidate.kind,
       task: text(candidate.task, `supervisor dag node ${nodeId} task`),
       requiredCapabilities,

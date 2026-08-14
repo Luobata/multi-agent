@@ -45,6 +45,7 @@ describe("requirement advancement control state", () => {
         config: {
           requirementAdvancement: {
             entrancePolicyId: "requirement-policy",
+            candidateUrl: "http://127.0.0.1:4319",
             polling: { enabled: true, intervalMs: 30_000 }
           }
         }
@@ -52,9 +53,17 @@ describe("requirement advancement control state", () => {
     } as unknown as Project;
     expect(requirementAdvancementConfig(project)).toEqual({
       entrancePolicyId: "requirement-policy",
+      candidateUrl: "http://127.0.0.1:4319",
       autoPollEnabled: true,
       pollIntervalMs: 30_000
     });
+  });
+
+  it("ignores a non-HTTP candidate URL from project configuration", () => {
+    const project = { connector: { config: { requirementAdvancement: {
+      entrancePolicyId: "requirement-policy", candidateUrl: "file:///tmp/candidate"
+    } } } } as unknown as Project;
+    expect(requirementAdvancementConfig(project)).not.toHaveProperty("candidateUrl");
   });
 
   it("reserves a stable key and reuses it after a response-less failure", () => {
@@ -116,6 +125,28 @@ describe("requirement advancement control state", () => {
       "human",
       "2026-08-10T01:05:00.000Z"
     )).toThrow(/已经产生 Run/);
+  });
+
+  it("opens a new cycle only for a cancelled requirement backed by a cancelled Invocation", () => {
+    const first = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
+    const cancelled = { ...first, status: "cancelled" as const, invocationId: "inv-cancelled", runId: "run-cancelled" };
+    const next = reserveAdvancement(
+      detail({ advancement: cancelled, exception: "cancelled", lane: "running" }),
+      config,
+      "human",
+      "2026-08-10T02:00:00.000Z"
+    );
+
+    expect(next).toMatchObject({ cycle: 2, status: "dispatching" });
+    expect(next.idempotencyKey).not.toBe(cancelled.idempotencyKey);
+    expect(() => reserveAdvancement(detail({ exception: "cancelled" }), config, "human", "2026-08-10T02:00:00.000Z"))
+      .toThrow("已取消的需求不能开始推进");
+    expect(() => reserveAdvancement(
+      detail({ advancement: { ...cancelled, status: "completed" }, exception: "cancelled" }),
+      config,
+      "human",
+      "2026-08-10T02:00:00.000Z"
+    )).toThrow("这轮推进已经产生 Run");
   });
 
   it("selects only due active cursors for a future poller and maps execution states to lanes", () => {

@@ -165,6 +165,53 @@ describe("BoardPage AI requirement creation", () => {
     expect(new Headers(fetchMock.mock.calls[0]![1]?.headers).get("x-multi-agent-project")).toBe("connected-b");
   });
 
+  it("disables AI requirement creation when the declared requirement-steward role has no current binding", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    act(() => root.render(<BoardPage go={vi.fn()} notify={vi.fn()} service={service} projects={[project]} projectBindings={[]} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(button("手动创建").disabled).toBe(false);
+    expect(button("和 AI 说需求").disabled).toBe(true);
+    expect(button("和 AI 说需求").title).toContain("完成角色任用");
+    expect(container.querySelector("#board-action-guidance")?.textContent).toContain("AI 需求入口需要项目声明 requirement-steward 角色");
+    expect(button("和 AI 说需求").getAttribute("aria-describedby")).toBe("board-action-guidance");
+  });
+
+  it("does not borrow another project's steward readiness on a project-scoped board", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    const projectA = connectedProject();
+    const projectB = connectedProjectB();
+    service.syncConnectedProjects([projectA, projectB]);
+    act(() => root.render(<BoardPage
+      spaceId={projectA.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[projectA, projectB]}
+      projectBindings={[{
+        projectId: projectB.id,
+        projectVersion: projectB.version,
+        version: 1,
+        roles: [{
+          roleId: "requirement-steward",
+          employeeId: "xiaomiwang-product-manager",
+          employeeVersion: 1,
+          skills: [],
+          skillVersions: {},
+          updatePolicy: "locked"
+        }],
+        createdAt: "2026-08-09T00:00:00.000Z",
+        updatedAt: "2026-08-09T00:00:00.000Z"
+      }]}
+    />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(button("和 AI 说需求").disabled).toBe(true);
+    expect(container.querySelector("#board-action-guidance")?.textContent).toContain("完成员工分派");
+  });
+
   it("requires an explicit project in aggregate mode and restores both entries after selection", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
     service.syncConnectedProjects([connectedProject(), connectedProjectB()]);
@@ -551,7 +598,7 @@ describe("BoardPage AI requirement creation", () => {
     expect(inbox?.textContent).toContain("旧已规划需求");
   });
 
-  it("renders seven inert lane skeletons until authoritative sources and terminal reconciliation are ready", async () => {
+  it("renders board data before terminal reconciliation finishes", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
     const project = connectedProject();
     service.syncConnectedProjects([project]);
@@ -599,16 +646,20 @@ describe("BoardPage AI requirement creation", () => {
     expect(button("和 AI 说需求").disabled).toBe(true);
 
     act(() => root.render(<BoardPage spaceId={project.id} go={go} notify={notify} service={service} projects={projects} invocations={invocations} sourceReady />));
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    for (let attempt = 0; attempt < 20 && fetchMock.mock.calls.length === 0; attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(container.querySelectorAll(".board-lane--loading")).toHaveLength(7);
-    expect(container.textContent).not.toContain(requirement.title);
+    expect(container.querySelectorAll(".board-lane--loading")).toHaveLength(0);
+    expect(container.querySelector<HTMLButtonElement>(`button[aria-label="查看需求详情：${requirement.code} ${requirement.title}"]`)).not.toBeNull();
+    expect(button("手动创建").disabled).toBe(false);
 
     const preview: RunMergePreview = {
       runId: "run-gated",
       status: "awaiting-acceptance",
       eligible: true,
       reasons: [],
+      acceptanceReadiness: { ready: false, reasons: ["not a merged delivery"] },
       worktreePath: "/repo/.multi-agent/worktrees/run-gated",
       repositoryRoot: "/repo",
       targetBranch: "main",
@@ -660,6 +711,7 @@ describe("BoardPage AI requirement creation", () => {
       status: "awaiting-acceptance",
       eligible: true,
       reasons: [],
+      acceptanceReadiness: { ready: false, reasons: ["not a merged delivery"] },
       worktreePath: "/repo/.multi-agent/worktrees/run-completed",
       repositoryRoot: "/repo",
       targetBranch: "main",
@@ -726,6 +778,74 @@ describe("BoardPage AI requirement creation", () => {
     expect(container.querySelector<HTMLElement>('section[aria-label^="待验收"]')?.textContent).toContain(requirement.title);
   });
 
+  it("keeps the board readable when merged delivery reconciliation rejects a mismatched fixed Run", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "保留可读的需求卡",
+      summary: "错误 Run 不得清空看板",
+      priority: "high",
+      rawRequirement: "验收 Run 与交付 Run 不一致",
+      acceptanceCriteria: ["看板仍可读"]
+    });
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-other",
+      runId: "run-other",
+      status: "completed",
+      observedAt: "2026-08-12T02:00:02.000Z"
+    }, config.pollIntervalMs);
+    await service.submitRequirementForAcceptance(requirement.id, {
+      runId: "run-accepted",
+      eligible: true,
+      worktreePath: "/repo/.multi-agent/worktrees/run-accepted",
+      testGate: { gateId: "quality-test", status: "passed" },
+      reviewGate: { gateId: "independent-review", status: "passed" },
+      mediaCount: 0,
+      structuredE2eCount: 1,
+      diffFiles: ["client/src/BoardPage.tsx"],
+      capturedAt: "2026-08-12T02:00:00.000Z"
+    });
+    await service.updateRequirementLane(requirement.id, "inbox");
+    const preview: RunMergePreview = {
+      runId: "run-other", status: "merged", eligible: true, reasons: [], acceptanceReadiness: { ready: false, reasons: ["legacy fixture"] },
+      worktreePath: "/repo/.multi-agent/worktrees/run-other", repositoryRoot: "/repo", targetBranch: "main", targetClean: true,
+      changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 1024 } },
+      safeGitCommands: [], evidence: { assets: [], structuredE2eCount: 1, acceptedVerdict: true, gates: [] },
+      delivery: { runId: "run-other", status: "merged", updatedAt: "2026-08-12T02:00:02.000Z" },
+      confirmationToken: "MERGE run-other", discardConfirmationToken: "DISCARD run-other"
+    };
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ data: preview }) });
+    const notify = vi.fn();
+    const completed: InvocationRecord = {
+      id: "inv-other", target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench", taskId: requirement.id }, status: "completed", phase: "done",
+      requestSummary: requirement.title, runId: "run-other", instanceIds: [],
+      createdAt: "2026-08-12T02:00:00.000Z", updatedAt: "2026-08-12T02:00:02.000Z",
+      completedAt: "2026-08-12T02:00:02.000Z", transitions: []
+    };
+
+    act(() => root.render(<BoardPage spaceId={project.id} go={vi.fn()} notify={notify} service={service} projects={[project]} invocations={[completed]} />));
+    for (let attempt = 0; attempt < 20 && !notify.mock.calls.some(([message]) => String(message).includes(requirement.code)); attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }
+
+    expect(container.querySelectorAll(".board-lane--loading")).toHaveLength(0);
+    expect(container.textContent).toContain(requirement.title);
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining(`${requirement.code} 需求推进状态同步失败`), "error");
+    expect(container.textContent).not.toContain("加载需求看板失败");
+    const unchanged = await service.getRequirement(requirement.id);
+    expect(unchanged.lane).toBe("inbox");
+    expect(unchanged.evidence.acceptance?.runId).toBe("run-accepted");
+    expect(unchanged.delivery).toBeUndefined();
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
   it("adopts a newer system retry only from the same browser-local requirement family", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
     const project = connectedProject();
@@ -787,6 +907,7 @@ describe("BoardPage AI requirement creation", () => {
       status: "awaiting-acceptance",
       eligible: true,
       reasons: [],
+      acceptanceReadiness: { ready: false, reasons: ["not a merged delivery"] },
       worktreePath: "/repo/.multi-agent/worktrees/run-system-retry",
       repositoryRoot: "/repo",
       targetBranch: "main",
@@ -874,6 +995,7 @@ describe("BoardPage AI requirement creation", () => {
       status: "merged",
       eligible: false,
       reasons: ["该交付已经合并。"],
+      acceptanceReadiness: { ready: false, reasons: ["原始交付 diff 为空。"] },
       worktreePath: "/repo/.multi-agent/worktrees/run-merged",
       repositoryRoot: "/repo",
       targetBranch: "main",

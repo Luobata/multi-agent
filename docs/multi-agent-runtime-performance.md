@@ -55,7 +55,7 @@
 
 ### 3.5 运行状态仍以单 daemon 内存所有权为主
 
-本轮异步任务由当前 daemon 持有。daemon 重启后的精确恢复、跨进程 Session 锁、Provider 全局配额以及项目写入租约尚未形成持久调度层，因此还不适合把本地 daemon 直接扩展为多人共享运行集群。
+本轮异步任务的执行所有权仍由当前 daemon 内存持有。恢复材料完整且没有 pending 人工决定的 Workflow 可在重启后从同一个 Run 的节点检查点重放，但原 Provider 进程不会恢复，也没有持久 owner/lease、跨进程 Session 锁、Provider 全局配额或项目写入租约。因此当前恢复语义不是跨进程恰好一次执行，仍不适合把本地 daemon 直接扩展为多人共享运行集群。
 
 ## 4. 本轮已落地改造
 
@@ -137,8 +137,8 @@ Workflow 页面改为向异步入口提交。界面中的“运行中”只覆�
 
 对 Web 或 MCP 客户端，统一采用“启动—观察—取证”三步：
 
-1. 调用 `start_workflow`、`start_publication` 或对应的 `POST /start`，保存 `invocationId`、`runId` 与 `monitor.initialCursor`。
-2. MCP 会话立即循环 `wait_workflow_progress`，每次传入上次的 `nextCursor`；变化或心跳都转述 `progressReport`，`terminal=false` 时不得结束当前回合。Web 界面也可通过 SSE 观察整体活动。
+1. 为一次逻辑启动生成稳定的 `idempotencyKey`，调用 `start_workflow`、`start_publication` 或对应的 `POST /start`，保存 `invocationId`、`runId` 与 `monitor.initialCursor`；网络重试必须复用原 key，新的逻辑运行必须使用新 key。
+2. MCP 会话立即循环 `wait_workflow_progress`，每次传入上次的 `nextCursor`；`terminal=false` 时不得结束当前回合。只有 changed/terminal 结果进入模型或向用户转述，heartbeat 仅作为 transport keepalive。Web 界面也可通过 SSE 观察整体活动。
 3. Invocation 进入终态后读取 Run 证据并交付规范化结果。连接中断时使用 `resume_workflow_monitor(runId)` 重挂，不能把 HTTP 连接存活视为任务存活。
 
 调用方超时只应表示“本次查询没有及时返回”，不能直接推断后台 Workflow 失败。后续增加取消能力时，也必须显式调用取消命令，不能依靠浏览器断开连接隐式取消。

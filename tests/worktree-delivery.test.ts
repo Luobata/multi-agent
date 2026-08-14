@@ -97,6 +97,91 @@ afterEach(() => {
 });
 
 describe("worktree delivery merge gate", () => {
+  it("reconstructs an exact merged delivery diff for acceptance backfill without making it merge eligible", async () => {
+    const root = repository();
+    const runId = "run-delivery-history-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "historical.txt"), "historical delivery\n", "utf8");
+    git(worktree!.path, "add", "historical.txt");
+    git(worktree!.path, "commit", "-m", "historical delivery");
+    const sourceCommit = git(worktree!.path, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(worktree!.path, "later.txt"), "must not enter historical preview\n", "utf8");
+    git(worktree!.path, "add", "later.txt");
+    git(worktree!.path, "commit", "-m", "later worktree state");
+    const runDir = artifactDirectory();
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+    fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
+      runId, status: "merged", updatedAt: new Date().toISOString(), baseCommit: worktree!.baseCommit,
+      sourceCommit, sourceBranch: `codex/${runId}`, targetBranch: "main", mergeCommit: sourceCommit
+    }, null, 2)}\n`, "utf8");
+    const headBefore = git(root, "rev-parse", "HEAD");
+    git(root, "worktree", "remove", "--force", worktree!.path);
+
+    const preview = await previewRunMerge(run, runDir);
+
+    expect(preview).toMatchObject({
+      status: "merged", eligible: false,
+      acceptanceReadiness: { ready: true, reasons: [] },
+      repositoryRoot: root,
+      commitAnchor: { baseCommit: worktree!.baseCommit, sourceCommit, mergeCommit: sourceCommit },
+      changes: { files: [{ status: "A", path: "historical.txt" }], fileCount: 1 }
+    });
+    expect(preview.changes.unifiedDiff.text).toContain("historical.txt");
+    expect(preview.changes.unifiedDiff.text).not.toContain("later.txt");
+    await expect(queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`, targetBranch: "main", actor: "reviewer"
+    })).rejects.toThrow(/已经合并/);
+    expect(git(root, "rev-parse", "HEAD")).toBe(headBefore);
+  }, 15_000);
+
+  it("fails deleted-worktree merged backfill closed when the commit relation is invalid", async () => {
+    const root = repository();
+    const runId = "run-delivery-history-invalid-anchor-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), "candidate\n", "utf8");
+    git(worktree!.path, "add", "candidate.txt");
+    git(worktree!.path, "commit", "-m", "candidate");
+    const sourceCommit = git(worktree!.path, "rev-parse", "HEAD");
+    const runDir = artifactDirectory();
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+    fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
+      runId, status: "merged", updatedAt: new Date().toISOString(), baseCommit: worktree!.baseCommit,
+      sourceCommit, sourceBranch: `codex/${runId}`, targetBranch: "main", mergeCommit: worktree!.baseCommit
+    }, null, 2)}\n`, "utf8");
+    git(root, "worktree", "remove", "--force", worktree!.path);
+
+    const preview = await previewRunMerge(run, runDir);
+
+    expect(preview.acceptanceReadiness.ready).toBe(false);
+    expect(preview.acceptanceReadiness.reasons.join(" ")).toMatch(/merge commit 不包含 source commit/);
+    expect(preview.commitAnchor).toBeUndefined();
+  }, 15_000);
+
+  it("fails merged acceptance backfill closed when gates, evidence, or the original diff are missing", async () => {
+    const root = repository();
+    const runId = "run-delivery-history-incomplete-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    const runDir = temporaryRoot("multi-agent-delivery-history-incomplete-");
+    fs.mkdirSync(runDir, { recursive: true });
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+    run.output = { gates: [] };
+    run.nodes = {};
+    fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
+      runId, status: "merged", updatedAt: new Date().toISOString(), baseCommit: worktree!.baseCommit,
+      sourceCommit: worktree!.baseCommit, sourceBranch: `codex/${runId}`, targetBranch: "main"
+    }, null, 2)}\n`, "utf8");
+
+    const preview = await previewRunMerge(run, runDir);
+
+    expect(preview.acceptanceReadiness.ready).toBe(false);
+    expect(preview.acceptanceReadiness.reasons.join(" ")).toMatch(/required Gate|quality\.test|quality\.audit/);
+    expect(preview.acceptanceReadiness.reasons).toContain("缺少截图、录屏或结构化 E2E 验收证据。");
+    expect(preview.acceptanceReadiness.reasons).toContain("原始交付 diff 为空。");
+  }, 15_000);
+
   it("opens only the validated managed Run worktree through an argv-safe desktop boundary", async () => {
     const root = repository();
     const runId = "run-delivery-open-1";

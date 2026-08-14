@@ -18,6 +18,7 @@
   --paper-sunken: #f4e3c2;
   --paper-hover: #ffe9bd;
   --ink: #4a3320;
+  --ink-1: var(--ink);
   --ink-hover: #34230f;
   --ink-2: #6b4d31;
   --ink-3: #8a6c4c;
@@ -34,6 +35,7 @@
   --season-autumn-soft: #ffd8ce;
   --season-winter: #5cb3e6;
   --season-winter-soft: #d5ecfb;
+  --season-winter-ink: var(--seal-blue);
   --season-rose: #e5533d;
   --season-rose-soft: #ffd8ce;
   --season-run: #5cb3e6;
@@ -87,12 +89,16 @@
 
   /* Rounded Japanese UI faces with reliable offline CJK fallbacks. */
   --font-display: "Hiragino Maru Gothic ProN", "Yu Gothic", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display-strong: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Hiragino Sans", sans-serif;
   --font-body: "Hiragino Sans", "Yu Gothic UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-machine: "SFMono-Regular", Menlo, Monaco, "Cascadia Mono", "Sarasa Mono SC", monospace;
+  --text-2xs: 10px;
+  --text-caption: 11px;
   --text-xs: 11px;
   --text-sm: 12px;
   --text-base: 14px;
   --text-body: 16px;
+  --text-lg: 18px;
   --text-subtitle: 20px;
   --text-title: 27px;
 

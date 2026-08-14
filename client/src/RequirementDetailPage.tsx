@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import { DemoBadge, DossierSection, EmptyState, Modal, ReadonlyEvidence, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
-import { isActiveRequirementAdvancement, requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
+import { isActiveRequirementAdvancement, isRecoverableCancelledAdvancement, requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { DagTaskNode, Requirement, RequirementDetail, RequirementLane } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, VISIBLE_REQUIREMENT_LANES, requirementLaneLabel } from "./dashboard/types";
@@ -87,11 +87,12 @@ function startBlockedReason(detail: RequirementDetail, configured: boolean, poli
   if (!policyAvailable) return "项目配置的入口策略不存在或已归档";
   if (detail.lane === "clarify") return "需求仍在待澄清，请先补齐关键信息";
   if (detail.lane === "acceptance" || detail.lane === "merging" || detail.lane === "done") return "该需求已经进入验收、待合入或完成阶段";
-  if (detail.exception === "cancelled") return "已取消的需求不能开始推进";
+  if (detail.exception === "cancelled" && !isRecoverableCancelledAdvancement(detail)) return "已取消的需求不能开始推进";
   if (detail.acceptanceCriteria.length === 0) return "请先补齐至少一条可观察的验收标准";
   if (detail.advancement?.invocationId
     && detail.advancement.status !== "failed"
-    && detail.advancement.status !== "blocked") {
+    && detail.advancement.status !== "blocked"
+    && !isRecoverableCancelledAdvancement(detail)) {
     return "当前推进轮次已经产生 Run，请先处理该 Run";
   }
   return undefined;
@@ -148,7 +149,9 @@ export function RequirementDetailPage({
     : undefined;
   const launchGaps = launchDecision ? requirementAdvancementSafetyGaps(launchDecision, workflows, managementPolicies) : [];
   const blockedStart = detail ? startBlockedReason(detail, Boolean(advancementConfig), Boolean(activePolicy)) : undefined;
-  const canRestart = detail?.advancement?.status === "failed" || detail?.advancement?.status === "blocked";
+  const canRestart = Boolean(detail && (detail.advancement?.status === "failed"
+    || detail.advancement?.status === "blocked"
+    || isRecoverableCancelledAdvancement(detail)));
   const awaitingDecision = detail?.advancement?.status === "awaiting-human-decision";
   const blockerDetail = blockerFromProgress(blockerProgress, detail?.advancement?.error);
   const syncDashboardProjection = useCallback((updated: Requirement) => {
@@ -198,7 +201,7 @@ export function RequirementDetailPage({
     setEvaluatingLaunch(true);
     setLaunchError("");
     try {
-      const input = buildRequirementAdvancementInput(detail);
+      const input = buildRequirementAdvancementInput(detail, undefined, advancementConfig);
       const evaluationInput = {
         route: input.route,
         tags: input.tags,
@@ -238,7 +241,7 @@ export function RequirementDetailPage({
       setData({ ...detail, advancement, exception: null, updatedAt: advancement.updatedAt });
       const receipt = await gateway.dispatch(
         advancementConfig.entrancePolicyId,
-        buildRequirementAdvancementInput(detail, advancement)
+        buildRequirementAdvancementInput(detail, advancement, advancementConfig)
       );
       const updated = await service.syncRequirementAdvancement(detail.id, advancement.idempotencyKey, {
         invocationId: receipt.invocation.id,

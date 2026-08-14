@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { JsonObject, JsonValue } from "../core/types.js";
 import type {
   InvocationDetail,
@@ -12,6 +11,8 @@ import type {
 export interface InvocationProgress {
   invocationId: string;
   runId: string;
+  /** Monotonic sequence derived from durable status transitions for this Invocation. */
+  sequence: number;
   workflowId: string;
   architecture: string;
   /** Overall lifecycle status of the invocation. */
@@ -39,6 +40,16 @@ export interface InvocationProgress {
     HumanDecisionRequest,
     "id" | "status" | "riskCategory" | "summary" | "round" | "comment" | "createdAt" | "decidedAt"
   >;
+}
+
+export interface ProgressEvent {
+  sequence: number;
+  cursor: string;
+  source: "invocation";
+  phase: string;
+  metrics: { steps: number; completed: number; failed: number };
+  heartbeat: boolean;
+  terminal: boolean;
 }
 
 export interface InvocationProgressStep {
@@ -95,12 +106,14 @@ export interface WorkflowProgressWaitResult {
   reason: "changed" | "heartbeat" | "terminal";
   progressReport: string;
   progress: InvocationProgress;
+  event: ProgressEvent;
 }
 
 const EMPTY_TALLY: Record<WorkInstanceStatus, number> = {
   queued: 0,
   waiting: 0,
   running: 0,
+  "cancellation-requested": 0,
   completed: 0,
   blocked: 0,
   failed: 0,
@@ -224,6 +237,7 @@ export function computeInvocationProgress(detail: InvocationDetail): InvocationP
   return {
     invocationId: invocation.id,
     runId: invocation.runId,
+    sequence: invocation.transitions.length + instances.reduce((total, instance) => total + instance.transitions.length, 0),
     workflowId: invocation.target.id,
     architecture: invocation.executionSnapshot?.workflow.architecture ?? "unknown",
     status: invocation.status,
@@ -252,27 +266,11 @@ export function computeInvocationProgress(detail: InvocationDetail): InvocationP
 }
 
 /**
- * Opaque cursor for long polling. It deliberately excludes timestamps and only changes when
- * caller-visible invocation, instance, leader, or outcome state changes.
+ * Durable cursor derived only from persisted transitions. Legacy hash cursors remain tolerated
+ * by the wait API and are advanced to the current run/sequence cursor.
  */
 export function invocationProgressCursor(progress: InvocationProgress): string {
-  const visibleState = {
-    status: progress.status,
-    phase: progress.phase,
-    error: progress.error,
-    round: progress.round,
-    tally: progress.tally,
-    steps: progress.steps.map((step) => ({
-      nodeId: step.nodeId,
-      status: step.status,
-      phase: step.phase,
-      error: step.error
-    })),
-    leaderReport: progress.leaderReport,
-    humanDecision: progress.humanDecision,
-    outcome: progress.outcome
-  };
-  return `v1:${createHash("sha256").update(JSON.stringify(visibleState)).digest("hex")}`;
+  return `${progress.runId}:${progress.sequence}`;
 }
 
 function statusLabel(status: InvocationStatus): string {
@@ -282,6 +280,7 @@ function statusLabel(status: InvocationStatus): string {
   if (status === "cancelled") return "已取消";
   if (status === "queued") return "排队中";
   if (status === "awaiting-human-decision") return "等待人工决策";
+  if (status === "cancellation-requested") return "正在取消";
   return "执行中";
 }
 

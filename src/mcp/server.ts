@@ -27,13 +27,14 @@ function content(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
 }
 
-function invocationHeaders(metadata: { project?: string; contextId?: string; caller?: string } = {}): Record<string, string> {
+function invocationHeaders(metadata: { project?: string; contextId?: string; caller?: string; idempotencyKey?: string } = {}): Record<string, string> {
   return Object.fromEntries(Object.entries({
     "x-multi-agent-source": "mcp",
     "x-multi-agent-source-label": "MCP conversation",
-    "x-multi-agent-project": metadata.project,
-    "x-multi-agent-context": metadata.contextId,
-    "x-multi-agent-caller": metadata.caller
+    "x-multi-agent-project": metadata.project ? encodeUtf8HeaderValue(metadata.project) : undefined,
+    "x-multi-agent-context": metadata.contextId ? encodeUtf8HeaderValue(metadata.contextId) : undefined,
+    "x-multi-agent-caller": metadata.caller ? encodeUtf8HeaderValue(metadata.caller) : undefined,
+    "x-multi-agent-idempotency-key": metadata.idempotencyKey ? encodeUtf8HeaderValue(metadata.idempotencyKey) : undefined
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0));
 }
 
@@ -61,6 +62,7 @@ const entranceSourceSchema = z.object({
   caller: z.string().min(1).optional(),
   contextId: z.string().min(1).optional(),
   taskId: z.string().min(1).optional(),
+  idempotencyKey: z.string().min(1).optional(),
   publicationId: z.string().min(1).optional()
 }).strict();
 const entranceEvaluationShape = {
@@ -693,20 +695,22 @@ export function createWorkbenchMcpServer(
       entrancePolicyId: resourceId,
       ...entranceEvaluationShape,
       message: z.string().min(1).optional(),
-      sessionId: z.string().min(1).optional()
+      sessionId: z.string().min(1).optional(),
+      candidateUrl: z.string().url().optional()
     }
-  }, async ({ entrancePolicyId, route, specialistKey, tags, signals, source, message, sessionId }) => {
+  }, async ({ entrancePolicyId, route, specialistKey, tags, signals, source, message, sessionId, candidateUrl }) => {
     const dispatchSource = { ...source, kind: "mcp" as const };
     return content(await request(
       daemonUrl,
       `/api/entrance-policies/${encodeURIComponent(entrancePolicyId)}/dispatch`,
       {
         method: "POST",
-        body: JSON.stringify({ route, specialistKey, tags, signals, source: dispatchSource, message, sessionId }),
+        body: JSON.stringify({ route, specialistKey, tags, signals, source: dispatchSource, message, sessionId, candidateUrl }),
         headers: invocationHeaders({
           project: dispatchSource.project,
           contextId: dispatchSource.contextId,
-          caller: dispatchSource.caller
+          caller: dispatchSource.caller,
+          idempotencyKey: dispatchSource.idempotencyKey
         })
       }
     ));
@@ -822,18 +826,19 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("start_workflow", {
     title: "Start multi-agent workflow",
-    description: "Start a registered Graph or Supervisor workflow asynchronously. The host MUST immediately loop wait_workflow_progress using monitor.initialCursor; while terminal=false it MUST NOT end the current turn, and it MUST relay every changed result or heartbeat to the user. At terminal state deliver progressReport as the final summary. Supervisor starts also return leaderSessionId for later continue_workflow_conversation; Graph starts never impersonate a leader session.",
+    description: "Start a registered Graph or Supervisor workflow asynchronously. The host MUST immediately loop wait_workflow_progress using monitor.initialCursor and MUST NOT end the current turn while terminal=false. Relay only changed or terminal results; heartbeat is transport-only. Supervisor starts also return leaderSessionId.",
     inputSchema: {
       workflowId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
       project: z.string().min(1).optional(),
       contextId: z.string().min(1).optional(),
-      caller: z.string().min(1).optional()
+      caller: z.string().min(1).optional(),
+      idempotencyKey: z.string().min(1).optional()
     }
-  }, async ({ workflowId, input, project, contextId, caller }) => content(await request(
+  }, async ({ workflowId, input, project, contextId, caller, idempotencyKey }) => content(await request(
     daemonUrl,
     `/api/workflows/${encodeURIComponent(workflowId)}/start`,
-    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
+    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller, idempotencyKey }) }
   )));
 
   server.registerTool("get_invocation", {
@@ -843,6 +848,20 @@ export function createWorkbenchMcpServer(
   }, async ({ invocationId }) => content(await request(
     daemonUrl,
     `/api/invocations/${encodeURIComponent(invocationId)}`
+  )));
+
+  server.registerTool("cancel_workflow", {
+    title: "Cancel workflow",
+    description: "Durably request cancellation for an asynchronous Invocation. Repeated requests are idempotent and return the persisted terminal state.",
+    inputSchema: {
+      invocationId: z.string().min(1),
+      reason: z.string().max(4_000).optional(),
+      actor: z.string().min(1).optional()
+    }
+  }, async ({ invocationId, reason, actor }) => content(await request(
+    daemonUrl,
+    `/api/invocations/${encodeURIComponent(invocationId)}/cancel`,
+    { method: "POST", body: JSON.stringify({ reason, actor: actor ?? "mcp-local-owner" }) }
   )));
 
   server.registerTool("list_human_decision_requests", {
@@ -876,14 +895,15 @@ export function createWorkbenchMcpServer(
       requestId: z.string().min(1),
       decision: z.enum(["approve", "reject"]),
       comment: z.string().max(4_000).optional(),
+      candidateUrl: z.string().url().optional(),
       decidedBy: z.string().min(1).optional()
     }
-  }, async ({ requestId, decision, comment, decidedBy }) => content(await request(
+  }, async ({ requestId, decision, comment, candidateUrl, decidedBy }) => content(await request(
     daemonUrl,
     `/api/human-decision-requests/${encodeURIComponent(requestId)}/decide`,
     {
       method: "POST",
-      body: JSON.stringify({ decision, comment, decidedBy: decidedBy ?? "mcp-local-owner" })
+      body: JSON.stringify({ decision, comment, candidateUrl, decidedBy: decidedBy ?? "mcp-local-owner" })
     }
   )));
 
@@ -898,7 +918,7 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("wait_workflow_progress", {
     title: "Wait for workflow progress",
-    description: "Long-poll one asynchronous workflow without busy polling. Call immediately after start_workflow or an invocation-started Entrance dispatch, then call again with nextCursor while terminal=false. The host MUST keep the current turn open and report progressReport on every changed response and heartbeat; when terminal=true, stop waiting and actively deliver the final summary.",
+    description: "Long-poll one asynchronous workflow without busy polling. Call again with nextCursor while terminal=false. Only changed or terminal results may enter model context or be relayed to users; heartbeat is transport keepalive and MUST NOT be injected into model context or require a relay.",
     inputSchema: {
       invocationId: z.string().min(1),
       cursor: z.string().min(1).optional(),
@@ -963,18 +983,19 @@ export function createWorkbenchMcpServer(
 
   server.registerTool("start_publication", {
     title: "Start workflow package",
-    description: "Asynchronously start a published Workflow through its stable Publication boundary. The host MUST immediately loop wait_workflow_progress using monitor.initialCursor, MUST NOT end the current turn while terminal=false, and must relay every changed result or heartbeat before terminal delivery. Employee Publications must use invoke_publication.",
+    description: "Asynchronously start a published Workflow through its stable Publication boundary. The host MUST immediately loop wait_workflow_progress and MUST NOT end the current turn while terminal=false. Relay changed or terminal results only; heartbeat is transport-only. Employee Publications use invoke_publication.",
     inputSchema: {
       publicationId: z.string().min(1),
       input: z.record(z.string(), z.unknown()).optional(),
       project: z.string().min(1).optional(),
       contextId: z.string().min(1).optional(),
-      caller: z.string().min(1).optional()
+      caller: z.string().min(1).optional(),
+      idempotencyKey: z.string().min(1).optional()
     }
-  }, async ({ publicationId, input, project, contextId, caller }) => content(await request(
+  }, async ({ publicationId, input, project, contextId, caller, idempotencyKey }) => content(await request(
     daemonUrl,
     `/api/publications/${encodeURIComponent(publicationId)}/start`,
-    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller }) }
+    { method: "POST", body: JSON.stringify(input ?? {}), headers: invocationHeaders({ project, contextId, caller, idempotencyKey }) }
   )));
 
   server.registerTool("resume_workflow_monitor", {
@@ -991,6 +1012,12 @@ export function createWorkbenchMcpServer(
     description: "List recent immutable Run records and their workflow status.",
     inputSchema: { limit: z.number().int().min(1).max(200).optional() }
   }, async ({ limit }) => content(await request(daemonUrl, `/api/runs?limit=${limit ?? 50}`)));
+
+  server.registerTool("get_run_receipt", {
+    title: "Get Run receipt",
+    description: "Read the canonical Run receipt, including legacy markers and available evidence links.",
+    inputSchema: { runId: z.string().regex(/^run-[A-Za-z0-9-]+$/) }
+  }, async ({ runId }) => content(await request(daemonUrl, `/api/runs/${encodeURIComponent(runId)}/receipt`)));
 
   server.registerTool("search_memory", {
     title: "Search employee memory",

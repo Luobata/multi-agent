@@ -13,6 +13,14 @@ export { createDefaultProviderRegistry, registerProviderAdapter } from "./runtim
 export type * from "./runtime/providers.js";
 export { runWorkflow } from "./runtime/runner.js";
 export {
+  normalizeValidationGroups,
+  preflightGateCandidate,
+  recordEnvironmentFailure,
+  reusableGateShard,
+  supportedRequiredChecks
+} from "./runtime/gateGovernance.js";
+export type { EnvironmentCircuitState, GateCandidatePreflight, GateShardEvidence, ValidationGroup } from "./runtime/gateGovernance.js";
+export {
   assessQueuedRun,
   createMergeValidationWorktree,
   discardRunWorktree,

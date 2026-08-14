@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RunsPage, acceptanceSnapshotFromPreview, filterRuns, sortHumanDecisionRequests } from "./RunsPage";
+import { RunsPage, acceptanceSnapshotFromPreview, filterRuns, isRunAcceptanceReady, sortHumanDecisionRequests } from "./RunsPage";
 import type { DashboardService } from "./dashboard/service";
 import type { Requirement } from "./dashboard/types";
 import type { HumanDecisionRequest, Run, RunMergePreview, RunMergeQueueResult } from "./types";
@@ -19,6 +19,7 @@ function unavailablePreview(runId: string): RunMergePreview {
     status: "not-ready",
     eligible: false,
     reasons: ["该 Run 没有可交付的 worktree。"],
+    acceptanceReadiness: { ready: false, reasons: ["该 Run 没有可验证的受管 worktree。"] },
     targetClean: false,
     changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 262_144 } },
     safeGitCommands: [],
@@ -281,6 +282,37 @@ describe("RunsPage focused hash selection", () => {
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an already loaded focused dossier interactive while background refreshes are pending", async () => {
+    let releaseList!: () => void;
+    let releaseDetail!: () => void;
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return new Promise((resolve) => {
+        releaseList = () => resolve({ ok: true, status: 200, json: async () => ({ data: runs }) });
+      });
+      if (url === "/api/runs/run-graph-1") return new Promise((resolve) => {
+        releaseDetail = () => resolve({ ok: true, status: 200, json: async () => ({ data: runs[1] }) });
+      });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: unavailablePreview("run-graph-1") }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+    });
+
+    await act(async () => {
+      root.render(<RunsPage notify={vi.fn()} focusedRunId="run-graph-1" activityRevision="poll-in-flight" />);
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".run-dossier")).toBeTruthy();
+    expect(container.querySelector('[aria-label="正在调取运行卷宗"]')).toBeNull();
+    expect(container.querySelector(".dossier-cover code")?.textContent).toBe("run-graph-1");
+
+    await act(async () => {
+      releaseList();
+      releaseDetail();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  });
+
   it("updates the deep link when the operator selects another run", async () => {
     const onSelectRun = vi.fn();
     await act(async () => { root.render(<RunsPage notify={vi.fn()} focusedRunId="run-graph-1" onSelectRun={onSelectRun} />); await Promise.resolve(); });
@@ -294,6 +326,68 @@ describe("RunsPage focused hash selection", () => {
     expect(container.querySelector(".page-grid--runs-embedded")).toBeTruthy();
     expect(container.textContent).toContain("验收与合并");
     expect(container.textContent).not.toContain("运行元数据");
+  });
+
+  it("switches an embedded requirement dossier to the new exact focused Run without falling back to the first Run", async () => {
+    await act(async () => {
+      root.render(<RunsPage notify={vi.fn()} mode="embedded" focusedRunId="run-graph-1" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector("#run-graph-1")?.classList.contains("selected")).toBe(true);
+
+    await act(async () => {
+      root.render(<RunsPage notify={vi.fn()} mode="embedded" focusedRunId="run-sup-1" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector("#run-sup-1")?.classList.contains("selected")).toBe(true);
+    expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
+    expect(container.querySelector(".dossier-cover code")?.textContent).toBe("run-sup-1");
+  });
+
+  it("renders a focused Run returned by the detail endpoint even when it is outside the recent list", async () => {
+    const historicalRun: Run = {
+      ...runs[1],
+      id: "run-historical-103",
+      workflow: "req-103-acceptance",
+      artifactDir: "/historical/req-103"
+    };
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: runs }) });
+      if (url === `/api/runs/${historicalRun.id}`) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: historicalRun }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: unavailablePreview(historicalRun.id) }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+    });
+
+    await act(async () => {
+      root.render(<RunsPage notify={vi.fn()} mode="embedded" focusedRunId={historicalRun.id} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".dossier-cover code")?.textContent).toBe(historicalRun.id);
+    expect(container.textContent).toContain("req-103-acceptance");
+    expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
+  });
+
+  it("shows the focused target error and never falls back when its detail request fails", async () => {
+    const missingRunId = "run-missing-focused-103";
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: runs }) });
+      if (url === `/api/runs/${missingRunId}`) return Promise.resolve({ ok: false, status: 404, json: async () => ({ error: { message: "目标 Run 不存在" } }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+    });
+
+    await act(async () => {
+      root.render(<RunsPage notify={vi.fn()} mode="embedded" focusedRunId={missingRunId} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("目标 Run 不存在");
+    expect(container.textContent).toContain(missingRunId);
+    expect(container.querySelector(".run-dossier")).toBeNull();
+    expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
   });
 
   it("shows a persistent establishing state instead of selecting the first Run", async () => {
@@ -346,6 +440,7 @@ const eligiblePreview: RunMergePreview = {
   status: "awaiting-acceptance",
   eligible: true,
   reasons: [],
+  acceptanceReadiness: { ready: false, reasons: ["仅 merged 历史交付使用独立回填资格。"] },
   worktreePath: deliveryRun.isolation?.worktreePath,
   repositoryRoot: "/repo",
   targetBranch: "main",
@@ -378,7 +473,7 @@ describe("RunsPage delivery acceptance", () => {
   let root: Root;
   const fetchMock = vi.fn();
   const notify = vi.fn();
-  let deliveryStatus: "base" | "conflict" | "conflict-failed" | "evidence-failed" | "retesting" | "kept" | "discarded" = "base";
+  let deliveryStatus: "base" | "conflict" | "conflict-failed" | "evidence-failed" | "evidence-queued" | "retesting" | "kept" | "discarded" | "merged" = "base";
   let heldMergePreview: Promise<{ ok: boolean; status: number; json: () => Promise<{ data: RunMergePreview }> }> | undefined;
 
   beforeEach(async () => {
@@ -421,7 +516,7 @@ describe("RunsPage delivery acceptance", () => {
               message: "CONFLICT (content): Merge conflict in client/src/RunsPage.tsx"
             }
           }
-          : deliveryStatus === "evidence-failed"
+          : deliveryStatus === "evidence-failed" || deliveryStatus === "evidence-queued"
             ? {
               ...eligiblePreview,
               delivery: {
@@ -429,7 +524,7 @@ describe("RunsPage delivery acceptance", () => {
                 status: "awaiting-acceptance" as const,
                 updatedAt: "2026-08-06T06:05:00.000Z",
                 evidenceRerun: {
-                  status: "failed" as const,
+                  status: deliveryStatus === "evidence-queued" ? "queued" as const : "failed" as const,
                   actor: "workbench-operator",
                   requestedAt: "2026-08-06T05:50:00.000Z",
                   updatedAt: "2026-08-06T06:05:00.000Z",
@@ -454,6 +549,19 @@ describe("RunsPage delivery acceptance", () => {
                   }
                 }
               }
+          : deliveryStatus === "merged"
+            ? {
+              ...eligiblePreview,
+              status: "merged" as const,
+              eligible: false,
+              reasons: ["该交付已经合并。"],
+              acceptanceReadiness: { ready: true, reasons: [] },
+              delivery: {
+                runId: deliveryRun.id, status: "merged" as const, updatedAt: "2026-08-12T04:00:00.000Z",
+                baseCommit: "base", sourceBranch: "codex/run-delivery-ui-1", sourceCommit: "source",
+                targetBranch: "main", mergeCommit: "merge"
+              }
+            }
           : deliveryStatus === "kept"
             ? {
               ...eligiblePreview,
@@ -570,22 +678,150 @@ describe("RunsPage delivery acceptance", () => {
     expect(Array.from(container.querySelectorAll("button")).some((button) => button.textContent === "批准并加入待合入")).toBe(true);
   });
 
-  it("offers an independent screenshot rerun when the Evidence wall has no media", async () => {
+  it("offers only acceptance backfill for a ready merged delivery", async () => {
+    deliveryStatus = "merged";
+    const dashboard = {
+      getRequirement: vi.fn().mockResolvedValue({ evidence: {} }),
+      submitRequirementForAcceptance: vi.fn().mockResolvedValue({ id: "req-104", code: "REQ-104", lane: "acceptance" }),
+      syncRequirementDelivery: vi.fn().mockResolvedValue({ id: "req-104" })
+    };
+    act(() => root.unmount());
+    root = createRoot(container);
+    await act(async () => {
+      root.render(<RunsPage notify={notify} dashboard={dashboard as never} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const labels = Array.from(container.querySelectorAll("button")).map((button) => button.textContent);
+    expect(labels).toContain("补登记该需求到待验收");
+    expect(labels).not.toContain("批准并加入待合入");
+    expect(labels).not.toContain("让 test-engineer 补采证据");
+    const backfill = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "补登记该需求到待验收");
+    await act(async () => { backfill?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(dashboard.submitRequirementForAcceptance).toHaveBeenCalledWith("req-104", expect.objectContaining({
+      runId: deliveryRun.id, eligible: true, diffFiles: ["client/src/RunsPage.tsx"]
+    }));
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/merge-queue"))).toBe(false);
+  });
+
+  it("navigates to a different bound acceptance Run without starting a cross-Run evidence rerun", async () => {
     const originalAssets = eligiblePreview.evidence.assets;
     eligiblePreview.evidence.assets = [];
     try {
       const projected = { id: "req-104", code: "REQ-104", lane: "running" } as Requirement;
-      const dashboard = { syncRequirementEvidenceCapture: vi.fn().mockResolvedValue(projected) } as unknown as DashboardService;
+      const dashboard = {
+        getRequirement: vi.fn().mockResolvedValue({ evidence: { acceptance: { runId: "run-accepted" } } }),
+        syncRequirementEvidenceCapture: vi.fn().mockResolvedValue(projected)
+      } as unknown as DashboardService;
       const onDashboardSync = vi.fn();
-      await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} onDashboardSync={onDashboardSync} />); await Promise.resolve(); });
-      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
-      expect(rerun).toBeTruthy();
-      await act(async () => { rerun?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
-      expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
-      expect(dashboard.syncRequirementEvidenceCapture).toHaveBeenCalledTimes(1);
-      expect(onDashboardSync).toHaveBeenCalledWith(projected);
+      const onSelectRun = vi.fn();
+      await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} onDashboardSync={onDashboardSync} onSelectRun={onSelectRun} />); await Promise.resolve(); });
+      const openBoundRun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "打开该需求绑定的验收 Run →");
+      expect(openBoundRun).toBeTruthy();
+      expect(container.textContent).toContain("为避免跨 Run 写入，不能在当前卷宗补采");
+      await act(async () => { openBoundRun?.click(); await Promise.resolve(); });
+      expect(onSelectRun).toHaveBeenCalledWith("run-accepted");
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST")).toBe(false);
+      expect(dashboard.syncRequirementEvidenceCapture).not.toHaveBeenCalled();
     } finally {
       eligiblePreview.evidence.assets = originalAssets;
+    }
+  });
+
+  it("reruns evidence for the selected bound Run when media is missing and its worktree exists", async () => {
+    const originalAssets = eligiblePreview.evidence.assets;
+    eligiblePreview.evidence.assets = [];
+    try {
+      const projected = { id: "req-104", code: "REQ-104", lane: "acceptance" } as Requirement;
+      const dashboard = {
+        getRequirement: vi.fn().mockResolvedValue({ evidence: { acceptance: { runId: deliveryRun.id } } }),
+        syncRequirementEvidenceCapture: vi.fn().mockResolvedValue(projected)
+      } as unknown as DashboardService;
+      await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} />); await Promise.resolve(); });
+      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
+      expect(rerun?.disabled).toBe(false);
+      await act(async () => { rerun?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith(`/api/runs/${deliveryRun.id}/evidence-rerun`) && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
+      expect(dashboard.syncRequirementEvidenceCapture).toHaveBeenCalledWith("req-104", deliveryRun.id, expect.objectContaining({ status: "queued" }));
+    } finally {
+      eligiblePreview.evidence.assets = originalAssets;
+    }
+  });
+
+  it("reruns evidence for the selected Run without a task binding", async () => {
+    const originalAssets = eligiblePreview.evidence.assets;
+    const originalTaskId = deliveryRun.taskId;
+    eligiblePreview.evidence.assets = [];
+    deliveryRun.taskId = undefined;
+    try {
+      await act(async () => { root.render(<RunsPage notify={notify} />); await Promise.resolve(); });
+      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
+      expect(rerun?.disabled).toBe(false);
+      expect(container.textContent).not.toContain("该需求尚未提交到待验收");
+      await act(async () => { rerun?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith(`/api/runs/${deliveryRun.id}/evidence-rerun`) && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
+    } finally {
+      eligiblePreview.evidence.assets = originalAssets;
+      deliveryRun.taskId = originalTaskId;
+    }
+  });
+
+  it("fails closed with an explicit reason when the acceptance binding cannot be read", async () => {
+    const originalAssets = eligiblePreview.evidence.assets;
+    eligiblePreview.evidence.assets = [];
+    const dashboard = {
+      getRequirement: vi.fn().mockRejectedValue(new Error("dashboard unavailable")),
+      syncRequirementEvidenceCapture: vi.fn()
+    } as unknown as DashboardService;
+    try {
+      await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} />); await new Promise((resolve) => setTimeout(resolve, 0)); });
+      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
+      expect(rerun?.disabled).toBe(true);
+      expect(container.textContent).toContain("无法核对该需求绑定的验收 Run，请重试或刷新页面后再补采");
+      expect(container.textContent).not.toContain("该需求尚未提交到待验收");
+      rerun?.click();
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST")).toBe(false);
+    } finally {
+      eligiblePreview.evidence.assets = originalAssets;
+    }
+  });
+
+  it("keeps evidence rerun disabled with a visible reason while the acceptance binding loads", async () => {
+    const originalAssets = eligiblePreview.evidence.assets;
+    eligiblePreview.evidence.assets = [];
+    const dashboard = {
+      getRequirement: vi.fn().mockReturnValue(new Promise(() => undefined)),
+      syncRequirementEvidenceCapture: vi.fn()
+    } as unknown as DashboardService;
+    try {
+      await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} />); await Promise.resolve(); });
+      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
+      expect(rerun?.disabled).toBe(true);
+      expect(container.textContent).toContain("正在核对该需求绑定的验收 Run");
+      rerun?.click();
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST")).toBe(false);
+    } finally {
+      eligiblePreview.evidence.assets = originalAssets;
+    }
+  });
+
+  it("explains why the bound acceptance Run cannot rerun evidence without a worktree", async () => {
+    const originalAssets = eligiblePreview.evidence.assets;
+    const originalWorktreePath = eligiblePreview.worktreePath;
+    eligiblePreview.evidence.assets = [];
+    eligiblePreview.worktreePath = undefined;
+    const dashboard = {
+      getRequirement: vi.fn().mockResolvedValue({ evidence: { acceptance: { runId: deliveryRun.id } } }),
+      syncRequirementEvidenceCapture: vi.fn()
+    } as unknown as DashboardService;
+    try {
+      await act(async () => { root.render(<RunsPage notify={notify} dashboard={dashboard} />); await Promise.resolve(); });
+      const rerun = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "让 test-engineer 补采证据");
+      expect(rerun?.disabled).toBe(true);
+      expect(container.textContent).toContain("绑定的验收 Run 没有可用 worktree");
+      expect(container.textContent).toContain("请重新发起验收 Run");
+    } finally {
+      eligiblePreview.evidence.assets = originalAssets;
+      eligiblePreview.worktreePath = originalWorktreePath;
     }
   });
 
@@ -605,6 +841,25 @@ describe("RunsPage delivery acceptance", () => {
     expect(fetchMock.mock.calls.some(([input, init]) => (
       String(input).endsWith("/evidence-rerun") && (init as RequestInit | undefined)?.method === "POST"
     ))).toBe(false);
+  });
+
+  it("does not project a queued rerun superseded by the fixed acceptance snapshot", async () => {
+    deliveryStatus = "evidence-queued";
+    const dashboard = {
+      getRequirement: vi.fn().mockResolvedValue({ evidence: { acceptance: {
+        runId: deliveryRun.id,
+        capturedAt: "2026-08-06T06:10:00.000Z",
+        mediaCount: 4
+      } } }),
+      syncRequirementEvidenceCapture: vi.fn()
+    } as unknown as DashboardService;
+
+    await act(async () => {
+      root.render(<RunsPage notify={notify} dashboard={dashboard} activityRevision="stale-evidence-queued" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(dashboard.syncRequirementEvidenceCapture).not.toHaveBeenCalled();
   });
 
   it("shows conflict revalidation as a pre-merge stage and keeps the dossier stable while polling", async () => {
@@ -654,6 +909,40 @@ describe("RunsPage delivery acceptance", () => {
     expect(snapshot.eligible).toBe(true);
     expect(snapshot.testGate?.status).toBe("passed");
     expect(snapshot.reviewGate?.status).toBe("passed");
+  });
+
+  it("keeps a verified Run acceptance-ready when only target cleanliness blocks merge", () => {
+    const preview: RunMergePreview = {
+      ...eligiblePreview,
+      status: "not-ready",
+      eligible: false,
+      reasons: ["目标仓库存在未提交改动，请先处理后再合并。"],
+      acceptanceReadiness: { ready: false, reasons: ["缺少与当前 Run 精确匹配的 merged 交付记录。"] }
+    };
+    expect(isRunAcceptanceReady(preview)).toBe(true);
+    expect(acceptanceSnapshotFromPreview(preview, "2026-08-14T05:30:00.000Z").eligible).toBe(true);
+  });
+
+  it("does not bypass a product or evidence blocker when merge is also unavailable", () => {
+    const preview: RunMergePreview = {
+      ...eligiblePreview,
+      status: "not-ready",
+      eligible: false,
+      reasons: ["Run 尚未通过，不能进入合并验收。", "目标仓库存在未提交改动，请先处理后再合并。"],
+      acceptanceReadiness: { ready: false, reasons: ["Run 尚未通过。"] }
+    };
+    expect(isRunAcceptanceReady(preview)).toBe(false);
+  });
+
+  it("derives a fixed acceptance snapshot from merged historical readiness without reopening merge eligibility", () => {
+    const snapshot = acceptanceSnapshotFromPreview({
+      ...eligiblePreview,
+      status: "merged",
+      eligible: false,
+      reasons: ["该交付已经合并。"],
+      acceptanceReadiness: { ready: true, reasons: [] }
+    }, "2026-08-12T04:00:00.000Z");
+    expect(snapshot).toMatchObject({ runId: deliveryRun.id, eligible: true, diffFiles: ["client/src/RunsPage.tsx"] });
   });
 
   it("opens the validated worktree through the explicit daemon action", async () => {

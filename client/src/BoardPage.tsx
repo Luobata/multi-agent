@@ -6,10 +6,10 @@ import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, form
 import { requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { ManagedProject, Requirement, RequirementException, RequirementPriority, SpaceNode } from "./dashboard/types";
-import { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
+import { acceptanceSnapshotFromPreview, isRunAcceptanceReady } from "./dashboard/acceptance";
 import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_PRIORITY_LABELS, VISIBLE_REQUIREMENT_LANES, visibleRequirementLane } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
-import type { HumanDecisionRequest, InvocationRecord, JsonValue, Project, RunMergePreview, Session } from "./types";
+import type { HumanDecisionRequest, InvocationRecord, JsonValue, Project, ProjectBinding, RunMergePreview, Session } from "./types";
 import "./board-ai.css";
 
 const REQUIREMENT_STEWARD_ROLE_ID = "requirement-steward";
@@ -127,7 +127,7 @@ function deliveryProgressChip(requirement: Requirement) {
   return <span className="board-evidence-capture" role="status">{labels[requirement.delivery.status]}</span>;
 }
 
-export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", sourceReady = true, sourceError, onRetrySource, projects: connectedProjects = EMPTY_PROJECTS, invocations = EMPTY_INVOCATIONS, humanDecisionRequests = EMPTY_HUMAN_DECISION_REQUESTS, onOpenRun }: {
+export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", sourceReady = true, sourceError, onRetrySource, projects: connectedProjects = EMPTY_PROJECTS, projectBindings, invocations = EMPTY_INVOCATIONS, humanDecisionRequests = EMPTY_HUMAN_DECISION_REQUESTS, onOpenRun }: {
   spaceId?: string;
   go: (hash: string) => void;
   notify: (message: string, kind?: "success" | "error") => void;
@@ -138,6 +138,8 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   sourceError?: string;
   onRetrySource?: () => void;
   projects?: Project[];
+  /** When supplied by bootstrap, AI creation fails closed unless the required Project Role is assigned. */
+  projectBindings?: ProjectBinding[];
   invocations?: InvocationRecord[];
   humanDecisionRequests?: HumanDecisionRequest[];
   onOpenRun?: (runId: string) => void;
@@ -147,49 +149,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   const { state, reload, setData } = useServiceData<{ requirements: Requirement[]; nodes: SpaceNode[] }>(
     async () => {
       const [requirements, nodes] = await Promise.all([service.listBoard(spaceId), service.listSpaces()]);
-      const invocationById = new Map(invocations.map((invocation) => [invocation.id, invocation]));
-      const reconciled = await Promise.all(requirements.map(async (requirement) => {
-        const advancement = requirement.advancement;
-        if (!advancement?.invocationId) return requirement;
-        const invocation = invocationById.get(advancement.invocationId);
-        if (!invocation) return requirement;
-        const config = requirementAdvancementConfig(
-          connectedProjects.find((project) => project.id === requirement.projectId)
-        );
-        let updated = requirement;
-        if (invocation.status !== advancement.status) {
-          updated = await service.syncRequirementAdvancement(requirement.id, advancement.idempotencyKey, {
-            invocationId: invocation.id,
-            runId: invocation.runId,
-            leaderSessionId: invocation.sessionId,
-            status: invocation.status,
-            observedAt: invocation.updatedAt,
-            error: invocation.error
-          }, config?.pollIntervalMs ?? 15_000);
-        }
-        if (invocation.status !== "completed" || !invocation.runId
-          || updated.lane === "acceptance" || updated.lane === "merging" || updated.lane === "done") return updated;
-        const preview = await api<RunMergePreview>(`/api/runs/${encodeURIComponent(invocation.runId)}/merge-preview`);
-        if (preview.status === "merged" || preview.delivery?.status === "merged") {
-          return service.syncRequirementDelivery(requirement.id, invocation.runId, "merged");
-        }
-        if (!preview.eligible) {
-          const warning = `${requirement.code} 已完成，但交付证据尚未满足自动待验收门禁：${preview.reasons.join("；") || "交付预览未就绪"}`;
-          const warningKey = `${requirement.id}:${invocation.runId}:${preview.status}:${warning}`;
-          if (!reportedAcceptanceWarnings.current.has(warningKey)) {
-            reportedAcceptanceWarnings.current.add(warningKey);
-            notify(warning, "error");
-          }
-          return updated;
-        }
-        return service.submitRequirementForAcceptance(
-          requirement.id,
-          acceptanceSnapshotFromPreview(preview, new Date().toISOString())
-        );
-      }));
-      return { requirements: reconciled, nodes };
+      return { requirements, nodes };
     },
-    [service, spaceId, catalogRevision, connectedProjects, invocations, notify],
+    [service, spaceId, catalogRevision],
     { enabled: sourceReady }
   );
   const [query, setQuery] = useState("");
@@ -217,9 +179,31 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   const data = state.status === "ready" ? state.data : undefined;
   const project = data?.nodes.find((node) => node.id === spaceId && node.kind === "project");
   const projects = (data?.nodes ?? []).filter((node): node is ManagedProject => node.kind === "project" && !node.archivedAt);
+  const requirementStewardProjectIds = new Set(
+    projectBindings === undefined && connectedProjects.length === 0
+      ? projects.map((candidate) => candidate.id)
+      : connectedProjects.flatMap((candidate) => {
+          if (candidate.status !== "active" || !candidate.roles.some((role) => role.id === REQUIREMENT_STEWARD_ROLE_ID)) return [];
+          if (projectBindings === undefined) return [candidate.id];
+          const binding = projectBindings
+            .filter((entry) => entry.projectId === candidate.id && entry.projectVersion === candidate.version)
+            .sort((left, right) => right.version - left.version)[0];
+          return binding?.roles.some((role) => role.roleId === REQUIREMENT_STEWARD_ROLE_ID) ? [candidate.id] : [];
+        })
+  );
+  // A project-scoped board must never inherit readiness from a different project.
+  // Otherwise an assigned steward elsewhere makes this page's AI button appear
+  // callable even though the current Project Role invocation will fail closed.
+  const agentProjects = projects.filter((candidate) =>
+    (!spaceId || candidate.id === spaceId) && requirementStewardProjectIds.has(candidate.id)
+  );
   const defaultCreateProjectId = () => {
     const candidate = spaceId ?? (projectFilter !== "all" ? projectFilter : "");
     return projects.some((item) => item.id === candidate) ? candidate : "";
+  };
+  const defaultAgentProjectId = () => {
+    const candidate = spaceId ?? (projectFilter !== "all" ? projectFilter : "");
+    return agentProjects.some((item) => item.id === candidate) ? candidate : "";
   };
   const projectName = (projectId: string) => data?.nodes.find((node) => node.id === projectId)?.name ?? projectId;
   const filtered = useMemo(() => {
@@ -237,6 +221,13 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     for (const requirement of filtered) map.get(visibleRequirementLane(requirement.lane))?.push(requirement);
     return map;
   }, [filtered]);
+  const actionGuidance = state.status !== "ready"
+    ? "正在同步最新需求数据；同步完成后才可创建。"
+    : projects.length === 0
+      ? "还没有 active 项目。请先到项目页读取声明并完成接入。"
+      : agentProjects.length === 0
+        ? "手动创建可用；AI 需求入口需要项目声明 requirement-steward 角色，并在接入配置中完成员工分派。"
+        : undefined;
 
   // The requirement board is a local projection; Invocation activity is the
   // durable source of truth. Reconcile whenever the app receives an SSE/bootstrap
@@ -301,7 +292,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
           if (preview.status === "merged" || preview.delivery?.status === "merged") {
             return service.syncRequirementDelivery(requirement.id, invocation.runId, "merged");
           }
-          if (!preview.eligible) {
+          if (!isRunAcceptanceReady(preview)) {
             const warning = `${requirement.code} 已完成，但交付证据尚未满足自动待验收门禁：${preview.reasons.join("；") || "交付预览未就绪"}`;
             const warningKey = `${requirement.id}:${invocation.runId}:${preview.status}:${warning}`;
             if (!reportedAcceptanceWarnings.current.has(warningKey)) {
@@ -319,8 +310,10 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
           return updated;
         }
       }));
-      for (const result of results) {
-        if (result.status === "fulfilled") updatedById.set(result.value.id, result.value);
+      for (const [index, result] of results.entries()) {
+        if (result.status === "fulfilled" && result.value !== pending[index]!.requirement) {
+          updatedById.set(result.value.id, result.value);
+        }
       }
       if (!cancelled && updatedById.size > 0) {
         setData({
@@ -329,9 +322,10 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
         });
       }
       if (!cancelled && warnings.length > 0) notify(warnings[0]!, "error");
-      const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      const rejectedIndex = results.findIndex((result) => result.status === "rejected");
+      const rejected = rejectedIndex >= 0 ? results[rejectedIndex] as PromiseRejectedResult : undefined;
       if (!cancelled && rejected) {
-        notify(`需求推进状态同步失败：${rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason)}`, "error");
+        notify(`${pending[rejectedIndex]!.requirement.code} 需求推进状态同步失败：${rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason)}`, "error");
       }
     })();
     return () => { cancelled = true; };
@@ -354,12 +348,12 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   };
 
   const openAgentCreate = () => {
-    resetAgentConversation(defaultCreateProjectId());
+    resetAgentConversation(defaultAgentProjectId());
     setAgentOpen(true);
   };
 
   const talkToRequirementSteward = async (draft: ComposerDraft): Promise<boolean> => {
-    if (!agentProjectId) return false;
+    if (!agentProjectId || !requirementStewardProjectIds.has(agentProjectId)) return false;
     setAgentError("");
     // A follow-up invalidates the visible draft immediately. The user must never be able to
     // confirm an older draft while the Agent is reconsidering scope or asking a new question.
@@ -462,8 +456,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       eyebrow="BOARD / SEVEN LANES"
       title={project ? `${project.name} · 需求看板` : "需求看板"}
       description="七列流转；排队中 / 执行中 / 待确认 / 待合入只由真实 Run 自动更新。人工验收后进入串行合入队列；冲突会留在待合入并显示阻塞，由原领队规划取舍、委派工程角色在原 worktree rebase，再经独立重测与原领队复验；只有无法恢复的异常才退回待验收。"
-      actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" disabled={!daemonAvailable || state.status !== "ready" || projects.length === 0} title={state.status !== "ready" ? "正在同步最新需求数据" : projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" disabled={!daemonAvailable || state.status !== "ready" || projects.length === 0} title={state.status !== "ready" ? "正在同步最新需求数据" : projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
+      actions={<>{spaceId && <button type="button" className="button secondary" onClick={() => go(`projects/${spaceId}`)}>← 返回项目详情</button>}<button type="button" className="button secondary" aria-describedby={actionGuidance ? "board-action-guidance" : undefined} disabled={!daemonAvailable || state.status !== "ready" || projects.length === 0} title={state.status !== "ready" ? "正在同步最新需求数据" : projects.length === 0 ? "请先正式接入一个 active 项目" : undefined} onClick={openCreate}>手动创建</button><button type="button" className="button primary" aria-describedby={actionGuidance ? "board-action-guidance" : undefined} disabled={!daemonAvailable || state.status !== "ready" || agentProjects.length === 0} title={state.status !== "ready" ? "正在同步最新需求数据" : agentProjects.length === 0 ? "没有已分派需求管家角色的 active 项目；请先在项目接入中完成角色任用" : undefined} onClick={openAgentCreate}>和 AI 说需求</button></>}
     />
+    {actionGuidance && <p id="board-action-guidance" className="dash-hint-line board-action-guidance" role="status">{actionGuidance}{state.status === "ready" && <button type="button" className="text-button" onClick={() => go("projects")}>前往项目接入 →</button>}</p>}
     <OfflineNotice />
     <div className="board-toolbar">
       <label className="space-search"><span className="sr-only">搜索需求</span><input type="search" placeholder="搜索编号、标题或摘要…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
@@ -552,7 +547,7 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
       <div className="board-ai-layout">
         <section className="board-ai-conversation" aria-label="需求管家对话">
           <header><div><span className="ai-content-badge">AI 生成内容</span><h3>先描述，再决定怎么推进</h3></div><p>文字、粘贴图片和飞书文档都会进入同一份会话证据；Agent 只整理草稿，不会替你创建需求。</p></header>
-          <Field label="所属项目"><SelectControl ariaLabel="AI 需求所属项目" value={agentProjectId} placeholder="请选择所属项目" options={projects.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => resetAgentConversation(value)} /></Field>
+          <Field label="所属项目"><SelectControl ariaLabel="AI 需求所属项目" value={agentProjectId} placeholder="请选择所属项目" options={agentProjects.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => resetAgentConversation(value)} /></Field>
           {!agentProjectId && <p className="muted">请先选择归属项目，再向需求管家描述需求。</p>}
           <div className="board-ai-transcript" aria-live="polite">
             {!agentSession && <div className="board-ai-welcome"><strong>把现在知道的都说出来</strong><p>可以是零散描述、界面截图或飞书 docx / wiki 链接。信息不足时我会先追问；足够时才给出可编辑草稿。</p></div>}

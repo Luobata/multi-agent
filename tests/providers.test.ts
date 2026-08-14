@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { ProviderExecutionError } from "../src/core/errors.js";
-import { buildCodexInvocationArgs, createDefaultProviderRegistry, providerChunkSignalsProgress, providerExitDiagnostic, providerSpawnEnvironment, registerProviderAdapter } from "../src/runtime/providers.js";
+import { buildCodexInvocationArgs, createDefaultProviderRegistry, providerChunkSignalsProgress, providerContract, providerExitDiagnostic, providerSpawnEnvironment, registerProviderAdapter } from "../src/runtime/providers.js";
 
 describe("provider adapters", () => {
+  it("declares that Codex enforces strict output schemas at invocation", () => {
+    expect(providerContract(createDefaultProviderRegistry().get("codex")!)).toMatchObject({
+      capabilities: ["strict-output-schema"],
+      invocationRequirements: ["strict-output-schema"]
+    });
+  });
+
   it("prepends the daemon Node directory so env-based Codex launchers work without a shell profile", () => {
     const inherited = { PATH: ["/usr/bin", "/bin"].join(":"), KEEP: "yes" };
     expect(providerSpawnEnvironment(inherited, "/opt/homebrew/bin/node")).toMatchObject({

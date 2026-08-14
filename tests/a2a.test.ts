@@ -81,7 +81,8 @@ describe("A2A publication mapping", () => {
     await service.createManagementPolicy({
       id: "a2a-supervision",
       allowedRoleIds: ["worker"],
-      instructions: "Finish when the available evidence is sufficient."
+      instructions: "Finish when the available evidence is sufficient.",
+      completion: { requireDelegation: false }
     });
     await service.createWorkflow({
       id: "a2a-supervisor-team",

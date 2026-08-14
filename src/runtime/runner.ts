@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { Ajv, type ErrorObject } from "ajv";
@@ -21,8 +21,26 @@ import type {
   WorkflowRunRecord
 } from "../core/types.js";
 import { RunStore, type RunEvent } from "./artifacts.js";
-import { createDefaultProviderRegistry, type ProviderProgress, type ProviderRegistry } from "./providers.js";
-import { parseProviderOutput, readJsonSchema, statusFromVerdict, validateStructuredOutput } from "./output.js";
+import { candidateWorkspaceSnapshot } from "./candidateRevision.js";
+import { createDefaultProviderRegistry, providerContract, type ProviderProgress, type ProviderRegistry } from "./providers.js";
+import { parseProviderOutput, preflightStrictOutputSchema, readJsonSchema, statusFromVerdict, validateStructuredOutput } from "./output.js";
+import {
+  ExecutionBudget,
+  ExecutionBudgetExceededError,
+  CapabilityBrokerUnavailableError,
+  SideEffectAuthorizationError,
+  type CapabilityBroker,
+  type Checkpoint,
+  type ExecutionBudgetSnapshot
+} from "./governance.js";
+
+const INLINE_DEPENDENCY_BYTES = 64 * 1024;
+
+interface RuntimeCheckpointValue {
+  runStatus: WorkflowRunRecord["status"];
+  cancellationEpoch: number;
+  budget?: ExecutionBudgetSnapshot;
+}
 
 export interface RunWorkflowOptions {
   input?: JsonObject;
@@ -57,6 +75,12 @@ export interface RunWorkflowOptions {
     decision: Promise<RuntimeHumanDecisionOutcome>;
   }>;
   signal?: AbortSignal;
+  /** Authorizes every actual Provider side effect. Omitted preserves legacy manifests and emits a warning event. */
+  capabilityBroker?: CapabilityBroker;
+  /** Shared per-Run budget ledger. Reservations prevent concurrent nodes from oversubscribing a quota. */
+  budget?: ExecutionBudget;
+  /** Reads the durable Invocation cancellation epoch used to fence late writes. */
+  getCancellationEpoch?: () => number | Promise<number>;
   /**
    * Continue a durable Run after the local daemon restarts. Successful or
    * deterministically terminal nodes are replayed from Run Store evidence;
@@ -126,12 +150,13 @@ function buildPromptBundle(
   node: ExecutionPlanNode,
   input: JsonObject,
   attemptDir: string,
-  providerCwd: string
+  providerCwd: string,
+  projectedNeeds?: Record<string, unknown>
 ): PromptBundle {
   const profile = resolveRoleProfile(loaded, node.role);
   const role = profile.definition;
   const outputSchema = readJsonSchema(path.resolve(loaded.projectRoot, role.outputSchema));
-  const needs = Object.fromEntries(
+  const needs = projectedNeeds ?? Object.fromEntries(
     node.needs.map((nodeId) => {
       const result = run.nodes[nodeId];
       return [nodeId, { status: result?.status, output: result?.output ?? null, error: result?.error ?? null }];
@@ -197,6 +222,46 @@ function buildPromptBundle(
   };
 }
 
+async function projectDependencies(
+  run: WorkflowRunRecord,
+  node: ExecutionPlanNode,
+  store: RunStore,
+  attemptDir: string
+): Promise<Record<string, unknown>> {
+  const projection: Record<string, unknown> = {};
+  const evidence: Record<string, unknown> = {};
+  for (const nodeId of node.needs) {
+    const result = run.nodes[nodeId];
+    const envelope = { status: result?.status, output: result?.output ?? null, error: result?.error ?? null };
+    const serialized = JSON.stringify(envelope.output);
+    if (Buffer.byteLength(serialized) <= INLINE_DEPENDENCY_BYTES) {
+      projection[nodeId] = envelope;
+      evidence[nodeId] = { mode: "inline", bytes: Buffer.byteLength(serialized) };
+      continue;
+    }
+    const digest = createHash("sha256").update(serialized).digest("hex");
+    const relativePath = `context/dependencies/${nodeId}-${digest.slice(0, 12)}.json`;
+    try {
+      const existing = await store.readArtifact<unknown>(relativePath);
+      const actual = createHash("sha256").update(JSON.stringify(existing)).digest("hex");
+      if (actual !== digest) throw new Error(`dependency artifact ${nodeId} digest mismatch`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await store.writeArtifact(relativePath, envelope.output);
+    }
+    const ref = { kind: "artifact-ref", path: relativePath, digest: `sha256:${digest}`, bytes: Buffer.byteLength(serialized) };
+    projection[nodeId] = {
+      status: envelope.status,
+      output: ref,
+      error: envelope.error,
+      summary: `Dependency ${nodeId} completed with status ${String(envelope.status)}; ${ref.bytes} byte output is available as a verified artifact.`
+    };
+    evidence[nodeId] = { mode: "artifact", ...ref };
+  }
+  await store.writeAttemptJson(attemptDir, "context-projection.json", evidence);
+  return projection;
+}
+
 async function executeNode(
   loaded: LoadedManifest,
   run: WorkflowRunRecord,
@@ -207,7 +272,8 @@ async function executeNode(
   emit: (type: string, nodeId?: string, detail?: JsonValue) => Promise<void>,
   providerCwd: string,
   signal?: AbortSignal,
-  options: ExecuteNodeOptions = {}
+  options: ExecuteNodeOptions = {},
+  governance: Pick<RunWorkflowOptions, "capabilityBroker" | "budget" | "openHumanDecision" | "getCancellationEpoch"> & { cancellationEpoch?: number } = {}
 ): Promise<NodeRunResult> {
   const role = loaded.manifest.roles[node.role];
   if (!role) throw new Error(`role not found: ${node.role}`);
@@ -264,11 +330,100 @@ async function executeNode(
           { kind: "aborted", retryable: false }
         );
       }
-      const bundle = buildPromptBundle(loaded, run, node, input, attemptDir, providerCwd);
+      const outputSchema = readJsonSchema(path.resolve(loaded.projectRoot, role.outputSchema));
+      const contract = providerContract(adapter);
+      const requiredCapabilities = Array.isArray(provider.requiredCapabilities)
+        ? provider.requiredCapabilities.filter((value): value is string => typeof value === "string")
+        : [];
+      let strictSchemaIssue: string | undefined;
+      try { preflightStrictOutputSchema(outputSchema, node.id); } catch (error) {
+        strictSchemaIssue = error instanceof Error ? error.message : String(error);
+      }
+      const unsupported = requiredCapabilities.filter((capability) => !contract.capabilities.includes(capability));
+      const adapterIssues = await adapter.preflight?.({
+        providerId: role.provider,
+        definition: provider,
+        projectRoot: providerCwd,
+        requiredCapabilities
+      }) ?? [];
+      await store.writeAttemptJson(attemptDir, "preflight.json", {
+        providerId: role.provider,
+        adapter: adapter.id,
+        contract,
+        requiredCapabilities,
+        unsupportedCapabilities: unsupported,
+        issues: adapterIssues,
+        strictOutputSchema: strictSchemaIssue ? { valid: false, issue: strictSchemaIssue } : { valid: true }
+      });
+      const requiresStrictOutputSchema = requiredCapabilities.includes("strict-output-schema")
+        || contract.invocationRequirements?.includes("strict-output-schema") === true;
+      if (requiresStrictOutputSchema && strictSchemaIssue) throw new Error(strictSchemaIssue);
+      if (unsupported.length > 0) {
+        throw new Error(`provider ${role.provider} does not support required capabilities: ${unsupported.join(", ")}`);
+      }
+      if (adapterIssues.length > 0) throw new Error(`provider ${role.provider} preflight failed: ${adapterIssues.join("; ")}`);
+      const projectedNeeds = await projectDependencies(run, node, store, attemptDir);
+      const bundle = buildPromptBundle(loaded, run, node, input, attemptDir, providerCwd, projectedNeeds);
       await store.writeText(attemptDir, "system-prompt.md", bundle.systemPrompt);
       await store.writeText(attemptDir, "request-prompt.md", bundle.requestPrompt);
       await store.writeText(attemptDir, "prompt.md", bundle.prompt);
       await emit("node.attempt.started", node.id, { attempt });
+      governance.budget?.assertWallClock();
+      const attemptReservation = governance.budget?.reserve("attempts");
+      let providerReservation: ReturnType<ExecutionBudget["reserve"]> | undefined;
+      const intent = {
+        kind: "provider-call" as const,
+        capability: `provider:${role.provider}:invoke`,
+        principal: nodeRoleId(node),
+        runId: run.id,
+        nodeId: node.id,
+        providerId: role.provider
+      };
+      try {
+        providerReservation = governance.budget?.reserve("providerCalls");
+        if (governance.capabilityBroker) {
+          let authorization;
+          try {
+            authorization = await governance.capabilityBroker.authorize(intent);
+          } catch (error) {
+            throw new CapabilityBrokerUnavailableError(intent, error);
+          }
+          if (authorization.compatibilityWarning) {
+            await emit("node.authorization.compatibility-warning", node.id, { warning: authorization.compatibilityWarning });
+          }
+          if (authorization.decision === "approval-required" && governance.openHumanDecision) {
+            const opened = await governance.openHumanDecision({
+              nodeId: node.id,
+              round: Number(node.metadata?.round ?? 1),
+              riskCategory: "irreversible-other",
+              summary: authorization.reason ?? `Approval required for ${intent.capability}`,
+              proposedAction: { action: "authorize-side-effect", intent: intent as unknown as JsonValue }
+            });
+            const outcome = await opened.decision;
+            if (outcome.decision === "rejected") {
+              throw new SideEffectAuthorizationError("approval-required", intent, authorization.reason ?? "human rejected the proposed side effect");
+            }
+            await emit("node.authorization.granted", node.id, {
+              requestId: outcome.requestId,
+              decidedBy: outcome.decidedBy ?? null,
+              comment: outcome.comment ?? null,
+              intent: intent as unknown as JsonValue
+            });
+          } else if (authorization.decision !== "allowed") {
+            throw new SideEffectAuthorizationError(authorization.decision, intent, authorization.reason);
+          }
+        } else {
+          await emit("node.authorization.compatibility-warning", node.id, {
+            warning: "legacy manifest has no CapabilityBroker; Provider invocation was allowed for compatibility"
+          });
+        }
+        attemptReservation?.commit();
+        providerReservation?.commit();
+      } catch (error) {
+        attemptReservation?.release();
+        providerReservation?.release();
+        throw error;
+      }
       const callSignal = providerCallSignal(signal, options.deadlineAt);
       let response: Awaited<ReturnType<typeof adapter.invoke>>;
       try {
@@ -311,10 +466,17 @@ async function executeNode(
       } finally {
         callSignal.clear();
       }
+      if (governance.getCancellationEpoch
+        && await governance.getCancellationEpoch() !== governance.cancellationEpoch) {
+        throw new ProviderExecutionError("workflow execution was cancelled; late Provider result was fenced", response.stdout, response.stderr, {
+          kind: "aborted", retryable: false, durationMs: response.durationMs
+        });
+      }
       await store.writeText(attemptDir, "stdout.txt", response.stdout);
       await store.writeText(attemptDir, "stderr.txt", response.stderr);
+      await store.writeText(attemptDir, "raw-output.txt", response.stdout);
       const output = parseProviderOutput(provider.outputProtocol ?? "json", response.stdout);
-      validateStructuredOutput(readJsonSchema(path.resolve(loaded.projectRoot, role.outputSchema)), output, node.id);
+      validateStructuredOutput(outputSchema, output, node.id);
       const status = statusFromVerdict(output, role.verdict);
       await store.writeAttemptJson(attemptDir, "result.json", output);
       await store.writeAttemptJson(attemptDir, "metadata.json", { attempt, durationMs: response.durationMs, status });
@@ -329,11 +491,20 @@ async function executeNode(
         await store.writeText(attemptDir, "stdout.txt", error.stdout);
         await store.writeText(attemptDir, "stderr.txt", error.stderr);
       }
-      const validationFailure = !(error instanceof ProviderExecutionError);
+      const validationFailure = !(error instanceof ProviderExecutionError)
+        && !(error instanceof SideEffectAuthorizationError)
+        && !(error instanceof CapabilityBrokerUnavailableError)
+        && !(error instanceof ExecutionBudgetExceededError);
       const retryable = error instanceof ProviderExecutionError
         ? error.retryable
         : Boolean(options.retryValidation);
-      lastFailure = error instanceof ProviderExecutionError
+      lastFailure = error instanceof SideEffectAuthorizationError
+        ? { category: "authorization", kind: error.decision, retryable: false }
+        : error instanceof CapabilityBrokerUnavailableError
+          ? { category: "authorization-technical", kind: "broker-unavailable", retryable: false }
+        : error instanceof ExecutionBudgetExceededError
+          ? { category: "budget", kind: error.counter, retryable: false }
+          : error instanceof ProviderExecutionError
         ? { category: "provider", kind: error.kind, retryable }
         : { category: "output-validation", retryable };
       const willRetry = recoveryAttempt < maxAttempts && retryable;
@@ -346,7 +517,13 @@ async function executeNode(
       await store.writeAttemptJson(attemptDir, "error.json", {
         attempt,
         error: error instanceof Error ? error.message : String(error),
-        kind: error instanceof ProviderExecutionError ? error.kind : "validation",
+        kind: error instanceof SideEffectAuthorizationError
+          ? error.decision
+          : error instanceof CapabilityBrokerUnavailableError
+            ? "broker-unavailable"
+          : error instanceof ExecutionBudgetExceededError
+            ? error.counter
+            : error instanceof ProviderExecutionError ? error.kind : "validation",
         retryable,
         willRetry,
         durationMs: error instanceof ProviderExecutionError ? error.durationMs : undefined
@@ -354,7 +531,13 @@ async function executeNode(
       await emit("node.attempt.failed", node.id, {
         attempt,
         error: error instanceof Error ? error.message : String(error),
-        kind: error instanceof ProviderExecutionError ? error.kind : "validation",
+        kind: error instanceof SideEffectAuthorizationError
+          ? error.decision
+          : error instanceof CapabilityBrokerUnavailableError
+            ? "broker-unavailable"
+          : error instanceof ExecutionBudgetExceededError
+            ? error.counter
+            : error instanceof ProviderExecutionError ? error.kind : "validation",
         retryable,
         willRetry
       });
@@ -364,7 +547,7 @@ async function executeNode(
 
   const failed: NodeRunResult = {
     ...result,
-    status: "failed",
+    status: lastFailure?.category === "authorization" && lastFailure.kind === "approval-required" ? "blocked" : "failed",
     completedAt: now(),
     error: lastError instanceof Error ? lastError.message : String(lastError),
     failure: lastFailure
@@ -399,17 +582,50 @@ export async function runWorkflow(
     ? path.resolve(options.artifactRoot)
     : path.resolve(loaded.projectRoot, loaded.manifest.artifactRoot ?? ".multi-agent");
   const store = await RunStore.create(artifactRoot, runId);
+  const effectivePolicyPack = loaded.manifest.workflows[workflowId]?.config.effectivePolicyPack;
+  if (effectivePolicyPack) {
+    await fs.promises.writeFile(
+      path.join(store.runDir, "effective-policy-pack.json"),
+      `${JSON.stringify(effectivePolicyPack, null, 2)}\n`,
+      "utf8"
+    );
+  }
+  const checkpointOwner = `runner-${process.pid}-${randomUUID().slice(0, 8)}`;
+  let checkpoint: Checkpoint<RuntimeCheckpointValue> | undefined;
+  let checkpointQueue: Promise<void> = Promise.resolve();
+  let budget = options.budget;
+  const cancellationEpoch = options.getCancellationEpoch ? await options.getCancellationEpoch() : 0;
+  const assertCancellationEpoch = async (): Promise<void> => {
+    if (options.getCancellationEpoch && await options.getCancellationEpoch() !== cancellationEpoch) {
+      throw new ProviderExecutionError("workflow cancellation epoch changed", "", "", { kind: "aborted", retryable: false });
+    }
+  };
   let run: WorkflowRunRecord;
   if (options.resume) {
-    const [persistedRun, persistedPlan] = await Promise.all([
+    const [persistedRun, persistedPlan, durableCheckpoint] = await Promise.all([
       fs.promises.readFile(path.join(store.runDir, "run.json"), "utf8"),
-      fs.promises.readFile(path.join(store.runDir, "plan.json"), "utf8")
+      fs.promises.readFile(path.join(store.runDir, "plan.json"), "utf8"),
+      store.readCheckpoint<RuntimeCheckpointValue>()
     ]);
     run = JSON.parse(persistedRun) as WorkflowRunRecord;
     plan = JSON.parse(persistedPlan) as typeof plan;
     if (run.id !== runId || run.workflow !== workflowId || run.architecture !== plan.architecture) {
       throw new Error(`Run ${runId} recovery snapshot does not match workflow ${workflowId}`);
     }
+    if (durableCheckpoint && Date.parse(durableCheckpoint.leaseExpiresAt) > Date.now()) {
+      throw new Error(`Run ${runId} checkpoint lease is held by ${durableCheckpoint.owner}`);
+    }
+    if (durableCheckpoint?.value.budget) {
+      budget = new ExecutionBudget(durableCheckpoint.value.budget.limits, durableCheckpoint.value.budget);
+    }
+    checkpoint = {
+      revision: (durableCheckpoint?.revision ?? 0) + 1,
+      owner: checkpointOwner,
+      fencingToken: (durableCheckpoint?.fencingToken ?? 0) + 1,
+      leaseExpiresAt: new Date(Date.now() + 30_000).toISOString(),
+      value: { runStatus: "running", cancellationEpoch, ...(budget ? { budget: budget.snapshot() } : {}) }
+    };
+    await store.commitCheckpoint(checkpoint, durableCheckpoint?.revision ?? 0);
     run.status = "running";
     delete run.completedAt;
     delete run.error;
@@ -434,12 +650,34 @@ export async function runWorkflow(
         }])
       )
     };
+    checkpoint = {
+      revision: 1,
+      owner: checkpointOwner,
+      fencingToken: 1,
+      leaseExpiresAt: new Date(Date.now() + 30_000).toISOString(),
+      value: { runStatus: "running", cancellationEpoch, ...(budget ? { budget: budget.snapshot() } : {}) }
+    };
+    await store.commitCheckpoint(checkpoint, 0);
   }
   const registry = options.providers ?? createDefaultProviderRegistry();
   const emit = async (type: string, nodeId?: string, detail?: JsonValue): Promise<void> => {
     const event: RunEvent = { at: now(), type, nodeId, detail };
     await store.appendEvent(event);
     await options.onEvent?.({ ...event, runId, workflow: workflowId });
+    checkpointQueue = checkpointQueue.then(async () => {
+      if (!checkpoint) return;
+      await assertCancellationEpoch();
+      const next: Checkpoint<RuntimeCheckpointValue> = {
+        ...checkpoint,
+        revision: checkpoint.revision + 1,
+        leaseExpiresAt: new Date(Date.now() + (/^run\.(?:passed|blocked|failed)$/.test(type) ? 0 : 30_000)).toISOString(),
+        value: { runStatus: run.status, cancellationEpoch, ...(budget ? { budget: budget.snapshot() } : {}) }
+      };
+      await store.commitCheckpoint(next, checkpoint.revision);
+      checkpoint = next;
+      await store.writeRunManifest({ budget: next.value.budget, checkpointRevision: next.revision });
+    });
+    await checkpointQueue;
   };
   if (!options.resume) {
     await store.writeInput(input);
@@ -535,7 +773,14 @@ export async function runWorkflow(
         emit,
         providerCwd,
         options.signal,
-        executionOptions
+      executionOptions,
+      {
+        capabilityBroker: options.capabilityBroker,
+        budget,
+        openHumanDecision: options.openHumanDecision,
+        getCancellationEpoch: options.getCancellationEpoch,
+        cancellationEpoch
+      }
       );
     } catch (error) {
       if (permit) throw error;
@@ -573,8 +818,32 @@ export async function runWorkflow(
       input,
       plan,
       run,
+      budget,
       scheduleNode,
       executeNode: executePreparedNode,
+      readArtifact: async <T>(relativePath: string): Promise<T | undefined> => {
+        try {
+          return await store.readArtifact<T>(relativePath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+          throw error;
+        }
+      },
+      writeArtifact: (relativePath, value) => store.writeArtifact(relativePath, value),
+      candidateSnapshot: () => candidateWorkspaceSnapshot(options.providerCwd ?? loaded.projectRoot),
+      executionPackageScripts: async () => {
+        try {
+          const value = JSON.parse(await fs.promises.readFile(
+            path.join(options.providerCwd ?? loaded.projectRoot, "package.json"),
+            "utf8"
+          )) as { scripts?: Record<string, unknown> };
+          return Object.fromEntries(Object.entries(value.scripts ?? {})
+            .filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+          throw error;
+        }
+      },
       requestHumanDecision: options.openHumanDecision
         ? async (request) => {
             const opened = await options.openHumanDecision!(request);
@@ -614,6 +883,31 @@ export async function runWorkflow(
       ? "blocked"
       : "passed");
   if (executionResult?.output !== undefined) run.output = executionResult.output;
+  const workflowContract = loaded.manifest.workflows[workflowId]?.outputSchema;
+  if (workflowContract && run.status === "passed") {
+    const schema = readJsonSchema(path.resolve(loaded.projectRoot, workflowContract));
+    try {
+      validateStructuredOutput(schema, run.output ?? null, `workflow ${workflowId}`);
+      await fs.promises.writeFile(path.join(store.runDir, "workflow-output-validation.json"), `${JSON.stringify({
+        status: "passed",
+        schemaVersion: loaded.manifest.workflows[workflowId]?.outputSchemaVersion ?? 1,
+        schemaDigest: loaded.manifest.workflows[workflowId]?.outputSchemaDigest ?? null
+      }, null, 2)}\n`, "utf8");
+      await emit("workflow.output-validation.passed");
+    } catch (error) {
+      run.status = "failed";
+      run.error = error instanceof Error ? error.message : String(error);
+      await fs.promises.writeFile(path.join(store.runDir, "workflow-output-validation.json"), `${JSON.stringify({
+        status: "failed",
+        category: "workflow-output-validation",
+        error: run.error,
+        output: run.output ?? null,
+        schemaVersion: loaded.manifest.workflows[workflowId]?.outputSchemaVersion ?? 1,
+        schemaDigest: loaded.manifest.workflows[workflowId]?.outputSchemaDigest ?? null
+      }, null, 2)}\n`, "utf8");
+      await emit("workflow.output-validation.failed", undefined, { category: "workflow-output-validation", error: run.error });
+    }
+  }
   run.completedAt = now();
   await store.writeRun(run);
   await emit(`run.${run.status}`);

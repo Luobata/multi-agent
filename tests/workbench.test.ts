@@ -406,6 +406,81 @@ describe("Local Agent Workbench", () => {
     expect(completed.run).toMatchObject({ id: receipt.runId, status: "passed" });
   });
 
+  it("binds a workflow idempotency key to one canonical request across races and daemon reopen", async () => {
+    const root = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot: root });
+    const employee = await service.createEmployee({
+      id: "idempotent-worker",
+      identity: { displayName: "Idempotent Worker", background: "Handles one durable request.", responsibilities: ["Respond"] }
+    });
+    const workflow = await service.createWorkflow({
+      id: "idempotent-flow",
+      nodes: [{ id: "respond", employeeId: employee.id }]
+    });
+    const source = {
+      kind: "http" as const,
+      caller: "requirement-board",
+      contextId: "browser-profile-a",
+      taskId: "req-42",
+      idempotencyKey: "requirement:req-42:advance:1"
+    };
+    const entrance = {
+      policyId: "test-entry",
+      policyVersion: 3,
+      result: { route: "specialist" as const, specialistKey: "implementation" },
+      decidedBy: "rule" as const,
+      target: { kind: "graph-workflow" as const, workflowId: workflow.id, workflowVersion: workflow.version }
+    };
+    const input = { message: "Implement once", context: { priority: "high", sequence: 1 } };
+
+    const firstStart = service.startWorkbenchWorkflow(workflow.id, input, source, { workflowVersion: workflow.version, entrance });
+    const sameStart = service.startWorkbenchWorkflow(
+      workflow.id,
+      { context: { sequence: 1, priority: "high" }, message: "Implement once" },
+      source,
+      { workflowVersion: workflow.version, entrance }
+    );
+    await expect(service.startWorkbenchWorkflow(
+      workflow.id,
+      { message: "A different request", context: { priority: "high", sequence: 1 } },
+      source,
+      { workflowVersion: workflow.version, entrance }
+    )).rejects.toThrow(/different workflow (start )?request/);
+
+    const [first, same] = await Promise.all([firstStart, sameStart]);
+    expect(first.invocation.id).toBe(same.invocation.id);
+    expect(first.invocation.idempotencyFingerprint).toMatch(/^v1:[a-f0-9]{64}$/);
+    await service.waitForInvocation(first.invocation.id);
+
+    await expect(service.startWorkbenchWorkflow(
+      workflow.id,
+      input,
+      { ...source, contextId: "browser-profile-b" },
+      { workflowVersion: workflow.version, entrance }
+    )).rejects.toThrow(/different workflow start request/);
+    await expect(service.startWorkbenchWorkflow(
+      workflow.id,
+      input,
+      source,
+      { workflowVersion: workflow.version, entrance: { ...entrance, policyVersion: 4 } }
+    )).rejects.toThrow(/different workflow start request/);
+
+    const reopened = await WorkbenchService.open({ dataRoot: root });
+    const retried = await reopened.startWorkbenchWorkflow(
+      workflow.id,
+      { context: { sequence: 1, priority: "high" }, message: "Implement once" },
+      source,
+      { workflowVersion: workflow.version, entrance }
+    );
+    expect(retried.invocation.id).toBe(first.invocation.id);
+    await expect(reopened.startWorkbenchWorkflow(
+      workflow.id,
+      { message: "Changed after reopen", context: { priority: "high", sequence: 1 } },
+      source,
+      { workflowVersion: workflow.version, entrance }
+    )).rejects.toThrow(/different workflow start request/);
+  });
+
   it("versions, clones, archives, invokes, and persists Employees through the Graph runtime", async () => {
     const root = temporaryRoot();
     const service = await WorkbenchService.open({ dataRoot: root });
@@ -503,6 +578,10 @@ describe("Local Agent Workbench", () => {
     expect(reopened.getEmployee(employee.id).presentation.avatarUrl).toBe("/avatars/local-analyst.png");
     expect(reopened.getSession(first.session.id).messages).toHaveLength(4);
     await expect(reopened.listRuns()).resolves.toHaveLength(3);
+    fs.writeFileSync(path.join(root, "artifacts", "runs", "index.json"), "{corrupt", "utf8");
+    await expect(reopened.listRuns()).resolves.toHaveLength(3);
+    await expect(reopened.listRuns(1)).resolves.toHaveLength(1);
+    expect(() => JSON.parse(fs.readFileSync(path.join(root, "artifacts", "runs", "index.json"), "utf8"))).not.toThrow();
   });
 
   it("classifies runs by category and project in listRuns", async () => {
@@ -672,6 +751,17 @@ describe("Local Agent Workbench", () => {
     expect(binding).toMatchObject({ projectVersion: 1, version: 1 });
     expect(binding.roles[0]?.skills).toEqual([{ id: "browser-e2e-validation", config: {}, enabled: true }]);
 
+    await expect(service.invokeEmployee(employee.id, { message: "bypass" }, { kind: "mcp", project: "cart-review" }))
+      .rejects.toThrow(/invokeProjectRole/);
+    const bypassGraph = await service.createWorkflow({
+      id: "project-bypass-graph",
+      nodes: [{ id: "respond", employeeId: employee.id }]
+    });
+    await expect(service.runWorkbenchWorkflow(bypassGraph.id, { message: "bypass" }, { kind: "mcp", project: "cart-review" }))
+      .rejects.toThrow(/cannot bypass Project Role assignments/);
+    await expect(service.invokeEmployee(employee.id, { message: "external label" }, { kind: "mcp", project: "unregistered-scope" }))
+      .resolves.toMatchObject({ status: "passed" });
+
     const first = await service.invokeProjectRole("cart-review", "tester", { message: "Check the running page" });
     expect(first.session.assignment).toMatchObject({
       projectId: "cart-review",
@@ -706,9 +796,9 @@ describe("Local Agent Workbench", () => {
     const fresh = await service.invokeProjectRole("cart-review", "tester", { message: "Start a new review" });
     expect(fresh.session.assignment?.projectBindingVersion).toBe(2);
     expect(fresh.message).toContain("Senior Shared Tester received");
-    expect(providerInvocations).toHaveLength(3);
-    expect(providerInvocations.every((invocation) => invocation.cwd === projectRoot)).toBe(true);
-    expect(providerInvocations.every((invocation) => invocation.projectRoot === projectRoot)).toBe(true);
+    expect(providerInvocations).toHaveLength(4);
+    expect(providerInvocations.slice(1).every((invocation) => invocation.cwd === projectRoot)).toBe(true);
+    expect(providerInvocations.slice(1).every((invocation) => invocation.projectRoot === projectRoot)).toBe(true);
   });
 
   it("versions Management Policies and runs a Supervisor Workflow as a dynamic execution graph", async () => {
@@ -763,6 +853,7 @@ describe("Local Agent Workbench", () => {
       instructions: "Delegate evidence collection and finish only after reviewing it.",
       limits: { maxRounds: 4, maxDelegations: 4, maxParallelDelegations: 2, maxDurationMs: 60_000 }
     });
+    expect(policy.completion.requireDelegation).toBe(true);
     const workflow = await service.createWorkflow({
       id: "supervised-research",
       architecture: "supervisor",
@@ -776,8 +867,10 @@ describe("Local Agent Workbench", () => {
       managementPolicy: { id: policy.id, version: 1 },
       supervisor: { employeeVersion: 1 }
     });
+    const inheritedPolicy = await service.updateManagementPolicy(policy.id, { instructions: "Keep delegation mandatory." });
+    expect(inheritedPolicy.completion.requireDelegation).toBe(true);
     const policyV2 = await service.updateManagementPolicy(policy.id, { instructions: "A newer policy adopted by the default latest updatePolicy at run time." });
-    expect(policyV2.version).toBe(2);
+    expect(policyV2.version).toBe(3);
     // The stored workflow definition still pins v1; latest resolution happens per-run, not by rewriting it.
     expect(service.getWorkflow(workflow.id)).toMatchObject({ managementPolicy: { id: policy.id, version: 1 } });
 
@@ -791,11 +884,11 @@ describe("Local Agent Workbench", () => {
     const invocation = service.getActivitySnapshot().invocations.find((item) => item.runId === result.run.id)!;
     const detail = await service.getInvocationDetail(invocation.id);
     expect(detail.invocation.status).toBe("completed");
-    // updatePolicy defaults to "latest", so the run adopts the newest policy version (v2) even though
+    // updatePolicy defaults to "latest", so the run adopts the newest policy version even though
     // the stored workflow still pins v1.
     expect(detail.invocation.executionSnapshot).toMatchObject({
       workflow: { id: workflow.id, version: 1, architecture: "supervisor" },
-      managementPolicy: { id: policy.id, version: 2 }
+      managementPolicy: { id: policy.id, version: 3 }
     });
     expect(detail.instances.map((instance) => [instance.nodeId, instance.kind, instance.roleId, instance.round])).toEqual([
       ["supervisor-r1", "supervisor", "supervisor", 1],
@@ -804,10 +897,113 @@ describe("Local Agent Workbench", () => {
     ]);
     const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8");
     expect(events.match(/"type":"node.scheduled"/g)).toHaveLength(3);
+    for (const nodeId of Object.keys(result.run.nodes)) {
+      expect(fs.existsSync(path.join(result.runDir, "nodes", nodeId, "attempt-1", "preflight.json"))).toBe(true);
+      expect(fs.existsSync(path.join(result.runDir, "nodes", nodeId, "attempt-1", "context-projection.json"))).toBe(true);
+    }
+    expect(JSON.parse(fs.readFileSync(path.join(result.runDir, "checkpoint.json"), "utf8"))).toMatchObject({
+      revision: expect.any(Number), fencingToken: expect.any(Number), value: { runStatus: "passed" }
+    });
+    expect((await service.listRuns(1))[0]).toMatchObject({ id: result.run.id, category: "supervisor" });
     await expect(service.archiveManagementPolicy(policy.id)).rejects.toThrow(/used by active workflows: supervised-research/);
     await service.archiveWorkflow(workflow.id);
-    await expect(service.archiveManagementPolicy(policy.id)).resolves.toMatchObject({ status: "archived", version: 3 });
-    await expect(service.restoreManagementPolicy(policy.id)).resolves.toMatchObject({ status: "active", version: 4 });
+    await expect(service.archiveManagementPolicy(policy.id)).resolves.toMatchObject({ status: "archived", version: 4 });
+    await expect(service.restoreManagementPolicy(policy.id)).resolves.toMatchObject({ status: "active", version: 5 });
+  });
+
+  it("pins each project-scoped Supervisor node to its own Project Role assignment", async () => {
+    let providerCalls = 0;
+    const providers: ProviderRegistry = new Map([["project-supervisor", {
+      id: "project-supervisor",
+      validate: () => [],
+      invoke: async (invocation) => {
+        providerCalls += 1;
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role === "supervisor" && round === 1) return {
+          stdout: JSON.stringify({ action: "delegate", summary: "Delegate.", assignments: [{ roleId: "worker", task: "Work." }] }),
+          stderr: "", durationMs: 1
+        };
+        if (role === "supervisor") return {
+          stdout: JSON.stringify({ action: "finish", summary: "Done.", result: { ok: true } }), stderr: "", durationMs: 1
+        };
+        return { stdout: JSON.stringify({ message: "worked" }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("project-supervisor-provider", { adapter: "project-supervisor", model: "test", outputProtocol: "json" });
+    await service.createSkill({ id: "lead-skill", description: "Lead.", instructions: "LEAD_SKILL" });
+    await service.createSkill({ id: "worker-skill", description: "Work.", instructions: "WORKER_SKILL" });
+    const lead = await service.createEmployee({ id: "project-lead", identity: { displayName: "Lead", background: "Leads.", responsibilities: ["Lead"] }, providerId: "project-supervisor-provider", skills: ["lead-skill", "worker-skill"] });
+    const worker = await service.createEmployee({ id: "project-worker", identity: { displayName: "Worker", background: "Works.", responsibilities: ["Work"] }, providerId: "project-supervisor-provider", skills: ["lead-skill", "worker-skill"] });
+    const projectRoot = temporaryRoot();
+    await service.createProject({
+      id: "supervisor-project", name: "Supervisor Project", rootPath: projectRoot,
+      descriptorPath: path.join(projectRoot, "multi-agent.project.yaml"), connector: { kind: "mcp", config: {} },
+      roles: [
+        { id: "lead", displayName: "Lead", instructions: "LEAD_ROLE", requiredSkills: ["lead-skill"], permissions: { write: "none" }, outputSchema: { type: "object" } },
+        { id: "worker", displayName: "Worker", instructions: "WORKER_ROLE", requiredSkills: ["worker-skill"], permissions: { write: "project" }, outputSchema: { type: "object" } }
+      ]
+    });
+    const binding = await service.saveProjectBinding("supervisor-project", { roles: [
+      { roleId: "lead", employeeId: lead.id, skills: ["lead-skill"] },
+      { roleId: "worker", employeeId: worker.id, skills: ["worker-skill"] }
+    ] });
+    const policy = await service.createManagementPolicy({ id: "project-policy", allowedRoleIds: ["worker"], instructions: "Delegate.", completion: { requireDelegation: true } });
+    const workflow = await service.createWorkflow({
+      id: "project-supervisor-workflow", architecture: "supervisor",
+      supervisor: { employeeId: lead.id, projectRoleId: "lead" }, managementPolicy: { id: policy.id },
+      members: [{ roleId: "worker", employeeId: worker.id, projectRoleId: "worker" }]
+    });
+    const result = await service.runWorkbenchWorkflow(workflow.id, { message: "Do it" }, {
+      kind: "mcp", project: "supervisor-project", projectBindingVersion: binding.version
+    });
+    const invocation = service.getActivitySnapshot().invocations.find((item) => item.runId === result.run.id)!;
+    expect(invocation.source.projectBindingVersion).toBe(binding.version);
+    expect(invocation.executionSnapshot?.employees).toEqual(expect.arrayContaining([
+      expect.objectContaining({ roleId: "supervisor", assignment: { projectId: "supervisor-project", projectVersion: 1, projectBindingVersion: 1, roleId: "lead" } }),
+      expect.objectContaining({ roleId: "worker", assignment: { projectId: "supervisor-project", projectVersion: 1, projectBindingVersion: 1, roleId: "worker" } })
+    ]));
+    const profiles = fs.readdirSync(path.join(result.runDir, "effective-profile"));
+    const compiled = profiles.map((file) => JSON.parse(fs.readFileSync(path.join(result.runDir, "effective-profile", file), "utf8")) as {
+      assignment?: { roleId: string };
+      fields: Array<{ key: string; value: unknown }>;
+      references: Array<{ kind: string; id: string }>;
+    });
+    expect(compiled.map((profile) => profile.assignment?.roleId)).toEqual(expect.arrayContaining(["lead", "worker"]));
+    const leadProfile = compiled.find((profile) => profile.assignment?.roleId === "lead")!;
+    const workerProfile = compiled.find((profile) => profile.assignment?.roleId === "worker")!;
+    expect(JSON.stringify(leadProfile.fields.find((field) => field.key === "instructions")?.value)).toContain("LEAD_ROLE");
+    expect(leadProfile.references.filter((reference) => reference.kind === "skill").map((reference) => reference.id)).toEqual(["lead-skill"]);
+    expect(JSON.stringify(workerProfile.fields.find((field) => field.key === "instructions")?.value)).toContain("WORKER_ROLE");
+    expect(workerProfile.references.filter((reference) => reference.kind === "skill").map((reference) => reference.id)).toEqual(["worker-skill"]);
+
+    const receipt = await service.startWorkbenchWorkflow(workflow.id, { message: "Start a leader Session" }, {
+      kind: "mcp", project: "supervisor-project", projectBindingVersion: binding.version
+    });
+    await service.waitForInvocation(receipt.invocation.id);
+    const continued = await service.continueWorkflowConversation(receipt.leaderSessionId!, "Explain the result");
+    expect(continued.session.assignment).toEqual({
+      projectId: "supervisor-project",
+      projectVersion: 1,
+      projectBindingVersion: binding.version,
+      roleId: "lead"
+    });
+    const continuedProfile = JSON.parse(fs.readFileSync(
+      path.join(continued.runDir, "effective-profile", "respond.json"),
+      "utf8"
+    )) as { assignment?: { roleId: string }; fields: Array<{ key: string; value: unknown }> };
+    expect(continuedProfile.assignment?.roleId).toBe("lead");
+    expect(JSON.stringify(continuedProfile.fields.find((field) => field.key === "instructions")?.value)).toContain("LEAD_ROLE");
+
+    const missing = await service.createWorkflow({
+      id: "missing-project-role", architecture: "supervisor", supervisor: { employeeId: lead.id },
+      managementPolicy: { id: policy.id }, members: [{ roleId: "worker", employeeId: worker.id, projectRoleId: "worker" }]
+    });
+    const before = providerCalls;
+    await expect(service.runWorkbenchWorkflow(missing.id, { message: "No provider" }, { kind: "mcp", project: "supervisor-project" }))
+      .rejects.toThrow(/must declare projectRoleId/);
+    expect(providerCalls).toBe(before);
   });
 
   it("distills a memory from a passed multi-node Supervisor Workflow run", async () => {
@@ -1289,7 +1485,8 @@ describe("Local Agent Workbench", () => {
       id: "unbounded-supervision",
       allowedRoleIds: ["worker"],
       instructions: "Keep working while progress is made; no fixed wall clock.",
-      limits: { maxRounds: 3, maxDelegations: 4, maxParallelDelegations: 1 }
+      limits: { maxRounds: 3, maxDelegations: 4, maxParallelDelegations: 1 },
+      completion: { requireDelegation: false }
     });
     // The policy carries no absolute duration ceiling.
     expect(policy.limits.maxDurationMs).toBeUndefined();
@@ -1749,7 +1946,7 @@ describe("Local Agent Workbench", () => {
     expect(template.outputSchema).toMatchObject({
       type: "object",
       additionalProperties: false,
-      required: ["verdict", "summary", "e2eEvidence"],
+      required: ["verdict", "summary", "e2eEvidence", "risks"],
       properties: {
         verdict: { enum: ["pass", "block"] },
         summary: { type: "string", minLength: 1 },
@@ -1859,7 +2056,8 @@ describe("Local Agent Workbench", () => {
     setOutput({
       verdict: "pass",
       summary: "关键路径全部通过。",
-      e2eEvidence: [{ method: "automation-run", steps: "运行 npm test", observed: "全部用例通过" }]
+      e2eEvidence: [{ method: "automation-run", steps: "运行 npm test", observed: "全部用例通过" }],
+      risks: []
     });
 
     const result = await service.invokeEmployee(employeeId, { message: "验收登录改动" });

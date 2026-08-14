@@ -96,6 +96,41 @@ export function readJsonSchema(schemaPath: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/** Fail closed before invoking a Provider with a schema that cannot guarantee a strict object envelope. */
+export function preflightStrictOutputSchema(schema: Record<string, unknown>, label: string): void {
+  const visit = (value: unknown, location: string): void => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const current = value as Record<string, unknown>;
+    if (current.type === "object" || current.properties !== undefined) {
+      const properties = current.properties;
+      if (typeof properties !== "object" || properties === null || Array.isArray(properties)) {
+        throw new Error(`${label} output schema preflight failed: ${location} properties must be an object`);
+      }
+      const keys = Object.keys(properties as Record<string, unknown>);
+      const required = current.required;
+      if (!Array.isArray(required) || required.some((item) => typeof item !== "string")) {
+        throw new Error(`${label} output schema preflight failed: ${location} required must list every property`);
+      }
+      const requiredKeys = required as string[];
+      if (new Set(requiredKeys).size !== requiredKeys.length
+        || keys.some((key) => !requiredKeys.includes(key))
+        || requiredKeys.some((key) => !keys.includes(key))) {
+        throw new Error(`${label} output schema preflight failed: ${location} properties and required must match exactly`);
+      }
+      if (current.additionalProperties !== false) {
+        throw new Error(`${label} output schema preflight failed: ${location} additionalProperties must be false`);
+      }
+      for (const [key, child] of Object.entries(properties as Record<string, unknown>)) visit(child, `${location}/properties/${key}`);
+    }
+    for (const keyword of ["items", "allOf", "anyOf", "oneOf"] as const) {
+      const child = current[keyword];
+      if (Array.isArray(child)) child.forEach((entry, index) => visit(entry, `${location}/${keyword}/${index}`));
+      else visit(child, `${location}/${keyword}`);
+    }
+  };
+  visit(schema, "#");
+}
+
 export function validateStructuredOutput(schema: Record<string, unknown>, output: JsonValue, label: string): void {
   const validate = new Ajv({ allErrors: true, strict: false }).compile(schema);
   if (validate(output)) return;

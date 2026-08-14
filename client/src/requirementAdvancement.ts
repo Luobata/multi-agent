@@ -8,6 +8,7 @@ import type {
   Workflow
 } from "./types";
 import type { RequirementAdvancement, RequirementDetail } from "./dashboard/types";
+import type { RequirementAdvancementConfig } from "./dashboard/advancement";
 
 export interface RequirementAdvancementInput {
   route: "auto";
@@ -15,6 +16,7 @@ export interface RequirementAdvancementInput {
   signals: JsonObject;
   source: InvocationSource;
   message: string;
+  candidateUrl?: string;
 }
 
 export interface RequirementAdvancementReceipt {
@@ -118,7 +120,8 @@ function requirementMessage(requirement: RequirementDetail): string {
 
 export function buildRequirementAdvancementInput(
   requirement: RequirementDetail,
-  advancement?: RequirementAdvancement
+  advancement?: RequirementAdvancement,
+  config?: RequirementAdvancementConfig
 ): RequirementAdvancementInput {
   return {
     route: "auto",
@@ -129,7 +132,8 @@ export function buildRequirementAdvancementInput(
       requiresIndependentValidation: true
     },
     source: sourceFor(requirement, advancement),
-    message: requirementMessage(requirement)
+    message: requirementMessage(requirement),
+    ...(config?.candidateUrl ? { candidateUrl: config.candidateUrl } : {})
   };
 }
 

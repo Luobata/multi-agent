@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, writeBody } from "./api";
 import { DossierSection, EmptyState, Modal, SelectControl, Stamp, formatTime, scrollRecordIntoView } from "./components";
 import { SupervisorRunTopology } from "./SupervisorRunTopology";
 import { EffectiveProfileView } from "./EffectiveProfileView";
-import { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
+import { acceptanceSnapshotFromPreview, isRunAcceptanceReady } from "./dashboard/acceptance";
 import type { DashboardService } from "./dashboard/service";
 import type { Requirement } from "./dashboard/types";
 import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunDeliveryRecord, RunEvidenceAsset, RunMergePreview, RunMergeQueueResult, RunNode, RunWorktreeOpenResult } from "./types";
 
-export { acceptanceSnapshotFromPreview } from "./dashboard/acceptance";
+export { acceptanceSnapshotFromPreview, isRunAcceptanceReady } from "./dashboard/acceptance";
 
 const CATEGORY_LABELS: Record<"single" | "graph" | "supervisor", string> = {
   single: "单任务",
@@ -331,6 +331,10 @@ function RunDeliveryPanel({
   onOpenDiscard,
   onSubmitToBoard,
   onRerunEvidence,
+  acceptanceBindingLoading,
+  acceptanceRunId,
+  acceptanceBindingError,
+  onOpenAcceptanceRun,
   evidenceRerunError,
   onRetryConflict,
   conflictRetrying,
@@ -349,6 +353,10 @@ function RunDeliveryPanel({
   onOpenDiscard: () => void;
   onSubmitToBoard: () => void;
   onRerunEvidence: () => void;
+  acceptanceBindingLoading: boolean;
+  acceptanceRunId?: string;
+  acceptanceBindingError: boolean;
+  onOpenAcceptanceRun: () => void;
   evidenceRerunError: string;
   onRetryConflict: () => void;
   conflictRetrying: boolean;
@@ -378,7 +386,29 @@ function RunDeliveryPanel({
   const conflictBusy = conflict && ["resolving", "retesting", "leader-review"].includes(conflictResolution?.status ?? "");
   const actionable = !merged && !discarded && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && (preview.status === "awaiting-acceptance" || preview.status === "conflict" || preview.status === "kept" || preview.status === "returned-to-acceptance");
   const canQueueMerge = preview.eligible && !merged && !discarded && !mergeBusy && !evidenceBusy && preview.status !== "conflict";
-  const canRerunEvidence = evidenceNeedsAttention && !evidenceBusy && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && !discarded && !merged;
+  const isAcceptanceRun = !taskId || Boolean(acceptanceRunId && acceptanceRunId === preview.runId);
+  const canRerunEvidence = evidenceNeedsAttention && !acceptanceBindingLoading && isAcceptanceRun && !evidenceBusy && !mergeBusy && !conflictBusy && Boolean(preview.worktreePath) && !discarded && !merged;
+  const evidenceDisabledReason = acceptanceBindingLoading
+    ? "正在核对该需求绑定的验收 Run，完成前不会启动补采。"
+    : acceptanceBindingError
+      ? "无法核对该需求绑定的验收 Run，请重试或刷新页面后再补采。"
+    : taskId && !acceptanceRunId
+      ? "该需求尚未提交到待验收；请先提交并固定验收 Run，再补采媒体证据。"
+      : !isAcceptanceRun
+        ? `当前是 Run ${preview.runId}，该需求绑定的验收 Run 是 ${acceptanceRunId}；为避免跨 Run 写入，不能在当前卷宗补采。`
+        : !preview.worktreePath
+          ? "绑定的验收 Run 没有可用 worktree，无法补采；请重新发起验收 Run。"
+          : discarded
+            ? "候选结果已丢弃，worktree 已清理，不能补采。"
+            : merged
+              ? "交付已经合并，当前验收 Run 不再接受补采。"
+              : evidenceBusy
+                ? "test-engineer 正在补采证据，请等待当前任务完成。"
+                : mergeBusy
+                  ? "当前合入流程正在重测或写入，不能并行启动另一轮补采。"
+                  : conflictBusy
+                    ? "冲突处理正在进行，不能并行启动证据补采。"
+                    : undefined;
   const diff = preview.changes.unifiedDiff;
   return <div className="run-delivery-panel">
     {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>{conflictResolution?.status === "resolving" ? "原领队正在规划并委派冲突修复" : conflictResolution?.status === "retesting" ? "冲突已解决，正在回跑测试" : conflictResolution?.status === "leader-review" ? "测试已通过，等待原领队放行" : conflictResolution?.status === "failed" ? "AI 冲突处理需要介入" : "目标分支存在合并冲突"}</strong><p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p>{conflictResolution?.leaderPlanRunId && <small>领队计划 Run：<code>{conflictResolution.leaderPlanRunId}</code></small>}{conflictResolution?.executionRoleId && <small>执行角色：<code>{conflictResolution.executionRoleId}</code></small>}{conflictResolution?.resolutionRunId && <small>工程修复 Run：<code>{conflictResolution.resolutionRunId}</code></small>}{conflictResolution?.testRunId && <small>复测 Run：<code>{conflictResolution.testRunId}</code></small>}{conflictResolution?.leaderReviewRunId && <small>领队复验 Run：<code>{conflictResolution.leaderReviewRunId}</code></small>}{conflictResolution?.status === "failed" && <button type="button" className="button secondary" disabled={conflictRetrying} aria-busy={conflictRetrying} onClick={onRetryConflict}>{conflictRetrying ? "正在重新排队…" : "重新让原领队处理冲突"}</button>}{conflictRetryError && <small className="inline-error">{conflictRetryError}</small>}</div>}
@@ -416,15 +446,17 @@ function RunDeliveryPanel({
       </div>}
       {evidenceNeedsAttention && <div className={`run-delivery-evidence-attention${evidenceFailed ? " run-delivery-evidence-attention--interrupted" : ""}`} role="status">
         <div><strong>{evidenceFailed ? "截图补采失败，仍没有可查看媒体" : "缺少可查看的截图或录屏"}</strong><p>{evidenceFailed ? (evidenceRerun.message ?? "上一轮补采未产出媒体证据，可以重新运行独立验收。") : "结构化 E2E 已保留；是否让项目 test-engineer 重新走一遍验收路径并补采真实界面证据？"}</p></div>
-        <button type="button" className="button secondary" disabled={!canRerunEvidence} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "test-engineer 补采中…" : evidenceFailed ? "重新运行 test-engineer 补采" : "让 test-engineer 补采证据"}</button>
-        {!canRerunEvidence && mergeBusy && <small>当前合入流程正在重测或写入，不能并行启动另一轮补采；若交付退回验收，可在这里直接重跑。</small>}
+        {!acceptanceBindingLoading && acceptanceRunId && !isAcceptanceRun
+          ? <button type="button" className="button secondary" onClick={onOpenAcceptanceRun}>打开该需求绑定的验收 Run →</button>
+          : <button type="button" className="button secondary" disabled={!canRerunEvidence} aria-busy={evidenceBusy} onClick={onRerunEvidence}>{evidenceBusy ? "test-engineer 补采中…" : evidenceFailed ? "重新运行 test-engineer 补采" : "让 test-engineer 补采证据"}</button>}
+        {!canRerunEvidence && evidenceDisabledReason && <small role="note">{evidenceDisabledReason}</small>}
         {evidenceRerunError && <small className="inline-error" role="alert">{evidenceRerunError}</small>}
       </div>}
       {preview.evidence.assets.length > 0 && <div className="run-delivery-evidence-wall">{preview.evidence.assets.map((asset) => <RunEvidenceCard key={asset.id} asset={asset} />)}</div>}
     </div>
     {boardSubmitError && <div className="inline-error" role="alert">{boardSubmitError}</div>}
     {(preview.eligible || actionable || canSubmitToBoard) && !discarded && <div className="run-delivery-actions">
-      {canSubmitToBoard && <button type="button" className="button secondary" disabled={boardSubmitting} aria-busy={boardSubmitting} onClick={onSubmitToBoard} title={taskId ? `写入看板需求 ${taskId} 的验收快照并迁移到待验收` : undefined}>{boardSubmitting ? "提交中…" : "提交该需求到待验收"}</button>}
+      {canSubmitToBoard && <button type="button" className="button secondary" disabled={boardSubmitting} aria-busy={boardSubmitting} onClick={onSubmitToBoard} title={taskId ? `写入看板需求 ${taskId} 的验收快照并迁移到待验收` : undefined}>{boardSubmitting ? "提交中…" : merged ? "补登记该需求到待验收" : "提交该需求到待验收"}</button>}
       {actionable && <button type="button" className="button danger" onClick={onOpenDiscard}>丢弃候选结果</button>}
       {actionable && <button type="button" className="button secondary" onClick={onOpenKeep}>人工保留</button>}
       {canQueueMerge && <button type="button" className="button primary" onClick={onOpenMerge}>批准并加入待合入</button>}
@@ -573,8 +605,10 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
 }) {
   const requestedRunId = focusedRunId || pendingRunId;
   const [runs, setRuns] = useState<Run[]>([]);
-  const [selectedId, setSelectedId] = useState("");
+  const [selectedId, setSelectedId] = useState(requestedRunId);
   const [detail, setDetail] = useState<Run>();
+  const [detailLoading, setDetailLoading] = useState(Boolean(requestedRunId));
+  const [receipt, setReceipt] = useState<Record<string, unknown>>();
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState("");
   const [detailError, setDetailError] = useState("");
@@ -612,6 +646,8 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   const [deciding, setDeciding] = useState(false);
   const [decisionError, setDecisionError] = useState("");
   const [decisionRevision, setDecisionRevision] = useState(0);
+  const [acceptanceBinding, setAcceptanceBinding] = useState<{ taskId: string; runId?: string; capturedAt?: string }>();
+  const [acceptanceBindingError, setAcceptanceBindingError] = useState("");
   const detailRunIdRef = useRef("");
   // A deep link should reveal its Run once when the operator enters the dossier.
   // Activity SSE updates also refresh this list; treating every refresh as a new
@@ -623,6 +659,13 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   // terminal delivery/capture effects on every render.
   const onDashboardSyncRef = useRef(onDashboardSync);
   onDashboardSyncRef.current = onDashboardSync;
+  // A focused Run is navigation state, so apply prop changes before the browser
+  // can paint the previous dossier. This is especially important for the
+  // requirement-embedded view, where acting on a stale Run could mutate the
+  // wrong delivery record.
+  useLayoutEffect(() => {
+    if (requestedRunId) setSelectedId(requestedRunId);
+  }, [requestedRunId]);
   useEffect(() => {
     let current = true;
     setLoading(true);
@@ -630,11 +673,10 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     api<Run[]>("/api/runs?limit=100").then((value) => {
       if (!current) return;
       setRuns(value);
-      setSelectedId((selected) => selected || value[0]?.id || "");
-      // A memory detail can hand us a run to open. Select and reveal it once the
-      // list confirms the run exists; silently ignore ids absent from the list.
+      // A focused Run is authoritative. Never briefly select the newest Run
+      // while its list entry is loading or when switching requirement dossiers.
+      setSelectedId((selected) => requestedRunId || selected || value[0]?.id || "");
       if (requestedRunId && value.some((run) => run.id === requestedRunId)) {
-        setSelectedId(requestedRunId);
         if (pendingRunId) onConsumePending?.();
       }
     }).catch((error: unknown) => {
@@ -657,6 +699,7 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     if (!selectedId) {
       detailRunIdRef.current = "";
       setDetail(undefined);
+      setDetailLoading(false);
       return;
     }
     let current = true;
@@ -666,12 +709,20 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
       detailRunIdRef.current = selectedId;
       setDetail(undefined);
     }
+    setDetailLoading(true);
     setDetailError("");
     api<Run>(`/api/runs/${encodeURIComponent(selectedId)}`)
       .then((value) => { if (current) { setDetail(value); setRetrying(false); } })
-      .catch((error: unknown) => { if (current) { setDetailError(error instanceof Error ? error.message : String(error)); setRetrying(false); } });
+      .catch((error: unknown) => { if (current) { setDetailError(error instanceof Error ? error.message : String(error)); setRetrying(false); } })
+      .finally(() => { if (current) setDetailLoading(false); });
     return () => { current = false; };
   }, [selectedId, activityRevision, decisionRevision, loadRevision]);
+  useEffect(() => {
+    if (!selectedId || !/(?:\?|&)view=receipt(?:&|$)/.test(window.location.hash)) { setReceipt(undefined); return; }
+    let current = true;
+    api<Record<string, unknown>>(`/api/runs/${encodeURIComponent(selectedId)}/receipt`).then(value => { if (current) setReceipt(value); }).catch(() => { if (current) setReceipt(undefined); });
+    return () => { current = false; };
+  }, [selectedId, activityRevision, loadRevision]);
   const projectOptions = useMemo(
     () => [...new Set(runs.map((run) => run.project).filter((project): project is string => Boolean(project)))].sort(),
     [runs]
@@ -680,10 +731,39 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     () => filterRuns(runs, { category: categoryFilter, project: projectFilter }),
     [runs, categoryFilter, projectFilter]
   );
-  const directed = Boolean(pendingRunId);
-  const targetMissing = directed && !loading && !listError && !runs.some((run) => run.id === pendingRunId);
+  const directed = Boolean(requestedRunId);
+  const targetMissing = Boolean(pendingRunId) && !loading && !listError && !runs.some((run) => run.id === pendingRunId);
   const summary = visibleRuns.find((run) => run.id === selectedId) ?? (directed ? undefined : visibleRuns[0]);
-  const selected = detail?.id === summary?.id ? detail : summary;
+  const selected = detail?.id === selectedId ? detail : summary;
+  // Running dossiers refresh every two seconds. Keep the last complete dossier interactive
+  // while those background reads are in flight; the skeleton is only an initial empty state.
+  const showDossierSkeleton = !selected && (loading || (directed && detailLoading));
+  const acceptanceBindingLoading = Boolean(dashboard && selected?.taskId && acceptanceBinding?.taskId !== selected.taskId);
+  const acceptanceRunId = acceptanceBinding && acceptanceBinding.taskId === selected?.taskId ? acceptanceBinding.runId : undefined;
+  useEffect(() => {
+    if (!dashboard || !selected?.taskId) {
+      setAcceptanceBinding(undefined);
+      setAcceptanceBindingError("");
+      return;
+    }
+    let current = true;
+    setAcceptanceBindingError("");
+    dashboard.getRequirement(selected.taskId)
+      .then((requirement) => {
+        if (current) setAcceptanceBinding({
+          taskId: selected.taskId!,
+          runId: requirement.evidence.acceptance?.runId,
+          capturedAt: requirement.evidence.acceptance?.capturedAt
+        });
+      })
+      .catch(() => {
+        if (current) {
+          setAcceptanceBinding({ taskId: selected.taskId! });
+          setAcceptanceBindingError(selected.taskId!);
+        }
+      });
+    return () => { current = false; };
+  }, [dashboard, selected?.taskId]);
   useEffect(() => {
     if (!selected?.id || targetMissing) return;
     window.scrollTo({ top: 0, behavior: "auto" });
@@ -756,14 +836,20 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   }, [dashboard, selected?.taskId, selected?.id, mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt]);
   useEffect(() => {
     const capture = mergePreview?.delivery?.evidenceRerun;
-    if (!dashboard || !selected?.taskId || !selected.id || !capture) return;
+    if (!dashboard || !selected?.taskId || acceptanceRunId !== selected.id || !capture) return;
+    const captureTime = new Date(capture.updatedAt).getTime();
+    const acceptanceTime = new Date(acceptanceBinding?.capturedAt ?? "").getTime();
+    if ((capture.status === "queued" || capture.status === "running")
+      && Number.isFinite(captureTime)
+      && Number.isFinite(acceptanceTime)
+      && captureTime <= acceptanceTime) return;
     void dashboard.syncRequirementEvidenceCapture(selected.taskId, selected.id, {
       status: capture.status,
       updatedAt: capture.updatedAt,
       message: capture.message,
       mediaCount: mergePreview.evidence.assets.length
     }).then((updated) => onDashboardSyncRef.current?.(updated)).catch(() => undefined);
-  }, [dashboard, selected?.taskId, selected?.id, mergePreview?.delivery?.evidenceRerun?.status, mergePreview?.delivery?.evidenceRerun?.updatedAt, mergePreview?.evidence.assets.length]);
+  }, [dashboard, selected?.taskId, selected?.id, acceptanceRunId, acceptanceBinding?.capturedAt, mergePreview?.delivery?.evidenceRerun?.status, mergePreview?.delivery?.evidenceRerun?.updatedAt, mergePreview?.evidence.assets.length]);
   useEffect(() => {
     if (!selected?.id) {
       setHumanRequests([]);
@@ -859,7 +945,7 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     }
   };
   const rerunEvidence = async () => {
-    if (!selected || !mergePreview?.worktreePath) return;
+    if (!selected || acceptanceBindingLoading || acceptanceBindingError === selected.taskId || (selected.taskId && acceptanceRunId !== selected.id) || !mergePreview?.worktreePath) return;
     setEvidenceRerunError("");
     try {
       const delivery = await api<RunDeliveryRecord>(`/api/runs/${encodeURIComponent(selected.id)}/evidence-rerun`, writeBody({
@@ -939,7 +1025,7 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     }
   };
   const submitToBoard = async () => {
-    if (!dashboard || !selected?.taskId || !mergePreview?.eligible || boardSubmitting) return;
+    if (!dashboard || !selected?.taskId || !mergePreview || !isRunAcceptanceReady(mergePreview) || boardSubmitting) return;
     setBoardSubmitting(true);
     setBoardSubmitError("");
     try {
@@ -968,16 +1054,18 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   const canSubmitToBoard = Boolean(
     dashboard
     && selected?.taskId
-    && mergePreview?.eligible
-    && !["queued-for-merge", "retesting", "merging", "merged", "discarded"].includes(mergePreview.status)
+    && mergePreview
+    && isRunAcceptanceReady(mergePreview)
+    && !["queued-for-merge", "retesting", "merging", "discarded"].includes(mergePreview.status)
   );
   const profileEntries = Object.entries(selected?.effectiveProfiles ?? {});
   const showHumanDecisionFirst = humanRequestsLoading || humanRequests.some((request) => request.status === "pending");
   return <div className={`page-grid page-grid--runs${mode === "embedded" ? " page-grid--runs-embedded" : ""}`}>
     <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="run-filter-bar"><div data-testid="run-type-filter"><SelectControl ariaLabel="按类型筛选运行卷宗" value={categoryFilter} options={[{ value: "all", label: "全部类型" }, { value: "single", label: "单任务" }, { value: "graph", label: "Graph 编排" }, { value: "supervisor", label: "领队协作" }]} onChange={(value) => setCategoryFilter(value as typeof categoryFilter)} /></div><div data-testid="run-project-filter"><SelectControl ariaLabel="按项目筛选运行卷宗" value={projectFilter} options={[{ value: "all", label: "全部项目" }, { value: "none", label: "无项目" }, ...projectOptions.map((project) => ({ value: project, label: project }))]} onChange={(value) => setProjectFilter(value)} /></div></div><div className="record-scroll run-list">{visibleRuns.map((run) => <button key={run.id} id={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => { setSelectedId(run.id); onSelectRun?.(run.id); }}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {run.architecture} · {Object.keys(run.nodes).length} 节点</small><div className="run-card-tags">{run.category && <span className={`run-category-tag run-category-tag--${run.category}`}>{CATEGORY_LABELS[run.category]}</span>}{run.project && <span className="run-project-chip">{run.project}</span>}</div></div><Stamp status={run.status} /></button>)}{!loading && visibleRuns.length === 0 && <div className="mini-empty">{runs.length === 0 ? "还没有 Run 证据。" : "没有符合筛选条件的卷宗。"}</div>}</div><footer className="list-footer"><span>{visibleRuns.length}/{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
-    <main className="detail-pane">{loading ? <div className="skeleton-page" aria-label="正在调取运行卷宗"><i /><i /><i /></div> : targetMissing ? <EmptyState title="运行卷宗正在建立" action={<><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</>}>Run {pendingRunId} 尚未出现在本地 Run Store，可稍后重试。</EmptyState> : listError || detailError ? <section className="run-detail-error" role="alert"><h2>运行卷宗加载失败</h2><p>{listError || detailError}</p><code>Run ID · {pendingRunId || selectedId || "未提供"}</code><div><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</div></section> : !selected ? <EmptyState title={directed ? "无法定位运行卷宗" : "尚无运行卷宗"}>{directed ? "URL 中没有可用的 Run ID。" : "直接交办员工或签发一次 Workflow 后，这里会出现不可变的执行记录。"}</EmptyState> : <div className="dossier run-dossier">
+    <main className="detail-pane">{showDossierSkeleton ? <div className="skeleton-page" aria-label="正在调取运行卷宗"><i /><i /><i /></div> : targetMissing ? <EmptyState title="运行卷宗正在建立" action={<><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</>}>Run {pendingRunId} 尚未出现在本地 Run Store，可稍后重试。</EmptyState> : listError || detailError ? <section className="run-detail-error" role="alert"><h2>运行卷宗加载失败</h2><p>{listError || detailError}</p><code>Run ID · {requestedRunId || selectedId || "未提供"}</code><div><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</div></section> : !selected ? <EmptyState title={directed ? "无法定位运行卷宗" : "尚无运行卷宗"}>{directed ? `无法找到目标 Run ${requestedRunId}，且不会回退到其他运行卷宗。` : "直接交办员工或签发一次 Workflow 后，这里会出现不可变的执行记录。"}</EmptyState> : <div className="dossier run-dossier">
       {fromStudio && returnAction}
       <header className="dossier-cover"><div className="file-index"><span>RUN EVIDENCE RECORD</span><code>{selected.id}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">证</div><div><h2 ref={dossierTitleRef} tabIndex={-1} aria-label={`${selected.workflow}，Run ${selected.id} 运行卷宗`}>{selected.workflow}</h2><p>{selected.status === "blocked" ? "流程已完成，但存在业务阻塞结论。" : selected.status === "failed" ? "执行发生技术故障，可查看原始输出与错误证据。" : selected.status === "running" ? "执行仍在进行。" : "流程完成，证据已归档。"}</p></div><Stamp status={selected.status} /></div></header>
+      {receipt && <section className="dossier-section run-receipt" aria-labelledby="run-receipt-title"><h3 id="run-receipt-title">Run Receipt</h3>{Boolean(receipt.legacy) && <p className="dash-hint-line">Legacy Run：缺失字段显示 unavailable，不推断失败原因。</p>}<dl><dt>状态 / 阶段</dt><dd>{String(receipt.status)} / {String(receipt.phase)}</dd><dt>下一步</dt><dd>{String(receipt.nextAction)}</dd><dt>预算</dt><dd><code>{JSON.stringify(receipt.budget)}</code></dd><dt>目标版本</dt><dd><code>{JSON.stringify(receipt.target)}</code></dd><dt>失败分类</dt><dd><code>{JSON.stringify(receipt.failure)}</code></dd></dl></section>}
       {view === "all" && <>{showHumanDecisionFirst && <DossierSection number="待办" title="需要你的决定"><HumanDecisionPanel requests={humanRequests} loading={humanRequestsLoading} commentDrafts={commentDrafts} deciding={deciding} onCommentChange={(requestId, value) => setCommentDrafts((drafts) => ({ ...drafts, [requestId]: value }))} onOpenDecision={openDecision} /></DossierSection>}
       <DossierSection number="01" title="运行元数据"><dl className="ledger"><dt>Run ID</dt><dd><code>{selected.id}</code></dd><dt>Architecture</dt><dd>{selected.architecture}</dd><dt>创建时间</dt><dd>{formatTime(selected.createdAt)}</dd><dt>完成时间</dt><dd>{formatTime(selected.completedAt)}</dd><dt>证据目录</dt><dd><code className="path-code">{selected.artifactDir}</code></dd><dt>隔离</dt><dd><IsolationValue isolation={selected.isolation} /></dd></dl></DossierSection>
       <DossierSection number="02" title="任务与当前请求"><div className="run-request-context">{!selected.invocation?.requestText && <div className="run-context-warning" role="status">当前 Run 未保存请求全文；以下仅为调用摘要。</div>}<h3>任务描述</h3><p>{selected.invocation?.taskDescription ?? "未保存独立任务描述。"}</p><h3>当前请求全文</h3><p>{selected.invocation?.requestText ?? "请求全文不可用。"}</p><h3>请求摘要（核对用）</h3><p>{selected.invocation?.requestSummary ?? "未保存调用摘要。"}</p></div></DossierSection>
@@ -1000,6 +1088,10 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
         onOpenDiscard={() => { setDiscardError(""); setDiscardToken(""); setDiscardOpen(true); }}
         onSubmitToBoard={() => void submitToBoard()}
         onRerunEvidence={() => void rerunEvidence()}
+        acceptanceBindingLoading={acceptanceBindingLoading}
+        acceptanceRunId={acceptanceRunId}
+        acceptanceBindingError={acceptanceBindingError === selected?.taskId}
+        onOpenAcceptanceRun={() => { if (acceptanceRunId) { setSelectedId(acceptanceRunId); onSelectRun?.(acceptanceRunId); } }}
         evidenceRerunError={evidenceRerunError}
         onRetryConflict={() => void retryConflict()}
         conflictRetrying={conflictRetrying}

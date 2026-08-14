@@ -174,7 +174,13 @@ export interface RepositoryBinding {
 
 export interface ProjectProfile {
   project: ManagedProject;
-  members: Array<{ id: string; name: string; role: string; status: "active" | "pending" }>;
+  assignment: {
+    bindingVersion?: number;
+    assignedRoles: number;
+    totalRoles: number;
+    ready: boolean;
+  };
+  members: Array<{ id: string; roleId: string; name: string; role: string; status: "active" | "pending" }>;
   skills: Array<{ id: string; name: string; source: string }>;
   knowledge: Array<{ id: string; title: string; kind: "document" | "knowledge-base"; updatedAt: string }>;
 }
@@ -206,11 +212,17 @@ export interface RunGateSnapshot {
  * Run 验收快照：把一次合格交付预览的关键证据固定到需求上。
  * 所有字段都来自 merge-preview 的真实返回值，不接受占位字符串。
  */
+export type RunAcceptanceSource =
+  | { kind: "worktree"; worktreePath: string }
+  | { kind: "merged-commits"; repositoryRoot: string; baseCommit: string; sourceCommit: string; mergeCommit: string };
+
 export interface RunAcceptanceSnapshot {
   runId: string;
   /** 对应服务端完整门禁计算后的 preview.eligible；旧 acceptedVerdict 不能替代硬门禁。 */
   eligible: boolean;
-  worktreePath: string;
+  /** New snapshots use this discriminated source. worktreePath remains readable for legacy snapshots. */
+  source?: RunAcceptanceSource;
+  worktreePath?: string;
   /** 对应 requiredCapability === "quality.test" 的 Gate。 */
   testGate?: RunGateSnapshot;
   /** 对应 requiredCapability === "quality.audit" 的 Gate。 */

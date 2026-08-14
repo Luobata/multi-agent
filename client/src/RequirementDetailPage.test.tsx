@@ -21,6 +21,7 @@ const project: Project = {
     config: {
       requirementAdvancement: {
         entrancePolicyId: "default-task-entrance-policy",
+        candidateUrl: "http://127.0.0.1:4319",
         polling: { enabled: false, intervalMs: 15_000 }
       }
     }
@@ -172,12 +173,14 @@ describe("RequirementDetailPage advancement launch", () => {
     expect(button("开始推进").disabled).toBe(false);
     await act(async () => { button("开始推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(evaluate).toHaveBeenCalledOnce();
+    expect(evaluate.mock.calls[0]![1]).not.toHaveProperty("candidateUrl");
     expect(dispatch).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain("safe-supervisor · v10");
     expect(document.body.textContent).toContain("启动门禁通过");
 
     await act(async () => { button("确认并开始推进").click(); await new Promise((resolve) => setTimeout(resolve, 20)); });
     expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch.mock.calls[0]![1]).toMatchObject({ candidateUrl: "http://127.0.0.1:4319" });
     expect(dispatch.mock.calls[0]![1].source).toMatchObject({
       taskId: requirement.id
     });
@@ -336,6 +339,52 @@ describe("RequirementDetailPage advancement launch", () => {
     await act(async () => { button("重新推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(gateway.evaluate).toHaveBeenCalledOnce();
     expect(document.body.textContent).toContain("启动门禁通过");
+  });
+
+  it("offers the previous Run and a new launch for a governance-cancelled Invocation cycle", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", idSeed: () => "req-cancelled" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "取消后恢复",
+      summary: "错误 Gate 证据导致取消",
+      priority: "high",
+      rawRequirement: "修正证据后重新推进",
+      acceptanceCriteria: ["创建下一推进周期"]
+    });
+    const config = { entrancePolicyId: entrancePolicy.id, autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-cancelled",
+      runId: "run-cancelled",
+      status: "cancelled",
+      observedAt: "2026-08-10T01:00:01.000Z"
+    }, config.pollIntervalMs);
+    const gateway: RequirementAdvancementGateway = {
+      evaluate: vi.fn().mockResolvedValue(decision),
+      dispatch: vi.fn()
+    };
+
+    act(() => root.render(<RequirementDetailPage
+      requirementId={requirement.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+      entrancePolicies={[entrancePolicy]}
+      workflows={[workflow]}
+      managementPolicies={[managementPolicy]}
+      gateway={gateway}
+      onOpenRun={vi.fn()}
+    />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    expect(button("查看上次 Run")).toBeTruthy();
+    expect(button("重新推进").disabled).toBe(false);
+    await act(async () => { button("重新推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(gateway.evaluate).toHaveBeenCalledOnce();
+    expect(document.body.textContent).toContain("启动门禁通过");
+    expect(document.body.textContent).toContain("已取消的需求不能迁移列");
   });
 
   it("shows the exact blocked Run reason and whether test gates were reached in every dossier section", async () => {

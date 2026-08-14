@@ -263,13 +263,21 @@ export function parseEntrancePolicyDispatchInput(
   const input = objectValue(value, "entrance policy dispatch");
   onlyKeys(
     input,
-    ["route", "specialistKey", "tags", "signals", "source", "message", "sessionId"],
+    ["route", "specialistKey", "tags", "signals", "source", "message", "sessionId", "candidateUrl"],
     "entrance policy dispatch"
   );
   const evaluation = evaluationFields(input, fallbackSource);
   const message = input.message === undefined ? undefined : textValue(input.message, "entrance policy dispatch.message");
   const sessionId = input.sessionId === undefined ? undefined : textValue(input.sessionId, "entrance policy dispatch.sessionId");
-  return { ...evaluation, message, sessionId };
+  const candidateUrl = input.candidateUrl === undefined ? undefined : textValue(input.candidateUrl, "entrance policy dispatch.candidateUrl");
+  if (candidateUrl) {
+    let parsed: URL;
+    try { parsed = new URL(candidateUrl); } catch { throw new Error("entrance policy dispatch.candidateUrl must be a valid HTTP(S) URL"); }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("entrance policy dispatch.candidateUrl must be a valid HTTP(S) URL");
+    }
+  }
+  return { ...evaluation, message, sessionId, candidateUrl };
 }
 
 function signalAtPath(signals: JsonObject, path: string): { exists: boolean; value?: JsonValue } {

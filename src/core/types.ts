@@ -22,6 +22,8 @@ export interface RuntimeHumanDecisionOutcome {
   decision: "approved" | "rejected";
   decidedBy?: string;
   comment?: string;
+  /** Human-approved browser target that overrides any product/default dashboard address. */
+  candidateUrl?: string;
 }
 
 export type OutputProtocol = "json" | "claude-json" | "claude-stream-json" | "codex-stream-json" | "raw";
@@ -33,6 +35,8 @@ export interface ProviderDefinition {
   model?: string;
   /** System-certified execution profiles used by project assignment compatibility checks. */
   runtimeProfiles?: string[];
+  /** Strong adapter capabilities that must be proven during durable preflight. */
+  requiredCapabilities?: string[];
   outputProtocol?: OutputProtocol;
   [key: string]: unknown;
 }
@@ -136,6 +140,10 @@ export interface WorkflowDefinition {
   architecture: string;
   description?: string;
   inputSchema?: string;
+  /** Optional second-layer contract for the architecture's final output. */
+  outputSchema?: string;
+  outputSchemaVersion?: number;
+  outputSchemaDigest?: string;
   config: JsonObject;
 }
 
@@ -159,9 +167,9 @@ export type NodeRunStatus = "pending" | "running" | "passed" | "blocked" | "fail
 export type WorkflowRunStatus = "running" | "passed" | "blocked" | "failed";
 
 export interface NodeRunFailure {
-  category: "provider" | "output-validation" | "preparation" | "interrupted";
+  category: "provider" | "output-validation" | "preparation" | "interrupted" | "authorization" | "authorization-technical" | "budget";
   /** Provider-specific machine classification. Absent for validation/preparation failures. */
-  kind?: import("./errors.js").ProviderFailureKind;
+  kind?: import("./errors.js").ProviderFailureKind | "denied" | "approval-required" | "broker-unavailable" | keyof import("../runtime/governance.js").ExecutionBudgetLimits;
   retryable: boolean;
 }
 
@@ -184,6 +192,14 @@ export interface WorkflowRunIsolation {
   worktreePath?: string;
   baseCommit?: string;
   fallbackReason?: string;
+  /** Explicit, content-addressed lineage when a later cycle inherits an earlier candidate. */
+  continuation?: {
+    fromRunId: string;
+    candidateRevision: string;
+    changedFiles: string[];
+  };
+  /** Durable fail-closed explanation when a predecessor was found but could not be inherited. */
+  continuationRejected?: { fromRunId: string; reason: string };
 }
 
 export interface WorkflowRunRecord {

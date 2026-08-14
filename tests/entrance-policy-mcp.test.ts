@@ -51,7 +51,8 @@ describe("Entrance Policy MCP adapter", () => {
           tags: ["server"],
           signals: { risk: 7 },
           source: { kind: "http", caller: "root-agent" },
-          message: "Execute after routing."
+          message: "Execute after routing.",
+          candidateUrl: "http://127.0.0.1:4319"
         }
       });
 
@@ -81,7 +82,8 @@ describe("Entrance Policy MCP adapter", () => {
       expect(dispatched).toMatchObject({
         route: "auto",
         source: { kind: "mcp", caller: "root-agent" },
-        message: "Execute after routing."
+        message: "Execute after routing.",
+        candidateUrl: "http://127.0.0.1:4319"
       });
     } finally {
       await client.close();

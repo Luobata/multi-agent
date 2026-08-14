@@ -24,6 +24,7 @@ export interface EffectiveProfileCompilationInput {
   request: string;
   taskTags: string[];
   knowledge: KnowledgeRuntimeResult;
+  assignment?: EffectiveExecutionProfile["assignment"];
   compiledAt?: string;
 }
 
@@ -85,7 +86,8 @@ function contribution(
 
 function projectAssignmentSources(
   state: WorkbenchState,
-  invocation: InvocationRecord
+  invocation: InvocationRecord,
+  explicitAssignment?: EffectiveExecutionProfile["assignment"]
 ): {
   assignment?: EffectiveExecutionProfile["assignment"];
   project?: ProjectDefinition;
@@ -94,7 +96,7 @@ function projectAssignmentSources(
   roleBinding?: ProjectRoleBinding;
 } {
   const session = invocation.sessionId ? state.sessions[invocation.sessionId] : undefined;
-  const assignment = session?.assignment;
+  const assignment = explicitAssignment ?? session?.assignment;
   if (!assignment) return {};
   const project = state.projects[assignment.projectId]?.versions.find(
     (candidate) => candidate.version === assignment.projectVersion
@@ -131,7 +133,7 @@ export function compileEffectiveExecutionProfile(input: EffectiveProfileCompilat
     snapshot: jsonSnapshot(baseEmployee)
   });
 
-  const assignmentSources = projectAssignmentSources(state, invocation);
+  const assignmentSources = projectAssignmentSources(state, invocation, input.assignment);
   let contractRef: EffectiveConfigurationReference | undefined;
   let bindingRef: EffectiveConfigurationReference | undefined;
   if (assignmentSources.assignment && assignmentSources.project && assignmentSources.role && assignmentSources.binding && assignmentSources.roleBinding) {

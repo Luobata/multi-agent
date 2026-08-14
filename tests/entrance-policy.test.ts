@@ -258,7 +258,8 @@ describe("task Entrance Policies", () => {
   });
 
   it("starts pinned Graph specialists and Supervisor leaders asynchronously", async () => {
-    const service = await WorkbenchService.open({ dataRoot: temporaryRoot() });
+    const dataRoot = temporaryRoot();
+    const service = await WorkbenchService.open({ dataRoot });
     await createEmployee(service, "graph-specialist");
     const graph = await service.createWorkflow({
       id: "specialist-graph",
@@ -291,7 +292,8 @@ describe("task Entrance Policies", () => {
 
     const leaderDispatch = await service.dispatchEntrancePolicy("workflow-routing", {
       ...evaluation(),
-      message: "Start the supervisor leader."
+      message: "Start the supervisor leader.",
+      candidateUrl: "http://127.0.0.1:4319"
     });
     expect(leaderDispatch.dispatch.kind).toBe("invocation-started");
     if (leaderDispatch.dispatch.kind !== "invocation-started") throw new Error("expected Supervisor receipt");
@@ -310,6 +312,12 @@ describe("task Entrance Policies", () => {
         target: { kind: "supervisor-workflow", workflowId: leader.id, workflowVersion: 1 }
       }
     });
+    const runInput = JSON.parse(fs.readFileSync(
+      path.join(dataRoot, "artifacts", "runs", leaderDispatch.dispatch.receipt.runId, "input.json"),
+      "utf8"
+    )) as Record<string, unknown>;
+    expect(runInput).toMatchObject({ candidateUrl: "http://127.0.0.1:4319" });
+    expect(JSON.stringify(runInput)).not.toContain("http://127.0.0.1:4318");
   });
 
   it("reuses one workflow Invocation for the same durable dispatch key, including after reopen", async () => {

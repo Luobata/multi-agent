@@ -63,10 +63,28 @@ export interface ProviderResponse {
   durationMs: number;
 }
 
+export interface ProviderContract {
+  version: 1;
+  capabilities: string[];
+  /** Constraints the adapter always enforces when invoking its Provider. */
+  invocationRequirements?: string[];
+  legacy?: boolean;
+}
+
+export interface ProviderPreflightContext extends ProviderValidationContext {
+  requiredCapabilities: string[];
+}
+
 export interface ProviderAdapter {
   id: string;
   validate(context: ProviderValidationContext): string[];
+  describe?(): ProviderContract;
+  preflight?(context: ProviderPreflightContext): string[] | Promise<string[]>;
   invoke(invocation: ProviderInvocation): Promise<ProviderResponse>;
+}
+
+export function providerContract(adapter: ProviderAdapter): ProviderContract {
+  return adapter.describe?.() ?? { version: 1, capabilities: [], legacy: true };
 }
 
 export type ProviderRegistry = Map<string, ProviderAdapter>;
@@ -343,7 +361,7 @@ class MockProviderAdapter implements ProviderAdapter {
   readonly id = "mock";
 
   validate(context: ProviderValidationContext): string[] {
-    const allowed = new Set(["adapter", "model", "runtimeProfiles", "outputProtocol", "latencyMs"]);
+    const allowed = new Set(["adapter", "model", "runtimeProfiles", "requiredCapabilities", "outputProtocol", "latencyMs"]);
     const definition = context.definition as Record<string, unknown>;
     const issues = Object.keys(definition)
       .filter((key) => !allowed.has(key))
@@ -432,6 +450,7 @@ function validateCommandProvider(context: ProviderValidationContext): string[] {
     "adapter",
     "model",
     "runtimeProfiles",
+    "requiredCapabilities",
     "command",
     "args",
     "env",
@@ -642,6 +661,7 @@ function validateCodexProvider(context: ProviderValidationContext): string[] {
     "adapter",
     "model",
     "runtimeProfiles",
+    "requiredCapabilities",
     "outputProtocol",
     "command",
     "sandbox",
@@ -772,6 +792,14 @@ export function buildCodexInvocationArgs(
 
 class CodexProviderAdapter implements ProviderAdapter {
   readonly id = "codex";
+
+  describe(): ProviderContract {
+    return {
+      version: 1,
+      capabilities: ["strict-output-schema"],
+      invocationRequirements: ["strict-output-schema"]
+    };
+  }
 
   validate(context: ProviderValidationContext): string[] {
     return validateCodexProvider(context);

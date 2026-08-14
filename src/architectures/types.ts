@@ -12,6 +12,8 @@ import type {
   WorkflowRunStatus,
   WorkflowRunRecord
 } from "../core/types.js";
+import type { ExecutionBudget } from "../runtime/governance.js";
+import type { CandidateWorkspaceSnapshot } from "../runtime/candidateRevision.js";
 
 export interface ArchitectureValidationContext {
   manifest: MultiAgentManifest;
@@ -49,10 +51,18 @@ export interface ArchitectureExecutionContext {
   input: JsonObject;
   plan: ExecutionPlan;
   run: WorkflowRunRecord;
+  /** One global Run ledger shared with Provider invocation and dynamic control-flow consumption. */
+  budget?: ExecutionBudget;
   scheduleNode(node: ExecutionPlanNode): Promise<void>;
   executeNode(node: ExecutionPlanNode, options?: ExecuteNodeOptions): Promise<NodeRunResult>;
   /** Optional Workbench control-plane hook. Architectures must never bypass it for gated work. */
   requestHumanDecision?(request: RuntimeHumanDecisionRequest): Promise<RuntimeHumanDecisionOutcome>;
+  /** Thin RunStore boundary for architecture-owned durable governance evidence. */
+  readArtifact<T = JsonValue>(relativePath: string): Promise<T | undefined>;
+  writeArtifact(relativePath: string, value: unknown): Promise<void>;
+  /** Deterministic execution-root facts exposed through the runtime boundary. */
+  candidateSnapshot(): Promise<CandidateWorkspaceSnapshot>;
+  executionPackageScripts(): Promise<Record<string, string>>;
   persist(): Promise<void>;
   emit(type: string, nodeId?: string, detail?: JsonValue): Promise<void>;
 }

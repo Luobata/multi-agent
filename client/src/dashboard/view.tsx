@@ -57,7 +57,7 @@ export function OfflineNotice() {
   if (available) return null;
   return <div className="dash-offline" role="status">
     <Stamp status="blocked" label="离线只读" />
-    <span>本地运行核心未连接 — 看板演示数据仍可浏览，新建 / 迁移 / 归档等写入暂不可用。</span>
+    <span>本地运行核心未连接 — 已加载的本地界面仍可浏览，新建 / 迁移 / 归档等写入暂不可用。</span>
   </div>;
 }
 

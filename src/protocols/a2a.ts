@@ -8,7 +8,6 @@ import {
   type Part,
   type Task
 } from "@a2a-js/sdk";
-import { TaskNotCancelableError } from "@a2a-js/sdk/errors";
 import {
   AgentEvent,
   DefaultRequestHandler,
@@ -179,8 +178,21 @@ class WorkbenchPublicationExecutor implements AgentExecutor {
     }
   }
 
-  async cancelTask(_taskId: string, _eventBus: ExecutionEventBus): Promise<void> {
-    throw new TaskNotCancelableError("Workbench v1 does not support safe cancellation propagation.");
+  async cancelTask(taskId: string, eventBus: ExecutionEventBus): Promise<void> {
+    const invocation = await this.service.requestCancellationByTaskId(taskId, {
+      actor: "a2a-client",
+      reason: "A2A cancelTask requested"
+    });
+    eventBus.publish(AgentEvent.statusUpdate({
+      taskId,
+      contextId: invocation.source.contextId ?? taskId,
+      status: {
+        state: TaskState.TASK_STATE_CANCELED,
+        message: agentMessage(invocation.source.contextId ?? taskId, taskId, "The workbench invocation was cancelled."),
+        timestamp: invocation.cancellation?.acknowledgedAt ?? new Date().toISOString()
+      },
+      metadata: { invocationId: invocation.id, workbenchStatus: invocation.status }
+    }));
   }
 }
 

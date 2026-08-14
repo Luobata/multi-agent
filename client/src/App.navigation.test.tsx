@@ -126,7 +126,7 @@ describe("App navigation freshness", () => {
     bootstrapRequests[index]?.resolve({ ok: false, status: 503, json: async () => ({ error: { message } }) });
   };
   const flush = async () => {
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)); });
   };
   const click = (element: Element) => {
     act(() => element.dispatchEvent(new MouseEvent("click", { bubbles: true })));
@@ -148,7 +148,7 @@ describe("App navigation freshness", () => {
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("EventSource", FakeEventSource);
     try { window.localStorage.clear(); window.sessionStorage.clear(); } catch { /* jsdom storage may be disabled */ }
-    window.location.hash = "";
+    window.location.hash = "#office";
     vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
     container = document.createElement("div");
     document.body.append(container);
@@ -164,15 +164,29 @@ describe("App navigation freshness", () => {
   });
 
   it("fetches the latest bootstrap on first load", async () => {
+    // This assertion covers bootstrap freshness, not route-chunk loading. Preload
+    // the lazy Office page so parallel full-suite transforms cannot leave the
+    // test observing Suspense's fallback after the bootstrap already settled.
+    await import("./OfficePage");
     act(() => root.render(<App />));
     expect(bootstrapRequests).toHaveLength(1);
 
     respond(0, bootstrapWith({ employees: [employee("mihuhu-frontend-engineer", "米糊糊 · 前端")] }));
     await flush();
 
-    expect(container.textContent).toContain("小镇运行核心已连接");
+    expect(container.textContent).toContain("本地运行核心已连接");
     expect(container.textContent).toContain("米糊糊 · 前端");
     expect(bootstrapRequests).toHaveLength(1);
+  });
+
+  it("opens the task-oriented dashboard for a new empty hash and exposes the lazy fallback", async () => {
+    window.history.replaceState(null, "", window.location.pathname);
+    act(() => root.render(<App />));
+    expect(container.textContent).toContain("正在打开档案页面");
+    respond(0, bootstrapWith({}));
+    await flush();
+    expect(container.textContent).toContain("现在做什么");
+    expect(container.textContent).toContain("继续工作");
   });
 
   it("refetches exactly once when entering another page through the side nav", async () => {
@@ -184,11 +198,12 @@ describe("App navigation freshness", () => {
     expect(bootstrapRequests).toHaveLength(2);
     respond(1, bootstrapWith({ employees: [employee("mihuhu-frontend-engineer", "米糊糊 · 前端")] }));
     await flush(); // lets the hashchange listener settle after navigate()
+    await flush(); // lets the route chunk resolve independently from bootstrap
 
     expect(window.location.hash).toBe("#employees");
     // navigate() and the hashchange listener agree on the page: a single request per navigation.
     expect(bootstrapRequests).toHaveLength(2);
-    expect(container.textContent).toContain("米糊糊 · 前端");
+    expect(container.querySelector(".app-content")?.textContent).toContain("员工档案");
   });
 
   it("does not leave the shell syncing when only a detail section changes inside the same page", async () => {
@@ -259,7 +274,7 @@ describe("App navigation freshness", () => {
     respondError(0, "连接中断，请检查本地核心");
     await flush();
 
-    expect(container.textContent).toContain("小镇运行核心未连接");
+    expect(container.textContent).toContain("本地运行核心未连接");
     expect(container.textContent).toContain("READ ONLY");
     expect(container.textContent).toContain("项目目录同步失败");
     expect(container.textContent).not.toContain("正在同步已接入项目");
@@ -270,7 +285,7 @@ describe("App navigation freshness", () => {
     act(() => root.render(<App />));
     respond(0, bootstrapWith({ employees: [employee("mihuhu-frontend-engineer", "米糊糊 · 前端")] }));
     await flush();
-    expect(container.textContent).toContain("小镇运行核心已连接");
+    expect(container.textContent).toContain("本地运行核心已连接");
     expect(FakeEventSource.urls).toEqual(["/api/activity/stream"]);
 
     click(navButton("员工大厅")); // active-tab refresh
@@ -278,7 +293,7 @@ describe("App navigation freshness", () => {
     await flush();
 
     // A failed background refresh must not flip the online daemon offline...
-    expect(container.textContent).toContain("小镇运行核心已连接");
+    expect(container.textContent).toContain("本地运行核心已连接");
     expect(container.textContent).not.toContain("READ ONLY");
     expect(container.textContent).toContain("米糊糊 · 前端"); // old data stays on screen
     // ...and must not tear down the existing activity stream.
@@ -294,7 +309,7 @@ describe("App navigation freshness", () => {
     respond(2, bootstrapWith({ employees: [employee("mihuhu-frontend-engineer", "米糊糊 · 前端")] }));
     await flush();
     expect(container.querySelector("[role='alert']")).toBeNull(); // retry success clears the error
-    expect(container.textContent).toContain("小镇运行核心已连接");
+    expect(container.textContent).toContain("本地运行核心已连接");
     expect(container.textContent).toContain("米糊糊 · 前端");
     // The retry recovered without duplicating the stream.
     expect(FakeEventSource.urls).toEqual(["/api/activity/stream"]);

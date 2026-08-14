@@ -44,6 +44,17 @@
 | `src/protocols/a2a.ts` | Publication 到 A2A Agent Card/Task/Artifact 的映射 |
 | `client/` | Kimi 设计的 React 档案室 |
 
+## Operational controls (U2–U5)
+
+Workbench operational controls share the same `WorkbenchService` and Store lock as the authoring APIs:
+
+- `workbench bundle export|preview|import` and `/api/bundles/*` use a versioned portable bundle. Imports are preview-first, skip conflicts by default, identify sensitive fields, and require the preview token for sensitive or replacement writes. Secret/token/password/credential/API-key/raw-env keys are omitted from exports.
+- `workbench doctor --json` and `/api/doctor` return one read-only `DoctorReport`; blocked reports set a non-zero CLI exit code.
+- `/api/runs/:id/receipt` and `workbench run get <id>` project current and legacy Run records into one receipt. Unknown legacy fields remain `unavailable`.
+- retention is preview/token/apply and protects active or human-waiting invocations. Browser backup/restore/reset accepts only a safe basename under the server-owned `dataRoot/backups`; traversal, symlink escape, and overwrite are rejected. Local restorable backups retain only system-safe references for secret-like fields and embed checksums; portable bundle export remains redacted and is not presented as a complete local backup. Restore previews before its Store-locked mutation. Reset requires the exact backup digest and a scope-derived typed token; Run evidence is outside the default registry/config scopes.
+
+The Settings archive exposes migration, diagnostics, retention/backup/reset, and security as four sections. Run receipts are deep-linked with `#runs/<runId>?view=receipt`; `#runs?run=<runId>` remains compatible.
+
 直接调用由 `WorkbenchService.directWorkflow()` 创建一节点 Graph，再走 `materializeWorkflow()` 和 `runWorkflow()`。它没有独立执行引擎，也没有新增 `direct` Architecture Adapter。
 
 ## 3. HTTP API
@@ -132,7 +143,7 @@ MCP server 只把 stdio tool call 转成 daemon HTTP 请求，不持有 Employee
 multi-agent-mcp --daemon-url http://127.0.0.1:4318
 ```
 
-调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包：Employee Publication 使用 `invoke_publication`，Workflow Publication 使用 `start_publication`，后者既保留稳定 Publication 边界，也避免同步请求占住整个 Run。需要先决定是否启用领队时，使用 `evaluate_entrance_policy` 做无副作用试算，或用 `dispatch_entrance_policy` 执行固定目标；消息正文不参与路由。直接运行长 Workflow 使用 `start_workflow`。两种异步启动都必须立即用回执的 `monitor.initialCursor` 循环 `wait_workflow_progress`；`terminal=false` 时保持当前回合，变化和心跳都转述 `progressReport`，终态才交付。断线后可用 `resume_workflow_monitor(runId)` 重挂。`run_workflow` 与 Workflow 目标的 `invoke_publication` 仅作为同步兼容入口，不适合长任务。
+调用 `invoke_employee` 时可以传 `sessionId` 继续一个固定版本 Session；省略后创建当前 Employee 版本的新 Session。推荐外部会话先用 `list_publications` 发现调用包：Employee Publication 使用 `invoke_publication`，Workflow Publication 使用 `start_publication`，后者既保留稳定 Publication 边界，也避免同步请求占住整个 Run。需要先决定是否启用领队时，使用 `evaluate_entrance_policy` 做无副作用试算，或用 `dispatch_entrance_policy` 执行固定目标；消息正文不参与路由。直接运行长 Workflow 使用 `start_workflow`。两种异步启动都必须立即用回执的 `monitor.initialCursor` 循环 `wait_workflow_progress`；`terminal=false` 时保持当前回合。只有 changed/terminal 结果进入模型上下文或向用户转述，heartbeat 只是 transport keepalive。cursor 使用持久 `runId:sequence`，旧 cursor 会恢复到最新 snapshot。断线后可用 `resume_workflow_monitor(runId)` 重挂。`run_workflow` 与 Workflow 目标的 `invoke_publication` 仅作为同步兼容入口，不适合长任务。
 
 运行时调度、有限重试和异步入口的设计与后续边界见 [Multi-Agent 运行性能与可靠性优化](multi-agent-runtime-performance.md)。
 

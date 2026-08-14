@@ -25,9 +25,16 @@ const e2eEvidenceValidator: GateValidator = (_gate, output) => {
     return { passed: false, reason: "此门禁要求至少一条真实 e2e 证据；仅静态检查（读源码/类型/lint）不被接受" };
   }
   for (const entry of evidence) {
-    const method = asObject(entry as JsonValue)?.method;
+    const evidenceEntry = asObject(entry as JsonValue);
+    const method = evidenceEntry?.method;
     if (typeof method !== "string" || !REAL_E2E_METHODS.has(method)) {
       return { passed: false, reason: `e2e 证据的 method 必须是 ${[...REAL_E2E_METHODS].join(" / ")} 之一` };
+    }
+    if (typeof evidenceEntry?.steps !== "string" || evidenceEntry.steps.trim().length === 0) {
+      return { passed: false, reason: "e2e 证据的 steps 必须是非空字符串" };
+    }
+    if (typeof evidenceEntry.observed !== "string" || evidenceEntry.observed.trim().length === 0) {
+      return { passed: false, reason: "e2e 证据的 observed 必须是非空字符串" };
     }
   }
   return { passed: true };

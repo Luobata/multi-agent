@@ -1,25 +1,26 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import { ArchivePage } from "./ArchivePage";
-import { BoardPage } from "./BoardPage";
-import { DashboardPage } from "./DashboardPage";
-import { EmployeePage } from "./EmployeePage";
-import { KnowledgePage } from "./KnowledgePage";
-import { MemoryPage } from "./MemoryPage";
 import { DaemonGate, Icon, Modal } from "./components";
-import { OfficePage } from "./OfficePage";
-import { ProjectDetailPage } from "./ProjectDetailPage";
-import { ProjectsHubPage } from "./ProjectsHubPage";
-import { PublicationsPage } from "./PublicationsPage";
-import { RequirementDetailPage } from "./RequirementDetailPage";
-import { RunsPage } from "./RunsPage";
-import { SettingsPage } from "./SettingsPage";
-import { SkillsPage } from "./SkillsPage";
 import { dashboardService } from "./dashboard/service";
 import { ErrorBlock, SkeletonBlock } from "./dashboard/view";
 import type { ActivityEvent, ActivitySnapshot, Bootstrap, HumanDecisionRequest } from "./types";
-import { WorkflowPage } from "./WorkflowPage";
 import { applyTheme, DEFAULT_THEME, readTheme, type ThemeName } from "./theme";
+
+const ArchivePage = lazy(() => import("./ArchivePage").then((module) => ({ default: module.ArchivePage })));
+const BoardPage = lazy(() => import("./BoardPage").then((module) => ({ default: module.BoardPage })));
+const DashboardPage = lazy(() => import("./DashboardPage").then((module) => ({ default: module.DashboardPage })));
+const EmployeePage = lazy(() => import("./EmployeePage").then((module) => ({ default: module.EmployeePage })));
+const KnowledgePage = lazy(() => import("./KnowledgePage").then((module) => ({ default: module.KnowledgePage })));
+const MemoryPage = lazy(() => import("./MemoryPage").then((module) => ({ default: module.MemoryPage })));
+const OfficePage = lazy(() => import("./OfficePage").then((module) => ({ default: module.OfficePage })));
+const ProjectDetailPage = lazy(() => import("./ProjectDetailPage").then((module) => ({ default: module.ProjectDetailPage })));
+const ProjectsHubPage = lazy(() => import("./ProjectsHubPage").then((module) => ({ default: module.ProjectsHubPage })));
+const PublicationsPage = lazy(() => import("./PublicationsPage").then((module) => ({ default: module.PublicationsPage })));
+const RequirementDetailPage = lazy(() => import("./RequirementDetailPage").then((module) => ({ default: module.RequirementDetailPage })));
+const RunsPage = lazy(() => import("./RunsPage").then((module) => ({ default: module.RunsPage })));
+const SettingsPage = lazy(() => import("./SettingsPage").then((module) => ({ default: module.SettingsPage })));
+const SkillsPage = lazy(() => import("./SkillsPage").then((module) => ({ default: module.SkillsPage })));
+const WorkflowPage = lazy(() => import("./WorkflowPage").then((module) => ({ default: module.WorkflowPage })));
 
 type Page = "office" | "employees" | "projects" | "skills" | "knowledge" | "workflows" | "runs" | "publications" | "memory" | "dashboard" | "project" | "board" | "requirement" | "archive" | "settings";
 
@@ -94,7 +95,7 @@ export function pageFromHash(hash = window.location.hash): PageRoute {
   }
   return TOP_LEVEL_PAGES.includes(head as Page)
     ? { page: head as Page, ...(params.get("item") ? { recordId: params.get("item")! } : {}) }
-    : { page: "office" };
+    : { page: "dashboard" };
 }
 
 function upsertById<T extends { id: string }>(items: T[], value: T): T[] {
@@ -213,7 +214,12 @@ export function App() {
       const bootstrap = await api<Bootstrap>("/api/bootstrap");
       if (seq !== bootstrapRequestSeq.current) return; // a newer navigation already superseded this response
       assertKnowledgeControlPlane(bootstrap);
-      dashboardService.syncConnectedProjects(bootstrap.projects, bootstrap.passiveProjectAccesses ?? []);
+      dashboardService.syncConnectedProjects(bootstrap.projects, bootstrap.passiveProjectAccesses ?? [], {
+        projectBindings: bootstrap.projectBindings,
+        employees: bootstrap.employees,
+        skills: bootstrap.skills,
+        knowledgeProfiles: bootstrap.knowledgeProfiles ?? []
+      });
       // Live SSE events that arrived while this request was in flight are newer
       // evidence than the snapshot: merge by id + updatedAt so they survive.
       setData((current) => ({ ...bootstrap, activity: mergeActivity(current.activity, bootstrap.activity) }));
@@ -278,13 +284,13 @@ export function App() {
     return () => window.removeEventListener("hashchange", update);
   }, []);
   useEffect(() => {
-    const hash = window.location.hash || "#office";
+    const hash = window.location.hash || "#dashboard";
     const key = `${SCROLL_MEMORY_PREFIX}${hash}`;
     let restored = 0;
     try { restored = Number(window.sessionStorage.getItem(key) ?? 0) || 0; } catch { /* keep the default */ }
     if ("scrollRestoration" in window.history) window.history.scrollRestoration = "manual";
     const restore = () => {
-      if ((window.location.hash || "#office") === hash) window.scrollTo({ top: restored, behavior: "auto" });
+      if ((window.location.hash || "#dashboard") === hash) window.scrollTo({ top: restored, behavior: "auto" });
     };
     const frame = window.requestAnimationFrame(restore);
     // Dossiers load asynchronously; repeat after their height becomes available.
@@ -390,7 +396,7 @@ export function App() {
     </svg>
     <a className="skip-link" href="#main-content">跳到主内容</a>
     <header className={`daemon-strip daemon-strip--${daemon}`} aria-live="polite">
-      <div><span className="daemon-dot" aria-hidden="true" /><strong>{daemon === "online" ? "小镇运行核心已连接" : daemon === "offline" ? "小镇运行核心未连接" : "正在核对小镇运行核心"}</strong><code>127.0.0.1 · LOOPBACK</code></div>
+      <div><span className="daemon-dot" aria-hidden="true" /><strong>{daemon === "online" ? "本地运行核心已连接" : daemon === "offline" ? "本地运行核心未连接" : "正在核对本地运行核心"}</strong><code>127.0.0.1 · LOOPBACK</code></div>
       <span>{daemon === "offline" ? "READ ONLY · 写入与运行暂不可用" : syncing ? "SYNCING · 正在同步最新档案" : "LOCAL GARDEN · EVIDENCE ON"}</span>
     </header>
     <nav className="side-nav" aria-label="主要导航">
@@ -403,6 +409,7 @@ export function App() {
       <div className="nav-foot"><span>KG</span><div><strong>Kindergarten Workbench</strong><small>班级在册 · A2A 1.0</small></div></div>
     </nav>
     <DaemonGate status={daemon}><div id="main-content" className="app-content" tabIndex={-1}>
+      <Suspense fallback={<main className="dash-page" aria-live="polite"><SkeletonBlock rows={5} label="正在打开档案页面" /></main>}>
       {page === "office" && <OfficePage data={data} streamStatus={activityStream} onOpenRun={(runId) => {
         studioOrigin.current = { scrollY: window.scrollY, cardRunId: runId };
         window.sessionStorage.setItem("workbench.studioRunOrigin", JSON.stringify(studioOrigin.current));
@@ -421,8 +428,11 @@ export function App() {
       {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} pendingRunId={route.runId ?? pendingRunId} onConsumePending={() => setPendingRunId("")} onSelectRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} dashboard={dashboardService} fromStudio={Boolean(studioOrigin.current && (route.runId ?? pendingRunId))} onReturnOffice={() => { if (studioOrigin.current && window.history.length > 1) window.history.back(); else window.location.hash = "office"; }} />}
       {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
-      {page === "dashboard" && <DashboardPage go={go} />}
-      {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")} />}
+      {page === "dashboard" && <DashboardPage go={go} bootstrap={data} daemon={daemon} />}
+      {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={[
+        ...data.projects.map((project) => `${project.id}:${project.version}:${project.status}`),
+        ...data.projectBindings.map((binding) => `${binding.projectId}:${binding.projectVersion}:${binding.version}`)
+      ].join("|")} />}
       {page === "board" && <BoardPage
         spaceId={route.spaceId}
         go={go}
@@ -432,6 +442,7 @@ export function App() {
         onRetrySource={refreshQuietly}
         catalogRevision={data.projects.map((project) => `${project.id}:${project.version}:${project.status}`).join("|")}
         projects={data.projects}
+        projectBindings={data.projectBindings}
         invocations={data.activity.invocations}
         humanDecisionRequests={data.humanDecisionRequests ?? []}
         onOpenRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)}
@@ -450,6 +461,7 @@ export function App() {
       />}
       {page === "archive" && <ArchivePage go={go} notify={notify} />}
       {page === "settings" && <SettingsPage />}
+      </Suspense>
     </div></DaemonGate>
     {notice && <AppNotice
       notice={notice}

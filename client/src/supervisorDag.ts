@@ -57,6 +57,7 @@ export interface DagNodeDraft {
   nodeId: string;
   roleId: string;
   needs: string[];
+  needsWhen?: SupervisorDagNode["needsWhen"];
   kind: SupervisorDagNodeKind;
   task: string;
   capabilitiesText: string;
@@ -77,6 +78,7 @@ export function dagNodeDrafts(definition: SupervisorDagDefinition | undefined): 
     nodeId: node.nodeId,
     roleId: node.roleId,
     needs: [...node.needs],
+    ...(node.needsWhen ? { needsWhen: structuredClone(node.needsWhen) } : {}),
     kind: node.kind,
     task: node.task,
     capabilitiesText: node.requiredCapabilities.join(", "),
@@ -195,6 +197,7 @@ export function dagPayloadFromDrafts(nodes: DagNodeDraft[]): SupervisorDagDefini
       nodeId: node.nodeId.trim(),
       roleId: node.roleId,
       needs: [...node.needs],
+      ...(node.needsWhen ? { needsWhen: structuredClone(node.needsWhen) } : {}),
       kind: node.kind,
       task: node.task.trim(),
       requiredCapabilities: parseCapabilities(node.capabilitiesText),

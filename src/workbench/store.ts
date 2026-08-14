@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, readFileSync, readdirSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -44,9 +44,9 @@ const SYSTEM_SKILL_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 const TEAM_ORCHESTRATION_SKILL_VERSION = 9;
 const TEAM_ORCHESTRATION_INSTRUCTIONS = [
   "Coordinate the assigned team within the Supervisor workflow policy. Delegate explicit work, preserve evidence, respect runtime limits and gates, and finish only when the required work is complete.",
-  "For any coding, test, audit, or integration request that needs more than one bounded milestone, first emit plan-todos. Split the work into dependency-ordered TODOs with one verifiable outcome each. Do not paste the whole request into every TODO. Give sequential TODOs handled by the same role on the same changeSet one stable sessionKey; the runtime preserves that member's logical Work Instance and prior bounded outputs between calls, serializes the session, and releases it only after its last planned TODO or the Run terminates. Delegate only ready todoId values and let the runtime inject the immutable planned task. While a TODO plan is active, every assignment must carry the exact planned todoId and must not override its task, roleId, workKind, or changeSet. Do not invent an unplanned test or audit assignment after implementation: once all required TODOs pass, emit finish and let the runtime execute the configured quality Gates automatically. Independent TODOs may run in parallel within maxParallelDelegations.",
+  "For any coding, test, audit, or integration request that needs more than one bounded milestone, first emit plan-todos. Split the work into dependency-ordered TODOs with one verifiable outcome each. Do not paste the whole request into every TODO. Give sequential TODOs handled by the same role on the same changeSet one stable sessionKey; the runtime preserves that member's logical Work Instance and prior bounded outputs between calls, serializes the session, and releases it only after its last planned TODO or the Run terminates. Delegate only ready todoId values and let the runtime inject the immutable planned task. While a TODO plan is active, every assignment must carry the exact planned todoId and must not override its task, roleId, workKind, or changeSet. For conditional repair, plan only the original validation TODO and one repair TODO whose needs includes the validation and whose needsWhen accepts blocked/failed; after repair passes, rerun the original validation todoId instead of adding a permanently blocked retest TODO. Do not invent an unplanned test or audit assignment after implementation: once all required TODOs pass or conditionally skipped branches converge, emit finish and let the runtime execute the configured quality Gates automatically. Independent TODOs may run in parallel within maxParallelDelegations.",
   "Every coding plan or direct coding delegation must include a structured impact assessment. Base it on changed files and contracts, UI routes, APIs, persistence/state boundaries, concurrency, security, migrations, shared packages, and target-branch drift. Choose regressionScope=targeted for local low-risk changes, package for shared/package behavior, and full only for high-risk cross-boundary or integration changes. List concrete requiredChecks. Downstream test and audit Gates receive this assessment and must reuse same-commit evidence, run only the recorded scope, and return to the leader before widening it. Never request full regression by habit.",
-  "For oversized validation, derive independent domains from acceptance criteria. Put each required check into exactly one optional validationGroups entry and create as many bounded groups as the actual checklist needs; there is no fixed group-count target or ceiling. Each test group should cover a coherent main path, related failure path, targeted automation group, or necessary type/build check. If you omit groups, the runtime derives them dynamically from checklist size. Serial quality-Gate groups reuse one retained test member Session, pass prior bounded evidence into the next group, and release that Work Instance only after the final group or Run termination. Later Gates reuse same-commit shard evidence and run only the smallest missing cross-shard check; never ask one tester to repeat every shard or debug test infrastructure indefinitely.",
+  "For oversized validation, derive independent domains from acceptance criteria. Put each required check into exactly one optional validationGroups entry and create as many bounded groups as the actual checklist needs; there is no fixed group-count target or ceiling. Each test group should cover a coherent main path, related failure path, targeted automation group, or necessary type/build check. When exact repository-relative coverage is known, include impactedFiles so later revisions can inherit only provably unaffected shards. If you omit groups, the runtime derives them dynamically from checklist size. Serial quality-Gate groups reuse one retained test member Session, pass prior bounded evidence into the next group, and release that Work Instance only after the final group or Run termination. Later Gates reuse same-commit shard evidence and run only the smallest missing cross-shard check; never ask one tester to repeat every shard or debug test infrastructure indefinitely.",
   "When the delivery queue calls the original leader back for a merge conflict, the leader owns the conflict tradeoff and must produce a concrete execution plan instead of blocking merely because the leader role is read-only. The trusted runtime starts and advances rebase Git state; it delegates each conflict round to a write-capable frontend, backend, or full-stack project role, which edits and tests only the preserved original worktree. The engineering role must preserve both the accepted requirement and valid target-branch behavior, never install dependencies, never modify or push the real target branch, and must not block merely because its sandbox cannot write parent-repository Git worktree metadata.",
   "After conflict repair, require the independent project test role to rerun requirement-scoped tests and browser evidence, then perform a final leader review. Emit the runtime-requested PASS marker only when the rebased code, test evidence, and original requirement all remain valid; otherwise block with concrete evidence. Automatic merge remains owned by the deterministic serial delivery queue."
 ].join("\n\n");
@@ -630,6 +630,7 @@ async function acquireFileLock(lockPath: string): Promise<() => Promise<void>> {
 export class WorkbenchStore {
   private state: WorkbenchState;
   private mutationQueue: Promise<void> = Promise.resolve();
+  private snapshotMtimeMs = -1;
 
   private constructor(
     public readonly dataRoot: string,
@@ -672,9 +673,13 @@ export class WorkbenchStore {
   }
 
   snapshot(): WorkbenchState {
-    const latest = normalizeState(JSON.parse(readFileSync(path.join(this.dataRoot, "state.json"), "utf8")) as WorkbenchState);
+    const statePath = path.join(this.dataRoot, "state.json");
+    const mtimeMs = statSync(statePath).mtimeMs;
+    if (mtimeMs === this.snapshotMtimeMs) return structuredClone(this.state);
+    const latest = normalizeState(JSON.parse(readFileSync(statePath, "utf8")) as WorkbenchState);
     if (latest.schemaVersion !== 1) throw new Error(`unsupported workbench schema version ${String(latest.schemaVersion)}`);
     this.state = latest;
+    this.snapshotMtimeMs = mtimeMs;
     return structuredClone(this.state);
   }
 
@@ -691,6 +696,7 @@ export class WorkbenchStore {
         result = await mutation(next);
         await writeJsonAtomic(path.join(this.dataRoot, "state.json"), next);
         this.state = next;
+        this.snapshotMtimeMs = -1;
       } catch (error) {
         failure = error;
       } finally {

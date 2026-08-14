@@ -61,7 +61,7 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
   };
 
   return <main className="dash-page">
-    <PageHeader eyebrow="PROJECT / CONNECTED DOSSIER" title="项目详情" description="项目事实来自正式接入声明；虚拟文件夹只负责分类，不会移动 Repository path。" actions={<button type="button" className="button secondary" onClick={() => go("projects")}>← 返回项目</button>} />
+    <PageHeader eyebrow="PROJECT / CONNECTED DOSSIER" title="项目详情" description="项目与角色事实来自接入声明和任用关系；active 只表示声明生效，全部角色分派后才可按角色运行。" actions={<button type="button" className="button secondary" onClick={() => go("projects")}>← 返回项目</button>} />
     <OfflineNotice />
     {state.status === "loading" && <SkeletonBlock rows={5} label="正在加载项目详情" />}
     {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
@@ -70,7 +70,12 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
       <div className="dash-panel dash-project-cover">
         <div className="dash-project-title">
           <h2>{project.name}</h2>
-          <Stamp status="active" label="已正式接入" />
+          <Stamp
+            status={profile.assignment.ready ? "active" : "pending"}
+            label={profile.assignment.ready
+              ? `运行就绪 · 任用 v${profile.assignment.bindingVersion}`
+              : `角色待分派 · ${profile.assignment.assignedRoles}/${profile.assignment.totalRoles}`}
+          />
         </div>
         <div className="dash-project-actions"><button type="button" className="button primary" onClick={() => go(`projects/${project.id}/board`)}>打开需求看板 →</button><button type="button" className="button secondary" onClick={() => go("projects")}>查看项目目录</button></div>
       </div>
@@ -84,7 +89,8 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
         tabIndex={0}
       >
         {activeTab === "overview" && <DossierSection number="01" title="项目概览">
-          <div className="dash-profile-grid"><Field label="收藏" hint="即时保存，6 秒内可撤销。"><SwitchControl checked={project.favorite} disabled={!daemonAvailable} ariaLabel={`收藏 ${project.name}`} onChange={() => favorite(project)} /></Field><ReadonlyEvidence label="项目 ID" value={project.id} mono /><ReadonlyEvidence label="默认分支" value={project.defaultBranch} mono /></div>
+          <div className="dash-profile-grid"><Field label="收藏" hint="即时保存，6 秒内可撤销。"><SwitchControl checked={project.favorite} disabled={!daemonAvailable} ariaLabel={`收藏 ${project.name}`} onChange={() => favorite(project)} /></Field><ReadonlyEvidence label="项目 ID" value={project.id} mono /><ReadonlyEvidence label="默认分支" value={project.defaultBranch} mono /><ReadonlyEvidence label="角色任用" value={`${profile.assignment.assignedRoles}/${profile.assignment.totalRoles}${profile.assignment.bindingVersion ? ` · v${profile.assignment.bindingVersion}` : " · 尚未保存"}`} /></div>
+          {!profile.assignment.ready && <p className="dash-hint-line" role="status">项目声明已生效，但角色任用未完成；按 Project Role 调用会被运行核心拒绝。请返回项目目录打开“接入配置”完成分派。</p>}
           <p className="dash-hint-line">登记于 {project.createdAt.slice(0, 10)} · 最近更新 {project.updatedAt.slice(0, 10)}</p>
         </DossierSection>}
 
@@ -94,11 +100,12 @@ export function ProjectDetailPage({ spaceId, go, notify, service = dashboardServ
         </DossierSection>}
 
         {activeTab === "members" && <DossierSection number="03" title="成员 / 角色">
-          <div className="dash-member-grid">{profile.members.map((member) => <article key={member.id}><span>{member.name.slice(0, 2)}</span><div><strong>{member.name}</strong><small>{member.role}</small></div><Stamp status={member.status === "active" ? "active" : "pending"} /></article>)}</div>
+          <div className="dash-member-grid">{profile.members.map((member) => <article key={member.id}><span>{member.status === "active" ? member.name.slice(0, 2) : "待"}</span><div><strong>{member.name}</strong><small>{member.role} · {member.roleId}</small></div><Stamp status={member.status === "active" ? "active" : "pending"} label={member.status === "active" ? "已分派" : "待分派"} /></article>)}</div>
+          {profile.members.length === 0 && <div className="mini-empty">项目声明没有可展示的角色契约。</div>}
         </DossierSection>}
 
         {activeTab === "knowledge" && <DossierSection number="04" title="Skills / 知识">
-          <div className="dash-profile-columns"><section><h4>Skills</h4>{profile.skills.map((skill) => <div className="dash-profile-row" key={skill.id}><strong>{skill.name}</strong><small>{skill.source}</small></div>)}</section><section><h4>Knowledge / Documents</h4>{profile.knowledge.map((item) => <div className="dash-profile-row" key={item.id}><strong>{item.title}</strong><small>{item.kind === "document" ? "文档" : "知识库"} · {item.updatedAt.slice(0, 10)}</small></div>)}</section></div>
+          <div className="dash-profile-columns"><section><h4>Skills</h4>{profile.skills.map((skill) => <div className="dash-profile-row" key={skill.id}><strong>{skill.name}</strong><small>{skill.source}</small></div>)}{profile.skills.length === 0 && <div className="mini-empty">声明与任用关系尚未绑定 Skill。</div>}</section><section><h4>Knowledge Profiles</h4>{profile.knowledge.map((item) => <div className="dash-profile-row" key={item.id}><strong>{item.title}</strong><small>知识档案 · {item.updatedAt.slice(0, 10)}</small></div>)}{profile.knowledge.length === 0 && <div className="mini-empty">声明与任用关系尚未绑定知识档案。</div>}</section></div>
         </DossierSection>}
 
         {activeTab === "settings" && <DossierSection number="05" title="项目设置">

@@ -181,6 +181,9 @@ interface WorkbenchWorkflowBase {
   status: RecordStatus;
   description: string;
   inputSchema?: JsonObject;
+  workflowOutputSchema?: JsonObject;
+  workflowOutputSchemaVersion?: number;
+  workflowOutputSchemaDigest?: string;
   presentation?: WorkbenchWorkflowPresentation;
   createdAt: string;
   updatedAt: string;
@@ -198,6 +201,8 @@ export interface GraphWorkbenchWorkflowDefinition extends WorkbenchWorkflowBase 
 export interface SupervisorEmployeeBinding {
   employeeId: string;
   employeeVersion: number;
+  /** Project role used when this workflow is invoked inside a registered Project. */
+  projectRoleId?: string;
 }
 
 export interface SupervisorMemberBinding extends SupervisorEmployeeBinding {
@@ -236,6 +241,8 @@ export type SupervisorDagNodeKind =
   | "delivery"
   | "other";
 export type SupervisorDagWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
+export type SupervisorDagDependencyStatus = "passed" | "blocked" | "failed" | "skipped" | "terminal";
+export interface SupervisorDagNeedCondition { nodeId: string; statuses: SupervisorDagDependencyStatus[]; }
 
 export interface SupervisorDagNode {
   /** Stable logical identity used by supervisor delegate decisions and Run evidence. */
@@ -243,6 +250,7 @@ export interface SupervisorDagNode {
   /** Workflow-local member slot. Multiple nodes may intentionally reference the same role. */
   roleId: string;
   needs: string[];
+  needsWhen?: SupervisorDagNeedCondition[];
   kind: SupervisorDagNodeKind;
   task: string;
   requiredCapabilities: string[];
@@ -298,6 +306,14 @@ export interface SupervisorWorkbenchWorkflowDefinition extends WorkbenchWorkflow
   };
   members: SupervisorMemberBinding[];
   flow: SupervisorFlowDefinition;
+  policyPackRef?: { id: string; version: number };
+  separationOfDuties?: {
+    producerRoleIds: string[];
+    approverRoleIds: string[];
+    mustDifferEmployee?: boolean;
+    sameSessionForbidden?: boolean;
+    independentEvidenceRequired?: boolean;
+  };
 }
 
 export type SupervisorWorkflowUpdatePolicy = "latest" | "locked";
@@ -577,6 +593,7 @@ export interface EntrancePolicyExecutionSnapshot {
 export interface EntrancePolicyDispatchInput extends EntrancePolicyEvaluationInput {
   message?: string;
   sessionId?: string;
+  candidateUrl?: string;
 }
 
 export type EntrancePolicyDispatchResult =
@@ -597,6 +614,7 @@ export type InvocationStatus =
   | "queued"
   | "running"
   | "awaiting-human-decision"
+  | "cancellation-requested"
   | "completed"
   | "blocked"
   | "failed"
@@ -605,6 +623,7 @@ export type WorkInstanceStatus =
   | "queued"
   | "waiting"
   | "running"
+  | "cancellation-requested"
   | "completed"
   | "blocked"
   | "failed"
@@ -616,6 +635,14 @@ export interface ActivityTransition<TStatus extends string> {
   status: TStatus;
   phase: string;
   message?: string;
+}
+
+export interface CancellationRecord {
+  actor: string;
+  reason?: string;
+  epoch: number;
+  requestedAt: string;
+  acknowledgedAt?: string;
 }
 
 export type HumanDecisionRequestStatus = "pending" | "approved" | "rejected" | "voided";
@@ -636,6 +663,7 @@ export interface HumanDecisionRequest {
   status: HumanDecisionRequestStatus;
   decidedBy?: string;
   comment?: string;
+  candidateUrl?: string;
   createdAt: string;
   updatedAt: string;
   decidedAt?: string;
@@ -657,6 +685,7 @@ export interface HumanDecisionRequestDecisionInput {
   decision: "approve" | "reject";
   decidedBy: string;
   comment?: string;
+  candidateUrl?: string;
 }
 
 /** One addressable request entering the workbench through HTTP, MCP, A2A, or its local debug desk. */
@@ -676,16 +705,30 @@ export interface InvocationRecord {
   /** Caller-supplied task description when distinct from the request text. */
   taskDescription?: string;
   requestContext?: JsonObject;
+  /** SHA-256 of the canonical workflow start request bound to source.idempotencyKey. */
+  idempotencyFingerprint?: string;
   runId: string;
   sessionId?: string;
   instanceIds: string[];
   executionSnapshot?: {
+    publication?: {
+      id: string;
+      publicationVersion: number;
+      targetVersion: number;
+      releaseChannel: PublicationReleaseChannel;
+    };
     workflow: { id: string; version: number; architecture: WorkbenchWorkflowDefinition["architecture"] };
     managementPolicy?: { id: string; version: number };
     entrance?: EntrancePolicyExecutionSnapshot;
-    employees: Array<{ roleId: string; employeeId: string; employeeVersion: number }>;
+    employees: Array<{
+      roleId: string;
+      employeeId: string;
+      employeeVersion: number;
+      assignment?: EmployeeSession["assignment"];
+    }>;
   };
   error?: string;
+  cancellation?: CancellationRecord;
   createdAt: string;
   startedAt?: string;
   updatedAt: string;
@@ -766,7 +809,11 @@ export type ActivityEvent =
 export interface PublicationTarget {
   kind: "employee" | "workflow";
   id: string;
+  /** Missing only on legacy records; readers resolve it when creating an Invocation. */
+  targetVersion?: number;
 }
+
+export type PublicationReleaseChannel = "locked" | "pinned" | "floating";
 
 export interface PublicationDefinition {
   id: string;
@@ -775,6 +822,7 @@ export interface PublicationDefinition {
   name: string;
   description: string;
   target: PublicationTarget;
+  releaseChannel: PublicationReleaseChannel;
   createdAt: string;
   updatedAt: string;
 }
@@ -1045,6 +1093,8 @@ interface WorkflowCreateBase {
   id: string;
   description?: string;
   inputSchema?: JsonObject;
+  workflowOutputSchema?: JsonObject;
+  workflowOutputSchemaVersion?: number;
   presentation?: WorkbenchWorkflowPresentation;
 }
 
@@ -1060,15 +1110,18 @@ export interface SupervisorWorkflowCreateInput extends WorkflowCreateBase {
   architecture: "supervisor";
   /** Defaults to "latest" when omitted. */
   updatePolicy?: SupervisorWorkflowUpdatePolicy;
-  supervisor: { employeeId: string; employeeVersion?: number };
+  supervisor: { employeeId: string; employeeVersion?: number; projectRoleId?: string };
   managementPolicy: { id: string; version?: number };
   members: Array<{
     roleId: string;
     description?: string;
     employeeId: string;
     employeeVersion?: number;
+    projectRoleId?: string;
   }>;
   flow?: SupervisorFlowInput;
+  policyPackRef?: { id: string; version: number };
+  separationOfDuties?: SupervisorWorkbenchWorkflowDefinition["separationOfDuties"];
 }
 
 export type WorkflowCreateInput = GraphWorkflowCreateInput | SupervisorWorkflowCreateInput;

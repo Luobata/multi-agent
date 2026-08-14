@@ -98,7 +98,7 @@ const defaultOutputSchema = JSON.stringify({
 const E2E_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["verdict", "summary", "e2eEvidence"],
+  required: ["verdict", "summary", "e2eEvidence", "risks"],
   properties: {
     verdict: { enum: ["pass", "block"] },
     summary: { type: "string", minLength: 1 },

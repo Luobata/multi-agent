@@ -1,64 +1,90 @@
-/** 全局工作台：统计 / 任务 / 活动 / 资源（资源为演示数据，徽标由数据驱动）。 */
-import { DemoBadge, RuntimeStatusChip, formatTime } from "./components";
+import { formatTime } from "./components";
 import { dashboardService, type DashboardService } from "./dashboard/service";
-import type { DashboardSummary } from "./dashboard/types";
-import { REQUIREMENT_LANES } from "./dashboard/types";
-import { ErrorBlock, OfflineNotice, PageHeader, SectionShell, SkeletonBlock, useServiceData } from "./dashboard/view";
+import type { DashboardSummary, Requirement } from "./dashboard/types";
+import { ErrorBlock, PageHeader, SectionShell, SkeletonBlock, useServiceData } from "./dashboard/view";
+import type { Bootstrap, InvocationRecord } from "./types";
 
-export function DashboardPage({ go, service = dashboardService }: {
+type QueueItem = {
+  id: string;
+  status: string;
+  title: string;
+  next: string;
+  meta: string[];
+  hash: string;
+  updatedAt: string;
+};
+
+const priority: Record<string, number> = {
+  "awaiting-human-decision": 0,
+  failed: 1,
+  blocked: 2,
+  "awaiting-acceptance": 3,
+  running: 4
+};
+
+function invocationQueue(invocations: InvocationRecord[], bootstrap: Bootstrap): QueueItem[] {
+  return invocations.flatMap((invocation) => {
+    if (!(invocation.status in priority)) return [];
+    const employeeIds = invocation.instanceIds
+      .map((id) => bootstrap.activity.instances.find((instance) => instance.id === id)?.employeeId)
+      .filter((id): id is string => Boolean(id));
+    const projectId = invocation.source.targetProject ?? invocation.source.project;
+    return [{
+      id: invocation.id,
+      status: invocation.status,
+      title: invocation.requestSummary || invocation.taskDescription || "未命名工作",
+      next: invocation.status === "awaiting-human-decision" ? "补充决策" : invocation.status === "running" ? "查看进度" : "查看错误并恢复",
+      meta: [...new Set([...employeeIds.map((id) => `Employee ${id}`), ...(projectId ? [`Project ${projectId}`] : []), `${invocation.target.kind === "workflow" ? "Workflow" : "Employee"} ${invocation.target.id}`, `Run ${invocation.runId}`])],
+      hash: `runs/${encodeURIComponent(invocation.runId)}`,
+      updatedAt: invocation.updatedAt
+    }];
+  });
+}
+
+export function DashboardPage({ go, bootstrap, daemon, service = dashboardService }: {
   go: (hash: string) => void;
+  bootstrap: Bootstrap;
+  daemon: "checking" | "online" | "offline";
   service?: DashboardService;
 }) {
-  const { state, reload } = useServiceData<DashboardSummary>(() => service.getDashboardSummary(), [service]);
+  const { state, reload } = useServiceData<{ summary: DashboardSummary; requirements: Requirement[] }>(async () => {
+    const [summary, requirements] = await Promise.all([service.getDashboardSummary(), service.listBoard()]);
+    return { summary, requirements };
+  }, [service]);
 
   return <main className="dash-page">
-    <PageHeader eyebrow="PROGRAM DESK / OVERVIEW" title="工作台" description="跨项目的研发状态总览：统计、任务、活动与资源占用。" />
-    <OfflineNotice />
-    {state.status === "loading" && <SkeletonBlock rows={4} label="正在加载工作台统计" />}
-    {state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
+    <PageHeader eyebrow="NEXT ACTION / WORKBENCH" title="现在做什么" description="先处理需要你关注的工作，再从运行卷宗核对交付证据。" />
+    {daemon === "offline" && <div className="dash-offline" role="status"><strong>当前为只读离线状态</strong><span>已保留的任务仍可查看；启动本地运行核心后可继续创建、运行和重试。</span></div>}
+    {(daemon === "checking" || state.status === "loading") && <SkeletonBlock rows={5} label="正在整理继续工作队列" />}
+    {state.status === "error" && <ErrorBlock message={state.error ?? "工作台加载失败"} onRetry={reload} />}
     {state.status === "ready" && state.data && (() => {
-      const summary = state.data;
-      return <div className="dash-grid">
-        <SectionShell title="统计" meta={<span>{formatTime(summary.generatedAt)} 更新</span>}>
-          <div className="dash-stat-grid">
-            <div className="dash-stat"><span>活跃项目</span><strong>{summary.projects.active}</strong><small>归档 {summary.projects.archived} · 收藏 {summary.projects.favorites}</small></div>
-            <div className="dash-stat"><span>进行中需求</span><strong>{summary.requirements.active}</strong><small>总计 {summary.requirements.total}</small></div>
-            <div className="dash-stat"><span>异常态需求</span><strong>{summary.requirements.exceptions}</strong><small>阻塞 / 失败 / 取消</small></div>
-            <div className="dash-stat"><span>待验收</span><strong>{summary.tasks.acceptance}</strong><small>排队 {summary.tasks.queued} · 执行 {summary.tasks.running} · 待确认 {summary.tasks.confirmation}</small></div>
-          </div>
+      const { summary, requirements } = state.data;
+      const acceptance = requirements.filter((item) => item.lane === "acceptance" && !item.archivedAt).map((item): QueueItem => ({
+        id: item.id, status: "awaiting-acceptance", title: item.title, next: "核对验收证据", meta: [`Project ${item.projectId}`, `Requirement ${item.code}`], hash: `requirements/${encodeURIComponent(item.id)}?section=acceptance`, updatedAt: item.updatedAt
+      }));
+      const queue = [...invocationQueue(bootstrap.activity.invocations, bootstrap), ...acceptance]
+        .sort((a, b) => priority[a.status]! - priority[b.status]! || b.updatedAt.localeCompare(a.updatedAt));
+      return <div className="task-dashboard">
+        <SectionShell title="继续工作" meta={<span aria-live="polite">{queue.length} 项需要关注</span>}>
+          {queue.length ? <ol className="continue-queue">
+            {queue.map((item) => <li key={`${item.status}:${item.id}`}>
+              <button type="button" onClick={() => go(item.hash)}>
+                <span className={`queue-status queue-status--${item.status}`}>{item.status}</span>
+                <strong>{item.title}</strong>
+                <span className="queue-next">下一步：{item.next} →</span>
+                <small>{item.meta.join(" · ")}</small>
+              </button>
+            </li>)}
+          </ol> : <div className="getting-started">
+            <div><strong>01 创建或完善员工</strong><span>准备一个能承担工作的成员档案。</span><button type="button" disabled={daemon !== "online"} onClick={() => go("employees")}>打开员工档案</button></div>
+            <div><strong>02 接入项目</strong><span>告诉工作台代码在哪里、需要哪些职责。</span><button type="button" disabled={daemon !== "online"} onClick={() => go("projects")}>接入项目</button></div>
+            <div><strong>03 启动团队或需求</strong><span>从需求看板发起一次真实工作。</span><button type="button" disabled={daemon !== "online"} onClick={() => go("board")}>打开需求看板</button></div>
+            <div><strong>04 查看交付证据</strong><span>从 Run Receipt 核对输出、测试与状态变化。</span><button type="button" onClick={() => go("runs")}>查看运行卷宗</button></div>
+          </div>}
         </SectionShell>
-
-        <SectionShell title="任务" meta={<button type="button" className="text-button" onClick={() => go("board")}>打开需求看板 →</button>}>
-          <div className="dash-lane-strip" role="list">
-            {REQUIREMENT_LANES.map((lane) => <button type="button" role="listitem" className="dash-lane-cell" key={lane.id} onClick={() => go("board")}>
-              <span>{lane.label}</span>
-              <strong>{summary.requirements.byLane[lane.id]}</strong>
-            </button>)}
-          </div>
-        </SectionShell>
-
-        <SectionShell title="活动" meta={<span>最近 {summary.activities.length} 条</span>}>
-          {summary.activities.length === 0
-            ? <p className="dash-empty-line">暂无活动记录；空间树与看板操作会记录在这里。</p>
-            : <ol className="dash-activity-list">
-              {summary.activities.map((item) => <li key={item.id}>
-                <time>{formatTime(item.at)}</time>
-                <div><strong>{item.actor} · {item.action}</strong><span>{item.target} — {item.detail}</span></div>
-              </li>)}
-            </ol>}
-        </SectionShell>
-
-        <SectionShell title="资源" meta={summary.resourceOverview.demo ? <DemoBadge /> : undefined}>
-          <div className="dash-resource-list">
-            {summary.resourceOverview.agents.map((agent) => <div className="dash-resource-row" key={agent.name}>
-              <div><strong>{agent.name}</strong><span>{agent.role}</span></div>
-              <div className="dash-resource-meter" role="meter" aria-label={`${agent.name} 负载 ${Math.round(agent.load * 100)}%`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(agent.load * 100)}>
-                <i style={{ width: `${Math.round(agent.load * 100)}%` }} />
-              </div>
-              <code>{Math.round(agent.load * 100)}%</code>
-            </div>)}
-          </div>
-          <p className="dash-hint-line"><RuntimeStatusChip status="idle" label="调度器未接入" /> 负载为演示数据，接入调度器后展示真实占用。</p>
+        <SectionShell title="概览与最近活动" meta={<span>{formatTime(summary.generatedAt)} 更新</span>}>
+          <div className="dashboard-secondary-stats"><span>活跃项目 <strong>{summary.projects.active}</strong></span><span>进行中需求 <strong>{summary.requirements.active}</strong></span><span>异常 <strong>{summary.requirements.exceptions}</strong></span><span>待验收 <strong>{summary.tasks.acceptance}</strong></span></div>
+          {summary.activities.length === 0 ? <p className="dash-empty-line">暂无活动记录。</p> : <ol className="dash-activity-list">{summary.activities.slice(0, 5).map((item) => <li key={item.id}><time>{formatTime(item.at)}</time><div><strong>{item.actor} · {item.action}</strong><span>{item.target} — {item.detail}</span></div></li>)}</ol>}
         </SectionShell>
       </div>;
     })()}

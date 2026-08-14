@@ -140,7 +140,8 @@ async function createFixture(mode: "approve" | "reject", dataRoot = temporaryRoo
     id: "risk-policy",
     allowedRoleIds: ["builder"],
     instructions: "Request a human decision before high-risk delegation.",
-    limits: { maxRounds: 4, maxDelegations: 4, maxParallelDelegations: 1 }
+    limits: { maxRounds: 4, maxDelegations: 4, maxParallelDelegations: 1 },
+    completion: { requireDelegation: false }
   });
   await service.createWorkflow({
     id: "risk-supervisor",
@@ -166,12 +167,15 @@ describe("Supervisor high-risk human decision gate", () => {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
     try {
-      const tools = (await client.listTools()).tools.map((tool) => tool.name);
-      expect(tools).toEqual(expect.arrayContaining([
+      const tools = (await client.listTools()).tools;
+      expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
         "list_human_decision_requests",
         "get_human_decision_request",
         "decide_human_decision_request"
       ]));
+      expect(tools.find((tool) => tool.name === "decide_human_decision_request")?.inputSchema).toMatchObject({
+        properties: { candidateUrl: { type: "string", format: "uri" } }
+      });
     } finally {
       await client.close();
       await server.close();
@@ -233,12 +237,18 @@ describe("Supervisor high-risk human decision gate", () => {
       body: {
         decision: "approve",
         decidedBy: "test-owner",
-        comment: "Approved for this pinned round."
+        comment: "Approved for this pinned round.",
+        candidateUrl: "http://127.0.0.1:4319/#candidate"
       }
     });
     expect(approvedResponse).toMatchObject({
       status: 200,
-      json: { data: { status: "approved", decidedBy: "test-owner", comment: "Approved for this pinned round." } }
+      json: { data: {
+        status: "approved",
+        decidedBy: "test-owner",
+        comment: "Approved for this pinned round.",
+        candidateUrl: "http://127.0.0.1:4319/#candidate"
+      } }
     });
 
     const repeated = await invokeRoute(app, "post", "/api/human-decision-requests/:id/decide", {

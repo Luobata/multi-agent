@@ -52,13 +52,26 @@ flowchart LR
 
 ## 快速开始
 
+前置条件：Node.js 22 或更高版本（以 `package.json#engines` 为准）和 npm。只有使用 Git worktree 隔离、项目接入或代码交付流程时才要求本机安装 Git。
+
+如果目标只是先验证引擎，推荐从不依赖全局注册表的声明式示例开始：
+
 ```bash
+node --version
 npm install
 npm run check
+npm run example:run
+```
+
+命令成功后，完整输入、计划、事件、Provider 原始输出和规范化结果位于 `templates/review-council/.multi-agent/runs/<run-id>/`。
+
+如果目标是管理长期存在的 Employee、Project 和 Workflow，再启动 Workbench：
+
+```bash
 npm run workbench
 ```
 
-然后打开 [http://127.0.0.1:4318](http://127.0.0.1:4318)。默认数据目录是 `~/.multi-agent/workbench`，可用 `MULTI_AGENT_DATA_DIR` 或 `--data-root` 覆盖。默认 `mock` Provider 不需要账号，可以先完成全链路验收。
+然后打开 [http://127.0.0.1:4318](http://127.0.0.1:4318)。默认数据目录是 `~/.multi-agent/workbench`，可用 `MULTI_AGENT_DATA_DIR` 或 `--data-root` 覆盖。新的数据目录只预置内建 Provider 和系统 Skill，Employee、Project、Workflow 与 Publication 为空，这是正常状态；先创建 Employee，再创建或导入 Workflow。默认 `mock` Provider 不需要账号，可用于全链路验收。
 
 开发客户端：
 
@@ -71,7 +84,7 @@ Vite 开发页位于 `http://127.0.0.1:4319`，API 转发到 4318。
 
 ## CLI
 
-声明式 Workflow CLI 继续可用：
+项目提供两种入口，它们共享 Core 与 Run Store 证据模型，但配置来源不同：声明式 CLI 直接读取仓库内 manifest，Workbench CLI/UI 读取长期注册表。声明式 Workflow CLI 适合可复制的仓库内配置和首次验证：
 
 ```bash
 npm run cli -- validate --config templates/review-council/multi-agent.yaml
@@ -79,7 +92,7 @@ npm run cli -- plan review-council --config templates/review-council/multi-agent
 npm run cli -- run review-council --config templates/review-council/multi-agent.yaml --input templates/review-council/input.example.json
 ```
 
-Workbench CLI 使用同一份全局注册表：
+Workbench CLI 使用与 UI 相同的全局注册表，适合版本化维护 Employee、Project、Workflow 和 Publication：
 
 ```bash
 npm run cli -- workbench skill-create templates/workbench/skill.example.json

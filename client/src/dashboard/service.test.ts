@@ -1,6 +1,6 @@
 /** service adapter 边界单测：正常路径 + 中文三段式错误路径 + demo:true 数据驱动断言。 */
 import { describe, expect, it } from "vitest";
-import { DASHBOARD_STORAGE_KEY, createDashboardService, mcpCatalogNodeId, type DashboardService } from "./service";
+import { DASHBOARD_STORAGE_KEY, createDashboardService, mcpCatalogNodeId, type DashboardService, type ProjectCatalogSnapshot } from "./service";
 import { REQUIREMENT_LANES } from "./types";
 import type { PassiveProjectAccess, Project } from "../types";
 
@@ -68,6 +68,36 @@ describe("empty production board and versioned persistence", () => {
     expect((await restored.listSpaces()).filter((node) => node.kind === "project")).toHaveLength(1);
   });
 
+  it("persists a cancelled Invocation cycle and reserves a distinct recovery cycle after reload", async () => {
+    const storage = memoryStorage();
+    const config = { entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const first = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    first.syncConnectedProjects([connectedProject("connected-a")]);
+    const created = await first.createRequirement({
+      projectId: "connected-a",
+      title: "治理取消后恢复",
+      summary: "保留上轮 Run 并创建下一周期",
+      priority: "high",
+      rawRequirement: "错误 Gate 证据导致治理取消",
+      acceptanceCriteria: ["可重新推进"]
+    });
+    const cycleOne = await first.reserveRequirementAdvancement(created.id, config, "human");
+    await first.syncRequirementAdvancement(created.id, cycleOne.idempotencyKey, {
+      invocationId: "inv-cancelled",
+      runId: "run-cancelled",
+      status: "cancelled",
+      observedAt: "2026-08-10T02:00:00.000Z"
+    }, config.pollIntervalMs);
+
+    const restored = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+    restored.syncConnectedProjects([connectedProject("connected-a")]);
+    const cycleTwo = await restored.reserveRequirementAdvancement(created.id, config, "human");
+
+    expect(cycleTwo).toMatchObject({ cycle: 2, status: "dispatching" });
+    expect(cycleTwo.idempotencyKey).not.toBe(cycleOne.idempotencyKey);
+    expect(await restored.getRequirement(created.id)).toMatchObject({ exception: null, advancement: { cycle: 2 } });
+  });
+
   it("does not reuse a persisted requirement id after the browser service is recreated", async () => {
     const storage = memoryStorage();
     const first = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
@@ -132,6 +162,30 @@ describe("empty production board and versioned persistence", () => {
     const repairedEnvelope = JSON.parse(storage.values.get(DASHBOARD_STORAGE_KEY)!) as typeof envelope;
     expect(repairedEnvelope.store.requirements.find((requirement) => requirement.id === created.id)?.lane).toBe("confirmation");
   });
+
+  it.each(["acceptance", "merging", "done"] as const)(
+    "keeps the persisted %s lifecycle locked when a completed advancement is repaired",
+    async (lane) => {
+      const storage = memoryStorage();
+      const first = createDashboardService({ delayMs: () => 0, initialData: "demo", storage });
+      const reserved = await first.reserveRequirementAdvancement("req-103", {
+        entrancePolicyId: "default-task-entrance-policy", autoPollEnabled: false, pollIntervalMs: 15_000
+      }, "human");
+      await first.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
+        invocationId: "inv-lifecycle-lock", runId: "run-lifecycle-lock", status: "completed",
+        observedAt: "2026-08-10T02:00:00.000Z"
+      }, 15_000);
+
+      const envelope = JSON.parse(storage.values.get(DASHBOARD_STORAGE_KEY)!) as {
+        store: { requirements: Array<{ id: string; lane: string }> };
+      };
+      envelope.store.requirements.find((requirement) => requirement.id === "req-103")!.lane = lane;
+      storage.values.set(DASHBOARD_STORAGE_KEY, JSON.stringify({ version: 2, store: envelope.store }));
+
+      const restored = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+      expect(await restored.getRequirement("req-103")).toMatchObject({ lane, advancement: { status: "completed" } });
+    }
+  );
 
   it("repairs legacy duplicate requirement ids without attaching one Run to two cards", async () => {
     const storage = memoryStorage();
@@ -251,6 +305,27 @@ describe("requirement advancement persistence", () => {
       observedAt: "2026-08-09T06:00:46.000Z"
     }, config.pollIntervalMs);
     expect(resumed).toMatchObject({ lane: "running", advancement: { status: "running" } });
+  });
+
+  it("does not let later advancement observations reopen acceptance", async () => {
+    const storage = memoryStorage();
+    const first = createDashboardService({ delayMs: () => 0, initialData: "demo", storage });
+    const reserved = await first.reserveRequirementAdvancement("req-103", config, "human");
+    await first.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
+      invocationId: "inv-acceptance-lock", runId: "run-acceptance-lock", status: "running",
+      observedAt: "2026-08-10T02:00:00.000Z"
+    }, config.pollIntervalMs);
+    const envelope = JSON.parse(storage.values.get(DASHBOARD_STORAGE_KEY)!) as {
+      store: { requirements: Array<{ id: string; lane: string }> };
+    };
+    envelope.store.requirements.find((requirement) => requirement.id === "req-103")!.lane = "acceptance";
+    storage.values.set(DASHBOARD_STORAGE_KEY, JSON.stringify({ version: 2, store: envelope.store }));
+    const restored = createDashboardService({ delayMs: () => 0, initialData: "empty", storage });
+
+    expect(await restored.syncRequirementAdvancement("req-103", reserved.idempotencyKey, {
+      invocationId: "inv-acceptance-lock", runId: "run-acceptance-lock", status: "completed",
+      observedAt: "2026-08-10T02:01:00.000Z"
+    }, config.pollIntervalMs)).toMatchObject({ lane: "acceptance", advancement: { status: "completed" } });
   });
 
   it("keeps the same cycle available for a safe retry when dispatch has no receipt", async () => {
@@ -664,6 +739,33 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
     expect(detail.evidence.reviewNotes).toContain("independent-review");
   });
 
+  it("accepts a complete merged commit source without inventing a worktree", async () => {
+    const service = makeService();
+    const snapshot = {
+      runId: "run-merged-history-102",
+      eligible: true,
+      source: {
+        kind: "merged-commits" as const,
+        repositoryRoot: "/repo",
+        baseCommit: "1".repeat(40),
+        sourceCommit: "2".repeat(40),
+        mergeCommit: "3".repeat(40)
+      },
+      testGate: { gateId: "quality-test", status: "passed" },
+      reviewGate: { gateId: "independent-review", status: "passed" },
+      mediaCount: 1,
+      structuredE2eCount: 1,
+      diffFiles: ["client/src/RunsPage.tsx"],
+      capturedAt: FIXED_NOW.toISOString()
+    };
+
+    await service.submitRequirementForAcceptance("req-102", snapshot);
+    const detail = await service.getRequirement("req-102");
+    expect(detail.evidence.acceptance).toEqual(snapshot);
+    expect(detail.evidence.reviewNotes).toContain("已合并提交证据 base/source/merge");
+    expect(detail.evidence.reviewNotes).not.toContain("候选 worktree");
+  });
+
   it("只用同一验收 Run 的交付状态驱动待合入、完成与异常退回", async () => {
     const service = makeService();
     const runId = "run-merge-queue-102";
@@ -762,6 +864,30 @@ describe("evidence capture projection", () => {
     expect((await restored.getRequirement("req-104")).evidence.acceptance).toMatchObject({ runId: "run-capture", capturedAt: FIXED_NOW.toISOString() });
   });
 
+  it("keeps a newer fixed acceptance snapshot when an older queued observation arrives", async () => {
+    const service = makeService();
+    const runId = "run-2026-08-10T14-16-02-469Z-37a4870a";
+    const capturedAt = "2026-08-10T14:20:00.000Z";
+    await service.submitRequirementForAcceptance("req-104", {
+      runId, eligible: true, worktreePath: `/repo/worktree/${runId}`,
+      testGate: { gateId: "quality.test", status: "passed" }, reviewGate: { gateId: "quality.audit", status: "passed" },
+      mediaCount: 4, structuredE2eCount: 24, diffFiles: ["client/src/RunsPage.tsx"], capturedAt
+    });
+
+    expect(await service.syncRequirementEvidenceCapture("req-104", runId, {
+      status: "queued", updatedAt: "2026-08-10T14:16:03.000Z", mediaCount: 4
+    })).toMatchObject({ lane: "acceptance" });
+    const fixedRequirement = await service.getRequirement("req-104");
+    expect(fixedRequirement.evidenceCapture).toBeUndefined();
+    expect(fixedRequirement.evidence.acceptance).toMatchObject({
+      runId, capturedAt, mediaCount: 4, structuredE2eCount: 24
+    });
+
+    expect(await service.syncRequirementEvidenceCapture("req-104", runId, {
+      status: "queued", updatedAt: "2026-08-10T14:21:00.000Z", mediaCount: 4
+    })).toMatchObject({ lane: "running", evidenceCapture: { status: "queued" } });
+  });
+
   it("does not let retained capture metadata pull a merged requirement back to acceptance", async () => {
     const service = makeService();
     const runId = "run-capture-merged";
@@ -776,12 +902,52 @@ describe("evidence capture projection", () => {
 });
 
 describe("project profile / repository bindings", () => {
-  it("集中返回成员、Skills、知识和多个仓库，并可新增路径绑定", async () => {
+  it("只投影真实角色任用、Skills 和知识，不为未绑定项目伪造成员", async () => {
+    const service = makeService();
+    const project: Project = {
+      ...connectedProject("catalog-project"),
+      roles: [{
+        id: "designer",
+        displayName: "产品设计师",
+        description: "设计",
+        instructions: "Review the product.",
+        requiredSkills: ["hallmark"],
+        optionalSkills: [],
+        knowledgeProfileIds: ["design-kb"]
+      }]
+    };
+    service.syncConnectedProjects([project], [], {
+      projectBindings: [], employees: [], skills: [], knowledgeProfiles: []
+    });
+    const pending = await service.getProjectProfile(project.id);
+    expect(pending.assignment).toEqual({ assignedRoles: 0, totalRoles: 1, ready: false });
+    expect(pending.members).toEqual([expect.objectContaining({ roleId: "designer", name: "未分派员工", status: "pending" })]);
+    expect(pending.skills).toEqual([{ id: "hallmark", name: "hallmark", source: "产品设计师 · 契约必需" }]);
+    expect(pending.knowledge).toEqual([{ id: "design-kb", title: "design-kb", kind: "knowledge-base", updatedAt: project.updatedAt }]);
+
+    service.syncConnectedProjects([project], [], {
+      projectBindings: [{
+        projectId: project.id,
+        projectVersion: project.version,
+        version: 3,
+        roles: [{ roleId: "designer", employeeId: "real-designer", employeeVersion: 7, skills: ["hallmark"], skillVersions: { hallmark: 2 }, knowledgeProfileIds: ["design-kb"], updatePolicy: "compatible" }],
+        createdAt: project.createdAt,
+        updatedAt: project.updatedAt
+      }],
+      employees: [{ id: "real-designer", identity: { displayName: "真实设计师" } }],
+      skills: [{ id: "hallmark", displayName: "Hallmark 设计审计" }],
+      knowledgeProfiles: [{ id: "design-kb", displayName: "项目设计知识", updatedAt: "2026-08-08T00:00:00.000Z" }]
+    } as unknown as ProjectCatalogSnapshot);
+    const ready = await service.getProjectProfile(project.id);
+    expect(ready.assignment).toEqual({ bindingVersion: 3, assignedRoles: 1, totalRoles: 1, ready: true });
+    expect(ready.members).toEqual([expect.objectContaining({ roleId: "designer", name: "真实设计师", status: "active" })]);
+    expect(ready.skills).toEqual([{ id: "hallmark", name: "Hallmark 设计审计", source: "产品设计师 · 任用关系" }]);
+    expect(ready.knowledge).toEqual([{ id: "design-kb", title: "项目设计知识", kind: "knowledge-base", updatedAt: "2026-08-08T00:00:00.000Z" }]);
+  });
+
+  it("集中返回多个仓库，并可新增路径绑定", async () => {
     const service = makeService();
     const profile = await service.getProjectProfile("prj-workbench");
-    expect(profile.members.length).toBeGreaterThan(0);
-    expect(profile.skills.length).toBeGreaterThan(0);
-    expect(profile.knowledge.length).toBeGreaterThan(0);
     expect(profile.project.repositories).toHaveLength(2);
     const updated = await service.bindRepository({ projectId: "prj-workbench", label: "服务端", path: "~/dev/backend", defaultBranch: "trunk" });
     expect(updated.repositories.at(-1)).toMatchObject({ label: "服务端", path: "~/dev/backend", defaultBranch: "trunk", primary: false });

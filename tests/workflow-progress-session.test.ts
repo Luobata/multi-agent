@@ -98,7 +98,8 @@ async function createSupervisorFixture(options: { blockFirstSupervisor?: boolean
   await service.createManagementPolicy({
     id: "durable-policy",
     allowedRoleIds: ["member"],
-    instructions: "Finish when the task is already complete."
+    instructions: "Finish when the task is already complete.",
+    completion: { requireDelegation: false }
   });
   await service.createWorkflow({
     id: "durable-supervisor",
@@ -119,6 +120,27 @@ async function createSupervisorFixture(options: { blockFirstSupervisor?: boolean
 }
 
 describe("Supervisor workflow progress sessions", () => {
+  it("durably cancels a running provider that ignores abort and fences its late completion", async () => {
+    const fixture = await createSupervisorFixture({ blockFirstSupervisor: true });
+    const receipt = await fixture.service.startWorkbenchWorkflow("durable-supervisor", { message: "cancel me" });
+    await fixture.providerStarted;
+    const cancelled = await fixture.service.requestCancellation(receipt.invocation.id, {
+      actor: "test-owner",
+      reason: "no longer needed",
+      graceMs: 1
+    });
+    expect(cancelled).toMatchObject({
+      status: "cancelled",
+      cancellation: { actor: "test-owner", reason: "no longer needed", epoch: 1 }
+    });
+    expect(cancelled.cancellation?.acknowledgedAt).toBeTruthy();
+    await expect(fixture.service.requestCancellation(receipt.invocation.id, { actor: "test-owner" }))
+      .resolves.toMatchObject({ status: "cancelled", cancellation: { epoch: 1 } });
+    fixture.release();
+    await fixture.service.waitForInvocation(receipt.invocation.id);
+    expect((await fixture.service.getInvocationDetail(receipt.invocation.id)).invocation.status).toBe("cancelled");
+  }, 10_000);
+
   it("creates a pinned active leader Session, persists deduplicated progress and terminal delivery, and keeps Graph separate", async () => {
     const fixture = await createSupervisorFixture();
     const receipt = await fixture.service.startWorkbenchWorkflow("durable-supervisor", { message: "完成持久会话任务" });

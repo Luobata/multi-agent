@@ -9,6 +9,7 @@ import type {
 
 export interface RequirementAdvancementConfig {
   entrancePolicyId: string;
+  candidateUrl?: string;
   autoPollEnabled: boolean;
   pollIntervalMs: number;
 }
@@ -61,14 +62,26 @@ function positivePollInterval(value: unknown): number {
     : 15_000;
 }
 
+function httpCandidateUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? value.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Project descriptor config is the only binding between a project and its advancement policy. */
 export function requirementAdvancementConfig(project: Project | undefined): RequirementAdvancementConfig | undefined {
   const config = record(project?.connector.config.requirementAdvancement);
   const entrancePolicyId = typeof config?.entrancePolicyId === "string" ? config.entrancePolicyId.trim() : "";
   if (!entrancePolicyId) return undefined;
   const polling = record(config!.polling);
+  const candidateUrl = httpCandidateUrl(config!.candidateUrl);
   return {
     entrancePolicyId,
+    ...(candidateUrl ? { candidateUrl } : {}),
     autoPollEnabled: polling?.enabled === true,
     pollIntervalMs: positivePollInterval(polling?.intervalMs)
   };
@@ -76,6 +89,12 @@ export function requirementAdvancementConfig(project: Project | undefined): Requ
 
 export function isActiveRequirementAdvancement(advancement: RequirementAdvancement | undefined): boolean {
   return Boolean(advancement && ACTIVE_STATUSES.has(advancement.status));
+}
+
+export function isRecoverableCancelledAdvancement(requirement: Pick<RequirementDetail, "exception" | "advancement">): boolean {
+  return requirement.exception === "cancelled"
+    && requirement.advancement?.status === "cancelled"
+    && Boolean(requirement.advancement.invocationId);
 }
 
 /**
@@ -121,7 +140,11 @@ export function reserveAdvancement(
   if (isActiveRequirementAdvancement(current)) {
     throw new Error(`需求已有进行中的推进任务：${current?.invocationId ?? current?.idempotencyKey}`);
   }
-  if (current?.invocationId && current.status !== "failed" && current.status !== "blocked") {
+  const recoverableCancellation = isRecoverableCancelledAdvancement(requirement);
+  if (current?.invocationId
+    && current.status !== "failed"
+    && current.status !== "blocked"
+    && !recoverableCancellation) {
     throw new Error("这轮推进已经产生 Run；请先在运行卷宗处理结果，再决定是否重新推进");
   }
   if (requirement.lane === "clarify") throw new Error("需求仍在待澄清；请先补齐关键信息并迁移回收件箱或已规划");
@@ -129,7 +152,7 @@ export function reserveAdvancement(
     const label = requirement.lane === "acceptance" ? "待验收" : requirement.lane === "merging" ? "待合入" : "已完成";
     throw new Error(`需求已经位于「${label}」，不能重新开始推进`);
   }
-  if (requirement.exception === "cancelled") throw new Error("已取消的需求不能开始推进");
+  if (requirement.exception === "cancelled" && !recoverableCancellation) throw new Error("已取消的需求不能开始推进");
   if (requirement.acceptanceCriteria.length === 0) throw new Error("缺少验收标准；请先补齐可观察的验收标准");
   const cycle = (current?.cycle ?? 0) + 1;
   return {

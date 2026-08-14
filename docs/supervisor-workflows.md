@@ -37,7 +37,7 @@ MCP 宿主收到回执后应立即循环调用 `wait_workflow_progress`：传入
 
 运行期间，Workbench 会把去重的系统进度消息写入领队 Session；终态写入领队交付消息，但 Session 仍保持 `active`。之后可用 `continue_workflow_conversation(leaderSessionId, message)` 调用固定版本的主管 Employee 继续对话。服务端会反查 Session 与原 Supervisor Invocation、Run、Workflow 和主管绑定，普通 Employee Session 不能冒充领队 Session；通用 `invoke_employee` 也不能绕过此入口复用领队 Session。
 
-daemon 重启不会恢复已经丢失的 Provider 进程。恢复门禁会把未终态 Invocation/WorkInstance 标为 `failed/interrupted`，同时把中断说明持久化到原领队 Session。原 Session 仍可读取和继续对话，主管能从会话历史解释原 Run 已中断。
+daemon 重启不会恢复已经丢失的 Provider 进程本身。对于执行快照、Run 文件、生成后的 manifest 和原执行目录仍完整，且没有等待中人工决定的 Workflow，恢复门禁会从持久检查点重新物化同一个 Run：已通过节点不重做，中断节点重新调用 Provider，原 worktree 继续复用。不满足这些条件的 Invocation/WorkInstance 才会转为 `failed/interrupted`，中断说明会持久化到原领队 Session。
 
 ## 创建与版本
 
@@ -107,7 +107,7 @@ MVP 还支持一个仅用于高风险派单前置控制的结构化动作：
 
 批准会唤醒内存中的同一后台 Invocation，并只执行请求里固定的派单；拒绝会把 comment 写回同一 Supervisor 历史，进入下一轮重规划，不创建新 Invocation 或 Session。请求只能决定一次；批准与拒绝都会留下持久状态记录，并向 Run 的 `events.jsonl` 追加 `human-decision.requested` / `human-decision.approved|rejected`，不会为审计改写 `run.json`。人工等待时间不计入 Management Policy 的 active execution duration。
 
-daemon 重启仍按现有中断恢复语义处理未终态 Invocation；关联 pending 请求原子转为 `voided`，记录 `runtime-recovery` 和中断原因，之后不能再决定。MVP 不提供跨进程恢复后续跑。
+daemon 重启时，关联 pending 请求会原子转为 `voided`，记录 `runtime-recovery` 和中断原因，之后不能再决定；存在这种请求的 Invocation 不会自动续跑。没有 pending 人工决定且恢复材料完整的 Workflow 可以从原 Run 检查点自动续跑，但这不等于恢复原 Provider 进程，也不提供跨进程队列所有权或恰好一次执行保证。
 
 `roleId` 是 Workflow 局部的稳定职责槽，不是 Employee ID、Provider ID 或工具名。Runtime 使用由成员清册生成的 JSON Schema 阻止主管调用未绑定角色，并再次执行 Policy 的轮次、派单、并行和时间限制。
 
@@ -136,6 +136,6 @@ supervisor-r1
 
 ## 当前边界
 
-- Supervisor 成员当前绑定全局 Employee，不绑定项目内部 Employee / Project Role。
+- Supervisor 定义可绑定全局 Employee；在已连接项目中调用时，也可为主管和每个成员声明 `projectRoleId`，运行时按项目版本、Binding 版本和 Employee 版本固定任用关系。
 - 不支持嵌套 Supervisor、Supervisor 调用 Graph Workflow、多主管或通用开放式 `ask_user`；当前人工交互仅限上述四类高风险动作的结构化一次性决定。
-- daemon 重启后不会恢复正在执行的 Provider 进程；Invocation 会转为 `failed/interrupted`，但 Run 证据和领队 Session 会保留并可继续对话。真正的持久队列/Provider 续跑仍属于后续可靠性工作。
+- daemon 重启后不会恢复正在执行的 Provider 进程；恢复材料完整且没有 pending 人工决定的 Workflow 会重放同一 Run，其他 Invocation 转为 `failed/interrupted`。真正的持久队列、租约、跨进程恰好一次执行和 Provider 续跑仍属于后续可靠性工作。

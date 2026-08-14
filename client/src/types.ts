@@ -214,6 +214,7 @@ export interface InvocationRecord {
   requestSummary: string;
   requestText?: string;
   taskDescription?: string;
+  idempotencyFingerprint?: string;
   runId: string;
   sessionId?: string;
   instanceIds: string[];
@@ -492,6 +493,7 @@ export interface SupervisorDagNode {
   /** Workflow-local member slot. Multiple nodes may intentionally reference the same role. */
   roleId: string;
   needs: string[];
+  needsWhen?: Array<{ nodeId: string; statuses: Array<"passed" | "blocked" | "failed" | "skipped" | "terminal"> }>;
   kind: SupervisorDagNodeKind;
   task: string;
   requiredCapabilities: string[];
@@ -515,7 +517,7 @@ export interface SupervisorWorkflow extends WorkflowBase {
   architecture: "supervisor";
   /** "latest" re-resolves pinned versions to newest on every run; "locked" holds until synced. */
   updatePolicy: SupervisorWorkflowUpdatePolicy;
-  supervisor: { employeeId: string; employeeVersion: number };
+  supervisor: { employeeId: string; employeeVersion: number; projectRoleId?: string };
   /** System skill pinned onto the supervisor position at materialization; members never receive it. */
   orchestrationSkill: { id: string; version: number };
   managementPolicy: { id: string; version: number };
@@ -524,6 +526,7 @@ export interface SupervisorWorkflow extends WorkflowBase {
     description: string;
     employeeId: string;
     employeeVersion: number;
+    projectRoleId?: string;
   }>;
   flow: SupervisorFlowDefinition;
 }
@@ -740,8 +743,10 @@ export interface RunMergePreview {
   status: "not-ready" | "awaiting-acceptance" | "queued-for-merge" | "retesting" | "merging" | "returned-to-acceptance" | "conflict" | "merged" | "kept" | "discarded";
   eligible: boolean;
   reasons: string[];
+  acceptanceReadiness: { ready: boolean; reasons: string[] };
   worktreePath?: string;
   repositoryRoot?: string;
+  commitAnchor?: { baseCommit: string; sourceCommit: string; mergeCommit: string };
   sourceBranch?: string;
   sourceCommit?: string;
   targetBranch?: string;

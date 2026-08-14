@@ -1,9 +1,11 @@
 import { Ajv } from "ajv";
 import { describe, expect, it } from "vitest";
 import {
+  supervisorHumanDecisionPlanIssues,
   supervisorValidationCheckGroups,
   supervisorValidationShardIssues
 } from "../src/architectures/supervisor.js";
+import type { SupervisorDagNodeTracker } from "../src/architectures/supervisorDag.js";
 import { supervisorDecisionSchema } from "../src/workbench/materialize.js";
 
 /**
@@ -47,9 +49,20 @@ describe("supervisorDecisionSchema", () => {
       },
       todos: [
         { id: "implement", roleId: "frontend-developer", task: "Implement", needs: [], workKind: "code", sessionKey: "frontend-lane" },
-        { id: "verify", roleId: "test-engineer", task: "Verify", needs: ["implement"], workKind: "test" }
+        { id: "verify", roleId: "test-engineer", task: "Verify", needs: ["implement"], workKind: "test",
+          needsWhen: [{ nodeId: "implement", statuses: ["blocked", "failed"] }] }
       ]
     })).toBe(true);
+    expect(validate({
+      action: "plan-todos",
+      summary: "Invalid empty condition.",
+      impact: { level: "low", regressionScope: "targeted", affectedAreas: [], reasons: ["test"], requiredChecks: [] },
+      todos: [
+        { id: "validate", roleId: "test-engineer", task: "Validate", needs: [], workKind: "test" },
+        { id: "repair", roleId: "backend-developer", task: "Repair", needs: ["validate"], workKind: "code",
+          needsWhen: [{ nodeId: "validate", statuses: [] }] }
+      ]
+    })).toBe(false);
     expect(validate({ action: "delegate", assignments: [{ roleId: "frontend-developer", task: "build UI" }] })).toBe(true);
     expect(validate({
       action: "request-human-decision",
@@ -84,6 +97,63 @@ describe("supervisorDecisionSchema", () => {
     expect(validate({ action: "delegate" })).toBe(false);
     expect(validate({ action: "request-human-decision", summary: "missing risk and assignments" })).toBe(false);
     expect(validate({ action: "satisfy-gate", gateId: "audit" })).toBe(false);
+  });
+
+  it("aligns TODO planning with the configured delegation limit", () => {
+    const single = supervisorDecisionSchema(roleIds, [], 1, undefined, 1);
+    const singleProperties = single.properties as { action: { enum: string[] }; todos?: unknown };
+    expect(singleProperties.action.enum).not.toContain("plan-todos");
+    expect(singleProperties.todos).toBeUndefined();
+
+    const large = supervisorDecisionSchema(roleIds, [], 2, undefined, 100);
+    expect((large.properties as { todos: { maxItems: number } }).todos.maxItems).toBe(100);
+    const validate = new Ajv({ allErrors: true, strict: false }).compile(large);
+    expect(validate({
+      action: "plan-todos",
+      summary: "large plan",
+      impact: { level: "low", regressionScope: "targeted", affectedAreas: [], reasons: ["bounded"], requiredChecks: [] },
+      todos: Array.from({ length: 65 }, (_, index) => ({
+        id: `task-${index}`,
+        roleId: "backend-developer",
+        task: `Task ${index}`,
+        needs: [],
+        workKind: "code"
+      }))
+    })).toBe(true);
+  });
+});
+
+describe("supervisorHumanDecisionPlanIssues", () => {
+  const trackers = new Map<string, SupervisorDagNodeTracker>([["impl-breadcrumb-nav", {
+    node: {
+      nodeId: "impl-breadcrumb-nav",
+      roleId: "engineer",
+      needs: [],
+      kind: "task",
+      task: "Implement breadcrumb navigation.",
+      requiredCapabilities: [],
+      workKind: "code",
+      required: true
+    },
+    status: "passed",
+    executions: []
+  }]]);
+
+  it("rejects a human-decision proposal that adds or reassigns an active TODO", () => {
+    expect(supervisorHumanDecisionPlanIssues([
+      { todoId: "impl-breadcrumb-nav", roleId: "test-engineer", workKind: "test" },
+      { todoId: "new-node", roleId: "engineer", workKind: "code" }
+    ], trackers)).toEqual([
+      expect.stringContaining("uses role test-engineer; expected engineer"),
+      expect.stringContaining("uses workKind test; expected code"),
+      expect.stringContaining("outside the active TODO plan")
+    ]);
+  });
+
+  it("allows gate recovery only through the original TODO identity", () => {
+    expect(supervisorHumanDecisionPlanIssues([
+      { todoId: "impl-breadcrumb-nav", roleId: "engineer", workKind: "code" }
+    ], trackers)).toEqual([]);
   });
 });
 

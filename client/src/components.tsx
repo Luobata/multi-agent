@@ -40,7 +40,7 @@ export function DaemonGate({ status, children }: PropsWithChildren<{ status: Dae
     <div className="daemon-gate" aria-busy={status === "checking"}>
       {status !== "online" && <div className="daemon-gate-notice" role="status">
         <Stamp status="blocked" label={status === "checking" ? "正在连接" : "暂不可写"} />
-        <span>{status === "checking" ? "正在核对本地档案服务；读取界面保持可用。" : "本地档案服务未连接 — 写入与运行暂不可用，已有档案仍可查阅。"}</span>
+        <span>{status === "checking" ? "正在核对本地运行核心；读取界面保持可用。" : "本地运行核心未连接 — 写入与运行暂不可用，已有档案仍可查阅。"}</span>
       </div>}
       {children}
     </div>

@@ -17,12 +17,28 @@ import type {
 } from "./types.js";
 import {
   normalizeSupervisorDagConfig,
+  supervisorDagCandidateEvidenceNodeIds,
+  supervisorDagDependencyMatches,
+  supervisorDagHasFreshCandidateEvidence,
+  supervisorDagHasFreshDependencyEvidence,
   supervisorDagIssues,
+  supervisorDagNodeReady,
   supervisorDagSnapshot,
   type SupervisorDagConfig,
   type SupervisorDagNodeTracker
 } from "./supervisorDag.js";
 import { resolveGateValidator } from "./gateValidators.js";
+import {
+  artifactDigest,
+  gateCandidateIdentity,
+  preflightGateCandidate,
+  recordEnvironmentFailure,
+  reusableGateShard,
+  normalizeValidationGroups,
+  supportedRequiredChecks,
+  type EnvironmentCircuitState,
+  type GateShardEvidence
+} from "../runtime/gateGovernance.js";
 
 type SupervisorWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
 
@@ -75,6 +91,8 @@ interface SupervisorFlowConfig {
 interface SupervisorTeamMemberConfig {
   roleId: string;
   role: string;
+  employeeId?: string;
+  principalId?: string;
   description: string;
   capabilities: string[];
   /** Bounded profile signals the supervisor uses to judge fit — not hard gates. */
@@ -85,12 +103,22 @@ interface SupervisorTeamMemberConfig {
 interface SupervisorWorkflowConfig {
   supervisor: {
     role: string;
+    employeeId?: string;
+    principalId?: string;
     capabilities: string[];
     skillInjection?: { id: string; version: number; reason: string };
   };
   policy: SupervisorPolicyConfig;
   members: SupervisorTeamMemberConfig[];
   flow: SupervisorFlowConfig;
+  effectivePolicyPack?: JsonObject;
+  separationOfDuties?: {
+    producerRoleIds: string[];
+    approverRoleIds: string[];
+    mustDifferEmployee?: boolean;
+    sameSessionForbidden?: boolean;
+    independentEvidenceRequired?: boolean;
+  };
 }
 
 interface SupervisorAssignment {
@@ -120,6 +148,8 @@ interface SupervisorImpactAssessment {
 interface SupervisorValidationGroup {
   id: string;
   requiredChecks: string[];
+  /** Optional exact file coverage. Cross-revision cache inheritance is disabled when absent. */
+  impactedFiles?: string[];
 }
 
 interface SupervisorTodo {
@@ -127,11 +157,34 @@ interface SupervisorTodo {
   roleId: string;
   task: string;
   needs: string[];
+  needsWhen?: import("./supervisorDag.js").SupervisorDagNeedCondition[];
   workKind: SupervisorWorkKind;
   changeSet?: string;
   sessionKey?: string;
   requiredCapabilities?: string[];
   context?: JsonObject;
+}
+
+export function supervisorHumanDecisionPlanIssues(
+  assignments: ReadonlyArray<Pick<SupervisorAssignment, "todoId" | "roleId" | "workKind">>,
+  dagTrackers: ReadonlyMap<string, SupervisorDagNodeTracker>
+): string[] {
+  return assignments.flatMap((assignment) => {
+    const todoId = assignment.todoId;
+    if (typeof todoId !== "string" || !todoId.trim()) {
+      return ["human-decision assignment for an active dynamic plan must specify todoId"];
+    }
+    const tracker = dagTrackers.get(todoId);
+    if (!tracker) return [`human-decision assignment references todoId ${todoId} outside the active TODO plan`];
+    const issues: string[] = [];
+    if (assignment.roleId !== tracker.node.roleId) {
+      issues.push(`human-decision assignment for todoId ${todoId} uses role ${assignment.roleId}; expected ${tracker.node.roleId}`);
+    }
+    if (assignment.workKind !== undefined && assignment.workKind !== tracker.node.workKind) {
+      issues.push(`human-decision assignment for todoId ${todoId} uses workKind ${assignment.workKind}; expected ${tracker.node.workKind}`);
+    }
+    return issues;
+  });
 }
 
 interface MemberSessionTurn {
@@ -311,6 +364,8 @@ const supervisorConfigSchema = {
       required: ["role"],
       properties: {
         role: { type: "string", minLength: 1 },
+        employeeId: { type: "string", minLength: 1 },
+        principalId: { type: "string", minLength: 1 },
         capabilities: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } },
         skillInjection: {
           type: "object",
@@ -383,11 +438,26 @@ const supervisorConfigSchema = {
         properties: {
           roleId: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
           role: { type: "string", minLength: 1 },
+          employeeId: { type: "string", minLength: 1 },
+          principalId: { type: "string", minLength: 1 },
           description: { type: "string", minLength: 1 },
           capabilities: { type: "array", uniqueItems: true, items: { type: "string", minLength: 1 } },
           responsibilities: { type: "array", items: { type: "string", minLength: 1 } },
           skillSummaries: { type: "array", items: { type: "string", minLength: 1 } }
         }
+      }
+    },
+    effectivePolicyPack: { type: "object" },
+    separationOfDuties: {
+      type: "object",
+      additionalProperties: false,
+      required: ["producerRoleIds", "approverRoleIds"],
+      properties: {
+        producerRoleIds: { type: "array", uniqueItems: true, items: { type: "string" } },
+        approverRoleIds: { type: "array", uniqueItems: true, items: { type: "string" } },
+        mustDifferEmployee: { type: "boolean" },
+        sameSessionForbidden: { type: "boolean" },
+        independentEvidenceRequired: { type: "boolean" }
       }
     },
     flow: {
@@ -449,6 +519,18 @@ const supervisorConfigSchema = {
                     type: "array",
                     uniqueItems: true,
                     items: { type: "string", pattern: "^[a-z][a-z0-9-]*$" }
+                  },
+                  needsWhen: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["nodeId", "statuses"],
+                      properties: {
+                        nodeId: { type: "string", pattern: "^[a-z][a-z0-9-]*$" },
+                        statuses: { type: "array", minItems: 1, uniqueItems: true, items: { enum: ["passed", "blocked", "failed", "skipped", "terminal"] } }
+                      }
+                    }
                   },
                   kind: { enum: ["task", "review", "test", "approval", "merge", "integration", "integration-test", "delivery", "other"] },
                   task: { type: "string", minLength: 1 },
@@ -535,6 +617,7 @@ function flowIssues(workflowId: string, flow: SupervisorFlowConfig): string[] {
 }
 
 function strictWorktreeFlowIssues(workflowId: string, value: SupervisorWorkflowConfig): string[] {
+  if ((value.effectivePolicyPack as { ref?: { id?: string } } | undefined)?.ref?.id !== "software-delivery") return [];
   if (value.policy.execution?.isolation !== "worktree") return [];
   const issues: string[] = [];
   const qualityTest = value.flow.gates.find((gate) => (
@@ -584,6 +667,17 @@ function validateSupervisor(context: ArchitectureValidationContext): string[] {
     roleIds.add(member.roleId);
     runtimeRoles.add(member.role);
   }
+  const sod = value.separationOfDuties;
+  if (sod?.mustDifferEmployee) {
+    const producers = value.members.filter((member) => sod.producerRoleIds.includes(member.roleId));
+    const approvers = value.members.filter((member) => sod.approverRoleIds.includes(member.roleId));
+    const hasIndependentPair = producers.some((producer) => approvers.some((approver) => (
+      producer.employeeId && approver.employeeId && producer.employeeId !== approver.employeeId
+    )));
+    if (!hasIndependentPair) {
+      issues.push(`workflow ${context.workflowId} staffing-gap/preparation: separation of duties requires a different producer and approver Employee`);
+    }
+  }
   if (value.policy.limits.maxParallelDelegations > value.policy.limits.maxDelegations) {
     issues.push(`workflow ${context.workflowId} maxParallelDelegations cannot exceed maxDelegations`);
   }
@@ -624,20 +718,33 @@ function supervisorWith(
     __supervisorRound: round,
     __managementPolicy: value.policy as unknown as JsonValue,
     __supervisorFlow: value.flow as unknown as JsonValue,
-    __supervisorTeam: value.members.map(({ roleId, description, capabilities, responsibilities, skillSummaries }) => ({
+    __supervisorTeam: value.members.map(({ roleId, employeeId, principalId, description, capabilities, responsibilities, skillSummaries }) => ({
       roleId,
+      employeeId: employeeId ?? null,
+      principalId: principalId ?? employeeId ?? null,
       description,
       capabilities,
       ...(responsibilities && responsibilities.length ? { responsibilities } : {}),
       ...(skillSummaries && skillSummaries.length ? { skillSummaries } : {})
     })),
     __supervisorCapabilities: value.supervisor.capabilities,
+    __effectivePolicyPack: value.effectivePolicyPack ?? null,
+    __separationOfDuties: value.separationOfDuties ?? null,
     __supervisorGates: gates,
     ...(dagTrackers ? { __supervisorDag: supervisorDagSnapshot(dagTrackers) } : {}),
     __gateExecution: null,
     __supervisorHistory: history,
     __previousAttemptError: ""
   };
+}
+
+function approvedCandidateUrl(input: JsonObject, decision?: { candidateUrl?: string; comment?: string }): string | undefined {
+  const explicit = typeof input.candidateUrl === "string" ? input.candidateUrl.trim() : "";
+  if (explicit) return explicit;
+  if (decision?.candidateUrl?.trim()) return decision.candidateUrl.trim();
+  const urls = decision?.comment?.match(/https?:\/\/[^\s<>"']+/g) ?? [];
+  if (urls.length === 1) return urls[0]!.replace(/[),.;]+$/, "");
+  return undefined;
 }
 
 function supervisorNode(
@@ -654,7 +761,12 @@ function supervisorNode(
     provider: "",
     needs,
     with: supervisorWith(value, round, history, gates, dagTrackers),
-    metadata: { kind: "supervisor", roleId: "supervisor", round }
+    metadata: {
+      kind: "supervisor", roleId: "supervisor", round,
+      employeeId: value.supervisor.employeeId ?? "",
+      principalId: value.supervisor.principalId ?? value.supervisor.employeeId ?? "",
+      workInstanceId: `supervisor-r${round}`
+    }
   };
 }
 
@@ -783,6 +895,7 @@ function todoDag(todos: SupervisorTodo[]): SupervisorDagConfig {
       nodeId: todo.id,
       roleId: todo.roleId,
       needs: [...todo.needs],
+      ...(todo.needsWhen ? { needsWhen: todo.needsWhen.map((condition) => ({ nodeId: condition.nodeId, statuses: [...condition.statuses] })) } : {}),
       kind: todoNodeKind(todo.workKind),
       task: todo.task,
       requiredCapabilities: [...(todo.requiredCapabilities ?? [])],
@@ -850,7 +963,11 @@ function validLeaderValidationGroups(impact: SupervisorImpactAssessment): Superv
   const grouped = groups.flatMap((group) => group.requiredChecks);
   if (grouped.length !== required.size || new Set(grouped).size !== grouped.length) return undefined;
   if (grouped.some((check) => !required.has(check))) return undefined;
-  return groups.map((group) => ({ id: group.id, requiredChecks: [...group.requiredChecks] }));
+  return groups.map((group) => ({
+    id: group.id,
+    requiredChecks: [...group.requiredChecks],
+    ...(group.impactedFiles?.length ? { impactedFiles: [...group.impactedFiles] } : {})
+  }));
 }
 
 /**
@@ -1023,18 +1140,15 @@ function resolveGateExecutor(
       ? { roleId: independentAuditor.roleId, role: independentAuditor.role }
       : undefined;
   }
-  // Capability tags are hints, not a hard gate. Prefer a member whose tags mention the required
-  // capability; otherwise honor the gate's explicit fallback: "supervisor" lets the supervisor cover
-  // (no tag check — that string-match was the anti-pattern), while "block" is softened to let any
-  // member run it rather than blocking on a tag mismatch. Only report no executor when the team is
-  // genuinely empty and the supervisor is not an allowed fallback.
+  // Prefer a member that explicitly advertises the Gate capability. The fallback is a control-flow
+  // contract, not a hint: "supervisor" delegates the check to the leader, while "block" must fail
+  // closed when no capable member exists. Routing a blocking Gate to an arbitrary member would make
+  // the persisted policy and the Run evidence disagree about who was qualified to validate the work.
   const hinted = value.members.find((candidate) => candidate.capabilities.includes(gate.requiredCapability));
   if (hinted) return { roleId: hinted.roleId, role: hinted.role };
   if (gate.fallback === "supervisor") {
     return { roleId: "supervisor", role: value.supervisor.role };
   }
-  const anyMember = value.members[0];
-  if (anyMember) return { roleId: anyMember.roleId, role: anyMember.role };
   return undefined;
 }
 
@@ -1101,8 +1215,95 @@ async function executeGateActivation(
   const role = context.loaded.manifest.roles[executor.role];
   if (!role) throw new Error(`gate executor runtime role not found: ${executor.role}`);
   const regressionImpact = sourceRegressionImpact(context, activation.sourceNodeIds);
+  const candidateUrl = approvedCandidateUrl(context.input);
+  const declaredCandidateRevision = typeof context.input.candidateRevision === "string" ? context.input.candidateRevision.trim() : "";
+  let workspaceCandidate: Awaited<ReturnType<ArchitectureExecutionContext["candidateSnapshot"]>> | undefined;
+  let candidateSnapshotError: string | undefined;
+  try {
+    workspaceCandidate = await context.candidateSnapshot();
+  } catch (error) {
+    candidateSnapshotError = error instanceof Error ? error.message : String(error);
+  }
+  const candidateRevision = declaredCandidateRevision || workspaceCandidate?.revision || context.run.isolation?.baseCommit || activation.key;
+  const candidateIdentity = gateCandidateIdentity({
+    candidateRevision,
+    sourceNodeIds: activation.sourceNodeIds,
+    changeSet: activation.key,
+    candidateUrl: candidateUrl ?? ""
+  });
+  type GovernanceArtifact = {
+    version: 1;
+    preflights: Record<string, Awaited<ReturnType<typeof preflightGateCandidate>>>;
+    circuits: Record<string, EnvironmentCircuitState>;
+    shards: GateShardEvidence[];
+    events: JsonValue[];
+  };
+  const governance = await context.readArtifact<GovernanceArtifact>("gate-governance.json") ?? {
+    version: 1, preflights: {}, circuits: {}, shards: [], events: []
+  };
+  const versionedCandidateFlow = context.run.isolation?.mode === "worktree" || Boolean(declaredCandidateRevision);
+  const browserGate = Boolean(candidateUrl && versionedCandidateFlow)
+    && (tracker.gate.requiredCapability === "quality.test" || tracker.gate.requiredCapability === "quality.audit");
+  if (browserGate && !declaredCandidateRevision && !workspaceCandidate) {
+    tracker.reason = `candidate preflight blocked: execution worktree revision is unavailable${candidateSnapshotError ? ` (${candidateSnapshotError})` : ""}`;
+    governance.events.push({ type: "gate.preflight.blocked", gateId: tracker.gate.id, candidateIdentity, reason: tracker.reason });
+    await context.writeArtifact("gate-governance.json", governance);
+    await context.emit("gate.preflight.blocked", undefined, { gateId: tracker.gate.id, candidateIdentity, reason: tracker.reason });
+    trackerStatus(tracker);
+    await context.persist();
+    return [];
+  }
+  const circuitKey = `${candidateIdentity}:MIDSCENE_ENVIRONMENT_BLOCKED`;
+  if (browserGate && governance.circuits[circuitKey]?.opened) {
+    tracker.reason = `browser environment circuit is open for candidate ${candidateRevision}; repeated Gate execution was suppressed`;
+    governance.events.push({ type: "gate.circuit.short-circuited", gateId: tracker.gate.id, candidateIdentity });
+    await context.writeArtifact("gate-governance.json", governance);
+    await context.emit("gate.circuit.short-circuited", undefined, { gateId: tracker.gate.id, candidateIdentity });
+    trackerStatus(tracker);
+    await context.persist();
+    return [];
+  }
+  if (browserGate && !governance.preflights[candidateIdentity]) {
+    const preflight = await preflightGateCandidate({
+      candidateUrl: candidateUrl!,
+      candidateRevision,
+      probe: async (url) => {
+        try {
+          const response = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5_000) });
+          return {
+            reachable: response.ok,
+            revision: response.headers.get("x-multi-agent-candidate-revision") ?? undefined,
+            reason: response.ok ? undefined : `candidate returned HTTP ${response.status}`
+          };
+        } catch (error) {
+          return { reachable: false, reason: error instanceof Error ? error.message : String(error) };
+        }
+      }
+    });
+    governance.preflights[candidateIdentity] = preflight;
+    governance.events.push({ type: preflight.status === "passed" ? "gate.preflight.passed" : "gate.preflight.blocked", gateId: tracker.gate.id, candidateIdentity });
+    await context.writeArtifact("gate-governance.json", governance);
+    await context.emit(preflight.status === "passed" ? "gate.preflight.passed" : "gate.preflight.blocked", undefined, {
+      gateId: tracker.gate.id, candidateIdentity, checks: preflight.checks
+    });
+    if (preflight.status === "blocked") {
+      tracker.reason = `candidate preflight blocked: ${preflight.checks.filter((check) => check.status === "blocked").map((check) => check.reason).join("; ")}`;
+      trackerStatus(tracker);
+      await context.persist();
+      return [];
+    }
+  } else if (browserGate && governance.preflights[candidateIdentity]?.status === "blocked") {
+    tracker.reason = "candidate preflight remains blocked";
+    trackerStatus(tracker);
+    return [];
+  }
   const baseGateTask = [
     scopedGateInstructions(tracker.gate.instructions, regressionImpact),
+    ...(candidateUrl ? [
+      "",
+      `Approved candidate URL: ${candidateUrl}`,
+      "This candidate URL overrides every default or main-dashboard URL. For browser validation, connect/open this exact address directly with Midscene; do not probe it with shell commands and do not fall back to another origin."
+    ] : []),
     ...(tracker.gate.requiredCapability === "quality.audit" && upstreamEvidenceNodeIds.length > 0
       ? [
           "",
@@ -1112,7 +1313,8 @@ async function executeGateActivation(
       : [])
   ].join("\n");
   const evidenceNeeds = [...new Set([...activation.sourceNodeIds, ...upstreamEvidenceNodeIds])];
-  const validationGroups = tracker.gate.requiredCapability === "quality.test" && regressionImpact
+  const validationGroups = (tracker.gate.requiredCapability === "quality.test"
+    || tracker.gate.requiredCapability === "quality.audit") && regressionImpact
     ? supervisorValidationCheckGroups(regressionImpact)
     : [];
   const executionGroups = validationGroups.length > 1 ? validationGroups : [{ id: "all", requiredChecks: [] }];
@@ -1154,6 +1356,7 @@ async function executeGateActivation(
         __changeSet: "",
         __regressionImpact: regressionImpact ? regressionImpact as unknown as JsonValue : null,
         __delegatedContext: {
+          ...(candidateUrl ? { candidateUrl, candidateUrlSource: "workflow-input-or-human-approval" } : {}),
           ...(regressionImpact ? { regressionImpact: regressionImpact as unknown as JsonValue } : {}),
           ...(upstreamEvidenceNodeIds.length > 0 ? { upstreamGateEvidenceNodeIds: upstreamEvidenceNodeIds } : {}),
           ...(shard ? { gateShard: shard } : {})
@@ -1189,6 +1392,7 @@ async function executeGateActivation(
       activation: activation.key,
       sourceNodeIds: activation.sourceNodeIds,
       upstreamEvidenceNodeIds,
+      ...(candidateUrl ? { candidateUrl, candidateUrlSource: "workflow-input-or-human-approval" } : {}),
       ...(shard ? { shard } : {})
     };
     return node;
@@ -1198,7 +1402,34 @@ async function executeGateActivation(
   // checkpoint after every completed shard. The same logical member Session is retained between
   // shards, so the tester receives the prior bounded evidence instead of being recreated cold.
   const results: Array<{ node: ExecutionPlanNode; result: NodeRunResult }> = [];
+  // Charge only an activation that is about to execute. Fast-path replays and
+  // missing-executor blocks above do not consume Provider-side Gate quota.
+  let gateCharged = false;
+  let circuitOpened = false;
+  let reusedShardCount = 0;
   for (const [index, node] of nodes.entries()) {
+    const group = executionGroups[index]!;
+    const cached = governance.shards.find((evidence) => reusableGateShard(evidence, {
+      candidateIdentity, candidateRevision, gateId: tracker.gate.id, shardId: group.id,
+      checks: group.requiredChecks, changedFiles: workspaceCandidate?.changedFiles ?? []
+    }));
+    if (cached) {
+      const inherited = cached.candidateIdentity !== candidateIdentity;
+      const reused = inherited ? { ...cached, candidateIdentity, candidateRevision, inheritedFromCandidateIdentity: cached.candidateIdentity } : cached;
+      if (inherited) governance.shards.push(reused);
+      governance.events.push({ type: "gate.shard.reused", gateId: tracker.gate.id, shardId: group.id, candidateIdentity,
+        ...(inherited ? { inheritedFromCandidateIdentity: cached.candidateIdentity } : {}) });
+      await context.writeArtifact("gate-governance.json", governance);
+      await context.emit("gate.shard.reused", undefined, { gateId: tracker.gate.id, shardId: group.id, candidateIdentity });
+      tracker.executions.push({ nodeId: cached.artifactPath, executorRoleId: executor.roleId, executorRuntimeRole: executor.role,
+        activation: activation.key, sourceNodeIds: activation.sourceNodeIds, status: "passed", evidence: cached as unknown as JsonValue, error: null });
+      reusedShardCount += 1;
+      continue;
+    }
+    if (!gateCharged) {
+      context.budget?.reserve("gates").commit();
+      gateCharged = true;
+    }
     if (gateMemberSession) {
       node.with.__memberSession = memberSessionSnapshot(gateMemberSession);
       await context.emit(index === 0 ? "supervisor.member-session.opened" : "supervisor.member-session.continued", node.id, {
@@ -1212,6 +1443,21 @@ async function executeGateActivation(
     await context.scheduleNode(node);
     const result = await context.executeNode(node, { dependencyFailure: "observe", deadlineAt });
     results.push({ node, result });
+    const serialized = JSON.stringify(result.output ?? result.error ?? null);
+    if (serialized.includes("MIDSCENE_ENVIRONMENT_BLOCKED")) {
+      const circuit = recordEnvironmentFailure(governance.circuits[circuitKey], {
+        candidateRevision, candidateUrl: candidateUrl ?? "", errorClass: "MIDSCENE_ENVIRONMENT_BLOCKED",
+        reason: result.error ?? "structured Gate evidence classified the browser environment as blocked"
+      });
+      governance.circuits[circuitKey] = circuit;
+      governance.events.push({ type: circuit.opened ? "gate.circuit.opened" : "gate.circuit.recovery-allowed", gateId: tracker.gate.id, shardId: group.id, candidateIdentity });
+      await context.writeArtifact("gate-governance.json", governance);
+      await context.emit(circuit.opened ? "gate.circuit.opened" : "gate.circuit.recovery-allowed", node.id, { gateId: tracker.gate.id, candidateIdentity, failures: circuit.failures });
+      if (circuit.opened) {
+        circuitOpened = true;
+        break;
+      }
+    }
     if (gateMemberSession) {
       gateMemberSession.turns.push({
         todoId: executionGroups[index]!.id,
@@ -1232,19 +1478,22 @@ async function executeGateActivation(
       }
     }
   }
-  let activationPassed = true;
+  let activationPassed = !circuitOpened && results.length + reusedShardCount === nodes.length;
   const errors: string[] = [];
   for (const { node, result } of results) {
+    const gateDecision = executor.roleId === "supervisor" ? decision(result.output) : undefined;
+    const semanticEvidence = executor.roleId === "supervisor" && gateDecision?.action === "satisfy-gate"
+      ? gateDecision.evidence
+      : result.output ?? null;
     let passed = result.status === "passed";
     if (passed && executor.roleId === "supervisor") {
-      const gateDecision = decision(result.output);
       passed = gateDecision?.action === "satisfy-gate" && gateDecision.gateId === tracker.gate.id;
     }
     let validatorReason: string | undefined;
     if (passed) {
       const validator = resolveGateValidator(tracker.gate);
       if (validator) {
-        const verdict = validator(tracker.gate, result.output ?? null);
+        const verdict = validator(tracker.gate, semanticEvidence);
         if (!verdict.passed) { passed = false; validatorReason = verdict.reason; }
       }
     }
@@ -1261,10 +1510,21 @@ async function executeGateActivation(
       executorRuntimeRole: executor.role,
       activation: activation.key,
       sourceNodeIds: activation.sourceNodeIds,
-      status: passed ? "passed" : result.status,
-      evidence: result.output ?? null,
+      status: passed ? "passed" : result.status === "passed" ? "blocked" : result.status,
+      evidence: semanticEvidence,
       error
     });
+    if (passed) {
+      const group = executionGroups[nodes.indexOf(node)]!;
+      const evidence: GateShardEvidence = {
+        candidateIdentity, candidateRevision, gateId: tracker.gate.id, shardId: group.id,
+        checks: group.requiredChecks, impactedFiles: group.impactedFiles ?? [], status: "passed",
+        artifactPath: `nodes/${node.id}`, artifactDigest: artifactDigest(semanticEvidence), sourceNodeIds: activation.sourceNodeIds
+      };
+      governance.shards = governance.shards.filter((item) => !(item.candidateIdentity === candidateIdentity && item.gateId === tracker.gate.id && item.shardId === group.id));
+      governance.shards.push(evidence);
+      await context.writeArtifact("gate-governance.json", governance);
+    }
     if (nodes.length > 1) {
       await context.emit(passed ? "gate.shard.passed" : "gate.shard.unsatisfied", node.id, {
         gateId: tracker.gate.id,
@@ -1398,6 +1658,15 @@ async function runCompletionGates(
       upstreamEvidenceNodeIds
     );
     nodeIds.push(...executedNodeIds);
+    // Completion Gates are ordered policy. A required upstream quality Gate that did not
+    // pass makes a before-completion audit of the same candidate redundant and misleading.
+    if (tracker.gate.required && tracker.gate.requiredCapability === "quality.test" && tracker.status !== "passed") {
+      await context.emit("gate.downstream.short-circuited", undefined, {
+        gateId: tracker.gate.id,
+        reason: "required quality-test did not pass"
+      });
+      break;
+    }
     if (tracker.status === "passed") upstreamEvidenceNodeIds.push(...executedNodeIds);
   }
   return nodeIds;
@@ -1477,10 +1746,45 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     : startedAt + value.policy.limits.maxDurationMs;
   const durationExceeded = () => deadlineAt !== undefined && Date.now() >= deadlineAt;
 
+  const settleConditionalSkips = async (): Promise<void> => {
+    if (!dagTrackers) return;
+    let changed = false;
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      for (const tracker of dagTrackers.values()) {
+        if (tracker.status !== "pending") continue;
+        const terminalBranchMismatch = tracker.node.needs.some((need) => {
+          const dependencyStatus = dagTrackers!.get(need)?.status ?? "pending";
+          if (dependencyStatus === "pending" || dependencyStatus === "running") return false;
+          const hasExplicitCondition = tracker.node.needsWhen?.some((condition) => condition.nodeId === need) ?? false;
+          if (hasExplicitCondition) {
+            return !supervisorDagDependencyMatches(tracker.node, need, dependencyStatus);
+          }
+          // Preserve the ordinary passed-only failure boundary: blocked/failed dependencies remain
+          // visible and do not silently disappear. Only a branch already skipped by an explicit
+          // condition propagates that convergence through an ordinary downstream edge.
+          return dependencyStatus === "skipped";
+        });
+        if (!terminalBranchMismatch) continue;
+        tracker.status = "skipped";
+        progressed = true;
+        changed = true;
+      }
+    }
+    if (changed) {
+      await context.emit("supervisor.dag.updated", context.plan.nodes[0]!.id, { dag: supervisorDagSnapshot(dagTrackers) });
+      await context.persist();
+    }
+  };
+
   supervisorLoop: while (true) {
+    await settleConditionalSkips();
     if (durationExceeded()) {
       return blocked("management policy duration limit reached before convergence", round - 1, delegationCount, trackers, dagTrackers);
     }
+    const roundReservation = context.budget?.reserve("depth");
+    roundReservation?.commit();
     const node = round === 1
       ? context.plan.nodes[0]!
       : supervisorNode(value, round, latestNodeIds, history, gateSnapshot(trackers), dagTrackers);
@@ -1519,10 +1823,19 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         };
       }
       if (dynamicTodos) {
-        return {
-          status: "failed",
-          output: output("supervisor attempted to replace an active dynamic TODO plan", round, delegationCount, trackers, undefined, dagTrackers)
-        };
+        const recoverableReason = requiredGateIssues(trackers).length > 0
+          ? "an active dynamic TODO plan already exists; remediate the blocked required Gate by delegating an existing passed code or integration todoId so the runtime can reopen it"
+          : "an active dynamic TODO plan already exists; delegate a ready todoId from that plan instead of replacing it";
+        history.push({ round, supervisorNodeId: node.id, decision: next as unknown as JsonValue, decisionRejected: recoverableReason });
+        await context.emit("supervisor.todos.rejected", node.id, {
+          issues: [recoverableReason], recoverable: true, activeTodoIds: [...dynamicTodos.keys()]
+        });
+        if (round >= value.policy.limits.maxRounds) {
+          return blocked(recoverableReason, round, delegationCount, trackers, dagTrackers);
+        }
+        latestNodeIds = [node.id];
+        round += 1;
+        continue;
       }
       const issues = dynamicTodoPlanIssues(
         context.plan.workflow,
@@ -1531,6 +1844,12 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         value.policy.limits.maxDelegations,
         next.impact
       );
+      if (next.impact) {
+        const scripts = await context.executionPackageScripts();
+        const normalized = normalizeValidationGroups(next.impact.requiredChecks, next.impact.validationGroups, supportedRequiredChecks(scripts));
+        if (normalized.status === "configuration-issue") issues.push(...normalized.issues);
+        else next.impact = { ...next.impact, requiredChecks: normalized.requiredChecks, validationGroups: normalized.validationGroups };
+      }
       if (issues.length > 0) {
         history.push({
           round,
@@ -1575,6 +1894,24 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     }
 
     if (next.action === "request-human-decision") {
+      if (dynamicTodos && dagTrackers) {
+        const issues = supervisorHumanDecisionPlanIssues(next.assignments, dagTrackers);
+        if (issues.length > 0) {
+          const reason = issues.join("; ");
+          history.push({ round, supervisorNodeId: node.id, decision: next as unknown as JsonValue, decisionRejected: reason });
+          await context.emit("supervisor.delegation.rejected", node.id, {
+            reason,
+            recoverable: true,
+            beforeHumanDecision: true
+          });
+          if (round >= value.policy.limits.maxRounds) {
+            return blocked(reason, round, delegationCount, trackers, dagTrackers);
+          }
+          latestNodeIds = [node.id];
+          round += 1;
+          continue;
+        }
+      }
       if (!context.requestHumanDecision) {
         return {
           status: "failed",
@@ -1604,6 +1941,10 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       // A human pause is control-plane latency, not active execution time. Preserve the configured
       // runtime budget by moving its deadline forward by the exact wait duration.
       if (deadlineAt !== undefined) deadlineAt += Date.now() - waitingStartedAt;
+      if (humanDecision.decision === "approved") {
+        const candidateUrl = approvedCandidateUrl(context.input, humanDecision);
+        if (candidateUrl) context.input.candidateUrl = candidateUrl;
+      }
       history.push({
         round,
         supervisorNodeId: node.id,
@@ -1612,7 +1953,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           requestId: humanDecision.requestId,
           decision: humanDecision.decision,
           decidedBy: humanDecision.decidedBy ?? null,
-          comment: humanDecision.comment ?? null
+          comment: humanDecision.comment ?? null,
+          candidateUrl: humanDecision.candidateUrl ?? context.input.candidateUrl ?? null
         }
       });
       if (humanDecision.decision === "rejected") {
@@ -1653,6 +1995,38 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             dagTrackers
           )
         };
+      }
+      const validator = resolveGateValidator(tracker.gate);
+      const validation = validator?.(tracker.gate, next.evidence);
+      if (validation && !validation.passed) {
+        const reason = validation.reason ?? `gate ${next.gateId} evidence validation failed`;
+        for (const activation of pending) {
+          tracker.executions.push({
+            nodeId: node.id,
+            executorRoleId: "supervisor",
+            executorRuntimeRole: value.supervisor.role,
+            activation: activation.key,
+            sourceNodeIds: activation.sourceNodeIds,
+            status: "blocked",
+            evidence: next.evidence,
+            error: reason
+          });
+        }
+        tracker.reason = reason;
+        trackerStatus(tracker);
+        history.push({
+          round,
+          supervisorNodeId: node.id,
+          decision: next as unknown as JsonValue,
+          decisionRejected: reason
+        });
+        await context.emit("gate.unsatisfied", node.id, { gateId: next.gateId, reason, status: "blocked" });
+        if (round >= value.policy.limits.maxRounds) {
+          return blocked(reason, round, delegationCount, trackers, dagTrackers);
+        }
+        latestNodeIds = [node.id];
+        round += 1;
+        continue;
       }
       for (const activation of pending) {
         tracker.passed.add(activation.key);
@@ -1717,7 +2091,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         );
       }
       const requiredDagNodes = dagTrackers
-        ? [...dagTrackers.values()].filter((tracker) => tracker.node.required && tracker.status !== "passed")
+        ? [...dagTrackers.values()].filter((tracker) => tracker.node.required && tracker.status !== "passed" && tracker.status !== "skipped")
         : [];
       if (requiredDagNodes.length > 0) {
         return blocked(
@@ -1879,10 +2253,22 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     for (let index = 0; index < next.assignments.length; index += 1) {
       const assignment = next.assignments[index]!;
       const requestedFlowNodeId = assignment.nodeId ?? assignment.todoId;
+      let reopeningAfterGateFailure = false;
+      let reopeningAfterCandidateEvidence = false;
+      let reopeningAfterConditionalEvidence = false;
+      let remediationGateEvidenceNodeIds: string[] = [];
+      let candidateEvidenceNodeIds: string[] = [];
       const dagTracker = dagTrackers && typeof requestedFlowNodeId === "string"
         ? dagTrackers.get(requestedFlowNodeId)
         : undefined;
       const activeDagTrackers = dagTrackers;
+      if (!activeDagTrackers && typeof assignment.todoId === "string" && assignment.todoId.trim()) {
+        const rejected = await recoverableDagDecision(
+          `supervisor delegated todoId ${assignment.todoId} without an accepted dynamic TODO plan; emit plan-todos again and address the recorded plan validation issues`
+        );
+        if (rejected) return rejected;
+        continue supervisorLoop;
+      }
       if (activeDagTrackers) {
         if (typeof requestedFlowNodeId !== "string" || !requestedFlowNodeId.trim()) {
           const rejected = await recoverableDagDecision(dynamicTodos
@@ -1905,24 +2291,75 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           && remediationRequiredGates.length > 0
           && (dagTracker.node.workKind === "code" || dagTracker.node.workKind === "integration")
         );
-        if (dagTracker.status === "passed" && !repairingAfterGateFailure) {
+        reopeningAfterGateFailure = dagTracker.status === "passed" && repairingAfterGateFailure;
+        candidateEvidenceNodeIds = supervisorDagCandidateEvidenceNodeIds(activeDagTrackers);
+        reopeningAfterCandidateEvidence = dagTracker.status === "passed"
+          && supervisorDagHasFreshCandidateEvidence(dagTracker, activeDagTrackers);
+        reopeningAfterConditionalEvidence = dagTracker.status === "passed"
+          && supervisorDagHasFreshDependencyEvidence(dagTracker, activeDagTrackers);
+        if (
+          dagTracker.status === "passed"
+          && !reopeningAfterGateFailure
+          && !reopeningAfterCandidateEvidence
+          && !reopeningAfterConditionalEvidence
+        ) {
           return dagViolation(`supervisor cannot delegate planned node ${requestedFlowNodeId} because it already passed`);
         }
-        if (dagTracker.status === "passed" && repairingAfterGateFailure) {
+        if (reopeningAfterGateFailure || reopeningAfterCandidateEvidence || reopeningAfterConditionalEvidence) {
           dagTracker.status = "pending";
           delete dagTracker.passedExecutionNodeId;
+        }
+        if (reopeningAfterGateFailure) {
+          remediationGateEvidenceNodeIds = [...new Set(remediationRequiredGates.flatMap((tracker) => {
+            const latestExecution = tracker.executions.at(-1);
+            return latestExecution && context.plan.nodes.some((candidate) => candidate.id === latestExecution.nodeId)
+              ? [latestExecution.nodeId]
+              : [];
+          }))];
           for (const gateId of invalidateCompletionGatesForRemediation(trackers, {
             ...assignment,
             workKind: dagTracker.node.workKind,
             ...(dagTracker.node.changeSet ? { changeSet: dagTracker.node.changeSet } : {})
           })) invalidatedGateIds.add(gateId);
         }
+        if (dagTracker.status === "blocked" || dagTracker.status === "failed") {
+          const pendingFailureHandlers = [...activeDagTrackers.values()].filter((candidate) => (
+            candidate.node.needsWhen?.some((condition) => (
+              condition.nodeId === requestedFlowNodeId
+              && supervisorDagDependencyMatches(candidate.node, requestedFlowNodeId, dagTracker.status)
+            ))
+            && candidate.status !== "passed"
+            && candidate.status !== "skipped"
+          ));
+          if (pendingFailureHandlers.length > 0) {
+            const reason = `supervisor cannot retry planned node ${requestedFlowNodeId} before conditional failure handlers pass: ${pendingFailureHandlers.map((candidate) => `${candidate.node.nodeId} (${candidate.status})`).join(", ")}`;
+            if (!dynamicTodos) return dagViolation(reason);
+            const rejected = await recoverableDagDecision(reason);
+            if (rejected) return rejected;
+            continue supervisorLoop;
+          }
+        }
         if (assignment.roleId !== dagTracker.node.roleId) {
           return dagViolation(
             `supervisor delegated planned node ${requestedFlowNodeId} to role ${assignment.roleId}; expected ${dagTracker.node.roleId}`
           );
         }
-        const unmetNeeds = dagTracker.node.needs.filter((need) => activeDagTrackers.get(need)?.status !== "passed");
+        // Gate remediation is a continuation of a TODO whose dependencies were already
+        // satisfied for its passed execution. A conditional repair may have depended on an
+        // earlier blocked validation that is now passed precisely because the repair worked;
+        // re-evaluating needsWhen here would make the completed repair impossible to reopen.
+        const unmetNeeds = reopeningAfterGateFailure
+          || reopeningAfterCandidateEvidence
+          || reopeningAfterConditionalEvidence
+          || supervisorDagNodeReady(dagTracker.node, activeDagTrackers)
+          ? []
+          : dagTracker.node.needs.filter((need) => {
+              const dependency = activeDagTrackers.get(need);
+              const condition = dagTracker.node.needsWhen?.find((candidate) => candidate.nodeId === need);
+              if (!condition) return dependency?.status !== "passed";
+              return dependency?.status === "pending" || dependency?.status === "running"
+                || (!condition.statuses.includes("terminal") && !condition.statuses.includes(dependency?.status ?? "pending" as never));
+            });
         if (unmetNeeds.length > 0) {
           return dagViolation(
             `supervisor delegated planned node ${requestedFlowNodeId} before dependencies passed: ${unmetNeeds.map((need) => `${need} (${activeDagTrackers.get(need)?.status ?? "unknown"})`).join(", ")}`
@@ -1958,14 +2395,67 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       const role = context.loaded.manifest.roles[member.role];
       if (!role) throw new Error(`supervisor member runtime role not found: ${member.role}`);
       const plannedTodo = dynamicTodos && requestedFlowNodeId ? dynamicTodos.get(requestedFlowNodeId) : undefined;
-      const delegatedTask = dagTracker?.node.task ?? assignment.task?.trim();
-      if (!delegatedTask) {
+      const baseDelegatedTask = dagTracker?.node.task ?? assignment.task?.trim();
+      if (!baseDelegatedTask) {
         return dagTrackers
           ? dagViolation(`supervisor planned node ${requestedFlowNodeId} has no delegated task`)
           : { status: "failed", output: output("delegate assignment task is missing", round, delegationCount, trackers) };
       }
+      const remediationGateIds = reopeningAfterGateFailure
+        ? remediationRequiredGates.map((tracker) => tracker.gate.id)
+        : [];
+      const delegatedTask = reopeningAfterGateFailure
+        ? [
+            baseDelegatedTask,
+            "",
+            "## Required Gate remediation activation",
+            `Required Gate(s) ${remediationGateIds.join(", ")} blocked after this TODO previously passed. This retry is a continuation of the accepted TODO for the reviewed candidate, not a first-time conditional activation.`,
+            "For this retry, the Gate remediation activation supersedes the original needsWhen trigger wording. Do not skip merely because the original upstream validation is now passed; that changed status is expected after the earlier repair succeeded.",
+            "Read the blocking Gate's structured output from Dependency evidence, address every concrete finding within the existing change set, and return fresh implementation and validation evidence."
+          ].join("\n")
+        : reopeningAfterCandidateEvidence
+          ? [
+              baseDelegatedTask,
+              "",
+              "## Candidate revalidation activation",
+              "This validation previously passed, but newer passed code or integration execution evidence changed the candidate afterward.",
+              "Read the fresh candidate evidence from Dependency evidence, rerun this TODO against the updated candidate, and return new validation evidence. The same candidate evidence may activate this validation only once."
+            ].join("\n")
+          : baseDelegatedTask;
       const workKind = dagTracker?.node.workKind ?? assignment.workKind ?? "other";
       const changeSet = dagTracker?.node.changeSet ?? assignment.changeSet;
+      const sod = value.separationOfDuties;
+      if (sod?.approverRoleIds.includes(assignment.roleId)) {
+        const producerEvidence = delegationLedger.filter((record) => (
+          sod.producerRoleIds.includes(record.assignment.roleId) && record.result.status === "passed"
+        ));
+        const conflictingProducer = producerEvidence.find((record) => {
+          const producer = members.get(record.assignment.roleId);
+          return sod.mustDifferEmployee === true
+            && producer?.employeeId !== undefined
+            && producer.employeeId === member.employeeId;
+        });
+        const approverSessionKey = plannedTodo?.sessionKey;
+        const conflictingSession = sod.sameSessionForbidden === true && approverSessionKey
+          ? producerEvidence.find((record) => record.worker.metadata?.memberSessionKey === approverSessionKey)
+          : undefined;
+        const missingEvidence = sod.independentEvidenceRequired === true
+          && !producerEvidence.some((record) => record.result.output !== undefined && record.result.output !== null);
+        if (conflictingProducer || conflictingSession || missingEvidence) {
+          const reason = conflictingProducer
+            ? `separation-of-duties gate blocked: producer and approver resolve to Employee ${member.employeeId}`
+            : conflictingSession
+              ? `separation-of-duties gate blocked: producer and approver share member Session ${approverSessionKey}`
+              : "separation-of-duties gate blocked: independent producer evidence is required";
+          await context.emit("supervisor.sod.blocked", node.id, {
+            reason,
+            producerEmployeeId: conflictingProducer ? members.get(conflictingProducer.assignment.roleId)?.employeeId ?? null : null,
+            approverEmployeeId: member.employeeId ?? null,
+            approverRoleId: assignment.roleId
+          });
+          return blocked(reason, round, delegationCount, trackers, dagTrackers);
+        }
+      }
       const effectiveAssignment: SupervisorAssignment = {
         ...assignment,
         ...(requestedFlowNodeId ? { nodeId: requestedFlowNodeId } : {}),
@@ -1979,8 +2469,14 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         ? executionNumber === 1 ? dagTracker.node.nodeId : `${dagTracker.node.nodeId}-retry-${executionNumber}`
         : `${member.roleId}-r${round}-${index + 1}`;
       const dependencyNodeIds = dagTracker
-        ? dagTracker.node.needs.map((need) => dagTrackers!.get(need)!.passedExecutionNodeId!)
+        ? dagTracker.node.needs.map((need) => {
+            const dependency = dagTrackers!.get(need)!;
+            return dependency.executions.at(-1)?.nodeId;
+          }).filter((nodeId): nodeId is string => Boolean(nodeId))
         : [];
+      const observesDependencyFailure = reopeningAfterGateFailure || Boolean(dagTracker?.node.needsWhen?.some((condition) =>
+        condition.statuses.some((status) => status !== "passed")
+      ));
       let memberSession: MemberSessionState | undefined;
       let retainMemberSession = false;
       if (plannedTodo?.sessionKey) {
@@ -2032,7 +2528,12 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           id: workerId,
           role: member.role,
           provider: role.provider,
-          needs: [node.id, ...dependencyNodeIds],
+          needs: [...new Set([
+            node.id,
+            ...dependencyNodeIds,
+            ...remediationGateEvidenceNodeIds,
+            ...(reopeningAfterCandidateEvidence ? candidateEvidenceNodeIds : [])
+          ])],
           with: {
             __delegatedRoleId: member.roleId,
             __todoId: plannedTodo?.id ?? "",
@@ -2046,7 +2547,20 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             __delegatedContext: {
               ...(plannedTodo?.context ?? {}),
               ...(assignment.context ?? {}),
-              ...(regressionImpact ? { regressionImpact: regressionImpact as unknown as JsonValue } : {})
+              ...(regressionImpact ? { regressionImpact: regressionImpact as unknown as JsonValue } : {}),
+              ...(reopeningAfterGateFailure ? {
+                gateRemediation: {
+                  gateIds: remediationGateIds,
+                  evidenceNodeIds: remediationGateEvidenceNodeIds,
+                  supersedesInitialNeedsWhen: true
+                }
+              } : {}),
+              ...(reopeningAfterCandidateEvidence ? {
+                candidateRevalidation: {
+                  evidenceNodeIds: candidateEvidenceNodeIds,
+                  supersedesPassedResult: true
+                }
+              } : {})
             },
             __supervisorSummary: next.summary ?? "",
             __previousAttemptError: ""
@@ -2054,11 +2568,24 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           metadata: {
             kind: "member",
             roleId: member.roleId,
+            employeeId: member.employeeId ?? "",
+            principalId: member.principalId ?? member.employeeId ?? "",
+            workInstanceId: workerId,
             round,
             parentNodeId: node.id,
             workKind,
             changeSet: changeSet ?? "",
             requiredCapabilities,
+            observesDependencyFailure,
+            ...(reopeningAfterGateFailure ? {
+              gateRemediation: true,
+              gateRemediationGateIds: remediationGateIds,
+              gateRemediationEvidenceNodeIds: remediationGateEvidenceNodeIds
+            } : {}),
+            ...(reopeningAfterCandidateEvidence ? {
+              candidateRevalidation: true,
+              candidateRevalidationEvidenceNodeIds: candidateEvidenceNodeIds
+            } : {}),
             ...(plannedTodo ? { todoId: plannedTodo.id } : {}),
             ...(memberSession ? {
               memberSessionId: memberSession.id,
@@ -2069,7 +2596,9 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
               flowNodeId: dagTracker.node.nodeId,
               flowNodeKind: dagTracker.node.kind,
               flowNodeRequired: dagTracker.node.required,
-              flowNodeExecution: executionNumber
+              flowNodeExecution: executionNumber,
+              dependencyNodeIds,
+              candidateNodeIds: candidateEvidenceNodeIds
             } : {})
           }
         }
@@ -2082,12 +2611,28 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       });
       await context.persist();
     }
-    for (const item of scheduled) await context.scheduleNode(item.worker);
-    const completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
-      assignment,
-      worker,
-      result: await context.executeNode(worker, { deadlineAt, retryValidation: true })
-    })));
+    // Reserve the whole fan-out atomically before scheduling or invoking any
+    // worker. A quota failure therefore cannot produce a partial delegation.
+    const delegationReservation = scheduled.length > 0
+      ? context.budget?.reserve("delegations", scheduled.length)
+      : undefined;
+    let completed: DelegationRecord[] = [];
+    try {
+      for (const item of scheduled) await context.scheduleNode(item.worker);
+      completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
+        assignment,
+        worker,
+        result: await context.executeNode(worker, {
+          deadlineAt,
+          retryValidation: true,
+          ...(worker.metadata?.observesDependencyFailure === true ? { dependencyFailure: "observe" } : {})
+        })
+      })));
+      delegationReservation?.commit();
+    } catch (error) {
+      delegationReservation?.release();
+      throw error;
+    }
     for (const record of completed) {
       const sessionId = typeof record.worker.metadata?.memberSessionId === "string"
         ? record.worker.metadata.memberSessionId
@@ -2122,9 +2667,16 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           nodeId: record.worker.id,
           status: record.result.status,
           output: record.result.output ?? null,
-          error: record.result.error ?? null
+          error: record.result.error ?? null,
+          dependencyNodeIds: Array.isArray(record.worker.metadata?.dependencyNodeIds)
+            ? record.worker.metadata.dependencyNodeIds.filter((nodeId): nodeId is string => typeof nodeId === "string")
+            : [],
+          candidateNodeIds: Array.isArray(record.worker.metadata?.candidateNodeIds)
+            ? record.worker.metadata.candidateNodeIds.filter((nodeId): nodeId is string => typeof nodeId === "string")
+            : []
         });
         if (record.result.status === "passed") tracker.passedExecutionNodeId = record.worker.id;
+        else delete tracker.passedExecutionNodeId;
       }
       await context.emit("supervisor.dag.updated", node.id, { dag: supervisorDagSnapshot(dagTrackers) });
       await context.persist();
