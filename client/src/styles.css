@@ -53,7 +53,7 @@ code, time, .stamp, .list-footer, .node-number { font-variant-numeric: tabular-n
 .daemon-gate { min-height: calc(100vh - var(--banner-height)); }
 .daemon-gate-notice { min-height: 44px; display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-5); border-bottom: 1px solid var(--seal-amber); background: var(--seal-amber-bg); color: var(--ink-2); font-size: var(--text-xs); }
 .daemon-write-surface { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
-.app-content { min-height: calc(100vh - var(--banner-height)); }
+.app-content { min-width: 0; min-height: calc(100vh - var(--banner-height)); }
 .page-grid { min-height: calc(100vh - var(--banner-height)); display: grid; grid-template-columns: var(--list-width) minmax(0, 1fr); }
 .daemon-gate-notice + .app-content .page-grid { min-height: calc(100vh - var(--banner-height) - 44px); }
 
@@ -4260,3 +4260,26 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
   .run-control-actions { justify-content: stretch; }
   .run-control-actions .button { width: 100%; min-height: 44px; }
 }
+.app-breadcrumb { min-width: 0; max-width: 100%; overflow-x: auto; border-bottom: 1px solid var(--line); background: var(--paper-sunken); scrollbar-width: thin; }
+.app-breadcrumb ol { display: flex; align-items: center; min-width: min-content; max-width: 100%; margin: 0; padding: var(--space-2) var(--space-4); list-style: none; }
+.app-breadcrumb li { display: flex; align-items: center; min-width: 0; white-space: nowrap; font-size: var(--text-sm); }
+.app-breadcrumb li:not(:first-child)::before { content: "/"; margin: 0 var(--space-2); color: var(--line-strong); }
+.app-breadcrumb a, .app-breadcrumb span { display: block; overflow: hidden; padding: var(--space-1) 2px; color: var(--ink-2); text-overflow: ellipsis; text-decoration: none; }
+.app-breadcrumb a { cursor: pointer; border-bottom: 2px solid transparent; transition: transform var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out); }
+.app-breadcrumb [aria-current="page"] { color: var(--ink); font-weight: 800; background: var(--paper-raised); }
+.app-breadcrumb a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; transform: translateY(-1px); border-bottom-color: currentColor; box-shadow: 2px 2px 0 var(--pixel-shadow); text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 2px; transition: none; }
+.app-breadcrumb a:active { transform: translate(2px, 2px); box-shadow: none; }
+.app-breadcrumb a:hover { transform: translateY(-1px); border-bottom-color: currentColor; text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 2px; }
+[data-theme="pixel"] .app-breadcrumb a:hover { transform: translateY(-2px); }
+[data-theme="pixel"] .app-breadcrumb a:focus-visible { transform: translateY(-2px); }
+@media (pointer: coarse) { .app-breadcrumb a { padding-block: 12px; } }
+
+/* Publication evidence contains long, machine-generated endpoints and JSON. Keep every
+   ancestor shrinkable so crayon's thicker frame never turns their intrinsic width into
+   page-level overflow; the evidence block remains the local scrolling boundary. */
+.page-grid--publications,
+.page-grid--publications > .detail-pane,
+.publication-dossier,
+.publication-dossier .dossier-section,
+.publication-dossier .evidence-block,
+.publication-dossier .evidence-block pre { min-width: 0; max-width: 100%; }
