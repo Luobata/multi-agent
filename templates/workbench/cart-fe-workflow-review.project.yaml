@@ -8,6 +8,10 @@ connector:
   kind: worktree-review
   config:
     roleSource: src/core/reviewRoleAgents.ts
+    requirementAdvancement:
+      entrancePolicyId: default-task-entrance-policy
+      triggerMode: explicit-delivery
+      deliveryTargets: [小米汪, 小米汪领队]
 roles:
   requirement-steward:
     displayName: 需求管家

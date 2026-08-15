@@ -322,7 +322,7 @@ describe("OfficePage supervisor studio", () => {
   const progress = {
     invocationId: "inv-team-1", runId: "run-team-1", workflowId: "team-flow", architecture: "supervisor",
     status: "running", phase: "provider", terminal: false, updatedAt: timestamp, round: 2,
-    tally: { queued: 0, waiting: 0, running: 1, completed: 3, blocked: 0, failed: 0, skipped: 0, cancelled: 0 },
+    tally: { queued: 0, waiting: 0, running: 1, "cancellation-requested": 0, completed: 3, blocked: 0, failed: 0, skipped: 0, cancelled: 0 },
     steps: [],
     leaderReport: { available: true, rounds: 2, delegations: 2, entries: [{ round: 2, action: "delegate", summary: longLeaderSummary, assignments: [{ roleId: "researcher", task: "调研" }], status: "running" }], gates: [{ gateId: longGateId, status: "pending" }] }
   };
@@ -369,6 +369,14 @@ describe("OfficePage supervisor studio", () => {
     expect(container.querySelector("[role=progressbar]")?.getAttribute("aria-valuenow")).toBe("75");
   });
 
+  it("attempts the cursor long-poll first and falls back to interval polling when the wait response is malformed", async () => {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    // The wait endpoint was tried…
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/progress/wait"))).toBe(true);
+    // …answered without nextCursor here, so the channel must fall back and keep the card fresh.
+    expect(container.querySelector<HTMLElement>(".studio-progress-fill")?.style.width).toBe("75%");
+  });
+
   it("opens the exact Run from the single whole-card control", async () => {
     const onOpenRun = vi.fn();
     act(() => root.render(<OfficePage data={bootstrap} streamStatus="live" onOpenRun={onOpenRun} />));
@@ -391,7 +399,7 @@ describe("OfficePage supervisor studio", () => {
       runId: "run-team-confirm",
       status: "awaiting-human-decision" as const,
       phase: "awaiting-human-decision",
-      tally: { queued: 0, waiting: 0, running: 0, completed: 3, blocked: 1, failed: 2, skipped: 0, cancelled: 0 }
+      tally: { queued: 0, waiting: 0, running: 0, "cancellation-requested": 0, completed: 3, blocked: 1, failed: 2, skipped: 0, cancelled: 0 }
     };
     fetchMock.mockImplementation((input: RequestInfo) => {
       const url = String(input);

@@ -24,6 +24,7 @@ import {
   supervisorDagIssues,
   supervisorDagNodeReady,
   supervisorDagSnapshot,
+  supervisorDagTrackerReady,
   type SupervisorDagConfig,
   type SupervisorDagNodeTracker
 } from "./supervisorDag.js";
@@ -33,11 +34,13 @@ import {
   gateCandidateIdentity,
   preflightGateCandidate,
   recordEnvironmentFailure,
+  reconcileRuntimeImpact,
   reusableGateShard,
   normalizeValidationGroups,
   supportedRequiredChecks,
   type EnvironmentCircuitState,
-  type GateShardEvidence
+  type GateShardEvidence,
+  type RuntimeImpactManifest
 } from "../runtime/gateGovernance.js";
 
 type SupervisorWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
@@ -738,6 +741,287 @@ function supervisorWith(
   };
 }
 
+function updateSupervisorRunState(
+  context: ArchitectureExecutionContext,
+  value: SupervisorWorkflowConfig,
+  round: number,
+  delegations: number,
+  history: JsonValue[],
+  trackers: Map<string, GateTracker>,
+  dagTrackers: Map<string, SupervisorDagNodeTracker> | undefined,
+  impact: SupervisorImpactAssessment | undefined,
+  planRevision: number
+): void {
+  const previousSequence = typeof context.run.architectureState?.sequence === "number"
+    ? context.run.architectureState.sequence
+    : 0;
+  context.run.architectureState = {
+    schemaVersion: 1,
+    kind: "supervisor",
+    sequence: previousSequence + 1,
+    round,
+    delegations,
+    planRevision,
+    scheduling: {
+      mode: "iterative",
+      schedulerVersion: 1,
+      compiledDispatchEnabled: false,
+      shadowReadyNodeIds: dagTrackers
+        ? [...dagTrackers.values()]
+            .filter((tracker) => supervisorDagTrackerReady(tracker, dagTrackers))
+            .map((tracker) => tracker.node.nodeId)
+        : []
+    },
+    limits: { ...value.policy.limits },
+    dag: supervisorDagSnapshot(dagTrackers),
+    gates: gateSnapshot(trackers),
+    impact: impact ? impact as unknown as JsonValue : null,
+    history: history.map((entry) => structuredClone(entry))
+  };
+}
+
+function jsonObject(value: unknown): JsonObject {
+  return JSON.parse(JSON.stringify(value)) as JsonObject;
+}
+
+function supervisorResumeState(input: {
+  round: number;
+  delegations: number;
+  planRevision: number;
+  latestNodeIds: string[];
+  deadlineAt?: number;
+  history: JsonValue[];
+  dynamicTodos?: Map<string, SupervisorTodo>;
+  dagTrackers?: Map<string, SupervisorDagNodeTracker>;
+  gateTrackers: Map<string, GateTracker>;
+  memberSessions: Map<string, MemberSessionState>;
+  delegationLedger: DelegationRecord[];
+  gateSequence: number;
+  impact?: SupervisorImpactAssessment;
+}): JsonObject {
+  return jsonObject({
+    schemaVersion: 1,
+    round: input.round,
+    delegations: input.delegations,
+    planRevision: input.planRevision,
+    latestNodeIds: input.latestNodeIds,
+    remainingDurationMs: input.deadlineAt === undefined ? null : Math.max(0, input.deadlineAt - Date.now()),
+    history: input.history,
+    dynamicTodos: input.dynamicTodos ? [...input.dynamicTodos.values()] : null,
+    dagTrackers: input.dagTrackers ? [...input.dagTrackers.values()].map((tracker) => ({
+      nodeId: tracker.node.nodeId,
+      status: tracker.status,
+      executions: tracker.executions,
+      passedExecutionNodeId: tracker.passedExecutionNodeId ?? null
+    })) : null,
+    gates: [...input.gateTrackers.values()].map((tracker) => ({
+      gateId: tracker.gate.id,
+      status: tracker.status,
+      activations: [...tracker.activations.values()],
+      passed: [...tracker.passed],
+      executions: tracker.executions,
+      reason: tracker.reason ?? null,
+      noExecutor: tracker.noExecutor
+    })),
+    memberSessions: [...input.memberSessions.values()],
+    delegationLedger: input.delegationLedger,
+    gateSequence: input.gateSequence,
+    impact: input.impact ?? null
+  });
+}
+
+function recordValue(value: unknown): JsonObject | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
+}
+
+function stringArray(value: JsonValue | undefined): string[] | undefined {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string") ? [...value] : undefined;
+}
+
+function restoreSupervisorResumeState(input: {
+  resume: JsonObject | undefined;
+  context: ArchitectureExecutionContext;
+  value: SupervisorWorkflowConfig;
+  members: ReadonlyMap<string, SupervisorTeamMemberConfig>;
+  gateTrackers: Map<string, GateTracker>;
+}): {
+  round: number;
+  delegations: number;
+  planRevision: number;
+  latestNodeIds: string[];
+  deadlineAt?: number;
+  history: JsonValue[];
+  dynamicTodos?: Map<string, SupervisorTodo>;
+  dagTrackers?: Map<string, SupervisorDagNodeTracker>;
+  memberSessions: MemberSessionState[];
+  delegationLedger: DelegationRecord[];
+  gateSequence: number;
+  impact?: SupervisorImpactAssessment;
+} | undefined {
+  const resume = input.resume;
+  if (!resume) return undefined;
+  if (resume.schemaVersion !== 1) {
+    throw new Error(`unsupported durable Supervisor resume schema: ${String(resume.schemaVersion)}`);
+  }
+  const round = resume.round;
+  const delegations = resume.delegations;
+  const planRevision = resume.planRevision;
+  const latestNodeIds = stringArray(resume.latestNodeIds);
+  const history = Array.isArray(resume.history) ? structuredClone(resume.history) : undefined;
+  if (!Number.isInteger(round) || Number(round) < 1
+    || !Number.isInteger(delegations) || Number(delegations) < 0
+    || !Number.isInteger(planRevision) || Number(planRevision) < 0
+    || !latestNodeIds || !history) {
+    throw new Error("durable Supervisor resume state has invalid counters, dependencies, or history");
+  }
+  const impactValue = resume.impact === null ? undefined : recordValue(resume.impact);
+  const impact = impactValue as unknown as SupervisorImpactAssessment | undefined;
+  const hasStaticDag = Boolean(input.value.flow.dag);
+  let dynamicTodos: Map<string, SupervisorTodo> | undefined;
+  let dagConfig = input.value.flow.dag;
+  if (!hasStaticDag && resume.dynamicTodos !== null) {
+    if (!Array.isArray(resume.dynamicTodos) || !impact) {
+      throw new Error("durable Supervisor resume state has an invalid dynamic TODO plan");
+    }
+    const parsed = decision({
+      action: "plan-todos",
+      summary: "durable Supervisor resume",
+      impact: impactValue!,
+      todos: resume.dynamicTodos
+    });
+    if (!parsed || parsed.action !== "plan-todos") {
+      throw new Error("durable Supervisor resume state failed dynamic TODO schema validation");
+    }
+    const issues = dynamicTodoPlanIssues(
+      input.context.plan.workflow,
+      parsed.todos,
+      input.members,
+      input.value.policy.limits.maxDelegations,
+      parsed.impact
+    );
+    if (issues.length > 0) throw new Error(`durable Supervisor resume plan is invalid: ${issues.join("; ")}`);
+    dynamicTodos = new Map(parsed.todos.map((todo) => [todo.id, todo]));
+    dagConfig = todoDag(parsed.todos);
+  }
+  let dagTrackers: Map<string, SupervisorDagNodeTracker> | undefined;
+  if (dagConfig) {
+    if (!Array.isArray(resume.dagTrackers)) {
+      throw new Error("durable Supervisor resume state is missing DAG trackers");
+    }
+    const saved = new Map<string, JsonObject>();
+    for (const raw of resume.dagTrackers) {
+      const entry = recordValue(raw);
+      if (!entry || typeof entry.nodeId !== "string" || saved.has(entry.nodeId)) {
+        throw new Error("durable Supervisor resume state has an invalid or duplicate DAG tracker");
+      }
+      saved.set(entry.nodeId, entry);
+    }
+    if (saved.size !== dagConfig.nodes.length || dagConfig.nodes.some((node) => !saved.has(node.nodeId))) {
+      throw new Error("durable Supervisor resume DAG does not match the pinned plan");
+    }
+    dagTrackers = new Map(dagConfig.nodes.map((node): [string, SupervisorDagNodeTracker] => {
+      const entry = saved.get(node.nodeId)!;
+      const status = entry.status;
+      if (typeof status !== "string" || !["pending", "running", "passed", "blocked", "failed", "skipped"].includes(status)) {
+        throw new Error(`durable Supervisor resume node ${node.nodeId} has invalid status ${String(status)}`);
+      }
+      const executions = Array.isArray(entry.executions)
+        ? entry.executions as unknown as SupervisorDagNodeTracker["executions"]
+        : undefined;
+      if (!executions) throw new Error(`durable Supervisor resume node ${node.nodeId} has invalid executions`);
+      return [node.nodeId, {
+        node,
+        // A crashed process cannot still own running work. Replaying the same safe round lets the
+        // Runner either reuse a durable terminal result or retry the interrupted node.
+        status: status === "running" ? "pending" : status as SupervisorDagNodeTracker["status"],
+        executions: structuredClone(executions),
+        ...(typeof entry.passedExecutionNodeId === "string"
+          ? { passedExecutionNodeId: entry.passedExecutionNodeId }
+          : {})
+      }];
+    }));
+  } else if (resume.dagTrackers !== null) {
+    throw new Error("durable Supervisor resume state contains a DAG without a pinned plan");
+  }
+  if (!Array.isArray(resume.gates)) throw new Error("durable Supervisor resume state has invalid Gates");
+  const savedGates = new Map<string, JsonObject>();
+  for (const raw of resume.gates) {
+    const entry = recordValue(raw);
+    if (!entry || typeof entry.gateId !== "string" || savedGates.has(entry.gateId)) {
+      throw new Error("durable Supervisor resume state has an invalid or duplicate Gate");
+    }
+    savedGates.set(entry.gateId, entry);
+  }
+  if (savedGates.size !== input.gateTrackers.size) {
+    throw new Error("durable Supervisor resume Gates do not match the pinned plan");
+  }
+  for (const tracker of input.gateTrackers.values()) {
+    const entry = savedGates.get(tracker.gate.id);
+    if (!entry || typeof entry.status !== "string" || !["pending", "passed", "blocked", "skipped"].includes(entry.status)) {
+      throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} is invalid`);
+    }
+    tracker.status = entry.status as GateRunStatus;
+    tracker.activations.clear();
+    if (!Array.isArray(entry.activations)) throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} has invalid activations`);
+    for (const rawActivation of entry.activations) {
+      const activation = recordValue(rawActivation);
+      const sourceNodeIds = activation ? stringArray(activation.sourceNodeIds) : undefined;
+      if (!activation || typeof activation.key !== "string" || !sourceNodeIds) {
+        throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} has an invalid activation`);
+      }
+      tracker.activations.set(activation.key, { key: activation.key, sourceNodeIds });
+    }
+    const passed = stringArray(entry.passed);
+    if (!passed || passed.some((key) => !tracker.activations.has(key))) {
+      throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} has invalid passed activations`);
+    }
+    tracker.passed = new Set(passed);
+    if (!Array.isArray(entry.executions)) throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} has invalid executions`);
+    tracker.executions = structuredClone(entry.executions) as unknown as GateExecutionRecord[];
+    tracker.reason = typeof entry.reason === "string" ? entry.reason : undefined;
+    tracker.noExecutor = entry.noExecutor === true;
+  }
+  const memberSessions = Array.isArray(resume.memberSessions)
+    ? resume.memberSessions.map((raw) => recordValue(raw) as unknown as MemberSessionState)
+    : undefined;
+  if (!memberSessions || memberSessions.some((session) => !session || typeof session.key !== "string" || !Array.isArray(session.turns))) {
+    throw new Error("durable Supervisor resume state has invalid member Sessions");
+  }
+  const delegationLedger = Array.isArray(resume.delegationLedger)
+    ? structuredClone(resume.delegationLedger) as unknown as DelegationRecord[]
+    : undefined;
+  if (!delegationLedger || delegationLedger.some((record) => (
+    !record || typeof record.assignment?.roleId !== "string" || typeof record.worker?.id !== "string"
+    || typeof record.result?.status !== "string"
+    || !input.context.plan.nodes.some((node) => node.id === record.worker.id)
+  ))) {
+    throw new Error("durable Supervisor resume state has an invalid delegation ledger");
+  }
+  const gateSequence = resume.gateSequence;
+  if (!Number.isInteger(gateSequence) || Number(gateSequence) < 0) {
+    throw new Error("durable Supervisor resume state has an invalid Gate sequence");
+  }
+  const remainingDurationMs = resume.remainingDurationMs === null ? undefined : resume.remainingDurationMs;
+  if (remainingDurationMs !== undefined
+    && (typeof remainingDurationMs !== "number" || !Number.isFinite(remainingDurationMs) || remainingDurationMs < 0)) {
+    throw new Error("durable Supervisor resume state has an invalid remaining duration");
+  }
+  return {
+    round: Number(round),
+    delegations: Number(delegations),
+    planRevision: Number(planRevision),
+    latestNodeIds,
+    deadlineAt: remainingDurationMs === undefined ? undefined : Date.now() + remainingDurationMs,
+    history,
+    dynamicTodos,
+    dagTrackers,
+    memberSessions,
+    delegationLedger,
+    gateSequence: Number(gateSequence),
+    ...(impact ? { impact } : {})
+  };
+}
+
 function approvedCandidateUrl(input: JsonObject, decision?: { candidateUrl?: string; comment?: string }): string | undefined {
   const explicit = typeof input.candidateUrl === "string" ? input.candidateUrl.trim() : "";
   if (explicit) return explicit;
@@ -1214,7 +1498,7 @@ async function executeGateActivation(
   }
   const role = context.loaded.manifest.roles[executor.role];
   if (!role) throw new Error(`gate executor runtime role not found: ${executor.role}`);
-  const regressionImpact = sourceRegressionImpact(context, activation.sourceNodeIds);
+  const declaredRegressionImpact = sourceRegressionImpact(context, activation.sourceNodeIds);
   const candidateUrl = approvedCandidateUrl(context.input);
   const declaredCandidateRevision = typeof context.input.candidateRevision === "string" ? context.input.candidateRevision.trim() : "";
   let workspaceCandidate: Awaited<ReturnType<ArchitectureExecutionContext["candidateSnapshot"]>> | undefined;
@@ -1236,11 +1520,33 @@ async function executeGateActivation(
     preflights: Record<string, Awaited<ReturnType<typeof preflightGateCandidate>>>;
     circuits: Record<string, EnvironmentCircuitState>;
     shards: GateShardEvidence[];
+    impactManifests?: Record<string, RuntimeImpactManifest>;
     events: JsonValue[];
   };
   const governance = await context.readArtifact<GovernanceArtifact>("gate-governance.json") ?? {
     version: 1, preflights: {}, circuits: {}, shards: [], events: []
   };
+  const runtimeImpact = reconcileRuntimeImpact({
+    ...(declaredRegressionImpact ? { declared: declaredRegressionImpact } : {}),
+    changedFiles: workspaceCandidate?.changedFiles ?? [],
+    snapshotAvailable: Boolean(workspaceCandidate),
+    packageScripts: await context.executionPackageScripts()
+  });
+  const regressionImpact = runtimeImpact.impact as SupervisorImpactAssessment | undefined;
+  governance.impactManifests ??= {};
+  governance.impactManifests[candidateIdentity] = runtimeImpact.manifest;
+  governance.events.push({
+    type: "impact.reconciled",
+    gateId: tracker.gate.id,
+    candidateIdentity,
+    manifest: runtimeImpact.manifest as unknown as JsonValue
+  });
+  await context.writeArtifact("gate-governance.json", governance);
+  await context.emit("supervisor.impact.reconciled", undefined, {
+    gateId: tracker.gate.id,
+    candidateIdentity,
+    manifest: runtimeImpact.manifest as unknown as JsonValue
+  });
   const versionedCandidateFlow = context.run.isolation?.mode === "worktree" || Boolean(declaredCandidateRevision);
   const browserGate = Boolean(candidateUrl && versionedCandidateFlow)
     && (tracker.gate.requiredCapability === "quality.test" || tracker.gate.requiredCapability === "quality.audit");
@@ -1737,6 +2043,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
   const gateSequence = { value: 0 };
   let round = 1;
   let delegationCount = 0;
+  let planRevision = hasStaticDag ? 1 : 0;
   let latestNodeIds: string[] = [];
   // Absolute wall-clock ceiling is optional. When the policy omits maxDurationMs the run has no
   // fixed deadline: it keeps going while nodes make progress and is bounded only by per-node idle
@@ -1744,7 +2051,56 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
   let deadlineAt = value.policy.limits.maxDurationMs === undefined
     ? undefined
     : startedAt + value.policy.limits.maxDurationMs;
+  const durableResumeState = await context.readArtifact<JsonObject>("supervisor-state.json");
+  const restored = restoreSupervisorResumeState({
+    resume: durableResumeState,
+    context,
+    value,
+    members,
+    gateTrackers: trackers
+  });
+  if (restored) {
+    round = restored.round;
+    delegationCount = restored.delegations;
+    planRevision = restored.planRevision;
+    latestNodeIds = restored.latestNodeIds;
+    deadlineAt = restored.deadlineAt;
+    history.push(...restored.history);
+    dynamicTodos = restored.dynamicTodos;
+    dagTrackers = restored.dagTrackers;
+    regressionImpact = restored.impact;
+    for (const session of restored.memberSessions) memberSessions.set(session.key, session);
+    delegationLedger.push(...restored.delegationLedger);
+    workerResults.push(...restored.delegationLedger.map(({ result }) => ({ status: result.status })));
+    gateSequence.value = restored.gateSequence;
+  }
   const durationExceeded = () => deadlineAt !== undefined && Date.now() >= deadlineAt;
+  const currentResumeState = (): JsonObject => supervisorResumeState({
+    round,
+    delegations: delegationCount,
+    planRevision,
+    latestNodeIds,
+    deadlineAt,
+    history,
+    dynamicTodos,
+    dagTrackers,
+    gateTrackers: trackers,
+    memberSessions,
+    delegationLedger,
+    gateSequence: gateSequence.value,
+    impact: regressionImpact
+  });
+  const syncSupervisorState = (): void => updateSupervisorRunState(
+    context,
+    value,
+    round,
+    delegationCount,
+    history,
+    trackers,
+    dagTrackers,
+    regressionImpact,
+    planRevision
+  );
 
   const settleConditionalSkips = async (): Promise<void> => {
     if (!dagTrackers) return;
@@ -1773,6 +2129,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       }
     }
     if (changed) {
+      syncSupervisorState();
       await context.emit("supervisor.dag.updated", context.plan.nodes[0]!.id, { dag: supervisorDagSnapshot(dagTrackers) });
       await context.persist();
     }
@@ -1792,6 +2149,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     const supervisorRole = context.loaded.manifest.roles[node.role];
     if (!supervisorRole) throw new Error(`supervisor runtime role not found: ${node.role}`);
     node.provider = supervisorRole.provider;
+    syncSupervisorState();
+    await context.writeArtifact("supervisor-state.json", currentResumeState());
     await context.scheduleNode(node);
     const supervisorResult = await context.executeNode(node, {
       dependencyFailure: "observe",
@@ -1867,6 +2226,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       }
       regressionImpact = next.impact;
       dynamicTodos = new Map(next.todos.map((todo) => [todo.id, todo]));
+      planRevision += 1;
       const plannedDag = todoDag(next.todos);
       dagTrackers = new Map(plannedDag.nodes.map((todo): [string, SupervisorDagNodeTracker] => [todo.nodeId, {
         node: todo,
@@ -1884,6 +2244,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         impact: next.impact as unknown as JsonValue,
         todos: next.todos as unknown as JsonValue
       });
+      syncSupervisorState();
       await context.persist();
       if (round >= value.policy.limits.maxRounds) {
         return blocked("management policy round limit reached after TODO planning", round, delegationCount, trackers, dagTrackers);
@@ -2168,7 +2529,37 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     if (next.impact) regressionImpact = next.impact;
 
     if (round >= value.policy.limits.maxRounds) {
-      return blocked("management policy round limit reached before convergence", round, delegationCount, trackers, dagTrackers);
+      const unresolved = dagTrackers
+        ? [...dagTrackers.values()].find((tracker) => tracker.status === "blocked" || tracker.status === "failed")
+        : undefined;
+      const latestExecution = unresolved?.executions.at(-1);
+      const lastHistory = history.at(-1);
+      const lastRejected = lastHistory
+        && typeof lastHistory === "object"
+        && !Array.isArray(lastHistory)
+        && typeof lastHistory.decisionRejected === "string"
+        ? lastHistory.decisionRejected
+        : undefined;
+      const detail = unresolved
+        ? `planned node ${unresolved.node.nodeId} remains ${unresolved.status}: ${latestExecution?.error ?? JSON.stringify(latestExecution?.output ?? null)}`
+        : lastRejected
+          ? `last rejected decision: ${lastRejected}`
+          : undefined;
+      const reason = `management policy round limit reached before convergence${detail ? `; ${detail}` : ""}`;
+      if (dagTrackers && (unresolved || lastRejected)) {
+        await context.emit("supervisor.dag.blocked", node.id, {
+          reason,
+          dag: supervisorDagSnapshot(dagTrackers)
+        });
+        await context.persist();
+      }
+      return blocked(
+        reason,
+        round,
+        delegationCount,
+        trackers,
+        dagTrackers
+      );
     }
     if (next.assignments.length === 0) {
       return {
@@ -2218,7 +2609,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       return blocked(openCircuit.reason, round, delegationCount, trackers, dagTrackers);
     }
 
-    const dagViolation = async (reason: string): Promise<ArchitectureExecutionResult> => {
+    const terminalDagBlock = async (reason: string): Promise<ArchitectureExecutionResult> => {
       await context.emit("supervisor.dag.blocked", node.id, {
         reason,
         dag: supervisorDagSnapshot(dagTrackers)
@@ -2233,9 +2624,14 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         decision: next as unknown as JsonValue,
         decisionRejected: reason
       });
+      await context.emit("supervisor.dag.rejected", node.id, {
+        reason,
+        recoverable: true,
+        dag: supervisorDagSnapshot(dagTrackers)
+      });
       await context.emit("supervisor.delegation.rejected", node.id, { reason, recoverable: true });
       if (round >= value.policy.limits.maxRounds) {
-        return blocked(reason, round, delegationCount, trackers, dagTrackers);
+        return terminalDagBlock(reason);
       }
       latestNodeIds = [node.id];
       round += 1;
@@ -2256,8 +2652,10 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       let reopeningAfterGateFailure = false;
       let reopeningAfterCandidateEvidence = false;
       let reopeningAfterConditionalEvidence = false;
+      let reopeningAfterRecoveryEvidence = false;
       let remediationGateEvidenceNodeIds: string[] = [];
       let candidateEvidenceNodeIds: string[] = [];
+      let recoveryEvidenceNodeIds: string[] = [];
       const dagTracker = dagTrackers && typeof requestedFlowNodeId === "string"
         ? dagTrackers.get(requestedFlowNodeId)
         : undefined;
@@ -2278,12 +2676,16 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           continue supervisorLoop;
         }
         if (!dagTracker) {
-          return dagViolation(hasStaticDag
+          const rejected = await recoverableDagDecision(hasStaticDag
             ? `supervisor delegated outside the declared DAG: ${requestedFlowNodeId}`
             : `supervisor delegated outside the active TODO plan: ${requestedFlowNodeId}`);
+          if (rejected) return rejected;
+          continue supervisorLoop;
         }
         if (scheduledDagNodes.has(requestedFlowNodeId)) {
-          return dagViolation(`supervisor delegated planned node ${requestedFlowNodeId} more than once in the same round`);
+          const rejected = await recoverableDagDecision(`supervisor delegated planned node ${requestedFlowNodeId} more than once in the same round`);
+          if (rejected) return rejected;
+          continue supervisorLoop;
         }
         scheduledDagNodes.add(requestedFlowNodeId);
         const repairingAfterGateFailure = Boolean(
@@ -2303,7 +2705,9 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           && !reopeningAfterCandidateEvidence
           && !reopeningAfterConditionalEvidence
         ) {
-          return dagViolation(`supervisor cannot delegate planned node ${requestedFlowNodeId} because it already passed`);
+          const rejected = await recoverableDagDecision(`supervisor cannot delegate planned node ${requestedFlowNodeId} because it already passed`);
+          if (rejected) return rejected;
+          continue supervisorLoop;
         }
         if (reopeningAfterGateFailure || reopeningAfterCandidateEvidence || reopeningAfterConditionalEvidence) {
           dagTracker.status = "pending";
@@ -2333,16 +2737,44 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           ));
           if (pendingFailureHandlers.length > 0) {
             const reason = `supervisor cannot retry planned node ${requestedFlowNodeId} before conditional failure handlers pass: ${pendingFailureHandlers.map((candidate) => `${candidate.node.nodeId} (${candidate.status})`).join(", ")}`;
-            if (!dynamicTodos) return dagViolation(reason);
             const rejected = await recoverableDagDecision(reason);
             if (rejected) return rejected;
             continue supervisorLoop;
           }
+          if (dagTracker.status === "blocked") {
+            const latestExecution = dagTracker.executions.at(-1);
+            recoveryEvidenceNodeIds = [...activeDagTrackers.values()].flatMap((candidate) => {
+              const consumesFailure = candidate.node.needsWhen?.some((condition) => (
+                condition.nodeId === requestedFlowNodeId
+                && supervisorDagDependencyMatches(candidate.node, requestedFlowNodeId, dagTracker.status)
+              ));
+              const recoveryExecution = candidate.executions.at(-1);
+              return consumesFailure
+                && candidate.status === "passed"
+                && recoveryExecution?.status === "passed"
+                && latestExecution
+                && recoveryExecution.dependencyNodeIds?.includes(latestExecution.nodeId)
+                ? [recoveryExecution.nodeId]
+                : [];
+            });
+            reopeningAfterRecoveryEvidence = recoveryEvidenceNodeIds.length > 0;
+            if (reopeningAfterRecoveryEvidence) {
+              dagTracker.status = "pending";
+              delete dagTracker.passedExecutionNodeId;
+            } else {
+              const rootCause = latestExecution?.error ?? JSON.stringify(latestExecution?.output ?? null);
+              return terminalDagBlock(
+                `planned node ${requestedFlowNodeId} remains blocked without new prerequisite evidence: ${rootCause}`
+              );
+            }
+          }
         }
         if (assignment.roleId !== dagTracker.node.roleId) {
-          return dagViolation(
+          const rejected = await recoverableDagDecision(
             `supervisor delegated planned node ${requestedFlowNodeId} to role ${assignment.roleId}; expected ${dagTracker.node.roleId}`
           );
+          if (rejected) return rejected;
+          continue supervisorLoop;
         }
         // Gate remediation is a continuation of a TODO whose dependencies were already
         // satisfied for its passed execution. A conditional repair may have depended on an
@@ -2361,26 +2793,29 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
                 || (!condition.statuses.includes("terminal") && !condition.statuses.includes(dependency?.status ?? "pending" as never));
             });
         if (unmetNeeds.length > 0) {
-          return dagViolation(
+          const rejected = await recoverableDagDecision(
             `supervisor delegated planned node ${requestedFlowNodeId} before dependencies passed: ${unmetNeeds.map((need) => `${need} (${activeDagTrackers.get(need)?.status ?? "unknown"})`).join(", ")}`
           );
+          if (rejected) return rejected;
+          continue supervisorLoop;
         }
       }
       const member = members.get(assignment.roleId);
       if (!member) {
         const reason = `supervisor delegated to unbound role ${assignment.roleId}`;
-        return dagTrackers ? dagViolation(reason) : blocked(reason, round, delegationCount, trackers);
+        if (!dagTrackers) return blocked(reason, round, delegationCount, trackers);
+        const rejected = await recoverableDagDecision(reason);
+        if (rejected) return rejected;
+        continue supervisorLoop;
       }
       if (dagTracker && assignment.workKind !== undefined && assignment.workKind !== dagTracker.node.workKind) {
         const reason = `supervisor delegated planned node ${requestedFlowNodeId} with workKind ${assignment.workKind}; expected ${dagTracker.node.workKind}`;
-        if (!dynamicTodos) return dagViolation(reason);
         const rejected = await recoverableDagDecision(reason);
         if (rejected) return rejected;
         continue supervisorLoop;
       }
       if (dagTracker && assignment.changeSet !== undefined && assignment.changeSet !== dagTracker.node.changeSet) {
         const reason = `supervisor delegated planned node ${requestedFlowNodeId} with changeSet ${assignment.changeSet}; expected ${dagTracker.node.changeSet ?? "none"}`;
-        if (!dynamicTodos) return dagViolation(reason);
         const rejected = await recoverableDagDecision(reason);
         if (rejected) return rejected;
         continue supervisorLoop;
@@ -2397,9 +2832,12 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       const plannedTodo = dynamicTodos && requestedFlowNodeId ? dynamicTodos.get(requestedFlowNodeId) : undefined;
       const baseDelegatedTask = dagTracker?.node.task ?? assignment.task?.trim();
       if (!baseDelegatedTask) {
-        return dagTrackers
-          ? dagViolation(`supervisor planned node ${requestedFlowNodeId} has no delegated task`)
-          : { status: "failed", output: output("delegate assignment task is missing", round, delegationCount, trackers) };
+        if (!dagTrackers) {
+          return { status: "failed", output: output("delegate assignment task is missing", round, delegationCount, trackers) };
+        }
+        const rejected = await recoverableDagDecision(`supervisor planned node ${requestedFlowNodeId} has no delegated task`);
+        if (rejected) return rejected;
+        continue supervisorLoop;
       }
       const remediationGateIds = reopeningAfterGateFailure
         ? remediationRequiredGates.map((tracker) => tracker.gate.id)
@@ -2421,6 +2859,14 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
               "This validation previously passed, but newer passed code or integration execution evidence changed the candidate afterward.",
               "Read the fresh candidate evidence from Dependency evidence, rerun this TODO against the updated candidate, and return new validation evidence. The same candidate evidence may activate this validation only once."
             ].join("\n")
+          : reopeningAfterRecoveryEvidence
+            ? [
+                baseDelegatedTask,
+                "",
+                "## Conditional recovery validation",
+                "A declared conditional recovery node passed after this TODO blocked.",
+                "Read that fresh recovery evidence from Dependency evidence and validate the repaired candidate."
+              ].join("\n")
           : baseDelegatedTask;
       const workKind = dagTracker?.node.workKind ?? assignment.workKind ?? "other";
       const changeSet = dagTracker?.node.changeSet ?? assignment.changeSet;
@@ -2532,7 +2978,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             node.id,
             ...dependencyNodeIds,
             ...remediationGateEvidenceNodeIds,
-            ...(reopeningAfterCandidateEvidence ? candidateEvidenceNodeIds : [])
+            ...(reopeningAfterCandidateEvidence ? candidateEvidenceNodeIds : []),
+            ...recoveryEvidenceNodeIds
           ])],
           with: {
             __delegatedRoleId: member.roleId,
@@ -2559,6 +3006,12 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
                 candidateRevalidation: {
                   evidenceNodeIds: candidateEvidenceNodeIds,
                   supersedesPassedResult: true
+                }
+              } : {}),
+              ...(reopeningAfterRecoveryEvidence ? {
+                conditionalRecovery: {
+                  evidenceNodeIds: recoveryEvidenceNodeIds,
+                  supersedesBlockedResult: true
                 }
               } : {})
             },
@@ -2618,6 +3071,14 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       : undefined;
     let completed: DelegationRecord[] = [];
     try {
+      if (dagTrackers) {
+        for (const { assignment } of scheduled) {
+          const tracker = assignment.nodeId ? dagTrackers.get(assignment.nodeId) : undefined;
+          if (tracker) tracker.status = "running";
+        }
+        syncSupervisorState();
+        await context.persist();
+      }
       for (const item of scheduled) await context.scheduleNode(item.worker);
       completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
         assignment,
@@ -2678,8 +3139,6 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         if (record.result.status === "passed") tracker.passedExecutionNodeId = record.worker.id;
         else delete tracker.passedExecutionNodeId;
       }
-      await context.emit("supervisor.dag.updated", node.id, { dag: supervisorDagSnapshot(dagTrackers) });
-      await context.persist();
     }
     delegationCount += completed.length;
     delegationLedger.push(...completed);
@@ -2701,9 +3160,16 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         error: result.error ?? null
       }))
     });
+    if (dagTrackers) {
+      syncSupervisorState();
+      await context.emit("supervisor.dag.updated", node.id, { dag: supervisorDagSnapshot(dagTrackers) });
+      await context.persist();
+    }
     const gateNodeIds = await runAfterDelegationGates(
       context, value, trackers, completed, delegationLedger, round, node.id, deadlineAt, gateSequence
     );
+    syncSupervisorState();
+    await context.persist();
     const missingGateExecutors = [...trackers.values()].filter((tracker) => tracker.gate.required && tracker.noExecutor);
     if (missingGateExecutors.length > 0) {
       return blocked(

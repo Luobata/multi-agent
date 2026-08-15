@@ -1,6 +1,6 @@
 /** service adapter 边界单测：正常路径 + 中文三段式错误路径 + demo:true 数据驱动断言。 */
-import { describe, expect, it } from "vitest";
-import { DASHBOARD_STORAGE_KEY, createDashboardService, mcpCatalogNodeId, type DashboardService, type ProjectCatalogSnapshot } from "./service";
+import { describe, expect, it, vi } from "vitest";
+import { DASHBOARD_STORAGE_KEY, createDashboardService, dashboardService, mcpCatalogNodeId, type DashboardService, type ProjectCatalogSnapshot } from "./service";
 import { REQUIREMENT_LANES } from "./types";
 import type { PassiveProjectAccess, Project } from "../types";
 
@@ -26,6 +26,17 @@ function memoryStorage(initial = new Map<string, string>()) {
 }
 
 describe("empty production board and versioned persistence", () => {
+  it("does not impose demo latency on the production singleton", async () => {
+    vi.useFakeTimers();
+    try {
+      const result = dashboardService.listSpaces();
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(result).resolves.toBeInstanceOf(Array);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("starts without demo nodes, requirements, activities, or archive records", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
     expect(await service.listSpaces()).toEqual([]);

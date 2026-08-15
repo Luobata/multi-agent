@@ -36,7 +36,20 @@ Entrance Policy 不是 Architecture Adapter。它没有循环，也不生成执�
 - `source` 中的协议、项目、角色、调用方和任务标识；
 - `signals` 中安全的点分路径，以及 `eq`、`neq`、`gte`、`lte`、`in`、`exists` 比较。
 
-消息正文不属于评估输入，也不能配置关键词匹配。正文只在 `dispatch` 已完成路由后传给目标执行，避免普通问答因为措辞碰巧包含“复杂”“团队”等词而被静默交给领队。
+消息正文不属于策略评估输入，也不能在策略中配置模糊关键词匹配。需要启动领队的入口先使用 `explicit-delivery` 模式严格解析完整口令，只接受 `交付领队` 或项目 `deliveryTargets` 明确列出的 `交付<领队名>`，再写入 `signals.explicitLeaderDelivery=true`。`请交付领队`、`交付一下`、`交付 领队`、普通的“多人协作/动态重规划”描述都不产生该信号。正文只在 `dispatch` 已完成路由后传给目标执行。
+
+项目通过自身 descriptor 绑定这套模式，而不是在 Role 或 Architecture 中硬编码：
+
+```yaml
+connector:
+  config:
+    requirementAdvancement:
+      entrancePolicyId: default-task-entrance-policy
+      triggerMode: explicit-delivery
+      deliveryTargets: [小米汪, 小米汪领队]
+```
+
+缺少 `triggerMode: explicit-delivery` 的旧项目配置会 fail closed，不再继续沿用宽松触发。每个项目必须在自己的 descriptor 中明确绑定后才能启动领队。
 
 `evaluate` 是纯试算：不创建 Invocation、Work Instance 或 Run。`dispatch` 才执行决策结果。`direct.mode=caller` 的含义是把控制权明确交还外部主 Agent，不创建内部 Invocation，也不会自动升级到领队。
 
@@ -60,7 +73,7 @@ Entrance Policy 不是 Architecture Adapter。它没有循环，也不生成执�
 {
   "id": "default-task-entrance-policy",
   "displayName": "默认请求分流策略",
-  "description": "按结构化信号选择直达、专家或小米汪领队团队。",
+  "description": "默认继续讨论，仅显式交付信号进入小米汪领队团队。",
   "direct": { "mode": "caller" },
   "specialists": {
     "frontend-developer": {
@@ -72,8 +85,8 @@ Entrance Policy 不是 Architecture Adapter。它没有循环，也不生成执�
   "leader": { "workflowId": "xiaomiwang-development-team" },
   "rules": [
     {
-      "id": "dynamic-replanning",
-      "when": { "signals": { "requiresDynamicReplanning": { "eq": true } } },
+      "id": "explicit-leader-delivery",
+      "when": { "signals": { "explicitLeaderDelivery": { "eq": true } } },
       "result": { "route": "leader" }
     },
     {

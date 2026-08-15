@@ -18,24 +18,58 @@ const priority: Record<string, number> = {
   "awaiting-human-decision": 0,
   failed: 1,
   blocked: 2,
-  "awaiting-acceptance": 3,
-  running: 4
+  completed: 3,
+  cancelled: 4,
+  "awaiting-acceptance": 5,
+  "cancellation-requested": 6,
+  running: 7,
+  queued: 8
 };
 
-function invocationQueue(invocations: InvocationRecord[], bootstrap: Bootstrap): QueueItem[] {
+const QUEUE_STATUS_LABELS: Record<string, string> = {
+  queued: "排队中",
+  running: "进行中",
+  "awaiting-human-decision": "待你决定",
+  "cancellation-requested": "取消中",
+  completed: "已完成",
+  blocked: "已阻塞",
+  failed: "已失败",
+  cancelled: "已取消",
+  "awaiting-acceptance": "待验收"
+};
+
+function invocationQueue(invocations: InvocationRecord[], bootstrap: Bootstrap, requirements: Requirement[]): QueueItem[] {
   return invocations.flatMap((invocation) => {
     if (!(invocation.status in priority)) return [];
     const employeeIds = invocation.instanceIds
       .map((id) => bootstrap.activity.instances.find((instance) => instance.id === id)?.employeeId)
       .filter((id): id is string => Boolean(id));
     const projectId = invocation.source.targetProject ?? invocation.source.project;
+    const requirement = invocation.source.taskId
+      ? requirements.find((candidate) => candidate.id === invocation.source.taskId
+        && (!projectId || candidate.projectId === projectId))
+      : undefined;
+    if (invocation.status === "completed" && (!requirement
+      || requirement.lane === "acceptance" || requirement.lane === "merging" || requirement.lane === "done")) return [];
+    const actions = invocation.control?.allowedActions ?? [];
+    const next = actions.includes("decide") || invocation.status === "awaiting-human-decision" ? "补充决策"
+      : actions.includes("review-delivery") ? "核对交付与验收"
+        : actions.includes("retry-successor") ? "查看原因并重新推进"
+          : actions.includes("restart-successor") ? "查看并创建后继周期"
+            : actions.includes("cancel") ? "查看进度或停止"
+              : invocation.status === "cancellation-requested" ? "等待安全停止" : "查看证据";
+    const hash = requirement && invocation.status === "completed"
+      ? `requirements/${encodeURIComponent(requirement.id)}?section=run`
+      : requirement && (invocation.status === "blocked" || invocation.status === "failed" || invocation.status === "cancelled")
+        ? `requirements/${encodeURIComponent(requirement.id)}`
+        : `runs/${encodeURIComponent(invocation.runId)}`;
     return [{
       id: invocation.id,
       status: invocation.status,
       title: invocation.requestSummary || invocation.taskDescription || "未命名工作",
-      next: invocation.status === "awaiting-human-decision" ? "补充决策" : invocation.status === "running" ? "查看进度" : "查看错误并恢复",
+      next,
       meta: [...new Set([...employeeIds.map((id) => `Employee ${id}`), ...(projectId ? [`Project ${projectId}`] : []), `${invocation.target.kind === "workflow" ? "Workflow" : "Employee"} ${invocation.target.id}`, `Run ${invocation.runId}`])],
-      hash: `runs/${encodeURIComponent(invocation.runId)}`,
+      hash,
       updatedAt: invocation.updatedAt
     }];
   });
@@ -50,7 +84,7 @@ export function DashboardPage({ go, bootstrap, daemon, service = dashboardServic
   const { state, reload } = useServiceData<{ summary: DashboardSummary; requirements: Requirement[] }>(async () => {
     const [summary, requirements] = await Promise.all([service.getDashboardSummary(), service.listBoard()]);
     return { summary, requirements };
-  }, [service]);
+  }, [service, bootstrap.activity.invocations.map((invocation) => `${invocation.id}:${invocation.updatedAt}`).join("|")]);
 
   return <main className="dash-page">
     <PageHeader eyebrow="NEXT ACTION / WORKBENCH" title="现在做什么" description="先处理需要你关注的工作，再从运行卷宗核对交付证据。" />
@@ -62,14 +96,14 @@ export function DashboardPage({ go, bootstrap, daemon, service = dashboardServic
       const acceptance = requirements.filter((item) => item.lane === "acceptance" && !item.archivedAt).map((item): QueueItem => ({
         id: item.id, status: "awaiting-acceptance", title: item.title, next: "核对验收证据", meta: [`Project ${item.projectId}`, `Requirement ${item.code}`], hash: `requirements/${encodeURIComponent(item.id)}?section=acceptance`, updatedAt: item.updatedAt
       }));
-      const queue = [...invocationQueue(bootstrap.activity.invocations, bootstrap), ...acceptance]
+      const queue = [...invocationQueue(bootstrap.activity.invocations, bootstrap, requirements), ...acceptance]
         .sort((a, b) => priority[a.status]! - priority[b.status]! || b.updatedAt.localeCompare(a.updatedAt));
       return <div className="task-dashboard">
         <SectionShell title="继续工作" meta={<span aria-live="polite">{queue.length} 项需要关注</span>}>
           {queue.length ? <ol className="continue-queue">
             {queue.map((item) => <li key={`${item.status}:${item.id}`}>
               <button type="button" onClick={() => go(item.hash)}>
-                <span className={`queue-status queue-status--${item.status}`}>{item.status}</span>
+                <span className={`queue-status queue-status--${item.status}`}>{QUEUE_STATUS_LABELS[item.status] ?? item.status}</span>
                 <strong>{item.title}</strong>
                 <span className="queue-next">下一步：{item.next} →</span>
                 <small>{item.meta.join(" · ")}</small>

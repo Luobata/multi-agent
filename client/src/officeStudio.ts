@@ -6,7 +6,7 @@ export function completionRatio(tally: Record<WorkInstanceStatus, number>): numb
   // Failed/blocked/skipped instances are retained as immutable attempt evidence.
   // They must not permanently depress delivery progress after the Supervisor has
   // replanned and a replacement instance succeeds.
-  const actionable = tally.completed + tally.queued + tally.waiting + tally.running;
+  const actionable = tally.completed + tally.queued + tally.waiting + tally.running + tally["cancellation-requested"];
   return actionable === 0 ? (tally.completed > 0 ? 1 : 0) : tally.completed / actionable;
 }
 

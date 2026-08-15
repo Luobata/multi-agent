@@ -528,7 +528,10 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
               <header className="board-lane-head"><h2>{lane.label}</h2><span className="board-lane-count">{cards.length}</span></header>
               <div className="board-lane-body">
                 {cards.map((requirement) => {
-                  const awaitingDecision = requirement.advancement?.status === "awaiting-human-decision";
+                  const advancementStatus = requirement.advancement?.status;
+                  const awaitingDecision = advancementStatus === "awaiting-human-decision";
+                  const endedAttempt = advancementStatus === "completed" || advancementStatus === "blocked"
+                    || advancementStatus === "failed" || advancementStatus === "cancelled";
                   const runId = requirement.advancement?.runId;
                   const invocationId = requirement.advancement?.invocationId;
                   const invocationDecisions = invocationId
@@ -545,8 +548,30 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
                     if (runId && onOpenRun) onOpenRun(runId);
                     else openRequirement();
                   };
+                  const actionTitle = awaitingDecision
+                    ? (isRepeatedDecision ? "新的确认请求" : "等待你的决定")
+                    : advancementStatus === "completed" ? "执行已结束，核对交付"
+                      : advancementStatus === "cancelled" ? "本轮已取消，选择后续动作"
+                        : advancementStatus === "blocked" ? "本轮已阻塞，需要处理"
+                          : advancementStatus === "failed" ? "本轮失败，需要处理" : "";
+                  const actionDetail = awaitingDecision
+                    ? (pendingDecision
+                        ? `${isRepeatedDecision ? "上一项决定已生效；" : ""}Run 在第 ${pendingDecision.round} 轮暂停 · ${formatTime(pendingDecision.createdAt)}`
+                        : "Run 已暂停，不会自行继续")
+                    : advancementStatus === "completed" ? "执行完成不等于需求交付；请核对证据并决定验收、保留或丢弃。"
+                      : advancementStatus === "cancelled" ? "原 Run 证据已保留；可在需求详情明确启动后继周期。"
+                        : "先查看根因与原始证据，修复配置或方案后再创建后继周期。";
+                  const openAttention = () => {
+                    if (awaitingDecision) return openDecision();
+                    go(`requirements/${requirement.id}${advancementStatus === "completed" ? "?section=run" : ""}`);
+                  };
+                  const actionLabel = awaitingDecision
+                    ? (runId && onOpenRun ? "处理待确认 →" : "查看待确认详情 →")
+                    : advancementStatus === "completed" ? "核对交付与验收 →"
+                      : advancementStatus === "cancelled" ? "查看并新建后继周期 →"
+                        : "查看原因并重新推进 →";
                   return <article key={requirement.id}
-                    className={`board-card${awaitingDecision ? " board-card--confirmation" : ""}${requirement.exception ? ` board-card--${requirement.exception}` : ""}`}>
+                    className={`board-card${awaitingDecision || endedAttempt ? " board-card--confirmation" : ""}${requirement.exception ? ` board-card--${requirement.exception}` : ""}`}>
                     <button type="button" className="board-card-main" onClick={openRequirement} aria-label={`查看需求详情：${requirement.code} ${requirement.title}`}>
                       <div className="board-card-top"><code>{requirement.code}</code>{!spaceId && <span className="board-card-project" title={projectName(requirement.projectId)}>{projectName(requirement.projectId)}</span>}</div>
                       <strong>{requirement.title}</strong>
@@ -561,14 +586,12 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
                         {exceptionChip(requirement.exception)}
                       </footer>
                     </button>
-                    {awaitingDecision && <div className="board-card-confirmation" role="status">
+                    {(awaitingDecision || endedAttempt) && <div className="board-card-confirmation" role="group" aria-label={actionTitle}>
                       <span>
-                        <strong>{isRepeatedDecision ? "新的确认请求" : "等待你的决定"}</strong>
-                        <small>{pendingDecision
-                          ? `${isRepeatedDecision ? "上一项决定已生效；" : ""}Run 在第 ${pendingDecision.round} 轮暂停 · ${formatTime(pendingDecision.createdAt)}`
-                          : "Run 已暂停，不会自行继续"}</small>
+                        <strong>{actionTitle}</strong>
+                        <small>{actionDetail}</small>
                       </span>
-                      <button type="button" className="button primary" onClick={openDecision}>{runId && onOpenRun ? "处理待确认 →" : "查看待确认详情 →"}</button>
+                      <button type="button" className="button primary" onClick={openAttention}>{actionLabel}</button>
                     </div>}
                   </article>;
                 })}

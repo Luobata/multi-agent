@@ -11,6 +11,7 @@ import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } 
 import { RunsPage } from "./RunsPage";
 import {
   buildRequirementAdvancementInput,
+  parseExplicitDeliveryIntent,
   requirementAdvancementGateway,
   requirementAdvancementSafetyGaps,
   type RequirementAdvancementGateway
@@ -76,6 +77,7 @@ const ADVANCEMENT_LABELS = {
   queued: "已排队",
   running: "Agent 正在推进",
   "awaiting-human-decision": "等待你的决定",
+  "cancellation-requested": "正在安全停止",
   completed: "执行完成，等待核对交付",
   blocked: "推进已阻塞",
   failed: "推进失败",
@@ -135,6 +137,7 @@ export function RequirementDetailPage({
   const [evaluatingLaunch, setEvaluatingLaunch] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState("");
+  const [deliveryCommand, setDeliveryCommand] = useState("");
   const [blockerProgress, setBlockerProgress] = useState<RequirementInvocationProgress>();
   const [blockerProgressLoading, setBlockerProgressLoading] = useState(false);
 
@@ -148,6 +151,7 @@ export function RequirementDetailPage({
     ? invocations.find((invocation) => invocation.id === detail.advancement?.invocationId)
     : undefined;
   const launchGaps = launchDecision ? requirementAdvancementSafetyGaps(launchDecision, workflows, managementPolicies) : [];
+  const deliveryIntent = parseExplicitDeliveryIntent(deliveryCommand, advancementConfig?.deliveryTargets ?? []);
   const blockedStart = detail ? startBlockedReason(detail, Boolean(advancementConfig), Boolean(activePolicy)) : undefined;
   const canRestart = Boolean(detail && (detail.advancement?.status === "failed"
     || detail.advancement?.status === "blocked"
@@ -197,11 +201,11 @@ export function RequirementDetailPage({
   }, [detail?.advancement?.invocationId, detail?.advancement?.status]);
 
   const evaluateLaunch = async () => {
-    if (!detail || !advancementConfig || blockedStart) return;
+    if (!detail || !advancementConfig || !deliveryIntent || blockedStart) return;
     setEvaluatingLaunch(true);
     setLaunchError("");
     try {
-      const input = buildRequirementAdvancementInput(detail, undefined, advancementConfig);
+      const input = buildRequirementAdvancementInput(detail, undefined, advancementConfig, deliveryIntent);
       const evaluationInput = {
         route: input.route,
         tags: input.tags,
@@ -229,7 +233,7 @@ export function RequirementDetailPage({
   };
 
   const launch = async () => {
-    if (!detail || !advancementConfig || !launchDecision || launchGaps.length > 0) return;
+    if (!detail || !advancementConfig || !launchDecision || !deliveryIntent || launchGaps.length > 0) return;
     setLaunching(true);
     setLaunchError("");
     // Only a successfully reserved cycle may be marked failed. A stale click must never
@@ -241,7 +245,7 @@ export function RequirementDetailPage({
       setData({ ...detail, advancement, exception: null, updatedAt: advancement.updatedAt });
       const receipt = await gateway.dispatch(
         advancementConfig.entrancePolicyId,
-        buildRequirementAdvancementInput(detail, advancement, advancementConfig)
+        buildRequirementAdvancementInput(detail, advancement, advancementConfig, deliveryIntent)
       );
       const updated = await service.syncRequirementAdvancement(detail.id, advancement.idempotencyKey, {
         invocationId: receipt.invocation.id,
@@ -360,12 +364,22 @@ export function RequirementDetailPage({
                 : blockedStart ?? "先核对入口，再创建受监控的领队 Run"}</small>
           </div>
           <div className="dash-advance-actions">
+            {(!detail.advancement?.runId || canRestart) && <label className="dash-delivery-command">
+              <span>显式交付口令</span>
+              <input
+                value={deliveryCommand}
+                onChange={(event) => { setDeliveryCommand(event.target.value); setLaunchDecision(undefined); }}
+                placeholder="交付领队"
+                aria-describedby="delivery-command-hint"
+              />
+              <small id="delivery-command-hint">仅接受“交付领队”{advancementConfig?.deliveryTargets?.length ? `、${advancementConfig.deliveryTargets.map((target) => `“交付${target}”`).join("、")}` : ""}；普通措辞不会启动领队。</small>
+            </label>}
             {detail.advancement?.runId && <button type="button" className={`button ${awaitingDecision ? "primary" : "secondary"}`} onClick={() => onOpenRun?.(detail.advancement!.runId!)} disabled={!onOpenRun}>{awaitingDecision ? "查看问题并作决定 →" : canRestart ? "查看上次 Run" : "查看 Run 与证据"}</button>}
             {(!detail.advancement?.runId || canRestart) && <button
                   type="button"
                   className="button primary dash-start-button"
-                  disabled={!daemonAvailable || evaluatingLaunch || launching || isActiveRequirementAdvancement(detail.advancement) || Boolean(blockedStart)}
-                  title={blockedStart}
+                  disabled={!daemonAvailable || !deliveryIntent || evaluatingLaunch || launching || isActiveRequirementAdvancement(detail.advancement) || Boolean(blockedStart)}
+                  title={blockedStart ?? (!deliveryIntent ? "请输入项目允许的显式交付口令" : undefined)}
                   onClick={() => void evaluateLaunch()}
                 >{evaluatingLaunch ? "正在核对入口…" : canRestart ? "重新推进" : detail.advancement?.status === "failed" ? "安全重试启动" : "开始推进"}</button>}
             <span>{advancementConfig?.autoPollEnabled ? "自动轮询已启用" : "自动轮询协议已预留 · 当前人工启动"}</span>

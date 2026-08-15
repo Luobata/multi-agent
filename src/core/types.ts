@@ -214,6 +214,8 @@ export interface WorkflowRunRecord {
   output?: JsonValue;
   error?: string;
   nodes: Record<string, NodeRunResult>;
+  /** Architecture-owned live state used for durable progress projection. Final output remains immutable evidence. */
+  architectureState?: JsonObject;
   /** Execution isolation evidence. Omitted = no isolation applied (current behavior). */
   isolation?: WorkflowRunIsolation;
 }

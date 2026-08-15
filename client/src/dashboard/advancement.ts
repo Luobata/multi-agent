@@ -10,6 +10,9 @@ import type {
 export interface RequirementAdvancementConfig {
   entrancePolicyId: string;
   candidateUrl?: string;
+  /** Present on descriptor-derived configs; optional for persisted legacy advancement cycles. */
+  triggerMode?: "explicit-delivery";
+  deliveryTargets?: string[];
   autoPollEnabled: boolean;
   pollIntervalMs: number;
 }
@@ -32,7 +35,8 @@ const ACTIVE_STATUSES = new Set<RequirementAdvancementStatus>([
   "dispatching",
   "queued",
   "running",
-  "awaiting-human-decision"
+  "awaiting-human-decision",
+  "cancellation-requested"
 ]);
 
 const IDEMPOTENCY_COLLISION = /idempotency key .* already bound to another workflow Invocation/i;
@@ -75,13 +79,19 @@ function httpCandidateUrl(value: unknown): string | undefined {
 /** Project descriptor config is the only binding between a project and its advancement policy. */
 export function requirementAdvancementConfig(project: Project | undefined): RequirementAdvancementConfig | undefined {
   const config = record(project?.connector.config.requirementAdvancement);
+  if (config?.triggerMode !== "explicit-delivery") return undefined;
   const entrancePolicyId = typeof config?.entrancePolicyId === "string" ? config.entrancePolicyId.trim() : "";
   if (!entrancePolicyId) return undefined;
   const polling = record(config!.polling);
   const candidateUrl = httpCandidateUrl(config!.candidateUrl);
+  const deliveryTargets = Array.isArray(config!.deliveryTargets)
+    ? [...new Set(config!.deliveryTargets.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean))]
+    : [];
   return {
     entrancePolicyId,
     ...(candidateUrl ? { candidateUrl } : {}),
+    triggerMode: config.triggerMode,
+    deliveryTargets,
     autoPollEnabled: polling?.enabled === true,
     pollIntervalMs: positivePollInterval(polling?.intervalMs)
   };
@@ -108,12 +118,11 @@ export function requirementOwnerLabel(requirement: Pick<Requirement, "owner" | "
 
 export function advancementLane(status: RequirementAdvancementStatus, current: RequirementLane): RequirementLane {
   if (status === "queued" || status === "dispatching") return "queued";
-  if (status === "awaiting-human-decision") return "confirmation";
-  if (status === "running" || status === "completed") return "running";
-  // Blocked / failed / cancelled are exception overlays, not lifecycle lanes.
-  // Once a paused Run terminates it must leave the confirmation lane; otherwise
-  // the card keeps looking actionable even though there is no pending decision.
-  if (current === "confirmation") return "running";
+  if (status === "running" || status === "cancellation-requested") return "running";
+  // Every ended Attempt is still an unresolved product obligation until a human
+  // reviews delivery, starts a successor, or explicitly abandons the Goal.
+  if (status === "awaiting-human-decision" || status === "completed"
+    || status === "blocked" || status === "failed" || status === "cancelled") return "confirmation";
   return current;
 }
 
@@ -157,6 +166,7 @@ export function reserveAdvancement(
   const cycle = (current?.cycle ?? 0) + 1;
   return {
     schemaVersion: 1,
+    lineageId: current?.lineageId ?? advancementNonce(),
     cycle,
     trigger,
     status: "dispatching",

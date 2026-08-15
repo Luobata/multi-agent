@@ -77,7 +77,7 @@ async function waitForPendingDecision(service: WorkbenchService, invocationId: s
   throw new Error(`timed out waiting for human decision on ${invocationId}`);
 }
 
-async function createFixture(mode: "approve" | "reject", dataRoot = temporaryRoot()) {
+async function createFixture(mode: "approve" | "reject", dataRoot = temporaryRoot(), planBeforeDecision = false) {
   let workerCalls = 0;
   let rejectedHistory: JsonValue[] | undefined;
   const providers: ProviderRegistry = new Map([["human-decision-test", {
@@ -90,13 +90,49 @@ async function createFixture(mode: "approve" | "reject", dataRoot = temporaryRoo
       };
       const round = Number(node.with?.__supervisorRound ?? 0);
       if (role.id === "supervisor") {
-        if (round === 1) {
+        if (planBeforeDecision && round === 1) {
+          return {
+            stdout: JSON.stringify({
+              action: "plan-todos",
+              summary: "Persist a bounded risky plan before approval.",
+              impact: {
+                level: "medium",
+                regressionScope: "package",
+                affectedAreas: ["src/risky.ts"],
+                reasons: ["dependency install affects the package"],
+                requiredChecks: []
+              },
+              todos: [
+                { id: "approved-change", roleId: "builder", task: "Implement the approved dependency change.", needs: [], workKind: "code" },
+                { id: "follow-up", roleId: "builder", task: "Complete the bounded follow-up.", needs: ["approved-change"], workKind: "code" }
+              ]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (round === (planBeforeDecision ? 2 : 1)) {
           return {
             stdout: JSON.stringify({
               action: "request-human-decision",
               riskCategory: "dependency-install",
               summary: "Install a new native dependency before implementation.",
-              assignments: [{ roleId: "builder", task: "Install and use native-addon", workKind: "code" }]
+              assignments: [{
+                ...(planBeforeDecision ? { todoId: "approved-change" } : {}),
+                roleId: "builder",
+                task: "Install and use native-addon",
+                workKind: "code"
+              }]
+            }),
+            stderr: "",
+            durationMs: 1
+          };
+        }
+        if (planBeforeDecision && round === 3) {
+          return {
+            stdout: JSON.stringify({
+              action: "delegate",
+              assignments: [{ todoId: "follow-up", roleId: "builder", workKind: "code" }]
             }),
             stderr: "",
             durationMs: 1
@@ -140,7 +176,7 @@ async function createFixture(mode: "approve" | "reject", dataRoot = temporaryRoo
     id: "risk-policy",
     allowedRoleIds: ["builder"],
     instructions: "Request a human decision before high-risk delegation.",
-    limits: { maxRounds: 4, maxDelegations: 4, maxParallelDelegations: 1 },
+    limits: { maxRounds: planBeforeDecision ? 5 : 4, maxDelegations: 4, maxParallelDelegations: 1 },
     completion: { requireDelegation: false }
   });
   await service.createWorkflow({
@@ -301,27 +337,73 @@ describe("Supervisor high-risk human decision gate", () => {
     expect(completed.run).toMatchObject({ output: { delegations: 0, rounds: 2 } });
   }, 10_000);
 
-  it("voids pending requests when restart recovery interrupts their non-terminal invocation", async () => {
+  it("preserves a pending request across restart recovery and resumes the same Run after approval", async () => {
     const dataRoot = temporaryRoot();
     const fixture = await createFixture("approve", dataRoot);
     const receipt = await fixture.service.startWorkbenchWorkflow("risk-supervisor", { message: "Will be interrupted" });
     const pending = await waitForPendingDecision(fixture.service, receipt.invocation.id);
+    const checkpoint = JSON.parse(fs.readFileSync(
+      path.join(dataRoot, "artifacts", "runs", receipt.runId, "checkpoint.json"),
+      "utf8"
+    )) as { leaseExpiresAt: string };
+    expect(new Date(checkpoint.leaseExpiresAt).getTime()).toBeLessThanOrEqual(Date.now());
 
     const reopened = await WorkbenchService.open({ dataRoot, providers: fixture.providers });
     await reopened.recoverInterruptedActivity();
 
-    expect((await reopened.getInvocationDetail(receipt.invocation.id)).invocation).toMatchObject({
-      status: "failed",
-      phase: "interrupted"
-    });
+    await waitForPendingDecision(reopened, receipt.invocation.id);
     expect(reopened.getHumanDecisionRequest(pending.id)).toMatchObject({
-      status: "voided",
-      decidedBy: "runtime-recovery",
-      comment: expect.stringContaining("restarted")
+      status: "pending",
+      invocationId: receipt.invocation.id,
+      runId: receipt.runId
     });
-    await expect(reopened.decideHumanDecisionRequest(pending.id, {
+    await reopened.decideHumanDecisionRequest(pending.id, {
       decision: "approve",
-      decidedBy: "late-owner"
-    })).rejects.toThrow(/already decided as voided/);
+      decidedBy: "restart-owner"
+    });
+    const completed = await reopened.waitForInvocation(receipt.invocation.id);
+    expect(completed.invocation).toMatchObject({ status: "completed" });
+    expect(reopened.getHumanDecisionRequest(pending.id)).toMatchObject({
+      status: "approved",
+      decidedBy: "restart-owner"
+    });
+    expect(fixture.workerCalls()).toBe(1);
+  }, 10_000);
+
+  it("restores a durable dynamic plan and round counter across restart", async () => {
+    const dataRoot = temporaryRoot();
+    const fixture = await createFixture("approve", dataRoot, true);
+    const receipt = await fixture.service.startWorkbenchWorkflow("risk-supervisor", { message: "Plan, pause, then resume" });
+    const pending = await waitForPendingDecision(fixture.service, receipt.invocation.id);
+    expect(pending.round).toBe(2);
+
+    const before = JSON.parse(fs.readFileSync(
+      path.join(dataRoot, "artifacts", "runs", receipt.runId, "supervisor-state.json"),
+      "utf8"
+    )) as { round?: number; dynamicTodos?: unknown[] };
+    expect(before).toMatchObject({ round: 2 });
+    expect(before.dynamicTodos).toHaveLength(2);
+
+    const reopened = await WorkbenchService.open({ dataRoot, providers: fixture.providers });
+    await reopened.recoverInterruptedActivity();
+    await waitForPendingDecision(reopened, receipt.invocation.id);
+    await reopened.decideHumanDecisionRequest(pending.id, {
+      decision: "approve",
+      decidedBy: "restart-owner"
+    });
+    const completed = await reopened.waitForInvocation(receipt.invocation.id);
+
+    expect(completed.run).toMatchObject({
+      status: "passed",
+      output: {
+        rounds: 4,
+        delegations: 2,
+        dag: { nodes: expect.arrayContaining([
+          expect.objectContaining({ nodeId: "approved-change", status: "passed" }),
+          expect.objectContaining({ nodeId: "follow-up", status: "passed" })
+        ]) }
+      }
+    });
+    expect(fixture.workerCalls()).toBe(2);
   }, 10_000);
 });

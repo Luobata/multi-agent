@@ -18,10 +18,29 @@ afterEach(() => {
 });
 
 describe("project descriptor", () => {
+  it("keeps the default leader route behind the explicit delivery signal", () => {
+    const policy = JSON.parse(
+      fs.readFileSync(path.resolve("templates/workbench/default-task-entrance-policy.json"), "utf8")
+    ) as { rules: Array<{ id: string; when: { signals?: Record<string, unknown> }; result: { route: string } }> };
+    const leaderRules = policy.rules.filter((rule) => rule.result.route === "leader");
+
+    expect(leaderRules).toEqual([expect.objectContaining({
+      id: "explicit-leader-delivery",
+      when: { signals: { explicitLeaderDelivery: { eq: true } } }
+    })]);
+    expect(policy.rules.map((rule) => rule.id)).not.toEqual(expect.arrayContaining([
+      "dynamic-replanning",
+      "independent-validation",
+      "multi-role-collaboration"
+    ]));
+  });
+
   it("loads the repository-owned requirement candidate URL", async () => {
     const project = await loadProjectDescriptor({ rootPath: path.resolve(".") });
     expect(project.connector?.config?.requirementAdvancement).toMatchObject({
       entrancePolicyId: "default-task-entrance-policy",
+      triggerMode: "explicit-delivery",
+      deliveryTargets: ["小米汪", "小米汪领队"],
       candidateUrl: "http://127.0.0.1:4319"
     });
   });
@@ -190,7 +209,10 @@ describe("project descriptor", () => {
   it("connects the review project to the conversational requirement steward", async () => {
     const descriptor = YAML.parse(
       fs.readFileSync(path.resolve("templates/workbench/cart-fe-workflow-review.project.yaml"), "utf8")
-    ) as { roles: Record<string, { outputSchema?: any; permissions?: { write?: string } }> };
+    ) as {
+      connector?: { config?: { requirementAdvancement?: Record<string, unknown> } };
+      roles: Record<string, { outputSchema?: any; permissions?: { write?: string } }>;
+    };
     const binding = JSON.parse(
       fs.readFileSync(path.resolve("templates/workbench/cart-fe-workflow-review.binding.json"), "utf8")
     ) as { roles: Array<{ roleId: string; employeeId: string }> };
@@ -203,6 +225,11 @@ describe("project descriptor", () => {
       roleId: "requirement-steward",
       employeeId: "xiaomiwang-product-manager"
     }));
+    expect(descriptor.connector?.config?.requirementAdvancement).toEqual({
+      entrancePolicyId: "default-task-entrance-policy",
+      triggerMode: "explicit-delivery",
+      deliveryTargets: ["小米汪", "小米汪领队"]
+    });
   });
 
   it("seeds the frontend project Employee on the Codex Provider", () => {

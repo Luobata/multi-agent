@@ -10,6 +10,9 @@ connector:
     sourceRoots: [src, client]
     requirementAdvancement:
       entrancePolicyId: default-task-entrance-policy
+      # 领队只接受以下显式交付口令；普通需求描述和“开始推进”不会触发。
+      triggerMode: explicit-delivery
+      deliveryTargets: [小米汪, 小米汪领队]
       candidateUrl: http://127.0.0.1:4319
       polling:
         # 人工按钮与未来轮询器复用同一幂等推进协议；首期只开放人工启动。

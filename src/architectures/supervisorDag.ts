@@ -58,6 +58,32 @@ export interface SupervisorDagNodeTracker {
   passedExecutionNodeId?: string;
 }
 
+function supervisorDagWhyNotRunning(
+  tracker: SupervisorDagNodeTracker,
+  trackers: ReadonlyMap<string, SupervisorDagNodeTracker>,
+  ready: boolean
+): JsonValue[] {
+  if (ready || tracker.status === "running" || tracker.status === "passed" || tracker.status === "skipped") return [];
+  if (tracker.status === "blocked" || tracker.status === "failed") {
+    return [{
+      kind: "terminal",
+      status: tracker.status,
+      reason: "terminal execution requires explicit Supervisor recovery evidence before it can be reopened"
+    }];
+  }
+  return tracker.node.needs.flatMap((dependencyId) => {
+    const dependencyStatus = trackers.get(dependencyId)?.status ?? "pending";
+    if (supervisorDagDependencyMatches(tracker.node, dependencyId, dependencyStatus as NodeRunStatus)) return [];
+    const condition = tracker.node.needsWhen?.find((candidate) => candidate.nodeId === dependencyId);
+    return [{
+      kind: "dependency",
+      nodeId: dependencyId,
+      status: dependencyStatus,
+      expectedStatuses: condition?.statuses ?? ["passed"]
+    }];
+  });
+}
+
 export function normalizeSupervisorDagConfig(dag: SupervisorDagConfig | undefined): SupervisorDagConfig | undefined {
   if (!dag) return undefined;
   return {
@@ -145,29 +171,39 @@ export function supervisorDagIssues(
 export function supervisorDagSnapshot(trackers: Map<string, SupervisorDagNodeTracker> | undefined): JsonValue {
   if (!trackers) return null;
   return {
-    nodes: [...trackers.values()].map((tracker) => ({
-      nodeId: tracker.node.nodeId,
-      roleId: tracker.node.roleId,
-      needs: tracker.node.needs,
-      ...(tracker.node.needsWhen ? { needsWhen: tracker.node.needsWhen.map((condition) => ({
-        nodeId: condition.nodeId,
-        statuses: [...condition.statuses]
-      })) } : {}),
-      kind: tracker.node.kind,
-      task: tracker.node.task,
-      requiredCapabilities: tracker.node.requiredCapabilities,
-      workKind: tracker.node.workKind,
-      changeSet: tracker.node.changeSet ?? null,
-      required: tracker.node.required,
-      status: tracker.status,
-      ready: tracker.status !== "skipped" && (
-        (tracker.status !== "passed" && supervisorDagNodeReady(tracker.node, trackers))
-        || (tracker.status === "passed" && supervisorDagHasFreshDependencyEvidence(tracker, trackers))
-        || (tracker.status === "passed" && supervisorDagHasFreshCandidateEvidence(tracker, trackers))
-      ),
-      executions: tracker.executions.map((execution) => ({ ...execution }))
-    }))
+    nodes: [...trackers.values()].map((tracker) => {
+      const ready = supervisorDagTrackerReady(tracker, trackers);
+      return {
+        nodeId: tracker.node.nodeId,
+        roleId: tracker.node.roleId,
+        needs: tracker.node.needs,
+        ...(tracker.node.needsWhen ? { needsWhen: tracker.node.needsWhen.map((condition) => ({
+          nodeId: condition.nodeId,
+          statuses: [...condition.statuses]
+        })) } : {}),
+        kind: tracker.node.kind,
+        task: tracker.node.task,
+        requiredCapabilities: tracker.node.requiredCapabilities,
+        workKind: tracker.node.workKind,
+        changeSet: tracker.node.changeSet ?? null,
+        required: tracker.node.required,
+        status: tracker.status,
+        ready,
+        whyNotRunning: supervisorDagWhyNotRunning(tracker, trackers, ready),
+        executions: tracker.executions.map((execution) => ({ ...execution }))
+      };
+    })
   };
+}
+
+/** Shared readiness predicate for execution planning and read-only progress projections. */
+export function supervisorDagTrackerReady(
+  tracker: SupervisorDagNodeTracker,
+  trackers: ReadonlyMap<string, SupervisorDagNodeTracker>
+): boolean {
+  return (tracker.status === "pending" && supervisorDagNodeReady(tracker.node, trackers))
+    || (tracker.status === "passed" && supervisorDagHasFreshDependencyEvidence(tracker, trackers))
+    || (tracker.status === "passed" && supervisorDagHasFreshCandidateEvidence(tracker, trackers));
 }
 
 export function supervisorDagDependencyMatches(node: SupervisorDagNodeConfig, dependencyId: string, status: NodeRunStatus): boolean {

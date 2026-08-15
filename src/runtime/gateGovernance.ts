@@ -2,6 +2,160 @@ import { createHash } from "node:crypto";
 
 export interface ValidationGroup { id: string; requiredChecks: string[]; impactedFiles?: string[] }
 
+export interface RuntimeImpactPlan {
+  level: "low" | "medium" | "high";
+  regressionScope: "none" | "targeted" | "package" | "full";
+  affectedAreas: string[];
+  reasons: string[];
+  requiredChecks: string[];
+  validationGroups?: ValidationGroup[];
+}
+
+export interface RuntimeImpactManifest {
+  schemaVersion: 1;
+  snapshotAvailable: boolean;
+  changedFiles: string[];
+  declaredImpactedFiles: string[];
+  directCoverageProven: boolean;
+  dependencyClosureProven: false;
+  boundaryChange: boolean;
+  widened: boolean;
+  effectiveLevel: RuntimeImpactPlan["level"];
+  effectiveRegressionScope: RuntimeImpactPlan["regressionScope"];
+  requiredChecks: string[];
+  reasons: string[];
+}
+
+const IMPACT_LEVEL_ORDER: Record<RuntimeImpactPlan["level"], number> = { low: 0, medium: 1, high: 2 };
+const IMPACT_SCOPE_ORDER: Record<RuntimeImpactPlan["regressionScope"], number> = { none: 0, targeted: 1, package: 2, full: 3 };
+
+function normalizedPath(value: string): string {
+  return value.trim().replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function pathCovered(file: string, declaration: string): boolean {
+  const normalizedFile = normalizedPath(file);
+  const normalizedDeclaration = normalizedPath(declaration).replace(/\/\*\*$/, "");
+  return normalizedDeclaration.length > 0
+    && (normalizedFile === normalizedDeclaration || normalizedFile.startsWith(`${normalizedDeclaration}/`));
+}
+
+function globalBoundaryFile(file: string): boolean {
+  const normalized = normalizedPath(file).toLowerCase();
+  return /(^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|tsconfig(?:\.[^/]+)?\.json)$/.test(normalized)
+    || /(^|\/)(?:migrations?|schemas?|security|auth)(?:\/|\.|$)/.test(normalized)
+    || /(^|\/)(?:vite|vitest|webpack|rollup|eslint|prettier)\.config\.[^/]+$/.test(normalized);
+}
+
+function widerLevel(left: RuntimeImpactPlan["level"], right: RuntimeImpactPlan["level"]): RuntimeImpactPlan["level"] {
+  return IMPACT_LEVEL_ORDER[left] >= IMPACT_LEVEL_ORDER[right] ? left : right;
+}
+
+function widerScope(
+  left: RuntimeImpactPlan["regressionScope"],
+  right: RuntimeImpactPlan["regressionScope"]
+): RuntimeImpactPlan["regressionScope"] {
+  return IMPACT_SCOPE_ORDER[left] >= IMPACT_SCOPE_ORDER[right] ? left : right;
+}
+
+function baselineChecks(
+  scope: RuntimeImpactPlan["regressionScope"],
+  packageScripts: Record<string, string | undefined>
+): string[] {
+  if (scope === "full" && packageScripts.check) return ["npm run check"];
+  if (scope === "package") {
+    return ["typecheck", "test"].filter((name) => Boolean(packageScripts[name])).map((name) => `npm run ${name}`);
+  }
+  if (scope === "full") {
+    return ["typecheck", "test", "build"].filter((name) => Boolean(packageScripts[name])).map((name) => `npm run ${name}`);
+  }
+  return [];
+}
+
+/**
+ * Reconcile a leader-authored impact plan with the actual candidate diff. The leader may widen
+ * this result but cannot narrow the deterministic floor. This deliberately does not claim a
+ * dependency closure; cross-candidate Gate reuse stays disabled until such a proof exists.
+ */
+export function reconcileRuntimeImpact(input: {
+  declared?: RuntimeImpactPlan;
+  changedFiles: string[];
+  snapshotAvailable: boolean;
+  packageScripts: Record<string, string | undefined>;
+}): { impact?: RuntimeImpactPlan; manifest: RuntimeImpactManifest } {
+  const changedFiles = [...new Set(input.changedFiles.map(normalizedPath).filter(Boolean))].sort();
+  const declaredImpactedFiles = [...new Set((input.declared?.validationGroups ?? [])
+    .flatMap((group) => group.impactedFiles ?? [])
+    .map(normalizedPath)
+    .filter(Boolean))].sort();
+  const directCoverageProven = input.snapshotAvailable
+    && changedFiles.length > 0
+    && declaredImpactedFiles.length > 0
+    && changedFiles.every((file) => declaredImpactedFiles.some((declaration) => pathCovered(file, declaration)));
+  const boundaryChange = changedFiles.some(globalBoundaryFile);
+  const deterministicScope: RuntimeImpactPlan["regressionScope"] = !input.snapshotAvailable
+    ? "full"
+    : boundaryChange
+      ? "full"
+      : changedFiles.length === 0
+        ? "none"
+        : directCoverageProven
+          ? "targeted"
+          : "package";
+  const deterministicLevel: RuntimeImpactPlan["level"] = deterministicScope === "full"
+    ? "high"
+    : deterministicScope === "package"
+      ? "medium"
+      : "low";
+  const effectiveScope = widerScope(input.declared?.regressionScope ?? "none", deterministicScope);
+  const effectiveLevel = widerLevel(input.declared?.level ?? "low", deterministicLevel);
+  const widened = effectiveScope !== (input.declared?.regressionScope ?? "none")
+    || effectiveLevel !== (input.declared?.level ?? "low");
+  const reasons = [...new Set([
+    ...(input.declared?.reasons ?? []),
+    ...(!input.snapshotAvailable ? ["candidate snapshot unavailable; deterministic impact fails closed to full regression"] : []),
+    ...(boundaryChange ? ["candidate changes a repository-wide boundary"] : []),
+    ...(changedFiles.length > 0 && !directCoverageProven && !boundaryChange
+      ? ["actual candidate diff is not fully covered by declared impacted files"]
+      : []),
+    ...(directCoverageProven ? ["actual candidate diff is directly covered by declared impacted files"] : [])
+  ])];
+  const requiredChecks = [...new Set([
+    ...(input.declared?.requiredChecks ?? []),
+    ...baselineChecks(effectiveScope, input.packageScripts)
+  ])];
+  const affectedAreas = [...new Set([...(input.declared?.affectedAreas ?? []), ...changedFiles])];
+  const impact = input.declared || changedFiles.length > 0 || !input.snapshotAvailable
+    ? {
+        level: effectiveLevel,
+        regressionScope: effectiveScope,
+        affectedAreas,
+        reasons,
+        requiredChecks,
+        ...(widened || !input.declared?.validationGroups
+          ? { validationGroups: requiredChecks.length > 0 ? [{ id: "deterministic-candidate", requiredChecks, impactedFiles: changedFiles }] : [] }
+          : { validationGroups: input.declared.validationGroups })
+      }
+    : undefined;
+  return {
+    ...(impact ? { impact } : {}),
+    manifest: {
+      schemaVersion: 1,
+      snapshotAvailable: input.snapshotAvailable,
+      changedFiles,
+      declaredImpactedFiles,
+      directCoverageProven,
+      dependencyClosureProven: false,
+      boundaryChange,
+      widened,
+      effectiveLevel,
+      effectiveRegressionScope: effectiveScope,
+      requiredChecks,
+      reasons
+    }
+  };
+}
+
 export interface GateCandidatePreflight {
   status: "passed" | "blocked";
   candidateUrl: string;
@@ -83,9 +237,11 @@ export function reusableGateShard(evidence: GateShardEvidence, input: {
   candidateIdentity: string; candidateRevision: string; gateId: string; shardId: string; checks: string[]; changedFiles: string[];
 }): boolean {
   const sameCandidate = evidence.candidateIdentity === input.candidateIdentity && evidence.candidateRevision === input.candidateRevision;
-  const provenUnaffectedInheritance = evidence.candidateIdentity !== input.candidateIdentity && input.changedFiles.length > 0
-    && evidence.impactedFiles.length > 0 && !input.changedFiles.some((file) => evidence.impactedFiles.includes(file));
-  return evidence.status === "passed" && (sameCandidate || provenUnaffectedInheritance) && evidence.gateId === input.gateId
+  // changedFiles/impactedFiles overlap is not a dependency-closure proof. A shared config,
+  // schema, generated artifact, or transitive caller can invalidate a shard without appearing
+  // in the prior model-declared impactedFiles. Cross-candidate reuse therefore fails closed until
+  // the runtime owns a deterministic dependency manifest and common-base proof.
+  return evidence.status === "passed" && sameCandidate && evidence.gateId === input.gateId
     && evidence.shardId === input.shardId && digestList(evidence.checks) === digestList(input.checks)
     && evidence.artifactPath.length > 0 && /^sha256:[a-f0-9]{64}$/.test(evidence.artifactDigest)
     && evidence.sourceNodeIds.length > 0;

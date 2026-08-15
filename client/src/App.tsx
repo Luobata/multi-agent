@@ -348,6 +348,48 @@ export function App() {
   const go = (hash: string) => { window.location.hash = hash; };
   const invocationRevision = data.activity.invocations.reduce((latest, invocation) => invocation.updatedAt > latest ? invocation.updatedAt : latest, "");
   const activityRevision = data.activity.instances.reduce((latest, instance) => instance.updatedAt > latest ? instance.updatedAt : latest, invocationRevision);
+  // Requirement cards are a browser-local projection, but Invocation activity is
+  // durable. Reconcile it at the App boundary so terminal/decision changes are not
+  // dependent on the Board page being mounted.
+  useEffect(() => {
+    if (daemon !== "online" || !invocationRevision) return;
+    let current = true;
+    void dashboardService.listBoard().then(async (requirements) => {
+      const invocationById = new Map(data.activity.invocations.map((invocation) => [invocation.id, invocation]));
+      const work = requirements.flatMap((requirement) => {
+        const advancement = requirement.advancement;
+        if (!advancement?.invocationId) return [];
+        const prior = invocationById.get(advancement.invocationId);
+        if (!prior) return [];
+        const successor = ["blocked", "failed", "cancelled"].includes(advancement.status)
+          ? data.activity.invocations
+              .filter((candidate) => candidate.id !== prior.id
+                && candidate.source.project === prior.source.project
+                && candidate.source.taskId === prior.source.taskId
+                && candidate.source.contextId === prior.source.contextId
+                && candidate.createdAt > prior.createdAt)
+              .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0]
+          : undefined;
+        const invocation = successor ?? prior;
+        if (invocation.id === advancement.invocationId && invocation.status === advancement.status) return [];
+        return [dashboardService.syncRequirementAdvancement(requirement.id, advancement.idempotencyKey, {
+          invocationId: invocation.id,
+          runId: invocation.runId,
+          leaderSessionId: invocation.sessionId,
+          status: invocation.status,
+          observedAt: invocation.updatedAt,
+          error: invocation.error,
+          ...(invocation.id !== advancement.invocationId ? { replacesInvocationId: advancement.invocationId } : {})
+        }, 15_000)];
+      });
+      const results = await Promise.allSettled(work);
+      const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (current && failed) notify(`需求状态自动同步失败：${failed.reason instanceof Error ? failed.reason.message : String(failed.reason)}`, "error");
+    }).catch((error: unknown) => {
+      if (current) notify(`需求状态自动同步失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    });
+    return () => { current = false; };
+  }, [daemon, invocationRevision, data.activity.invocations, notify]);
   const awaitingDecisionRevision = data.activity.invocations
     .filter((invocation) => invocation.status === "awaiting-human-decision")
     .map((invocation) => `${invocation.id}:${invocation.updatedAt}`)
@@ -365,6 +407,10 @@ export function App() {
       });
     return () => { current = false; };
   }, [awaitingDecisionRevision, daemon]);
+  const pendingDecisionInvocations = data.activity.invocations
+    .filter((invocation) => invocation.status === "awaiting-human-decision")
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const pendingDecisionCount = pendingDecisionInvocations.length;
   const nav = [
     { id: "office" as const, label: "员工大厅", icon: "office" as const },
     { id: "dashboard" as const, label: "工作台", icon: "dashboard" as const },
@@ -401,7 +447,10 @@ export function App() {
     </header>
     <nav className="side-nav" aria-label="主要导航">
       <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>双叶幼儿园</strong><small>CRAYON KINDERGARTEN DOSSIER</small></div></div>
-      <div className="nav-items">{nav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
+      <div className="nav-items">{nav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={pendingDecisionCount > 0 && (item.id === "board" || item.id === "runs") ? `${item.label} · ${pendingDecisionCount} 项待你决定` : item.label} key={item.id} onClick={() => {
+        if (item.id === "runs" && pendingDecisionInvocations[0]) go(`runs/${encodeURIComponent(pendingDecisionInvocations[0].runId)}`);
+        else navigate(item.id);
+      }}><Icon name={item.icon} /><span>{item.label}</span>{pendingDecisionCount > 0 && (item.id === "board" || item.id === "runs") && <span className="nav-attention-badge" aria-label={`${pendingDecisionCount} 项待你决定`}>{pendingDecisionCount}</span>}</button>)}</div>
       <div className="nav-items nav-utility">{utilityNav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
       <button type="button" className="mobile-more" aria-expanded={moreOpen} onClick={() => setMoreOpen(true)}><Icon name="command" /><span>更多</span></button>
       <button type="button" className="command-hint" title="命令入口" onClick={() => setCommandOpen(true)}><Icon name="command" /><span>命令面板</span><kbd>⌘K</kbd></button>
@@ -425,7 +474,7 @@ export function App() {
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
-      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} pendingRunId={route.runId ?? pendingRunId} onConsumePending={() => setPendingRunId("")} onSelectRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} dashboard={dashboardService} fromStudio={Boolean(studioOrigin.current && (route.runId ?? pendingRunId))} onReturnOffice={() => { if (studioOrigin.current && window.history.length > 1) window.history.back(); else window.location.hash = "office"; }} />}
+      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} pendingRunId={route.runId ?? pendingRunId} onConsumePending={() => setPendingRunId("")} onSelectRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} onOpenRequirement={(requirementId, section = "overview") => go(`requirements/${encodeURIComponent(requirementId)}${section === "overview" ? "" : `?section=${section}`}`)} dashboard={dashboardService} fromStudio={Boolean(studioOrigin.current && (route.runId ?? pendingRunId))} onReturnOffice={() => { if (studioOrigin.current && window.history.length > 1) window.history.back(); else window.location.hash = "office"; }} />}
       {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
       {page === "dashboard" && <DashboardPage go={go} bootstrap={data} daemon={daemon} />}

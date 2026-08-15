@@ -19,6 +19,24 @@ export interface RequirementAdvancementInput {
   candidateUrl?: string;
 }
 
+export interface ExplicitDeliveryIntent {
+  command: string;
+  target: string;
+}
+
+/** Exact, project-scoped opt-in. Similar-looking prose must never start a leader run. */
+export function parseExplicitDeliveryIntent(
+  value: string,
+  configuredTargets: string[]
+): ExplicitDeliveryIntent | undefined {
+  const command = value.trim();
+  const match = /^交付([^\s，。！？、]+)$/.exec(command);
+  if (!match) return undefined;
+  const target = match[1]!;
+  if (target !== "领队" && !configuredTargets.includes(target)) return undefined;
+  return { command, target };
+}
+
 export interface RequirementAdvancementReceipt {
   invocation: InvocationRecord;
   runId: string;
@@ -90,7 +108,7 @@ function sourceFor(requirement: RequirementDetail, advancement?: RequirementAdva
     // globally unique idempotency key also scopes the provider Session and prevents two local
     // `req-local-1` records from serializing into the same conversation.
     contextId: advancement
-      ? `requirement-run:${advancement.idempotencyKey}`
+      ? `requirement-lineage:${advancement.lineageId ?? advancement.idempotencyKey}`
       : `requirement:${requirement.projectId}:${requirement.id}`,
     taskId: requirement.id,
     ...(advancement ? { idempotencyKey: advancement.idempotencyKey } : {})
@@ -121,15 +139,18 @@ function requirementMessage(requirement: RequirementDetail): string {
 export function buildRequirementAdvancementInput(
   requirement: RequirementDetail,
   advancement?: RequirementAdvancement,
-  config?: RequirementAdvancementConfig
+  config?: RequirementAdvancementConfig,
+  deliveryIntent?: ExplicitDeliveryIntent
 ): RequirementAdvancementInput {
   return {
     route: "auto",
     tags: ["requirement-advancement", "repository-development"],
     signals: {
-      requiredRoleCount: 3,
-      requiresDynamicReplanning: true,
-      requiresIndependentValidation: true
+      ...(deliveryIntent ? {
+        explicitLeaderDelivery: true,
+        deliveryTarget: deliveryIntent.target,
+        deliveryCommand: deliveryIntent.command
+      } : {})
     },
     source: sourceFor(requirement, advancement),
     message: requirementMessage(requirement),

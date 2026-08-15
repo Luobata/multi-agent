@@ -1,7 +1,7 @@
 {
   "id": "default-task-entrance-policy",
   "displayName": "默认请求分流策略",
-  "description": "简单任务交还调用方，单角色任务直达项目专家，多角色协作、动态重规划或独立验收进入小米汪领队团队。",
+  "description": "默认继续讨论；仅入口确认了“交付领队”或项目配置的明确领队名后，才进入小米汪领队团队。",
   "direct": {
     "mode": "caller"
   },
@@ -37,37 +37,11 @@
   },
   "rules": [
     {
-      "id": "dynamic-replanning",
+      "id": "explicit-leader-delivery",
       "when": {
         "signals": {
-          "requiresDynamicReplanning": {
+          "explicitLeaderDelivery": {
             "eq": true
-          }
-        }
-      },
-      "result": {
-        "route": "leader"
-      }
-    },
-    {
-      "id": "independent-validation",
-      "when": {
-        "signals": {
-          "requiresIndependentValidation": {
-            "eq": true
-          }
-        }
-      },
-      "result": {
-        "route": "leader"
-      }
-    },
-    {
-      "id": "multi-role-collaboration",
-      "when": {
-        "signals": {
-          "requiredRoleCount": {
-            "gte": 2
           }
         }
       },

@@ -6,7 +6,7 @@ import { EffectiveProfileView } from "./EffectiveProfileView";
 import { acceptanceSnapshotFromPreview, isRunAcceptanceReady } from "./dashboard/acceptance";
 import type { DashboardService } from "./dashboard/service";
 import type { Requirement } from "./dashboard/types";
-import type { HumanDecisionRequest, HumanDecisionRiskCategory, JsonValue, Run, RunDeliveryActionResult, RunDeliveryRecord, RunEvidenceAsset, RunMergePreview, RunMergeQueueResult, RunNode, RunWorktreeOpenResult } from "./types";
+import type { HumanDecisionRequest, HumanDecisionRiskCategory, InvocationProgress, InvocationRecord, JsonValue, Run, RunDeliveryActionResult, RunDeliveryRecord, RunEvidenceAsset, RunMergePreview, RunMergeQueueResult, RunNode, RunWorktreeOpenResult } from "./types";
 
 export { acceptanceSnapshotFromPreview, isRunAcceptanceReady } from "./dashboard/acceptance";
 
@@ -88,29 +88,267 @@ interface GateVerdict {
   status: string;
   reason?: string;
   requiredCapability?: string;
+  mode?: string;
+  fallback?: string;
+  /** Runtime node ids whose outputs were used as gate evidence. */
+  sources: string[];
+}
+
+/** Reads one supervisor gate snapshot entry (run.output.gates / architectureState.gates); tolerant of partial data. */
+function gateVerdictFrom(value: JsonValue | undefined): GateVerdict | undefined {
+  const item = objectValue(value);
+  if (!item || typeof item.gateId !== "string") return undefined;
+  const executions = Array.isArray(item.executions) ? item.executions : [];
+  const sources = [...new Set(executions.flatMap((execution) => {
+    const record = objectValue(execution as JsonValue);
+    return Array.isArray(record?.sourceNodeIds) ? record.sourceNodeIds.filter((id): id is string => typeof id === "string") : [];
+  }))];
+  return {
+    gateId: String(item.gateId),
+    status: typeof item.status === "string" ? item.status : "unknown",
+    reason: typeof item.reason === "string" && item.reason ? item.reason : undefined,
+    requiredCapability: typeof item.requiredCapability === "string" ? item.requiredCapability : undefined,
+    mode: typeof item.mode === "string" ? item.mode : undefined,
+    fallback: typeof item.fallback === "string" ? item.fallback : undefined,
+    sources
+  };
 }
 
 /** Reads the supervisor gate snapshot off `run.output.gates`; safe when absent or malformed. */
 function gateVerdicts(value: JsonValue | undefined): GateVerdict[] {
   const raw = objectValue(value)?.gates;
   if (!Array.isArray(raw)) return [];
-  return raw
-    .map((item) => objectValue(item))
-    .filter((item): item is Record<string, JsonValue> => item !== undefined && typeof item.gateId === "string")
-    .map((item) => ({
-      gateId: String(item.gateId),
-      status: typeof item.status === "string" ? item.status : "unknown",
-      reason: typeof item.reason === "string" ? item.reason : undefined,
-      requiredCapability: typeof item.requiredCapability === "string" ? item.requiredCapability : undefined
-    }));
+  return raw.map(gateVerdictFrom).filter((gate): gate is GateVerdict => gate !== undefined);
 }
 
 function GateVerdictList({ gates }: { gates: GateVerdict[] }) {
   if (gates.length === 0) return null;
   return <ul className="run-gate-list">{gates.map((gate) => <li key={gate.gateId} className={`run-gate-item run-gate-item--${gate.status}`}>
-    <div className="run-gate-head"><code>{gate.gateId}</code><span className={`gate-status gate-status--${gate.status}`}>{GATE_STATUS_LABELS[gate.status] ?? gate.status}</span>{gate.requiredCapability && <small>{gate.requiredCapability}</small>}</div>
-    {gate.status !== "passed" && gate.reason && <p className="gate-reason">{gate.reason}</p>}
+    <div className="run-gate-head"><code>{gate.gateId}</code><span className={`gate-status gate-status--${gate.status}`}>{GATE_STATUS_LABELS[gate.status] ?? gate.status}</span>{gate.requiredCapability && <small>{gate.requiredCapability}</small>}{gate.mode && <small>{gate.mode}{gate.fallback ? ` · 领队可兜底` : ""}</small>}</div>
+    {gate.reason && <p className="gate-reason">{gate.reason}</p>}
+    {gate.sources.length > 0 && <p className="run-gate-sources">证据来源节点：{gate.sources.join("、")}</p>}
   </li>)}</ul>;
+}
+
+/* ---------- Supervisor observability (live architectureState + progress) ---------- */
+
+interface SupervisorDagWaitReason {
+  kind?: string;
+  nodeId?: string;
+  status?: string;
+  expectedStatuses?: string[];
+  reason?: string;
+}
+
+interface SupervisorDagNodeView {
+  nodeId: string;
+  status?: string;
+  ready?: boolean;
+  needs?: string[];
+  whyNotRunning?: SupervisorDagWaitReason[];
+}
+
+interface SupervisorLiveState {
+  round?: number;
+  delegations?: number;
+  planRevision?: number;
+  limits?: { maxRounds?: number; maxDelegations?: number; maxParallelDelegations?: number };
+  dag?: SupervisorDagNodeView[];
+  gates?: GateVerdict[];
+  scheduling?: {
+    mode?: string;
+    schedulerVersion?: number;
+    compiledDispatchEnabled?: boolean;
+    shadowReadyNodeIds?: string[];
+  };
+}
+
+function dagNodeViews(value: JsonValue | undefined): SupervisorDagNodeView[] {
+  const raw = objectValue(value)?.nodes;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => objectValue(item))
+    .filter((item): item is Record<string, JsonValue> => item !== undefined && typeof item.nodeId === "string")
+    .map((item) => ({
+      nodeId: String(item.nodeId),
+      status: typeof item.status === "string" ? item.status : undefined,
+      ready: typeof item.ready === "boolean" ? item.ready : undefined,
+      needs: Array.isArray(item.needs) ? item.needs.filter((need): need is string => typeof need === "string") : undefined,
+      whyNotRunning: Array.isArray(item.whyNotRunning)
+        ? item.whyNotRunning.map((reason) => objectValue(reason)).filter((reason): reason is Record<string, JsonValue> => reason !== undefined).map((reason) => ({
+            kind: typeof reason.kind === "string" ? reason.kind : undefined,
+            nodeId: typeof reason.nodeId === "string" ? reason.nodeId : undefined,
+            status: typeof reason.status === "string" ? reason.status : undefined,
+            expectedStatuses: Array.isArray(reason.expectedStatuses) ? reason.expectedStatuses.filter((s): s is string => typeof s === "string") : undefined,
+            reason: typeof reason.reason === "string" ? reason.reason : undefined
+          }))
+        : undefined
+    }));
+}
+
+/**
+ * Live supervisor projection persisted on run.json (`architectureState`, schemaVersion 1).
+ * Absent on legacy/非 supervisor runs — every consumer must treat it as optional and never
+ * invent limits, reasons or paths the backend did not persist.
+ */
+function supervisorLiveState(run: Run | undefined, progress?: InvocationProgress): SupervisorLiveState | undefined {
+  const progressState = objectValue(progress?.supervisor);
+  const raw = progressState?.kind === "supervisor" ? progressState : objectValue(run?.architectureState);
+  if (!raw || raw.kind !== "supervisor") return undefined;
+  const limits = objectValue(raw.limits);
+  const scheduling = objectValue(raw.scheduling);
+  return {
+    round: typeof raw.round === "number" ? raw.round : undefined,
+    delegations: typeof raw.delegations === "number" ? raw.delegations : undefined,
+    planRevision: typeof raw.planRevision === "number" ? raw.planRevision : undefined,
+    limits: limits ? {
+      maxRounds: typeof limits.maxRounds === "number" ? limits.maxRounds : undefined,
+      maxDelegations: typeof limits.maxDelegations === "number" ? limits.maxDelegations : undefined,
+      maxParallelDelegations: typeof limits.maxParallelDelegations === "number" ? limits.maxParallelDelegations : undefined
+    } : undefined,
+    dag: raw.dag ? dagNodeViews(raw.dag) : undefined,
+    gates: Array.isArray(raw.gates) ? raw.gates.map(gateVerdictFrom).filter((gate): gate is GateVerdict => gate !== undefined) : undefined,
+    scheduling: scheduling ? {
+      mode: typeof scheduling.mode === "string" ? scheduling.mode : undefined,
+      schedulerVersion: typeof scheduling.schedulerVersion === "number" ? scheduling.schedulerVersion : undefined,
+      compiledDispatchEnabled: typeof scheduling.compiledDispatchEnabled === "boolean" ? scheduling.compiledDispatchEnabled : undefined,
+      shadowReadyNodeIds: Array.isArray(scheduling.shadowReadyNodeIds)
+        ? scheduling.shadowReadyNodeIds.filter((id): id is string => typeof id === "string")
+        : undefined
+    } : undefined
+  };
+}
+
+/** Terminal runs carry the same DAG snapshot on `run.output.dag`; prefer the live projection while running. */
+function supervisorDagView(run: Run | undefined, progress?: InvocationProgress): SupervisorDagNodeView[] {
+  const live = supervisorLiveState(run, progress)?.dag;
+  if (live && live.length > 0) return live;
+  return dagNodeViews(objectValue(run?.output)?.dag);
+}
+
+function waitReasonText(reasons: SupervisorDagWaitReason[] | undefined): string {
+  if (!reasons || reasons.length === 0) return "";
+  return reasons
+    .map((reason) => reason.kind === "terminal"
+      ? reason.reason ?? `节点已 ${reason.status ?? "终止"}，需要明确恢复证据后才能重开`
+      : `等待 ${reason.nodeId ?? "上游节点"}（当前 ${reason.status ?? "未知"}，需要 ${(reason.expectedStatuses ?? ["passed"]).join("/")}）`)
+    .join("；");
+}
+
+interface RunStepRow {
+  key: string;
+  nodeId: string;
+  roleId?: string;
+  round?: number;
+  status: string;
+  phase?: string;
+  error?: string;
+  /** DAG flow node this execution belongs to, used to join persisted whyNotRunning evidence. */
+  flowNodeId?: string;
+}
+
+/** Steps come from the progress projection when available; otherwise the run record itself. */
+function runStepRows(run: Run, progress: InvocationProgress | undefined): RunStepRow[] {
+  if (progress && Array.isArray(progress.steps) && progress.steps.length > 0) {
+    return progress.steps.map((step, index) => ({
+      key: `${step.nodeId}-${index}`,
+      nodeId: step.nodeId,
+      roleId: step.roleId,
+      round: step.round,
+      status: step.status,
+      phase: step.phase,
+      error: step.error,
+      flowNodeId: typeof run.nodes[step.nodeId]?.metadata?.flowNodeId === "string" ? String(run.nodes[step.nodeId]!.metadata!.flowNodeId) : undefined
+    }));
+  }
+  return Object.values(run.nodes).map((node) => ({
+    key: node.nodeId,
+    nodeId: node.nodeId,
+    roleId: node.roleId,
+    round: typeof node.metadata?.round === "number" ? node.metadata.round : undefined,
+    status: node.status,
+    phase: undefined,
+    error: node.error,
+    flowNodeId: typeof node.metadata?.flowNodeId === "string" ? node.metadata.flowNodeId : undefined
+  }));
+}
+
+/** Text equivalent of the runtime topology SVG: every node, its status, wait reason and error. */
+function RunStepsTable({ run, progress }: { run: Run; progress: InvocationProgress | undefined }) {
+  const rows = runStepRows(run, progress);
+  if (rows.length === 0) return null;
+  const dagByFlowId = new Map(supervisorDagView(run, progress).map((node) => [node.nodeId, node]));
+  const showWaitReasons = rows.some((row) => {
+    const dagNode = dagByFlowId.get(row.flowNodeId ?? row.nodeId);
+    return dagNode?.whyNotRunning && dagNode.whyNotRunning.length > 0;
+  });
+  return <div className="run-steps-table-scroll" tabIndex={0} aria-label="执行步骤表，可横向滚动查看全部列"><table className="run-steps-table">
+    <caption>执行步骤表：与上方动态执行图等价的文本视图{showWaitReasons ? "；等待原因来自服务端持久投影" : ""}</caption>
+    <thead><tr><th scope="col">节点</th><th scope="col">角色</th><th scope="col">轮次</th><th scope="col">状态</th><th scope="col">阶段</th>{showWaitReasons && <th scope="col">等待原因</th>}<th scope="col">错误</th></tr></thead>
+    <tbody>{rows.map((row) => {
+      const dagNode = dagByFlowId.get(row.flowNodeId ?? row.nodeId);
+      const waiting = waitReasonText(dagNode?.whyNotRunning);
+      return <tr key={row.key} className={`run-step-row run-step-row--${row.status}`}>
+        <td><code>{row.nodeId}</code></td>
+        <td>{row.roleId ?? "—"}</td>
+        <td>{row.round ?? "—"}</td>
+        <td>{row.status}</td>
+        <td>{row.phase ?? "—"}</td>
+        {showWaitReasons && <td>{waiting || "—"}</td>}
+        <td>{row.error ? <span className="inline-error">{row.error}</span> : "—"}</td>
+      </tr>;
+    })}</tbody>
+  </table></div>;
+}
+
+const DECISION_ACTION_LABELS: Record<string, string> = {
+  "plan-todos": "规划",
+  delegate: "委派",
+  "satisfy-gate": "补门禁",
+  finish: "收尾",
+  unknown: "决策"
+};
+
+/** Full leader decision timeline from the progress projection (every round, not just the latest). */
+function DecisionTimeline({ progress }: { progress: InvocationProgress | undefined }) {
+  // Progress payloads from older daemons or partial mocks may omit leaderReport entirely.
+  const report = progress?.leaderReport;
+  const entries = Array.isArray(report?.entries) ? report.entries : [];
+  if (!report?.available) return <p className="run-node-placeholder">尚无领队决策记录。</p>;
+  return <ol className="run-decision-timeline">{entries.map((entry, index) => <li key={`${entry.round}-${index}`} className={`run-decision-entry run-decision-entry--${entry.status}`}>
+    <div className="run-decision-head">
+      <span className="run-decision-round">Round {entry.round}</span>
+      <code>{DECISION_ACTION_LABELS[entry.action] ?? entry.action}</code>
+      <span className={`run-decision-status run-decision-status--${entry.status}`}>{entry.status}</span>
+    </div>
+    {entry.summary && <p className="run-decision-summary">{entry.summary}</p>}
+    {Array.isArray(entry.assignments) && entry.assignments.length > 0 && <ul className="run-decision-assignments">{entry.assignments.map((assignment, assignmentIndex) => <li key={assignmentIndex}>
+      <strong>{assignment.roleId ?? "未指定角色"}</strong>{assignment.task ? `：${assignment.task}` : ""}{assignment.workKind ? <small>（{assignment.workKind}）</small> : null}
+    </li>)}</ul>}
+  </li>)}</ol>;
+}
+
+/** Round/delegation usage with policy limits; renders only what the backend actually persisted. */
+function SupervisorLimitsLine({ run, progress }: { run: Run; progress: InvocationProgress | undefined }) {
+  const live = supervisorLiveState(run, progress);
+  const round = live?.round ?? (progress && progress.round > 0 ? progress.round : undefined);
+  const delegations = live?.delegations ?? progress?.leaderReport?.delegations;
+  const limits = live?.limits;
+  const parts: string[] = [];
+  if (round !== undefined) parts.push(limits?.maxRounds !== undefined ? `轮次 ${round} / 上限 ${limits.maxRounds}` : `轮次 ${round}`);
+  if (delegations !== undefined) parts.push(limits?.maxDelegations !== undefined ? `累计委派 ${delegations} / 上限 ${limits.maxDelegations}` : `累计委派 ${delegations}`);
+  if (limits?.maxParallelDelegations !== undefined) parts.push(`单批并行上限 ${limits.maxParallelDelegations}`);
+  if (live?.planRevision !== undefined) parts.push(`计划版本 v${live.planRevision}`);
+  if (live?.scheduling?.mode) {
+    const version = live.scheduling.schedulerVersion !== undefined ? ` v${live.scheduling.schedulerVersion}` : "";
+    parts.push(`调度 ${live.scheduling.mode}${version}`);
+  }
+  if (live?.scheduling?.compiledDispatchEnabled === false) parts.push("完成即补位关闭");
+  if (live?.scheduling?.shadowReadyNodeIds) {
+    parts.push(`影子就绪 ${live.scheduling.shadowReadyNodeIds.length}（仅观测）`);
+  }
+  if (parts.length === 0) return null;
+  return <p className="run-limits-line">{parts.join(" · ")}</p>;
 }
 
 function dagFlowTag(node: RunNode): string {
@@ -600,7 +838,15 @@ function RunMergeConfirmation({
   </Modal>;
 }
 
-export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pendingRunId = "", onConsumePending, onSelectRun, onDashboardSync, mode = "full", view = "all", dashboard, fromStudio = false, onReturnOffice }: {
+/** Client mirror of `WorkflowProgressWaitResult` (src/workbench/invocationProgress.ts), fields optional for tolerance. */
+interface ProgressWaitResult {
+  nextCursor?: string;
+  changed?: boolean;
+  terminal?: boolean;
+  progress?: InvocationProgress;
+}
+
+export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pendingRunId = "", onConsumePending, onSelectRun, onDashboardSync, onOpenRequirement, mode = "full", view = "all", dashboard, fromStudio = false, onReturnOffice }: {
   notify: (message: string, kind?: "success" | "error") => void;
   activityRevision?: string;
   focusedRunId?: string;
@@ -609,6 +855,7 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   onConsumePending?: () => void;
   onSelectRun?: (runId: string) => void;
   onDashboardSync?: (requirement: Requirement) => void;
+  onOpenRequirement?: (requirementId: string, section?: "overview" | "run" | "acceptance") => void;
   mode?: "full" | "embedded";
   view?: "all" | "acceptance";
   fromStudio?: boolean;
@@ -659,6 +906,14 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   const [deciding, setDeciding] = useState(false);
   const [decisionError, setDecisionError] = useState("");
   const [decisionRevision, setDecisionRevision] = useState(0);
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState("");
+  const [progress, setProgress] = useState<InvocationProgress>();
+  // Supervisor dossiers prefer the cursor long-poll; any malformed/failed wait response
+  // falls back to the interval refresh below so a missing endpoint can never freeze the UI.
+  const [progressChannel, setProgressChannel] = useState<"idle" | "longpoll" | "interval">("idle");
   const [acceptanceBinding, setAcceptanceBinding] = useState<{ taskId: string; runId?: string; capturedAt?: string }>();
   const [acceptanceBindingError, setAcceptanceBindingError] = useState("");
   const detailRunIdRef = useRef("");
@@ -787,11 +1042,55 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     const timer = window.setInterval(() => setLoadRevision((value) => value + 1), 2000);
     return () => window.clearInterval(timer);
   }, [targetMissing, pendingRunId]);
+  const supervisorInvocationId = selected?.architecture === "supervisor" ? selected.invocation?.id : undefined;
+  useEffect(() => {
+    if (!supervisorInvocationId) {
+      setProgress(undefined);
+      return;
+    }
+    let current = true;
+    api<InvocationProgress>(`/api/invocations/${encodeURIComponent(supervisorInvocationId)}/progress`)
+      .then((value) => { if (current) setProgress(value); })
+      .catch(() => { /* the dossier still renders from the run record itself */ });
+    return () => { current = false; };
+  }, [supervisorInvocationId, activityRevision, loadRevision]);
+  useEffect(() => {
+    if (!supervisorInvocationId || selected?.status !== "running" || targetMissing) return;
+    let cancelled = false;
+    let cursor: string | undefined;
+    setProgressChannel((channel) => channel === "longpoll" ? channel : "longpoll");
+    const loop = async () => {
+      while (!cancelled) {
+        try {
+          const result = await api<ProgressWaitResult>(`/api/invocations/${encodeURIComponent(supervisorInvocationId)}/progress/wait?timeoutMs=20000${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+          if (cancelled) return;
+          if (!result || typeof result.nextCursor !== "string" || !result.progress) throw new Error("progress wait result is malformed");
+          cursor = result.nextCursor;
+          setProgress(result.progress);
+          if (result.changed || result.terminal) setLoadRevision((value) => value + 1);
+          if (result.terminal) return;
+          // Yield between iterations so an instantly-resolving (mocked or proxied) endpoint
+          // can never spin the render loop; the server normally holds this request open.
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        } catch {
+          if (!cancelled) setProgressChannel("interval");
+          return;
+        }
+      }
+    };
+    void loop();
+    return () => {
+      cancelled = true;
+      setProgressChannel((channel) => channel === "longpoll" ? "idle" : channel);
+    };
+  }, [supervisorInvocationId, selected?.status, targetMissing]);
   useEffect(() => {
     if (selected?.status !== "running" || targetMissing) return;
+    // The interval is the documented fallback: it stays off while the long-poll channel is live.
+    if (supervisorInvocationId && progressChannel === "longpoll") return;
     const timer = window.setInterval(() => setLoadRevision((value) => value + 1), 2000);
     return () => window.clearInterval(timer);
-  }, [selected?.status, targetMissing]);
+  }, [selected?.status, targetMissing, supervisorInvocationId, progressChannel]);
   const retry = () => { setRetrying(true); setLoadRevision((value) => value + 1); };
   const returnAction = onReturnOffice ? <button type="button" className="secondary-button run-return-button" onClick={onReturnOffice}>← 返回领队工作室</button> : undefined;
   useEffect(() => {
@@ -1089,6 +1388,30 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
       setOpeningWorktree(false);
     }
   };
+  const cancelInvocation = async () => {
+    const invocationId = selected?.invocation?.id;
+    if (!invocationId || cancelling) return;
+    setCancelling(true);
+    setCancelError("");
+    setDetail((current) => current?.id === selected.id && current.invocation
+      ? { ...current, invocation: { ...current.invocation, status: "cancellation-requested" } }
+      : current);
+    try {
+      await api<InvocationRecord>(`/api/invocations/${encodeURIComponent(invocationId)}/cancel`, writeBody({
+        actor: "workbench-operator",
+        ...(cancelReason.trim() ? { reason: cancelReason.trim() } : {})
+      }));
+      setCancelOpen(false);
+      setCancelReason("");
+      setLoadRevision((value) => value + 1);
+      notify(`Run ${selected.id} 已安全停止；原始证据仍完整保留。`, "success");
+    } catch (error) {
+      setCancelError(error instanceof Error ? error.message : String(error));
+      setLoadRevision((value) => value + 1);
+    } finally {
+      setCancelling(false);
+    }
+  };
   const canSubmitToBoard = Boolean(
     dashboard
     && selected?.taskId
@@ -1101,17 +1424,50 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   );
   const profileEntries = Object.entries(selected?.effectiveProfiles ?? {});
   const showHumanDecisionFirst = humanRequestsLoading || humanRequests.some((request) => request.status === "pending");
+  const controlActions = selected?.invocation?.control?.allowedActions ?? (
+    selected?.invocation?.status === "queued" || selected?.invocation?.status === "running"
+      ? ["monitor", "cancel"]
+      : selected?.invocation?.status === "awaiting-human-decision" ? ["decide", "cancel"] : []
+  );
+  const canCancelInvocation = controlActions.includes("cancel");
+  const needsGoalAction = controlActions.some((action) => action === "review-delivery"
+    || action === "retry-successor" || action === "restart-successor" || action === "abandon-goal");
   return <div className={`page-grid page-grid--runs${mode === "embedded" ? " page-grid--runs-embedded" : ""}`}>
     <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="run-filter-bar"><div data-testid="run-type-filter"><SelectControl ariaLabel="按类型筛选运行卷宗" value={categoryFilter} options={[{ value: "all", label: "全部类型" }, { value: "single", label: "单任务" }, { value: "graph", label: "Graph 编排" }, { value: "supervisor", label: "领队协作" }]} onChange={(value) => setCategoryFilter(value as typeof categoryFilter)} /></div><div data-testid="run-project-filter"><SelectControl ariaLabel="按项目筛选运行卷宗" value={projectFilter} options={[{ value: "all", label: "全部项目" }, { value: "none", label: "无项目" }, ...projectOptions.map((project) => ({ value: project, label: project }))]} onChange={(value) => setProjectFilter(value)} /></div></div><div className="record-scroll run-list">{visibleRuns.map((run) => <button key={run.id} id={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => { setSelectedId(run.id); onSelectRun?.(run.id); }}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {run.architecture} · {Object.keys(run.nodes).length} 节点</small><div className="run-card-tags">{run.category && <span className={`run-category-tag run-category-tag--${run.category}`}>{CATEGORY_LABELS[run.category]}</span>}{run.project && <span className="run-project-chip">{run.project}</span>}</div></div><Stamp status={run.status} /></button>)}{!loading && visibleRuns.length === 0 && <div className="mini-empty">{runs.length === 0 ? "还没有 Run 证据。" : "没有符合筛选条件的卷宗。"}</div>}</div><footer className="list-footer"><span>{visibleRuns.length}/{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
     <main className="detail-pane">{showDossierSkeleton ? <div className="skeleton-page" aria-label="正在调取运行卷宗"><i /><i /><i /></div> : targetMissing ? <EmptyState title="运行卷宗正在建立" action={<><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</>}>Run {pendingRunId} 尚未出现在本地 Run Store，可稍后重试。</EmptyState> : listError || detailError ? <section className="run-detail-error" role="alert"><h2>运行卷宗加载失败</h2><p>{listError || detailError}</p><code>Run ID · {requestedRunId || selectedId || "未提供"}</code><div><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</div></section> : !selected ? <EmptyState title={directed ? "无法定位运行卷宗" : "尚无运行卷宗"}>{directed ? `无法找到目标 Run ${requestedRunId}，且不会回退到其他运行卷宗。` : "直接交办员工或签发一次 Workflow 后，这里会出现不可变的执行记录。"}</EmptyState> : <div className="dossier run-dossier">
       {fromStudio && returnAction}
       <header className="dossier-cover"><div className="file-index"><span>RUN EVIDENCE RECORD</span><code>{selected.id}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">证</div><div><h2 ref={dossierTitleRef} tabIndex={-1} aria-label={`${selected.workflow}，Run ${selected.id} 运行卷宗`}>{selected.workflow}</h2><p>{selected.status === "blocked" ? "流程已完成，但存在业务阻塞结论。" : selected.status === "failed" ? "执行发生技术故障，可查看原始输出与错误证据。" : selected.status === "running" ? "执行仍在进行。" : "流程完成，证据已归档。"}</p></div><Stamp status={selected.status} /></div></header>
+      {(canCancelInvocation || needsGoalAction || selected.invocation?.status === "cancellation-requested") && <section className="run-control-bar" aria-label="本次运行的可用操作">
+        <div><span>CONTROL PLANE · NEXT ACTION</span><strong>{selected.invocation?.status === "cancellation-requested"
+          ? "正在安全停止"
+          : controlActions.includes("review-delivery") ? "执行已结束，请核对交付"
+            : controlActions.includes("restart-successor") ? "本轮已取消，请决定是否继续目标"
+              : controlActions.includes("retry-successor") ? "本轮未达成，请先处理根因"
+                : "运行仍在进行"}</strong><p>{selected.invocation?.status === "cancellation-requested"
+          ? "系统正在作废待决请求并等待实例收尾；无需重复操作。"
+          : needsGoalAction && selected.taskId ? "原 Run 是不可变证据；后续推进会创建新的执行周期。" : "你可以继续监控，或显式停止这一轮执行。"}</p></div>
+        <div className="run-control-actions">
+          {needsGoalAction && selected.taskId && onOpenRequirement && <button type="button" className="button primary" onClick={() => onOpenRequirement(selected.taskId!, controlActions.includes("review-delivery") ? "run" : "overview")}>{controlActions.includes("review-delivery") ? "核对交付与验收" : "回到需求处理下一步"}</button>}
+          {needsGoalAction && !selected.taskId && <span className="run-control-unavailable">原 Run 不可原地重试；请从协作编排新启动一次。</span>}
+          {canCancelInvocation && <button type="button" className="button danger" onClick={() => { setCancelError(""); setCancelOpen(true); }}>停止本轮运行</button>}
+        </div>
+      </section>}
       {receipt && <section className="dossier-section run-receipt" aria-labelledby="run-receipt-title"><h3 id="run-receipt-title">Run Receipt</h3>{Boolean(receipt.legacy) && <p className="dash-hint-line">Legacy Run：缺失字段显示 unavailable，不推断失败原因。</p>}<dl><dt>状态 / 阶段</dt><dd>{String(receipt.status)} / {String(receipt.phase)}</dd><dt>下一步</dt><dd>{String(receipt.nextAction)}</dd><dt>预算</dt><dd><code>{JSON.stringify(receipt.budget)}</code></dd><dt>目标版本</dt><dd><code>{JSON.stringify(receipt.target)}</code></dd><dt>失败分类</dt><dd><code>{JSON.stringify(receipt.failure)}</code></dd></dl></section>}
       {view === "all" && <>{showHumanDecisionFirst && <DossierSection number="待办" title="需要你的决定"><HumanDecisionPanel requests={humanRequests} loading={humanRequestsLoading} commentDrafts={commentDrafts} deciding={deciding} onCommentChange={(requestId, value) => setCommentDrafts((drafts) => ({ ...drafts, [requestId]: value }))} onOpenDecision={openDecision} /></DossierSection>}
       <DossierSection number="01" title="运行元数据"><dl className="ledger"><dt>Run ID</dt><dd><code>{selected.id}</code></dd><dt>Architecture</dt><dd>{selected.architecture}</dd><dt>创建时间</dt><dd>{formatTime(selected.createdAt)}</dd><dt>完成时间</dt><dd>{formatTime(selected.completedAt)}</dd><dt>证据目录</dt><dd><code className="path-code">{selected.artifactDir}</code></dd><dt>隔离</dt><dd><IsolationValue isolation={selected.isolation} /></dd></dl></DossierSection>
       <DossierSection number="02" title="任务与当前请求"><div className="run-request-context">{!selected.invocation?.requestText && <div className="run-context-warning" role="status">当前 Run 未保存请求全文；以下仅为调用摘要。</div>}<h3>任务描述</h3><p>{selected.invocation?.taskDescription ?? "未保存独立任务描述。"}</p><h3>当前请求全文</h3><p>{selected.invocation?.requestText ?? "请求全文不可用。"}</p><h3>请求摘要（核对用）</h3><p>{selected.invocation?.requestSummary ?? "未保存调用摘要。"}</p></div></DossierSection>
       {profileEntries.length > 0 && <DossierSection number="02" title="有效执行配置与来源"><div className="run-profile-list">{profileEntries.map(([nodeId, profile]) => <details key={nodeId} open={profileEntries.length === 1}><summary><strong>{nodeId}</strong><span>{profile.employee.displayName} · v{profile.employee.version}</span></summary><EffectiveProfileView profile={profile} /></details>)}</div></DossierSection>}
       {selected.architecture === "supervisor" && <DossierSection number={profileEntries.length > 0 ? "03" : "02"} title="动态执行图"><SupervisorRunTopology nodes={Object.values(selected.nodes)} /></DossierSection>}
+      {selected.architecture === "supervisor" && <DossierSection number="进度" title="执行步骤与领队决策">
+        <SupervisorLimitsLine run={selected} progress={progress} />
+        <RunStepsTable run={selected} progress={progress} />
+        {selected.status === "running" && (supervisorLiveState(selected, progress)?.gates?.length ?? 0) > 0 && <>
+          <h3 className="run-subhead">门禁状态（进行中，服务端持久投影）</h3>
+          <GateVerdictList gates={supervisorLiveState(selected, progress)?.gates ?? []} />
+        </>}
+        <h3 className="run-subhead">领队决策时间线</h3>
+        <DecisionTimeline progress={progress} />
+      </DossierSection>}
       <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "04" : "03") : (selected.architecture === "supervisor" ? "03" : "02")} title="节点结果"><div className="run-node-list">{Object.values(selected.nodes).length === 0 && <p className="run-node-placeholder">{selected.status === "running" ? "节点正在建立，尚无角色输出。" : "此 Run 未记录节点输出。"}</p>}{Object.values(selected.nodes).map((node, index) => { const decision = supervisorDecision(node); return <article key={node.nodeId}><div className="run-node-head"><span className="node-number">{String(index + 1).padStart(2, "0")}</span><div><strong>{node.nodeId}</strong><code>{node.roleId}{node.metadata?.kind === "supervisor" ? ` · 领队 Round ${node.metadata.round ?? "—"}` : node.metadata?.kind === "member" ? ` · 成员 Round ${node.metadata.round ?? "—"}` : ""}{dagFlowTag(node)}</code></div><Stamp status={node.status} /></div><dl className="ledger horizontal"><dt>尝试</dt><dd>{node.attempts}</dd><dt>开始</dt><dd>{formatTime(node.startedAt)}</dd><dt>结束</dt><dd>{formatTime(node.completedAt)}</dd></dl>{decision && <div className="supervisor-decision-summary"><code>{decision.action.toUpperCase()}</code><span>{decision.summary ?? "领队未提供本轮摘要。"}</span></div>}{node.error && <div className="inline-error">{node.error}</div>}{node.output !== undefined ? <><E2eEvidenceList entries={e2eEvidenceEntries(node.output)} /><pre className="result-json">{JSON.stringify(node.output, null, 2)}</pre></> : node.status === "running" || selected.status === "running" ? <p className="run-node-placeholder">该节点正在执行，尚无输出。</p> : <p className="run-node-placeholder">该节点未记录输出。</p>}<code className="artifact-path">{node.artifactDir}</code></article>; })}</div></DossierSection>
       {selected.output !== undefined && <DossierSection number={profileEntries.length > 0 ? (selected.architecture === "supervisor" ? "05" : "04") : (selected.architecture === "supervisor" ? "04" : "03")} title="Workflow 最终输出">{finalSummary(selected) && <p className="workflow-final-summary">{finalSummary(selected)}</p>}<GateVerdictList gates={gateVerdicts(selected.output)} /><E2eEvidenceList entries={e2eEvidenceEntries(selected.output)} /><pre className="result-json">{JSON.stringify(selected.output, null, 2)}</pre></DossierSection>}
       {!showHumanDecisionFirst && <DossierSection number="人审" title="人在回路"><HumanDecisionPanel requests={humanRequests} loading={humanRequestsLoading} commentDrafts={commentDrafts} deciding={deciding} onCommentChange={(requestId, value) => setCommentDrafts((drafts) => ({ ...drafts, [requestId]: value }))} onOpenDecision={openDecision} /></DossierSection>}</>}
@@ -1143,5 +1499,8 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     {keepOpen && mergePreview && <RunKeepConfirmation preview={mergePreview} note={keepNote} busy={keeping} error={keepError} onNoteChange={setKeepNote} onClose={() => { if (!keeping) setKeepOpen(false); }} onKeep={() => void keepDelivery()} />}
     {discardOpen && mergePreview && <RunDiscardConfirmation preview={mergePreview} token={discardToken} note={discardNote} busy={discarding} error={discardError} onTokenChange={setDiscardToken} onNoteChange={setDiscardNote} onClose={() => { if (!discarding) setDiscardOpen(false); }} onDiscard={() => void discardDelivery()} />}
     {decisionTarget && <HumanDecisionConfirmation target={decisionTarget} comment={(commentDrafts[decisionTarget.request.id] ?? "").trim()} busy={deciding} error={decisionError} onClose={() => { if (!deciding) setDecisionTarget(undefined); }} onConfirm={() => void submitDecision()} />}
+    {cancelOpen && selected?.invocation && <Modal title="停止本轮运行" eyebrow="CANCEL ATTEMPT · EVIDENCE PRESERVED" onClose={() => { if (!cancelling) setCancelOpen(false); }}>
+      <div className="modal-body compact-form"><p>这会停止当前 Invocation 的所有实例，并作废尚未处理的人工决定。Run、提示词、输出和状态迁移证据都会保留；需求本身不会被删除。</p><label><span>停止原因（可选）</span><textarea rows={3} maxLength={2000} disabled={cancelling} value={cancelReason} onChange={(event) => setCancelReason(event.target.value)} placeholder="例如：推进方向偏离需求，先停止并修正范围。" /></label>{cancelError && <div className="inline-error" role="alert">{cancelError}</div>}<div className="modal-actions"><button type="button" className="button secondary" disabled={cancelling} onClick={() => setCancelOpen(false)}>继续运行</button><button type="button" className="button danger-filled" disabled={cancelling} onClick={() => void cancelInvocation()}>{cancelling ? "正在停止…" : "确认停止本轮运行"}</button></div></div>
+    </Modal>}
   </div>;
 }

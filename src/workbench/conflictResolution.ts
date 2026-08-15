@@ -25,7 +25,30 @@ function stringsForKey(value: JsonValue | undefined, key: string, found: string[
   return found;
 }
 
+function uniqueMatches(value: string, pattern: RegExp): string[] {
+  return [...new Set([...value.matchAll(pattern)].map((match) => match[1]).filter((entry): entry is string => Boolean(entry)))];
+}
+
+function hasCandidateIdentityAttestation(value: JsonValue | undefined, expected: ConflictRetestEvidence): boolean {
+  return stringsForKey(value, "summary").some((summary) => {
+    const urls = uniqueMatches(summary, /(?:^|[\s;；，,。])url=([^\s;；，,。]+)/giu);
+    const sourceCommits = uniqueMatches(summary, /(?:^|[\s;；，,。])sourceCommit=([0-9a-f]{40})(?=$|[\s;；，,。])/giu);
+    const candidateRevisions = uniqueMatches(summary, /(?:^|[\s;；，,。])candidateRevision=(sha256:[0-9a-f]{64})(?=$|[\s;；，,。])/giu);
+    return urls.length === 1
+      && sourceCommits.length === 1
+      && candidateRevisions.length === 1
+      && urls[0] === expected.url
+      && sourceCommits[0] === expected.sourceCommit
+      && candidateRevisions[0] === expected.candidateRevision;
+  });
+}
+
 export function validateConflictRetestEvidence(output: JsonValue | undefined, expected: ConflictRetestEvidence): string[] {
+  // Project test roles use strict, versioned output schemas. Some schemas expose
+  // identity fields directly; the standard tester schema intentionally allows
+  // only verdict/summary/e2eEvidence/risks. A canonical identity attestation in
+  // summary keeps that schema satisfiable while remaining exact and unambiguous.
+  if (hasCandidateIdentityAttestation(output, expected)) return [];
   const issues: string[] = [];
   for (const key of ["url", "sourceCommit", "candidateRevision"] as const) {
     const values = stringsForKey(output, key);

@@ -825,9 +825,18 @@ describe("Supervisor deterministic capabilities and Gates", () => {
     expect(String(builderContexts[0]?.__delegatedTask)).not.toContain("Wire only");
 
     expect(gateContexts).toHaveLength(2);
-    expect(gateContexts[0]).toMatchObject({ __regressionImpact: impact });
-    expect(String(gateContexts[0]?.__delegatedTask)).toContain("Run only changed-path and directly related regression checks");
-    expect(String(gateContexts[0]?.__delegatedTask)).toContain("do not run package-wide or repository-wide suites");
+    expect(gateContexts[0]).toMatchObject({
+      __regressionImpact: {
+        ...impact,
+        level: "high",
+        regressionScope: "full",
+        reasons: expect.arrayContaining([
+          "Only one local helper and its direct caller change; public contracts remain stable.",
+          "candidate snapshot unavailable; deterministic impact fails closed to full regression"
+        ])
+      }
+    });
+    expect(String(gateContexts[0]?.__delegatedTask)).toContain("Full regression is justified");
     expect(String(gateContexts[1]?.__delegatedTask)).toContain("Upstream quality Gate evidence is attached");
     expect(String(gateContexts[1]?.__delegatedTask)).toContain("Do not repeat browser or automated regression");
     expect(Object.keys(gateNeeds[1] ?? {})).toEqual(expect.arrayContaining([

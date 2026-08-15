@@ -202,8 +202,27 @@ export interface InvocationSource {
   publicationId?: string;
 }
 
-export type InvocationStatus = "queued" | "running" | "awaiting-human-decision" | "completed" | "blocked" | "failed" | "cancelled";
-export type WorkInstanceStatus = "queued" | "waiting" | "running" | "completed" | "blocked" | "failed" | "skipped" | "cancelled";
+export type InvocationStatus = "queued" | "running" | "awaiting-human-decision" | "cancellation-requested" | "completed" | "blocked" | "failed" | "cancelled";
+export type WorkInstanceStatus = "queued" | "waiting" | "running" | "cancellation-requested" | "completed" | "blocked" | "failed" | "skipped" | "cancelled";
+
+export type InvocationControlAction = "monitor" | "cancel" | "decide" | "review-delivery" | "view-evidence" | "retry-successor" | "restart-successor" | "abandon-goal";
+
+export interface InvocationControlProjection {
+  schemaVersion: 1;
+  attempt: { phase: "queued" | "active" | "waiting" | "ended"; outcome?: "succeeded" | "blocked" | "failed" | "cancelled" };
+  goal: { state: "active" | "attention" | "satisfied" };
+  owner: "runtime" | "user" | "configuration-owner" | "none";
+  allowedActions: InvocationControlAction[];
+  lineage?: { rootInvocationId: string; predecessorInvocationId?: string; cycle: number };
+}
+
+export interface CancellationRecord {
+  actor: string;
+  reason?: string;
+  epoch: number;
+  requestedAt: string;
+  acknowledgedAt?: string;
+}
 
 export interface InvocationRecord {
   id: string;
@@ -231,6 +250,8 @@ export interface InvocationRecord {
     employees: Array<{ roleId: string; employeeId: string; employeeVersion: number }>;
   };
   error?: string;
+  cancellation?: CancellationRecord;
+  control?: InvocationControlProjection;
   createdAt: string;
   startedAt?: string;
   updatedAt: string;
@@ -288,6 +309,7 @@ export type ActivityEvent =
 export interface InvocationProgress {
   invocationId: string;
   runId: string;
+  sequence?: number;
   workflowId: string;
   architecture: string;
   status: InvocationStatus;
@@ -306,6 +328,7 @@ export interface InvocationProgress {
     entries: Array<{ round: number; action: string; summary?: string; assignments: Array<{ roleId?: string; task?: string; workKind?: string }>; status: WorkInstanceStatus | "pending" }>;
     gates: Array<{ gateId: string; status: string }>;
   };
+  supervisor?: JsonObject;
   outcome?: { status: string; summary?: string; reason?: string };
 }
 
@@ -620,6 +643,8 @@ export interface Run {
   completedAt?: string;
   output?: JsonValue;
   error?: string;
+  /** Architecture-owned durable live projection; currently populated by Supervisor runs. */
+  architectureState?: JsonObject;
   /** Present on listRuns summaries (not on getRun detail): coarse run classification. */
   category?: "single" | "graph" | "supervisor";
   /** Present on listRuns summaries when the correlated invocation carried a project. */
@@ -630,6 +655,11 @@ export interface Run {
   taskId?: string;
   invocation?: {
     id: string;
+    /** Optional for legacy Run payloads created before control-plane projection v1. */
+    status?: InvocationStatus;
+    source?: InvocationSource;
+    cancellation?: CancellationRecord;
+    control?: InvocationControlProjection;
     requestSummary: string;
     requestText?: string;
     taskDescription?: string;

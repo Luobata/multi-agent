@@ -3,7 +3,7 @@ import { activeSupervisorInvocations, completionRatio, historicalExceptionCount,
 import type { InvocationRecord, WorkInstanceStatus } from "./types";
 
 function tally(overrides: Partial<Record<WorkInstanceStatus, number>>): Record<WorkInstanceStatus, number> {
-  return { queued: 0, waiting: 0, running: 0, completed: 0, blocked: 0, failed: 0, skipped: 0, cancelled: 0, ...overrides };
+  return { queued: 0, waiting: 0, running: 0, "cancellation-requested": 0, completed: 0, blocked: 0, failed: 0, skipped: 0, cancelled: 0, ...overrides };
 }
 
 const base: InvocationRecord = {
@@ -41,6 +41,7 @@ describe("progressTone", () => {
   it("maps status to a tone", () => {
     expect(progressTone("running")).toBe("running");
     expect(progressTone("queued")).toBe("running");
+    expect(progressTone("cancellation-requested")).toBe("running");
     expect(progressTone("awaiting-human-decision")).toBe("confirmation");
     expect(progressTone("completed")).toBe("completed");
     expect(progressTone("blocked")).toBe("blocked");

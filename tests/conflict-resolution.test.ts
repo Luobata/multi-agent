@@ -75,6 +75,30 @@ describe("merge conflict leader protocol", () => {
     expect(classifyConflictRetestFailure("leader says evidence is insufficient", [])).toBe("evidence-incomplete");
   });
 
+  it("accepts one exact schema-compatible candidate identity attestation in summary", () => {
+    const expected = {
+      url: "http://127.0.0.1:49166/?candidate-token=proof123",
+      sourceCommit: "cb557b3fa52cafc949dc2523a8f253868696bfd7",
+      candidateRevision: "sha256:996def400b586948f3ba6771a580d192de4e40d9cae3d4db384a51747954ceca"
+    };
+    expect(validateConflictRetestEvidence({
+      verdict: "pass",
+      summary: `Pass。CANDIDATE_IDENTITY url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`
+    }, expected)).toEqual([]);
+    expect(validateConflictRetestEvidence({
+      verdict: "pass",
+      summary: `url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`
+    }, expected)).toEqual([]);
+    expect(validateConflictRetestEvidence({
+      verdict: "pass",
+      summary: `url=${expected.url}；url=http://127.0.0.1:4318/；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`
+    }, expected)).toHaveLength(3);
+    expect(validateConflictRetestEvidence({
+      verdict: "pass",
+      summary: `url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=sha256:${"0".repeat(64)}。`
+    }, expected)).toHaveLength(3);
+  });
+
   it("binds pre-test and post-test workspace state to the persisted source commit", () => {
     const clean = { revision: "sha256:one", baseCommit: "source-1", changedFiles: [] };
     expect(validateCandidateWorkspaceState(clean, { sourceCommit: "source-1" })).toEqual([]);

@@ -302,7 +302,8 @@ describe("workflow runtime", () => {
     const result = await runWorkflow(loaded, "resource-guarded", {
       input,
       providers: new Map([["command", adapter]]),
-      acquireNodePermit: async () => {
+      acquireNodePermit: async (_node, onWait) => {
+        await onWait(["shared-browser"]);
         const predecessor = tail;
         let release = () => {};
         const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -315,6 +316,7 @@ describe("workflow runtime", () => {
 
     expect(result.run.status).toBe("passed");
     expect(maximumActiveProviders).toBe(1);
+    expect(events.filter((event) => event === "node.resources.waiting")).toHaveLength(2);
     expect(events.filter((event) => event === "node.resources.acquired")).toHaveLength(2);
     expect(events.filter((event) => event === "node.resources.released")).toHaveLength(2);
   });

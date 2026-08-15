@@ -481,6 +481,67 @@ describe("Local Agent Workbench", () => {
     )).rejects.toThrow(/different workflow start request/);
   });
 
+  it("allows only one active Attempt in a durable requirement lineage", async () => {
+    let markStarted = () => {};
+    let release = () => {};
+    const providerStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+    const providerGate = new Promise<void>((resolve) => { release = resolve; });
+    const providers: ProviderRegistry = new Map([["lineage-slow", {
+      id: "lineage-slow",
+      validate: () => [],
+      invoke: async () => {
+        markStarted();
+        await providerGate;
+        return { stdout: JSON.stringify({ message: "cycle complete" }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("lineage-provider", { adapter: "lineage-slow", model: "lineage-model", outputProtocol: "json" });
+    const employee = await service.createEmployee({
+      id: "lineage-worker",
+      identity: { displayName: "Lineage Worker", background: "Handles one Goal Attempt.", responsibilities: ["Respond"] },
+      providerId: "lineage-provider"
+    });
+    const workflow = await service.createWorkflow({
+      id: "lineage-flow",
+      nodes: [{ id: "respond", employeeId: employee.id }]
+    });
+    const lineageSource = {
+      kind: "workbench" as const,
+      caller: "requirement-board",
+      project: "project-one",
+      taskId: "req-42",
+      contextId: "requirement-lineage:goal-42"
+    };
+
+    const first = await service.startWorkbenchWorkflow(
+      workflow.id,
+      { message: "cycle one" },
+      { ...lineageSource, idempotencyKey: "goal-42-cycle-1" }
+    );
+    await providerStarted;
+    await expect(service.startWorkbenchWorkflow(
+      workflow.id,
+      { message: "cycle two" },
+      { ...lineageSource, idempotencyKey: "goal-42-cycle-2" }
+    )).rejects.toThrow(/already has active Invocation/);
+
+    release();
+    await service.waitForInvocation(first.invocation.id);
+    const successor = await service.startWorkbenchWorkflow(
+      workflow.id,
+      { message: "cycle two" },
+      { ...lineageSource, idempotencyKey: "goal-42-cycle-2" }
+    );
+    expect(successor.invocation.id).not.toBe(first.invocation.id);
+    expect(successor.invocation.control?.lineage).toMatchObject({
+      rootInvocationId: first.invocation.id,
+      predecessorInvocationId: first.invocation.id,
+      cycle: 2
+    });
+    await service.waitForInvocation(successor.invocation.id);
+  });
+
   it("versions, clones, archives, invokes, and persists Employees through the Graph runtime", async () => {
     const root = temporaryRoot();
     const service = await WorkbenchService.open({ dataRoot: root });

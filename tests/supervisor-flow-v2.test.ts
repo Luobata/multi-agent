@@ -172,8 +172,9 @@ describe("Supervisor Flow v2 declarative DAG runtime", () => {
     expect(withoutDag.presentation).toBeUndefined();
   });
 
-  it("runs ready frontend/backend and branch tests in parallel, then merge and integration-test", async () => {
-    const buildBarrier = parallelBarrier(2);
+  it("serializes ready mutations in one workspace while keeping branch tests parallel", async () => {
+    let activeBuilds = 0;
+    let maximumActiveBuilds = 0;
     const testBarrier = parallelBarrier(2);
     const observedNeeds = new Map<string, string[]>();
     const providers: ProviderRegistry = new Map([["flow-v2-runtime", {
@@ -205,7 +206,12 @@ describe("Supervisor Flow v2 declarative DAG runtime", () => {
         const flowNodeId = node.metadata?.flowNodeId;
         if (!flowNodeId) throw new Error("member execution is missing flowNodeId");
         observedNeeds.set(flowNodeId, Object.keys(invocation.templateContext.needs as Record<string, unknown>));
-        if (flowNodeId === "frontend-task" || flowNodeId === "backend-task") await buildBarrier();
+        if (flowNodeId === "frontend-task" || flowNodeId === "backend-task") {
+          activeBuilds += 1;
+          maximumActiveBuilds = Math.max(maximumActiveBuilds, activeBuilds);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          activeBuilds -= 1;
+        }
         if (flowNodeId === "frontend-test" || flowNodeId === "backend-test") await testBarrier();
         return { stdout: JSON.stringify({ message: `${flowNodeId} passed.` }), stderr: "", durationMs: 1 };
       }
@@ -226,6 +232,7 @@ describe("Supervisor Flow v2 declarative DAG runtime", () => {
 
     const result = await service.runWorkbenchWorkflow("flow-v2", { message: "Ship both branches." });
     expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(maximumActiveBuilds).toBe(1);
     expect(result.run.output).toMatchObject({
       summary: "Flow v2 complete.",
       result: { delivered: true },
@@ -297,15 +304,120 @@ describe("Supervisor Flow v2 declarative DAG runtime", () => {
       reason: expect.stringContaining(reason),
       dag: { nodes: expect.arrayContaining([expect.objectContaining({ nodeId: "merge", status: "pending" })]) }
     });
-    expect(Object.keys(result.run.nodes)).toEqual(["supervisor-r1"]);
+    expect(Object.keys(result.run.nodes)).toEqual([
+      "supervisor-r1", "supervisor-r2", "supervisor-r3", "supervisor-r4", "supervisor-r5", "supervisor-r6"
+    ]);
     const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8")
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as { type: string; detail?: { reason?: string } });
     expect(events).toContainEqual(expect.objectContaining({
+      type: "supervisor.dag.rejected",
+      detail: expect.objectContaining({ reason: expect.stringContaining(reason), recoverable: true })
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
       type: "supervisor.dag.blocked",
       detail: expect.objectContaining({ reason: expect.stringContaining(reason) })
     }));
+  });
+
+  it("feeds a static DAG scheduling mistake back to the Supervisor and accepts the corrected next round", async () => {
+    let workerCalls = 0;
+    const providers: ProviderRegistry = new Map([["corrected-flow-decision", {
+      id: "corrected-flow-decision",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        const round = Number((invocation.templateContext.node as { with?: { __supervisorRound?: number } }).with?.__supervisorRound ?? 0);
+        if (role === "supervisor" && round === 1) {
+          return { stdout: JSON.stringify({ action: "delegate", assignments: [{ nodeId: "frontend-task", roleId: "backend" }] }), stderr: "", durationMs: 1 };
+        }
+        if (role === "supervisor" && round === 2) {
+          return { stdout: JSON.stringify({ action: "delegate", assignments: [{ nodeId: "frontend-task", roleId: "frontend" }] }), stderr: "", durationMs: 1 };
+        }
+        if (role === "supervisor") {
+          return { stdout: JSON.stringify({ action: "finish", summary: "Corrected flow complete.", result: { delivered: true } }), stderr: "", durationMs: 1 };
+        }
+        workerCalls += 1;
+        return { stdout: JSON.stringify({ message: "Frontend task passed." }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("corrected-flow-provider", { adapter: "corrected-flow-decision", outputProtocol: "json" });
+    await createFlowTeam(service, "corrected-flow-provider");
+    await service.createWorkflow({
+      id: "corrected-static-flow",
+      architecture: "supervisor",
+      supervisor: { employeeId: "flow-lead" },
+      managementPolicy: { id: "flow-policy" },
+      members: [{ roleId: "frontend", employeeId: "flow-frontend" }, { roleId: "backend", employeeId: "flow-backend" }],
+      flow: { stages: flowStages, gates: [], dag: { nodes: [flowDag.nodes[0]!] } }
+    });
+
+    const result = await service.runWorkbenchWorkflow("corrected-static-flow", { message: "Correct a scheduling mistake." });
+    expect(result.run.status).toBe("passed");
+    expect(workerCalls).toBe(1);
+    expect(Object.keys(result.run.nodes)).toEqual(["supervisor-r1", "supervisor-r2", "frontend-task", "supervisor-r3"]);
+    const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8");
+    expect(events).toContain("supervisor.dag.rejected");
+    expect(events).toContain("expected frontend");
+  });
+
+  it("stops an unchanged blocked DAG node once and preserves its root cause", async () => {
+    let workerCalls = 0;
+    const providers: ProviderRegistry = new Map([["blocked-static-dag", {
+      id: "blocked-static-dag",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role === "supervisor") {
+          return { stdout: JSON.stringify({ action: "delegate", assignments: [{ nodeId: "build", roleId: "builder" }] }), stderr: "", durationMs: 1 };
+        }
+        workerCalls += 1;
+        return { stdout: JSON.stringify({ message: "Signing credential is unavailable.", verdict: "Block" }), stderr: "", durationMs: 1 };
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("blocked-static-provider", { adapter: "blocked-static-dag", outputProtocol: "json" });
+    await service.createEmployee({
+      id: "blocked-static-lead",
+      identity: { displayName: "Blocked Lead", background: "Coordinates one DAG node.", responsibilities: ["Coordinate"] },
+      providerId: "blocked-static-provider"
+    });
+    await service.createEmployee({
+      id: "blocked-static-builder",
+      identity: { displayName: "Blocked Builder", background: "Reports environment blockers.", responsibilities: ["Build"] },
+      providerId: "blocked-static-provider",
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["message", "verdict"],
+        properties: { message: { type: "string" }, verdict: { enum: ["Pass", "Block"] } }
+      },
+      verdict: { path: "verdict", pass: ["Pass"], block: ["Block"] }
+    });
+    await service.createManagementPolicy({
+      id: "blocked-static-policy",
+      allowedRoleIds: ["builder"],
+      instructions: "Do not rerun a blocked DAG node without new evidence.",
+      limits: { maxRounds: 6, maxDelegations: 6, maxParallelDelegations: 1 }
+    });
+    await service.createWorkflow({
+      id: "blocked-static-flow",
+      architecture: "supervisor",
+      supervisor: { employeeId: "blocked-static-lead" },
+      managementPolicy: { id: "blocked-static-policy" },
+      members: [{ roleId: "builder", employeeId: "blocked-static-builder" }],
+      flow: { stages: flowStages, gates: [], dag: { nodes: [{ nodeId: "build", roleId: "builder", needs: [], kind: "task", task: "Build signed artifact." }] } }
+    });
+
+    const result = await service.runWorkbenchWorkflow("blocked-static-flow", { message: "Build once." });
+    expect(result.run.status).toBe("blocked");
+    expect(workerCalls).toBe(1);
+    expect(result.run.output).toMatchObject({
+      reason: expect.stringContaining("Signing credential is unavailable")
+    });
+    expect(Object.keys(result.run.nodes)).toEqual(["supervisor-r1", "build", "supervisor-r2"]);
   });
 
   it("rejects invalid merge/integration structure and duplicate DAG node ids before execution", async () => {

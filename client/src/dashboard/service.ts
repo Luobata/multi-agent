@@ -1167,5 +1167,6 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
 /** 应用级单例：页面默认经此适配层读写，测试可注入独立实例。 */
 export const dashboardService = createDashboardService({
   initialData: "empty",
+  delayMs: () => 0,
   storage: typeof window === "undefined" ? undefined : window.localStorage
 });

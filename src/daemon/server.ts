@@ -257,29 +257,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   });
 
   app.get("/api/bootstrap", (_request, response) => {
-    send(response, {
-      providers: service.listProviders(),
-      skills: service.listSkills(true),
-      knowledgeBases: service.listKnowledgeBases(true),
-      knowledgeProfiles: service.listKnowledgeProfiles(true),
-      knowledgeChanges: service.listKnowledgeChangeRequests(),
-      workflowChanges: service.listWorkflowChangeRequests(),
-      configurationProposals: service.listConfigurationProposals(),
-      architectureTemplates: service.listArchitectureTemplates(),
-      gateValidators: service.listGateValidators(),
-      employees: service.listEmployees(true),
-      employeeTemplates: service.listEmployeeTemplates(true),
-      managementPolicies: service.listManagementPolicies(true),
-      entrancePolicies: service.listEntrancePolicies(true),
-      workflows: service.listWorkflows(true),
-      sessions: service.listSessions(),
-      publications: service.listPublications(true),
-      projects: service.listProjects(true),
-      projectBindings: service.listProjectBindings(),
-      passiveProjectAccesses: service.listPassiveProjectAccesses(),
-      humanDecisionRequests: service.listHumanDecisionRequests(),
-      activity: service.getActivitySnapshot()
-    });
+    send(response, service.getBootstrapSnapshot());
   });
 
   app.get("/api/activity", (request, response) => {
@@ -707,6 +685,16 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   });
   app.patch("/api/employees/:id", asyncRoute(async (request, response) => {
     send(response, await service.updateEmployee(routeParam(request, "id"), request.body));
+  }));
+  app.post("/api/employees/:id/repin-project", asyncRoute(async (request, response) => {
+    const requestedVersion = request.body?.projectVersion;
+    if (requestedVersion !== undefined && (!Number.isInteger(requestedVersion) || requestedVersion < 1)) {
+      throw new Error("projectVersion must be a positive integer");
+    }
+    send(response, await service.repinEmployeeProject(
+      routeParam(request, "id"),
+      requestedVersion as number | undefined
+    ));
   }));
   app.post("/api/employees/:id/clone", asyncRoute(async (request, response) => {
     send(

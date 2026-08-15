@@ -1276,6 +1276,80 @@ describe("RunsPage human-in-the-loop decisions", () => {
   });
 });
 
+describe("RunsPage Invocation controls", () => {
+  it("shows server-authorized cancellation behind an explicit confirmation and preserves the reason", async () => {
+    const notify = vi.fn();
+    const activeRun: Run = {
+      id: "run-active-control",
+      workflow: "active-team",
+      architecture: "supervisor",
+      artifactDir: "/active",
+      status: "running",
+      createdAt: "2026-08-15T01:00:00.000Z",
+      nodes: {},
+      taskId: "req-active",
+      invocation: {
+        id: "inv-active-control",
+        status: "running",
+        source: { kind: "workbench", taskId: "req-active", project: "project-a" },
+        requestSummary: "Active controlled run",
+        control: {
+          schemaVersion: 1,
+          attempt: { phase: "active" },
+          goal: { state: "active" },
+          owner: "runtime",
+          allowedActions: ["monitor", "cancel"]
+        }
+      }
+    };
+    const fetchMock = vi.fn((input: RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [activeRun] }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: unavailablePreview(activeRun.id) }) });
+      if (url === "/api/human-decision-requests") return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
+      if (url === `/api/invocations/${activeRun.invocation!.id}/cancel` && init?.method === "POST") {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: { ...activeRun.invocation, status: "cancelled" } }) });
+      }
+      if (url === `/api/runs/${activeRun.id}`) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: activeRun }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    Object.defineProperty(HTMLDialogElement.prototype, "showModal", { configurable: true, value(this: HTMLDialogElement) { this.setAttribute("open", ""); } });
+    Object.defineProperty(HTMLDialogElement.prototype, "close", { configurable: true, value(this: HTMLDialogElement) { this.removeAttribute("open"); } });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    act(() => root.render(<RunsPage notify={notify} focusedRunId={activeRun.id} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    const stop = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "停止本轮运行");
+    expect(stop).toBeTruthy();
+    await act(async () => { stop?.click(); });
+    const dialog = container.querySelector("dialog")!;
+    expect(dialog.textContent).toContain("Run、提示词、输出和状态迁移证据都会保留");
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/cancel"))).toHaveLength(0);
+    const textarea = dialog.querySelector("textarea")!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(textarea, "方向偏离，先修正范围");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "确认停止本轮运行")?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const cancelCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/cancel"));
+    expect(JSON.parse(String((cancelCall?.[1] as RequestInit).body))).toEqual({ actor: "workbench-operator", reason: "方向偏离，先修正范围" });
+    expect(container.querySelector("dialog")).toBeNull();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining("已安全停止"), "success");
+
+    act(() => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+    Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+    Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
+  });
+});
+
 describe("sortHumanDecisionRequests", () => {
   it("pins pending requests first, then newest first", () => {
     const sorted = sortHumanDecisionRequests([
@@ -1300,5 +1374,156 @@ describe("filterRuns", () => {
     const legacy: Run[] = [{ id: "legacy", workflow: "w", architecture: "graph", artifactDir: "/x", status: "passed", createdAt: "2026-08-06T00:00:00.000Z", nodes: {} }];
     expect(filterRuns(legacy, { category: "graph", project: "all" }).map((run) => run.id)).toEqual(["legacy"]);
     expect(filterRuns(legacy, { category: "single", project: "all" })).toHaveLength(0);
+  });
+});
+
+const observabilityRun: Run = {
+  id: "run-obs-1",
+  workflow: "team-flow",
+  architecture: "supervisor",
+  artifactDir: "/obs",
+  status: "running",
+  createdAt: "2026-08-06T05:00:00.000Z",
+  category: "supervisor",
+  invocation: { id: "inv-obs-1", requestSummary: "观测性验证运行" },
+  nodes: {
+    "supervisor-r1": { nodeId: "supervisor-r1", roleId: "leader", metadata: { kind: "supervisor", round: 1 }, status: "passed", attempts: 1, output: { action: "delegate", summary: "第一轮：先调研" } },
+    "research-r1-1": { nodeId: "research-r1-1", roleId: "researcher", metadata: { kind: "member", round: 1, flowNodeId: "research" }, status: "passed", attempts: 1 },
+    "build-r2-1": { nodeId: "build-r2-1", roleId: "builder", metadata: { kind: "member", round: 2, flowNodeId: "build", dependencyNodeIds: ["research-r1-1"] }, status: "failed", attempts: 1, error: "构建失败：缺少环境变量" },
+    "validate-r2-2": { nodeId: "validate-r2-2", roleId: "tester", metadata: { kind: "member", round: 2, flowNodeId: "validate" }, status: "blocked", attempts: 1, error: "候选不可达" }
+  },
+  // Live projection persisted by the Supervisor runtime (schemaVersion 1).
+  ...({ architectureState: {
+    schemaVersion: 1,
+    kind: "supervisor",
+    round: 2,
+    delegations: 3,
+    planRevision: 1,
+    limits: { maxRounds: 8, maxDelegations: 24, maxParallelDelegations: 4 },
+    dag: { nodes: [
+      { nodeId: "research", status: "passed", ready: false, needs: [] },
+      { nodeId: "build", status: "pending", ready: false, needs: ["research"], whyNotRunning: [{ kind: "dependency", nodeId: "research", status: "pending", expectedStatuses: ["passed"] }] }
+    ] },
+    gates: [{ gateId: "e2e", status: "pending", reason: "等待构建产物", requiredCapability: "quality.test", executions: [{ sourceNodeIds: ["build-r2-1"] }] }]
+  } } as Partial<Run>)
+};
+
+const observabilityProgress = {
+  invocationId: "inv-obs-1",
+  runId: "run-obs-1",
+  status: "running",
+  phase: "delegating",
+  terminal: false,
+  round: 2,
+  tally: { queued: 0, waiting: 0, running: 1, "cancellation-requested": 0, completed: 2, blocked: 0, failed: 1, skipped: 0, cancelled: 0 },
+  steps: [
+    { nodeId: "research-r1-1", roleId: "researcher", round: 1, employeeId: "emp-r", status: "completed", phase: "done" },
+    { nodeId: "build-r2-1", roleId: "builder", round: 2, employeeId: "emp-b", status: "failed", phase: "working", error: "构建失败：缺少环境变量" },
+    { nodeId: "validate-r2-2", roleId: "tester", round: 2, employeeId: "emp-t", status: "blocked", phase: "done", error: "候选不可达" }
+  ],
+  leaderReport: {
+    available: true,
+    rounds: 2,
+    delegations: 3,
+    entries: [
+      { round: 1, action: "delegate", summary: "第一轮：先调研", assignments: [{ roleId: "researcher", task: "调研方案" }], status: "completed" },
+      { round: 2, action: "delegate", summary: "第二轮：并行构建", assignments: [{ roleId: "builder", task: "实现" }], status: "failed" }
+    ],
+    gates: [{ gateId: "e2e", status: "pending" }]
+  },
+  // Newer than observabilityRun.architectureState: proves the progress channel drives live UI.
+  supervisor: {
+    schemaVersion: 1,
+    kind: "supervisor",
+    sequence: 9,
+    round: 3,
+    delegations: 4,
+    planRevision: 2,
+    limits: { maxRounds: 8, maxDelegations: 24, maxParallelDelegations: 4 },
+    scheduling: { mode: "iterative", schedulerVersion: 1, compiledDispatchEnabled: false, shadowReadyNodeIds: ["build"] },
+    dag: { nodes: [
+      { nodeId: "research", status: "passed", ready: false, needs: [] },
+      { nodeId: "build", status: "pending", ready: false, needs: ["research"], whyNotRunning: [{ kind: "dependency", nodeId: "research", status: "pending", expectedStatuses: ["passed"] }] },
+      { nodeId: "validate", status: "blocked", ready: false, needs: [], whyNotRunning: [{ kind: "terminal", status: "blocked", reason: "需要明确恢复证据后才能重开验证" }] }
+    ] },
+    gates: [{ gateId: "e2e", status: "pending", reason: "等待重试候选", requiredCapability: "quality.test", executions: [{ sourceNodeIds: ["validate-r2-2"] }] }]
+  }
+};
+
+describe("RunsPage supervisor observability", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  const fetchMock = vi.fn();
+
+  beforeEach(async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [observabilityRun] }) });
+      if (url === "/api/runs/run-obs-1") return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: observabilityRun }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: unavailablePreview("run-obs-1") }) });
+      // The wait endpoint deliberately answers malformed: the dossier must fall back, never crash.
+      if (url.includes("/progress/wait")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+      if (url.endsWith("/progress")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: observabilityProgress }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root.render(<RunsPage notify={vi.fn()} focusedRunId="run-obs-1" />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    document.body.replaceChildren();
+    fetchMock.mockReset();
+  });
+
+  it("prefers the cursor long-poll for a running supervisor dossier and survives a malformed wait response", () => {
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/api/invocations/inv-obs-1/progress/wait"))).toBe(true);
+    expect(container.textContent).toContain("执行步骤与领队决策");
+  });
+
+  it("renders the full decision timeline, not only the latest round", () => {
+    const entries = container.querySelectorAll(".run-decision-entry");
+    expect(entries).toHaveLength(2);
+    expect(container.textContent).toContain("第一轮：先调研");
+    expect(container.textContent).toContain("第二轮：并行构建");
+    expect(container.textContent).toContain("调研方案");
+  });
+
+  it("renders the steps table as the text equivalent of the topology, with wait reasons and errors", () => {
+    const table = container.querySelector("table.run-steps-table");
+    expect(table).toBeTruthy();
+    expect(table?.querySelector("caption")?.textContent).toContain("与上方动态执行图等价的文本视图");
+    expect(table?.textContent).toContain("research-r1-1");
+    expect(table?.textContent).toContain("等待 research（当前 pending，需要 passed）");
+    expect(table?.textContent).toContain("需要明确恢复证据后才能重开验证");
+    expect(table?.textContent).toContain("构建失败：缺少环境变量");
+  });
+
+  it("shows persisted round/delegation limits without inventing them", () => {
+    const line = container.querySelector(".run-limits-line");
+    expect(line?.textContent).toContain("轮次 3 / 上限 8");
+    expect(line?.textContent).toContain("累计委派 4 / 上限 24");
+    expect(line?.textContent).toContain("单批并行上限 4");
+    expect(line?.textContent).toContain("计划版本 v2");
+    expect(line?.textContent).toContain("调度 iterative v1");
+    expect(line?.textContent).toContain("完成即补位关闭");
+    expect(line?.textContent).toContain("影子就绪 1（仅观测）");
+  });
+
+  it("marks the topology as real-edge mode when durable dependency evidence exists", () => {
+    expect(container.textContent).toContain("实线＝真实依赖");
+    expect(container.querySelector(".supervisor-run-edge--dependency")).toBeTruthy();
+  });
+
+  it("shows live gate reason and evidence source while running", () => {
+    expect(container.textContent).toContain("门禁状态（进行中");
+    expect(container.textContent).toContain("等待重试候选");
+    expect(container.textContent).toContain("证据来源节点：validate-r2-2");
   });
 });

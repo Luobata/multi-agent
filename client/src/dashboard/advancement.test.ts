@@ -45,6 +45,7 @@ describe("requirement advancement control state", () => {
         config: {
           requirementAdvancement: {
             entrancePolicyId: "requirement-policy",
+            triggerMode: "explicit-delivery",
             candidateUrl: "http://127.0.0.1:4319",
             polling: { enabled: true, intervalMs: 30_000 }
           }
@@ -53,6 +54,8 @@ describe("requirement advancement control state", () => {
     } as unknown as Project;
     expect(requirementAdvancementConfig(project)).toEqual({
       entrancePolicyId: "requirement-policy",
+      triggerMode: "explicit-delivery",
+      deliveryTargets: [],
       candidateUrl: "http://127.0.0.1:4319",
       autoPollEnabled: true,
       pollIntervalMs: 30_000
@@ -61,14 +64,22 @@ describe("requirement advancement control state", () => {
 
   it("ignores a non-HTTP candidate URL from project configuration", () => {
     const project = { connector: { config: { requirementAdvancement: {
-      entrancePolicyId: "requirement-policy", candidateUrl: "file:///tmp/candidate"
+      entrancePolicyId: "requirement-policy", triggerMode: "explicit-delivery", candidateUrl: "file:///tmp/candidate"
     } } } } as unknown as Project;
     expect(requirementAdvancementConfig(project)).not.toHaveProperty("candidateUrl");
+  });
+
+  it("does not bind legacy advancement configs without the explicit delivery trigger", () => {
+    const project = { connector: { config: { requirementAdvancement: {
+      entrancePolicyId: "requirement-policy"
+    } } } } as unknown as Project;
+    expect(requirementAdvancementConfig(project)).toBeUndefined();
   });
 
   it("reserves a stable key and reuses it after a response-less failure", () => {
     const first = reserveAdvancement(detail(), config, "human", "2026-08-10T01:00:00.000Z");
     expect(first).toMatchObject({ cycle: 1, status: "dispatching" });
+    expect(first.lineageId).toBeTruthy();
     expect(first.idempotencyKey).toMatch(/^requirement:project-1:req-1:advance:1:/);
     const retried = reserveAdvancement(
       detail({ advancement: { ...first, status: "failed", error: "network lost" } }),
@@ -77,6 +88,7 @@ describe("requirement advancement control state", () => {
       "2026-08-10T01:01:00.000Z"
     );
     expect(retried.idempotencyKey).toBe(first.idempotencyKey);
+    expect(retried.lineageId).toBe(first.lineageId);
     expect(retried.cycle).toBe(1);
     expect(retried.trigger).toBe("automatic");
   });
@@ -118,6 +130,7 @@ describe("requirement advancement control state", () => {
       "2026-08-10T01:05:00.000Z"
     );
     expect(next).toMatchObject({ cycle: 2, status: "dispatching" });
+    expect(next.lineageId).toBe(first.lineageId);
     expect(next.idempotencyKey).toMatch(/^requirement:project-1:req-1:advance:2:/);
     expect(() => reserveAdvancement(
       detail({ advancement: { ...failed, status: "completed" }, exception: null }),
@@ -157,10 +170,12 @@ describe("requirement advancement control state", () => {
     expect(dueRequirementAdvancements([due, later, terminal] as Requirement[], "2026-08-10T01:00:20.000Z").map((item) => item.id)).toEqual(["req-1"]);
     expect(advancementLane("queued", "inbox")).toBe("queued");
     expect(advancementLane("awaiting-human-decision", "running")).toBe("confirmation");
+    expect(advancementLane("cancellation-requested", "confirmation")).toBe("running");
     expect(advancementLane("running", "confirmation")).toBe("running");
-    expect(advancementLane("blocked", "confirmation")).toBe("running");
-    expect(advancementLane("failed", "confirmation")).toBe("running");
-    expect(advancementLane("failed", "running")).toBe("running");
+    expect(advancementLane("completed", "running")).toBe("confirmation");
+    expect(advancementLane("blocked", "confirmation")).toBe("confirmation");
+    expect(advancementLane("failed", "running")).toBe("confirmation");
+    expect(advancementLane("cancelled", "running")).toBe("confirmation");
   });
 
   it("ignores an older Invocation observation so the board cannot regress after approval", () => {

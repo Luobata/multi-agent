@@ -16,6 +16,7 @@ export type RequirementAdvancementStatus =
   | "queued"
   | "running"
   | "awaiting-human-decision"
+  | "cancellation-requested"
   | "completed"
   | "blocked"
   | "failed"
@@ -27,6 +28,8 @@ export type RequirementAdvancementStatus =
  */
 export interface RequirementAdvancement {
   schemaVersion: 1;
+  /** Stable, globally unique Goal family shared by every successor Attempt. */
+  lineageId?: string;
   cycle: number;
   trigger: "human" | "automatic";
   status: RequirementAdvancementStatus;

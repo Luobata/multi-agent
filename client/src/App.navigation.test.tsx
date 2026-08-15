@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { Bootstrap, Employee, WorkInstanceRecord, WorkInstanceStatus } from "./types";
+import type { Bootstrap, Employee, InvocationRecord, WorkInstanceRecord, WorkInstanceStatus } from "./types";
 
 const timestamp = "2026-08-01T00:00:00.000Z";
 
@@ -266,6 +266,31 @@ describe("App navigation freshness", () => {
     expect(labels.filter((label) => label === "项目")).toHaveLength(1);
     expect(labels).not.toContain("项目空间");
     expect(labels).not.toContain("项目接入");
+  });
+
+  it("surfaces pending human decisions globally and deep-links the Runs nav to the exact Run", async () => {
+    const awaiting: InvocationRecord = {
+      id: "inv-global-decision",
+      target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench" },
+      status: "awaiting-human-decision",
+      phase: "awaiting-human-decision",
+      requestSummary: "需要用户批准",
+      runId: "run-global-decision",
+      instanceIds: [],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      transitions: []
+    };
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({ activity: { invocations: [awaiting], instances: [] } }));
+    await flush();
+
+    expect(navButton("需求看板").querySelector(".nav-attention-badge")?.textContent).toBe("1");
+    const runsButton = navButton("运行卷宗");
+    expect(runsButton.getAttribute("title")).toContain("1 项待你决定");
+    click(runsButton);
+    expect(window.location.hash).toBe("#runs/run-global-decision");
   });
 
   it("enters read-only offline only when the very first bootstrap fails", async () => {

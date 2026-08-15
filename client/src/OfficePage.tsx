@@ -3,6 +3,14 @@ import { api } from "./api";
 import { EmployeeAvatar, RuntimeStatusChip, UtilityIcon, employeeRuntimeHealth, employeeRuntimeStatus, formatTime } from "./components";
 import { isSystemEmployee, systemEmployeeScope } from "./employeeAccess";
 import { activeSupervisorInvocations, completionRatio, historicalExceptionCount, progressTone, studioSupervisorInvocations } from "./officeStudio";
+
+/** Client mirror of `WorkflowProgressWaitResult`, fields optional for tolerance. */
+interface ProgressWaitResult {
+  nextCursor?: string;
+  changed?: boolean;
+  terminal?: boolean;
+  progress?: InvocationProgress;
+}
 import type {
   Bootstrap,
   Employee,
@@ -19,13 +27,14 @@ interface OfficePageProps {
   onOpenRun?: (runId: string) => void;
 }
 
-const activeInstanceStatuses = new Set<WorkInstanceStatus>(["queued", "waiting", "running"]);
+const activeInstanceStatuses = new Set<WorkInstanceStatus>(["queued", "waiting", "running", "cancellation-requested"]);
 
 const statusLabels: Record<WorkInstanceStatus | InvocationStatus | "idle", string> = {
   idle: "空闲待命",
   queued: "排队中",
   waiting: "等待中",
   running: "工作中",
+  "cancellation-requested": "正在取消",
   "awaiting-human-decision": "等待人工决定",
   completed: "已完成",
   blocked: "已阻塞",
@@ -239,7 +248,11 @@ export function OfficePage({ data, streamStatus, onOpenRun }: OfficePageProps) {
   useEffect(() => {
     if (activeSupervisors.length === 0) return;
     let cancelled = false;
-    const poll = async () => {
+    // Cursor long-poll is the primary channel; any malformed/failed wait response flips the
+    // whole effect back to the 2s interval so an older daemon can never freeze the studio cards.
+    let longPollLive = true;
+    const cursors = new Map<string, string>();
+    const pollOnce = async () => {
       await Promise.all(activeSupervisors.map(async (invocation) => {
         try {
           const value = await api<InvocationProgress>(`/api/invocations/${encodeURIComponent(invocation.id)}/progress`);
@@ -249,8 +262,28 @@ export function OfficePage({ data, streamStatus, onOpenRun }: OfficePageProps) {
         }
       }));
     };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 2000);
+    const waitLoop = async (invocationId: string) => {
+      while (!cancelled && longPollLive) {
+        try {
+          const cursor = cursors.get(invocationId);
+          const result = await api<ProgressWaitResult>(`/api/invocations/${encodeURIComponent(invocationId)}/progress/wait?timeoutMs=20000${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+          if (cancelled || !longPollLive) return;
+          if (!result || typeof result.nextCursor !== "string" || !result.progress) throw new Error("progress wait result is malformed");
+          cursors.set(invocationId, result.nextCursor);
+          setProgressById((current) => ({ ...current, [invocationId]: result.progress! }));
+          if (result.terminal) return;
+          // Yield between iterations so an instantly-resolving endpoint can never spin.
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        } catch {
+          longPollLive = false;
+          if (!cancelled) void pollOnce();
+          return;
+        }
+      }
+    };
+    void pollOnce();
+    activeSupervisors.forEach((invocation) => { void waitLoop(invocation.id); });
+    const timer = window.setInterval(() => { if (!longPollLive) void pollOnce(); }, 2000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [activeSupervisorKey]);
   const renderRoster = (employees: Employee[], systemLevel: boolean) => employees.map((employee, index) => {

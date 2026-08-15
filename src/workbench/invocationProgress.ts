@@ -33,6 +33,8 @@ export interface InvocationProgress {
   steps: InvocationProgressStep[];
   /** Leader (supervisor) narrative reconstructed from the run record, newest round last. */
   leaderReport: LeaderReport;
+  /** Durable architecture-owned live projection. Present for Supervisor runs after activation. */
+  supervisor?: JsonObject;
   /** Present when the run finished with a delivery/blocked/failed summary. */
   outcome?: { status: string; summary?: string; reason?: string };
   /** Latest durable human-decision request, including terminal decisions for audit-oriented callers. */
@@ -228,6 +230,8 @@ export function computeInvocationProgress(detail: InvocationDetail): InvocationP
       completedAt: instance.completedAt
     }));
   const leaderReport = buildLeaderReport(run);
+  const supervisor = asObject(run?.architectureState);
+  const architectureSequence = typeof supervisor?.sequence === "number" ? supervisor.sequence : 0;
   const latestHumanDecision = detail.humanDecisionRequests?.at(-1);
   const round = Math.max(
     0,
@@ -237,7 +241,9 @@ export function computeInvocationProgress(detail: InvocationDetail): InvocationP
   return {
     invocationId: invocation.id,
     runId: invocation.runId,
-    sequence: invocation.transitions.length + instances.reduce((total, instance) => total + instance.transitions.length, 0),
+    sequence: invocation.transitions.length
+      + instances.reduce((total, instance) => total + instance.transitions.length, 0)
+      + architectureSequence,
     workflowId: invocation.target.id,
     architecture: invocation.executionSnapshot?.workflow.architecture ?? "unknown",
     status: invocation.status,
@@ -251,6 +257,7 @@ export function computeInvocationProgress(detail: InvocationDetail): InvocationP
     tally,
     steps,
     leaderReport,
+    ...(supervisor?.kind === "supervisor" ? { supervisor: structuredClone(supervisor) } : {}),
     humanDecision: latestHumanDecision ? {
       id: latestHumanDecision.id,
       status: latestHumanDecision.status,

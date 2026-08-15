@@ -171,6 +171,41 @@ describe("workbench daemon", () => {
     expect(JSON.stringify(detail.run)).toContain("Please clarify this vague request");
   });
 
+  it("repins a project-scoped Employee through the live daemon after a project descriptor upgrade", async () => {
+    const { base, service } = await fixture();
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-repin-project-"));
+    directories.push(projectRoot);
+    const projectInput = {
+      id: "repin-project",
+      name: "Repin Project",
+      rootPath: projectRoot,
+      descriptorPath: path.join(projectRoot, "multi-agent.project.yaml"),
+      roles: [{ id: "developer", displayName: "Developer" }]
+    };
+    await service.createProject(projectInput);
+    await service.createEmployee({
+      id: "repin-worker",
+      identity: {
+        displayName: "Repin Worker",
+        background: "Works only in the repin fixture.",
+        responsibilities: ["Implement fixture work"]
+      },
+      scope: { kind: "project", projectId: projectInput.id, projectVersion: 1 }
+    });
+    await service.updateProject(projectInput.id, { ...projectInput, description: "Project v2." });
+
+    const response = await fetch(`${base}/api/employees/repin-worker/repin-project`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      data: { id: "repin-worker", version: 2, scope: { projectVersion: 2 } }
+    });
+  });
+
   it("preserves Unicode invocation metadata from encoded and legacy HTTP headers", async () => {
     const { base } = await fixture();
     const invoke = (label: string) => fetch(`${base}/api/employees/desk-agent/invoke`, {

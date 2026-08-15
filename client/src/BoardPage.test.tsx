@@ -866,7 +866,7 @@ describe("BoardPage AI requirement creation", () => {
       status: "blocked",
       observedAt: "2026-08-12T04:16:07.000Z"
     }, config.pollIntervalMs);
-    const family = `requirement-run:${reserved.idempotencyKey}`;
+    const family = `requirement-lineage:${reserved.lineageId}`;
     const base: Pick<InvocationRecord, "target" | "source" | "phase" | "requestSummary" | "instanceIds" | "transitions"> = {
       target: { kind: "workflow", id: "team-flow", version: 1 },
       source: { kind: "workbench", project: project.id, taskId: requirement.id, contextId: family },

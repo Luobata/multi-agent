@@ -29,11 +29,54 @@ describe("Supervisor runtime topology", () => {
       ["supervisor-r2", 2, "supervisor"]
     ]);
     expect(layout.edges).toEqual([
-      { from: "supervisor-r1", to: "research-r1-1" },
-      { from: "supervisor-r1", to: "build-r1-2" },
-      { from: "research-r1-1", to: "supervisor-r2" },
-      { from: "build-r1-2", to: "supervisor-r2" }
+      { from: "supervisor-r1", to: "research-r1-1", kind: "delegation" },
+      { from: "supervisor-r1", to: "build-r1-2", kind: "delegation" },
+      { from: "research-r1-1", to: "supervisor-r2", kind: "sequence" },
+      { from: "build-r1-2", to: "supervisor-r2", kind: "sequence" }
     ]);
+    expect(layout.edgeMode).toBe("schematic");
+    expect(layout.rounds).toBe(2);
+  });
+
+  it("draws durable dependency edges instead of schematic sequence edges when the runtime recorded them", () => {
+    const build: RunNode = {
+      nodeId: "backend-build",
+      roleId: "build",
+      metadata: { kind: "member", round: 2, flowNodeId: "backend-build", dependencyNodeIds: ["frontend-research"] },
+      status: "running",
+      attempts: 1
+    };
+    const layout = layoutSupervisorRun([
+      node("supervisor-r1", "supervisor", "supervisor", 1),
+      node("frontend-research", "research", "member", 1),
+      node("supervisor-r2", "supervisor", "supervisor", 2),
+      build,
+      node("supervisor-r3", "supervisor", "supervisor", 3)
+    ]);
+    expect(layout.edgeMode).toBe("real");
+    expect(layout.edges).toContainEqual({ from: "frontend-research", to: "backend-build", kind: "dependency" });
+    expect(layout.edges.some((edge) => edge.kind === "sequence")).toBe(false);
+    // Delegation edges stay factual in both modes.
+    expect(layout.edges).toContainEqual({ from: "supervisor-r2", to: "backend-build", kind: "delegation" });
+  });
+
+  it("labels schematic edges as schematic in visible text and in the accessible summary", () => {
+    const markup = renderToStaticMarkup(createElement(SupervisorRunTopology, { nodes: [
+      node("supervisor-r1", "supervisor", "supervisor", 1),
+      node("research-r1-1", "research", "member", 1)
+    ] }));
+    expect(markup).toContain("示意布局：边仅表示轮次先后顺序，不代表真实依赖关系。");
+    expect(markup).toContain("边为轮次示意");
+  });
+
+  it("labels real dependency edges in visible text when durable evidence exists", () => {
+    const markup = renderToStaticMarkup(createElement(SupervisorRunTopology, { nodes: [
+      node("supervisor-r1", "supervisor", "supervisor", 1),
+      { nodeId: "build-r1-1", roleId: "build", metadata: { kind: "member", round: 1, dependencyNodeIds: ["supervisor-r1"] }, status: "passed", attempts: 1 }
+    ] }));
+    expect(markup).toContain("实线＝真实依赖");
+    expect(markup).toContain("含真实依赖边");
+    expect(markup).toContain("supervisor-run-edge--dependency");
   });
 
   it("renders a non-color status label and preserves the full long id as accessible SVG text", () => {

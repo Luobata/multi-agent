@@ -71,7 +71,12 @@ import {
 } from "./operations.js";
 import { MemoryExtractor, summarizerContent, buildRunEvidence, type RunLike, type SummarizeFn } from "../memory/extractor.js";
 import { buildEvidenceRerunRequest, parseOriginalRunRequest } from "./evidenceRerun.js";
-import { employeeRuntimeResources, ExclusiveRuntimeResourceQueue } from "./runtimeResources.js";
+import {
+  employeeRuntimeResources,
+  ExclusiveRuntimeResourceQueue,
+  nodeMutationResources
+} from "./runtimeResources.js";
+import { invocationControlProjection, withInvocationControl } from "./lifecycleControl.js";
 import type { MemoryEvidence, MemoryRecord, MemoryScope, MemorySearchQuery } from "../memory/types.js";
 import type {
   KnowledgeBaseCreateInput,
@@ -1739,6 +1744,20 @@ function isInvocationTerminal(status: InvocationStatus): boolean {
   return ["completed", "blocked", "failed", "cancelled"].includes(status);
 }
 
+function activitySnapshotFromState(state: WorkbenchState, limit = 100): ActivitySnapshot {
+  const ordered = Object.values(state.invocations).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const bounded = Math.max(1, Math.min(500, limit));
+  const active = ordered.filter((invocation) => !isInvocationTerminal(invocation.status));
+  const included = [...active, ...ordered.filter((invocation) => isInvocationTerminal(invocation.status)).slice(0, bounded)];
+  const invocationIds = new Set(included.map((invocation) => invocation.id));
+  return {
+    invocations: included.map((invocation) => withInvocationControl(invocation, ordered)),
+    instances: Object.values(state.workInstances)
+      .filter((instance) => invocationIds.has(instance.invocationId))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  };
+}
+
 function isInstanceTerminal(status: WorkInstanceStatus): boolean {
   return ["completed", "blocked", "failed", "skipped", "cancelled"].includes(status);
 }
@@ -1793,6 +1812,11 @@ export class WorkbenchService {
     fingerprint: string;
     receipt: Promise<InvocationStartResult>;
   }>();
+  /**
+   * In-process claim that closes the gap before a lineage Invocation reaches the Store.
+   * Persisted non-terminal Invocations remain the cross-restart source of truth.
+   */
+  private readonly activeLineageStarts = new Map<string, string>();
   private readonly humanDecisionWaiters = new Map<string, {
     promise: Promise<RuntimeHumanDecisionOutcome>;
     resolve: (outcome: RuntimeHumanDecisionOutcome) => void;
@@ -2045,9 +2069,6 @@ export class WorkbenchService {
     manifestPath: string;
   } | undefined> {
     if (invocation.target.kind !== "workflow" || !invocation.executionSnapshot) return undefined;
-    if (Object.values(this.snapshot().humanDecisionRequests).some((request) => (
-      request.invocationId === invocation.id && request.status === "pending"
-    ))) return undefined;
     if (!/^run-[A-Za-z0-9-]+$/.test(invocation.runId)) return undefined;
     const runDir = path.join(this.store.dataRoot, "artifacts", "runs", invocation.runId);
     try {
@@ -2211,6 +2232,9 @@ export class WorkbenchService {
       }
       for (const request of Object.values(next.humanDecisionRequests)) {
         if (request.status !== "pending") continue;
+        // A durable Supervisor checkpoint can reopen the same idempotent request and
+        // rebuild its in-memory waiter. Preserve that user obligation across restarts.
+        if (recoveries.has(request.invocationId)) continue;
         request.status = "voided";
         request.decidedBy = "runtime-recovery";
         request.comment = "Local runtime restarted before the human decision was received.";
@@ -2254,9 +2278,15 @@ export class WorkbenchService {
   }
 
   private emitActivity(event: ActivityEvent): void {
+    const projected = event.type === "invocation.changed"
+      ? {
+          ...event,
+          invocation: withInvocationControl(event.invocation, Object.values(this.snapshot().invocations))
+        } satisfies ActivityEvent
+      : event;
     for (const listener of this.activityListeners) {
       try {
-        listener(event);
+        listener(projected);
       } catch {
         // A disconnected observer must not interrupt Provider execution.
       }
@@ -2264,17 +2294,66 @@ export class WorkbenchService {
   }
 
   getActivitySnapshot(limit = 100): ActivitySnapshot {
+    return activitySnapshotFromState(this.snapshot(), limit);
+  }
+
+  /**
+   * Build the browser control-plane snapshot from one coherent Store revision.
+   * Calling the public list methods here would deep-clone the full WorkbenchState
+   * once per field, which makes every page entry scale with field-count × history.
+   */
+  getBootstrapSnapshot() {
     const state = this.snapshot();
-    const ordered = Object.values(state.invocations).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    const bounded = Math.max(1, Math.min(500, limit));
-    const active = ordered.filter((invocation) => !isInvocationTerminal(invocation.status));
-    const included = [...active, ...ordered.filter((invocation) => isInvocationTerminal(invocation.status)).slice(0, bounded)];
-    const invocationIds = new Set(included.map((invocation) => invocation.id));
+    const projects = Object.values(state.projects).map((record) => record.current);
     return {
-      invocations: included,
-      instances: Object.values(state.workInstances)
-        .filter((instance) => invocationIds.has(instance.invocationId))
-        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      providers: Object.entries(state.providers).map(([id, definition]) => ({ id, definition })),
+      skills: Object.values(state.skills).sort((left, right) => left.displayName.localeCompare(right.displayName)),
+      knowledgeBases: Object.values(state.knowledgeBases)
+        .map((record) => record.current)
+        .sort((left, right) => left.displayName.localeCompare(right.displayName)),
+      knowledgeProfiles: Object.values(state.knowledgeProfiles)
+        .map((record) => record.current)
+        .sort((left, right) => left.displayName.localeCompare(right.displayName)),
+      knowledgeChanges: Object.values(state.knowledgeChangeRequests)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+      workflowChanges: Object.values(state.workflowChangeRequests)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+      configurationProposals: Object.values(state.configurationProposals)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+      architectureTemplates: listArchitectureTemplates(),
+      gateValidators: listRegisteredGateValidators(),
+      employees: Object.values(state.employees)
+        .map((record) => record.current)
+        .sort((left, right) => left.identity.displayName.localeCompare(right.identity.displayName)),
+      employeeTemplates: Object.values(state.employeeTemplates)
+        .map((record) => record.current)
+        .sort((left, right) => left.displayName.localeCompare(right.displayName)),
+      managementPolicies: Object.values(state.managementPolicies)
+        .map((record) => record.current)
+        .sort((left, right) => left.displayName.localeCompare(right.displayName)),
+      entrancePolicies: Object.values(state.entrancePolicies)
+        .map((record) => record.current)
+        .sort((left, right) => left.displayName.localeCompare(right.displayName)),
+      workflows: Object.values(state.workflows)
+        .map((record) => record.current)
+        .sort((left, right) => left.id.localeCompare(right.id)),
+      sessions: Object.values(state.sessions)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+      publications: Object.values(state.publications)
+        .sort((left, right) => left.name.localeCompare(right.name)),
+      projects: projects.sort((left, right) => left.name.localeCompare(right.name)),
+      projectBindings: Object.values(state.projectBindings)
+        .map((record) => record.current)
+        .sort((left, right) => left.projectId.localeCompare(right.projectId)),
+      passiveProjectAccesses: Object.values(state.passiveProjectAccesses)
+        .map((access) => ({
+          ...access,
+          linkedProjectId: passiveProjectAccessLinkedProjectId(access, projects)
+        }))
+        .sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt)),
+      humanDecisionRequests: Object.values(state.humanDecisionRequests)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+      activity: activitySnapshotFromState(state)
     };
   }
 
@@ -2294,7 +2373,12 @@ export class WorkbenchService {
     const humanDecisionRequests = Object.values(state.humanDecisionRequests)
       .filter((request) => request.invocationId === id)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-    return { invocation, instances, humanDecisionRequests, run };
+    return {
+      invocation: withInvocationControl(invocation, Object.values(state.invocations)),
+      instances,
+      humanDecisionRequests,
+      run
+    };
   }
 
   listHumanDecisionRequests(filter: { invocationId?: string; status?: HumanDecisionRequest["status"] } = {}): HumanDecisionRequest[] {
@@ -2346,10 +2430,27 @@ export class WorkbenchService {
     const idempotencyKey = this.humanDecisionIdempotencyKey(input);
     const timestamp = now();
     let created = false;
+    let awaitingRestored = false;
     const request = await this.store.mutate((state) => {
       const existing = Object.values(state.humanDecisionRequests)
         .find((candidate) => candidate.idempotencyKey === idempotencyKey);
-      if (existing) return existing;
+      if (existing) {
+        const invocation = state.invocations[existing.invocationId];
+        if (existing.status === "pending" && invocation && !isInvocationTerminal(invocation.status)
+          && invocation.status !== "awaiting-human-decision") {
+          invocation.status = "awaiting-human-decision";
+          invocation.phase = "awaiting-human-decision";
+          invocation.updatedAt = timestamp;
+          invocation.transitions.push({
+            at: timestamp,
+            status: "awaiting-human-decision",
+            phase: "awaiting-human-decision",
+            message: `Restored pending decision after runtime recovery: ${existing.riskCategory}: ${existing.summary}`
+          });
+          awaitingRestored = true;
+        }
+        return existing;
+      }
       const invocation = state.invocations[input.invocationId];
       if (!invocation) throw new Error(`invocation not found: ${input.invocationId}`);
       const snapshot = invocation.executionSnapshot?.workflow;
@@ -2400,7 +2501,7 @@ export class WorkbenchService {
       created = true;
       return next;
     });
-    if (created) {
+    if (created || awaitingRestored) {
       const invocation = this.snapshot().invocations[input.invocationId];
       if (invocation) this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
     }
@@ -2445,7 +2546,10 @@ export class WorkbenchService {
         || invocation.executionSnapshot.workflow.version !== target.workflowVersion) {
         throw new Error("human decision request no longer matches its pinned invocation/run/workflow version");
       }
-      if (invocation.status !== "awaiting-human-decision") {
+      // The durable pending request is the authority. During restart recovery the
+      // runner may briefly move queued -> running before it reopens the same waiter;
+      // accepting the decision in that window is safe and removes a user-visible race.
+      if (isInvocationTerminal(invocation.status) || invocation.status === "cancellation-requested") {
         throw new Error(`invocation ${invocation.id} is not awaiting a human decision`);
       }
       target.status = input.decision === "approve" ? "approved" : "rejected";
@@ -3146,6 +3250,17 @@ export class WorkbenchService {
           "running",
           detail?.kind === "idle-timeout" ? "idle-timeout" : "hard-timeout"
         );
+      } else if (event.type === "node.resources.waiting") {
+        const detail = event.detail as { resources?: string[] } | undefined;
+        await this.transitionInstance(
+          invocationId,
+          event.nodeId,
+          "waiting",
+          "waiting-resource",
+          detail?.resources?.length ? `等待独占资源：${detail.resources.join(", ")}` : "等待独占运行资源"
+        );
+      } else if (event.type === "node.resources.acquired") {
+        await this.transitionInstance(invocationId, event.nodeId, "running", "resource-acquired");
       } else if (event.type === "node.attempt.failed") {
         const detail = event.detail as { error?: string } | undefined;
         await this.transitionInstance(invocationId, event.nodeId, "running", "retrying", detail?.error);
@@ -3257,12 +3372,15 @@ export class WorkbenchService {
           budget: this.executionBudget ? new ExecutionBudget(this.executionBudget) : undefined,
           openHumanDecision: (request) => this.openHumanDecisionRequest(invocation, workflow, request),
           getCancellationEpoch: () => this.snapshot().invocations[invocation.id]?.cancellation?.epoch ?? 0,
-          acquireNodePermit: async (node) => {
+          acquireNodePermit: async (node, onWait) => {
             const employee = employees.get(node.role);
             if (!employee) throw new Error(`runtime role ${node.role} is not materialized`);
-            const resources = employeeRuntimeResources(employee);
+            const resources = [
+              ...employeeRuntimeResources(employee),
+              ...nodeMutationResources(node, effectiveProviderCwd)
+            ];
             if (resources.length === 0) return undefined;
-            const release = await this.runtimeResources.acquire(resources);
+            const release = await this.runtimeResources.acquire(resources, onWait);
             return { release, resources };
           },
           prepareNode: async (node) => {
@@ -3386,6 +3504,8 @@ export class WorkbenchService {
               && candidate.target.id === workflow.id
               && candidate.source.project === invocation.source.project
               && candidate.source.taskId === invocation.source.taskId
+              && (!invocation.source.contextId?.startsWith("requirement-lineage:")
+                || candidate.source.contextId === invocation.source.contextId)
               && isInvocationTerminal(candidate.status))
             .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0]
         : undefined;
@@ -7855,8 +7975,9 @@ export class WorkbenchService {
 
   private async workflowInvocationReceipt(invocation: InvocationRecord): Promise<InvocationStartResult> {
     const initialCursor = invocationProgressCursor(await this.getInvocationProgress(invocation.id));
+    const projectedInvocation = withInvocationControl(invocation, Object.values(this.snapshot().invocations));
     return {
-      invocation,
+      invocation: projectedInvocation,
       runId: invocation.runId,
       ...(invocation.executionSnapshot?.workflow.architecture === "supervisor" && invocation.sessionId
         ? { leaderSessionId: invocation.sessionId }
@@ -7904,6 +8025,12 @@ export class WorkbenchService {
     options: { workflowVersion?: number; entrance?: EntrancePolicyExecutionSnapshot; providerCwd?: string } = {}
   ): Promise<InvocationStartResult> {
     const idempotencyKey = source.idempotencyKey?.trim();
+    const lineageContext = source.contextId?.startsWith("requirement-lineage:")
+      ? source.contextId
+      : undefined;
+    if (lineageContext && !idempotencyKey) {
+      throw new Error("requirement lineage workflow starts require an idempotency key");
+    }
     if (!idempotencyKey) return this.startWorkbenchWorkflowOnce(id, input, source, options);
     const fingerprint = workflowStartFingerprint(id, input, { ...source, idempotencyKey }, options);
 
@@ -7934,6 +8061,28 @@ export class WorkbenchService {
       }
       return pending.receipt;
     }
+
+    const lineageKey = lineageContext
+      ? `${source.project ?? ""}\u0000${source.taskId ?? ""}\u0000${lineageContext}`
+      : undefined;
+    if (lineageKey) {
+      const activeLineageInvocation = Object.values(this.snapshot().invocations).find((candidate) => (
+        candidate.source.project === source.project
+        && candidate.source.taskId === source.taskId
+        && candidate.source.contextId === lineageContext
+        && !isInvocationTerminal(candidate.status)
+      ));
+      if (activeLineageInvocation) {
+        throw new Error(
+          `requirement lineage already has active Invocation ${activeLineageInvocation.id}; wait for it to end before starting a successor`
+        );
+      }
+      const claimedBy = this.activeLineageStarts.get(lineageKey);
+      if (claimedBy) {
+        throw new Error(`requirement lineage is already starting cycle ${claimedBy}`);
+      }
+      this.activeLineageStarts.set(lineageKey, idempotencyKey);
+    }
     const started = this.startWorkbenchWorkflowOnce(id, input, { ...source, idempotencyKey }, {
       ...options,
       idempotencyFingerprint: fingerprint
@@ -7944,6 +8093,9 @@ export class WorkbenchService {
     } finally {
       if (this.idempotentWorkflowStarts.get(idempotencyKey)?.receipt === started) {
         this.idempotentWorkflowStarts.delete(idempotencyKey);
+      }
+      if (lineageKey && this.activeLineageStarts.get(lineageKey) === idempotencyKey) {
+        this.activeLineageStarts.delete(lineageKey);
       }
     }
   }
@@ -8219,6 +8371,10 @@ export class WorkbenchService {
       const enriched = this.classifyRunSummary(run, invocation);
       const invocationContext = invocation ? {
         id: invocation.id,
+        status: invocation.status,
+        source: invocation.source,
+        ...(invocation.cancellation ? { cancellation: invocation.cancellation } : {}),
+        control: invocationControlProjection(invocation, Object.values(this.snapshot().invocations)),
         requestSummary: invocation.requestSummary,
         ...(invocation.requestText ? { requestText: invocation.requestText } : {}),
         ...(invocation.taskDescription ? { taskDescription: invocation.taskDescription } : {})
@@ -8667,7 +8823,8 @@ export class WorkbenchService {
             `冲突修复后候选 commit：${sourceCommit}`,
             `候选 revision：${snapshot.revision}`,
             "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。请在原候选 worktree 上执行独立测试，界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码或 Git 历史。",
-            "结构化输出必须原样包含 url、sourceCommit、candidateRevision。测试、环境或证据有任一缺口必须返回 Block；只有可复现且证据充分才返回 Pass。"
+            `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${candidatePreview.url}；sourceCommit=${sourceCommit}；candidateRevision=${snapshot.revision}。`,
+            "服务端还会独立校验候选真实 GET、工作区 commit 与 revision；不得只复述身份而改用其他页面测试。测试、环境或证据有任一缺口必须返回 Block；只有可复现且证据充分才返回 Pass。"
           ].join("\n"),
           "system:merge-conflict-retest"
         );
@@ -9117,7 +9274,9 @@ export class WorkbenchService {
     } catch { /* legacy Run without a manifest */ }
     const receipt = receiptFor(
       { ...run, ...(runManifest.budget ? { budget: runManifest.budget } : {}) },
-      invocation as unknown as Record<string, unknown> | undefined
+      invocation
+        ? withInvocationControl(invocation, Object.values(this.snapshot().invocations)) as unknown as Record<string, unknown>
+        : undefined
     );
     const definitions = [
       ["run", "run.json"], ["events", "events.jsonl"], ["checkpoint", "checkpoint.json"],

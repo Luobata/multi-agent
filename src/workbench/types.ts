@@ -645,6 +645,37 @@ export interface CancellationRecord {
   acknowledgedAt?: string;
 }
 
+export type InvocationControlAction =
+  | "monitor"
+  | "cancel"
+  | "decide"
+  | "review-delivery"
+  | "view-evidence"
+  | "retry-successor"
+  | "restart-successor"
+  | "abandon-goal";
+
+/**
+ * Additive compatibility projection. Runtime status remains the immutable Attempt
+ * evidence; this projection explains ownership and legal next actions without
+ * making clients infer them from status strings or error prose.
+ */
+export interface InvocationControlProjection {
+  schemaVersion: 1;
+  attempt: {
+    phase: "queued" | "active" | "waiting" | "ended";
+    outcome?: "succeeded" | "blocked" | "failed" | "cancelled";
+  };
+  goal: { state: "active" | "attention" | "satisfied" };
+  owner: "runtime" | "user" | "configuration-owner" | "none";
+  allowedActions: InvocationControlAction[];
+  lineage?: {
+    rootInvocationId: string;
+    predecessorInvocationId?: string;
+    cycle: number;
+  };
+}
+
 export type HumanDecisionRequestStatus = "pending" | "approved" | "rejected" | "voided";
 
 /** Durable control-plane record pinned to the exact Supervisor decision that created it. */
@@ -729,6 +760,8 @@ export interface InvocationRecord {
   };
   error?: string;
   cancellation?: CancellationRecord;
+  /** Derived at read/event boundaries; legacy persisted records need no migration. */
+  control?: InvocationControlProjection;
   createdAt: string;
   startedAt?: string;
   updatedAt: string;

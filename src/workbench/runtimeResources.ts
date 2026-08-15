@@ -1,6 +1,9 @@
+import path from "node:path";
+import type { ExecutionPlanNode } from "../core/types.js";
 import type { EmployeeDefinition } from "./types.js";
 
 export const MIDSCENE_BROWSER_RESOURCE = "midscene-browser";
+export const WORKSPACE_MUTATION_RESOURCE_PREFIX = "workspace-mutation:";
 
 function enabledSkillIds(employee: EmployeeDefinition): Set<string> {
   return new Set(employee.skills.flatMap((binding) => {
@@ -15,13 +18,26 @@ export function employeeRuntimeResources(employee: EmployeeDefinition): string[]
   return skills.has("browser-e2e-validation") ? [MIDSCENE_BROWSER_RESOURCE] : [];
 }
 
+/** Serializes mutation-capable Supervisor nodes that share one physical checkout/worktree. */
+export function nodeMutationResources(node: ExecutionPlanNode, providerCwd: string | undefined): string[] {
+  const workKind = typeof node.metadata?.workKind === "string"
+    ? node.metadata.workKind
+    : typeof node.with.__workKind === "string"
+      ? node.with.__workKind
+      : undefined;
+  if (workKind !== "code" && workKind !== "integration") return [];
+  return [`${WORKSPACE_MUTATION_RESOURCE_PREFIX}${path.resolve(providerCwd ?? ".")}`];
+}
+
 /** Fair, process-local exclusive queue for adapters that cannot be shared concurrently. */
 export class ExclusiveRuntimeResourceQueue {
   private readonly tails = new Map<string, Promise<void>>();
 
-  async acquire(resources: string[]): Promise<() => void> {
+  async acquire(resources: string[], onWait?: (resources: string[]) => void | Promise<void>): Promise<() => void> {
     const releases: Array<() => void> = [];
-    for (const resource of [...new Set(resources)].sort()) {
+    const normalized = [...new Set(resources)].sort();
+    if (normalized.some((resource) => this.tails.has(resource))) await onWait?.(normalized);
+    for (const resource of normalized) {
       releases.push(await this.acquireOne(resource));
     }
     let released = false;

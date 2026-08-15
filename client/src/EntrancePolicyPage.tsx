@@ -418,9 +418,7 @@ function EvaluationDesk({ policy, data, notify }: { policy: EntrancePolicy; data
   const [evaluating, setEvaluating] = useState(false);
   const signalsIssue = objectIssue(signalsText, "Signals");
   const presets = [
-    { label: "动态重规划", value: { requiresDynamicReplanning: true } },
-    { label: "独立验收", value: { requiresIndependentValidation: true } },
-    { label: "多角色协作", value: { requiredRoleCount: 2 } }
+    { label: "显式交付领队（调试）", value: { explicitLeaderDelivery: true, deliveryTarget: "领队" } }
   ];
 
   useEffect(() => { setDecision(undefined); }, [policy.id, policy.version]);

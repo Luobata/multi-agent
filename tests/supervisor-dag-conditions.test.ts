@@ -35,8 +35,36 @@ describe("Supervisor DAG conditional dependencies", () => {
     expect(supervisorDagNodeReady(state.get("repair")!.node, state)).toBe(true);
     expect(supervisorDagNodeReady({ ...node("ordinary", ["validate"]) }, state)).toBe(false);
     expect(supervisorDagSnapshot(state)).toMatchObject({ nodes: [
-      expect.objectContaining({ nodeId: "validate", ready: true }),
+      expect.objectContaining({
+        nodeId: "validate",
+        ready: false,
+        whyNotRunning: [expect.objectContaining({ kind: "terminal", status: "blocked" })]
+      }),
       expect.objectContaining({ nodeId: "repair", ready: true, needsWhen: [{ nodeId: "validate", statuses: ["blocked", "failed"] }] })
+    ] });
+  });
+
+  it("explains every unmet dependency for a pending node", () => {
+    const dag: SupervisorDagConfig = { nodes: [
+      node("build"),
+      node("review"),
+      node("release", ["build", "review"])
+    ] };
+    const state = trackers(dag);
+    state.get("build")!.status = "running";
+    state.get("review")!.status = "blocked";
+
+    expect(supervisorDagSnapshot(state)).toMatchObject({ nodes: [
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        nodeId: "release",
+        ready: false,
+        whyNotRunning: [
+          { kind: "dependency", nodeId: "build", status: "running", expectedStatuses: ["passed"] },
+          { kind: "dependency", nodeId: "review", status: "blocked", expectedStatuses: ["passed"] }
+        ]
+      })
     ] });
   });
 

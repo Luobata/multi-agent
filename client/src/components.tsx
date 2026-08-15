@@ -311,6 +311,7 @@ const runtimeChipLabels: Record<RuntimeChipStatus, string> = {
   queued: "排队中",
   waiting: "等待中",
   running: "工作中",
+  "cancellation-requested": "正在取消",
   completed: "已完成",
   blocked: "已阻塞",
   failed: "故障",
@@ -331,6 +332,7 @@ export function employeeRuntimeStatus(
   instances: ReadonlyArray<Pick<WorkInstanceRecord, "status" | "updatedAt">>,
   now: number = Date.now()
 ): RuntimeChipStatus {
+  if (instances.some((instance) => instance.status === "cancellation-requested")) return "cancellation-requested";
   if (instances.some((instance) => instance.status === "running")) return "running";
   if (instances.some((instance) => instance.status === "waiting")) return "waiting";
   if (instances.some((instance) => instance.status === "queued")) return "queued";
@@ -379,6 +381,7 @@ function RuntimeChipShape({ status }: { status: RuntimeChipStatus }) {
   if (status === "queued") return <path d="M8 2.5 13.5 8 8 13.5 2.5 8Z" />;
   if (status === "waiting") return <circle cx="8" cy="8" r="5.25" />;
   if (status === "running") return <path d="M8 1.5 9.9 6.1 14.5 8 9.9 9.9 8 14.5 6.1 9.9 1.5 8 6.1 6.1Z" fill="currentColor" stroke="none" />;
+  if (status === "cancellation-requested") return <><circle cx="8" cy="8" r="5.25" /><path d="m5.5 5.5 5 5m0-5-5 5" /></>;
   if (status === "completed") return <path d="M4 3h3v2h2V3h3v2h1v5h-1v1h-1v1h-1v1h-1v1H7v-1H6v-1H5v-1H4v-1H3V5h1V3z" fill="currentColor" stroke="none" />;
   if (status === "failed") return <><path d="M8 2.5 14 13.5H2Z" /><path d="M8 6.5v3" /><path d="M8 11.25v1.5" /></>;
   if (status === "blocked") return <><rect x="3" y="3" width="10" height="10" /><path d="M5.5 8h5" /></>;

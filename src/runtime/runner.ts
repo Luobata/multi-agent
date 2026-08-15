@@ -64,7 +64,10 @@ export interface RunWorkflowOptions {
    * session) exclusive without turning an Employee identity into a capacity
    * limit.
    */
-  acquireNodePermit?: (node: ExecutionPlanNode) => Promise<{
+  acquireNodePermit?: (
+    node: ExecutionPlanNode,
+    onWait: (resources: string[]) => Promise<void>
+  ) => Promise<{
     release: () => void | Promise<void>;
     resources?: string[];
   } | undefined>;
@@ -392,12 +395,28 @@ async function executeNode(
             await emit("node.authorization.compatibility-warning", node.id, { warning: authorization.compatibilityWarning });
           }
           if (authorization.decision === "approval-required" && governance.openHumanDecision) {
-            const opened = await governance.openHumanDecision({
+            const decisionRequest: RuntimeHumanDecisionRequest = {
               nodeId: node.id,
               round: Number(node.metadata?.round ?? 1),
               riskCategory: "irreversible-other",
               summary: authorization.reason ?? `Approval required for ${intent.capability}`,
               proposedAction: { action: "authorize-side-effect", intent: intent as unknown as JsonValue }
+            };
+            // Release the process-owned lease before exposing the durable request. If the daemon
+            // exits in the narrow hand-off window, recovery can safely recreate the same request
+            // through its deterministic idempotency key instead of waiting for a stale lease.
+            await emit("human-decision.suspending", node.id, {
+              round: decisionRequest.round,
+              riskCategory: decisionRequest.riskCategory,
+              summary: decisionRequest.summary
+            });
+            const opened = await governance.openHumanDecision(decisionRequest);
+            await emit("human-decision.requested", node.id, {
+              requestId: opened.requestId,
+              round: decisionRequest.round,
+              riskCategory: decisionRequest.riskCategory,
+              summary: decisionRequest.summary,
+              proposedAction: decisionRequest.proposedAction
             });
             const outcome = await opened.decision;
             if (outcome.decision === "rejected") {
@@ -670,7 +689,15 @@ export async function runWorkflow(
       const next: Checkpoint<RuntimeCheckpointValue> = {
         ...checkpoint,
         revision: checkpoint.revision + 1,
-        leaseExpiresAt: new Date(Date.now() + (/^run\.(?:passed|blocked|failed)$/.test(type) ? 0 : 30_000)).toISOString(),
+        // Human input is a durable suspension boundary, not a process-owned wait.
+        // Releasing the lease lets a restarted daemon reacquire and rebuild the waiter.
+        leaseExpiresAt: new Date(Date.now() + (
+          /^run\.(?:passed|blocked|failed)$/.test(type)
+            || type === "human-decision.suspending"
+            || type === "human-decision.requested"
+            ? 0
+            : 30_000
+        )).toISOString(),
         value: { runStatus: run.status, cancellationEpoch, ...(budget ? { budget: budget.snapshot() } : {}) }
       };
       await store.commitCheckpoint(next, checkpoint.revision);
@@ -759,7 +786,9 @@ export async function runWorkflow(
     }
     let permit: Awaited<ReturnType<NonNullable<RunWorkflowOptions["acquireNodePermit"]>>> = undefined;
     try {
-      permit = await options.acquireNodePermit?.(prepared.node);
+      permit = await options.acquireNodePermit?.(prepared.node, async (resources) => {
+        await emit("node.resources.waiting", prepared.node.id, { resources });
+      });
       if (permit?.resources?.length) {
         await emit("node.resources.acquired", prepared.node.id, { resources: permit.resources });
       }
@@ -846,6 +875,14 @@ export async function runWorkflow(
       },
       requestHumanDecision: options.openHumanDecision
         ? async (request) => {
+            // The suspension checkpoint must be durable before the request becomes visible in
+            // the Workbench store. This closes the restart race between those two persistence
+            // layers while the deterministic request key keeps replay idempotent.
+            await emit("human-decision.suspending", request.nodeId, {
+              round: request.round,
+              riskCategory: request.riskCategory,
+              summary: request.summary
+            });
             const opened = await options.openHumanDecision!(request);
             await emit("human-decision.requested", request.nodeId, {
               requestId: opened.requestId,

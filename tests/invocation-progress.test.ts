@@ -120,6 +120,55 @@ describe("computeInvocationProgress", () => {
     expect(progress.leaderReport.delegations).toBe(2);
   });
 
+  it("projects durable supervisor state and includes its revision in the wait cursor sequence", () => {
+    const detail: InvocationDetail = {
+      invocation: invocation({ transitions: [{ status: "running", phase: "executing", at: timestamp }] }),
+      instances: [instance({
+        nodeId: "implement",
+        status: "running",
+        phase: "provider",
+        transitions: [{ status: "running", phase: "provider", at: timestamp }]
+      })],
+      run: {
+        id: "run-abc",
+        status: "running",
+        architectureState: {
+          schemaVersion: 1,
+          kind: "supervisor",
+          sequence: 4,
+          round: 2,
+          planRevision: 1,
+          scheduling: {
+            mode: "iterative",
+            schedulerVersion: 1,
+            compiledDispatchEnabled: false,
+            shadowReadyNodeIds: []
+          },
+          dag: {
+            nodes: [{
+              nodeId: "verify",
+              status: "pending",
+              ready: false,
+              whyNotRunning: [{ kind: "dependency", nodeId: "implement", status: "running", expectedStatuses: ["passed"] }]
+            }]
+          }
+        },
+        nodes: {}
+      }
+    };
+
+    const progress = computeInvocationProgress(detail);
+
+    expect(progress.sequence).toBe(6);
+    expect(progress.supervisor).toMatchObject({
+      kind: "supervisor",
+      sequence: 4,
+      planRevision: 1,
+      scheduling: { mode: "iterative", compiledDispatchEnabled: false },
+      dag: { nodes: [expect.objectContaining({ nodeId: "verify", ready: false })] }
+    });
+  });
+
   it("surfaces a TODO plan and one retained member session as one progress step", () => {
     const detail: InvocationDetail = {
       invocation: invocation({

@@ -154,7 +154,13 @@ export async function retentionPreview(dataRoot: string, state: WorkbenchState, 
 export function receiptFor(run: Record<string, unknown> | null, invocation?: Record<string, unknown>): Record<string, unknown> {
   if (!run) throw new Error("run not found");
   const status = String(run.status ?? invocation?.status ?? "unavailable"); const legacy = !("phase" in run) || !("budget" in run);
-  return { runId: run.id ?? invocation?.runId, status, phase: run.phase ?? "unavailable", failure: run.failure ?? { category: "unavailable", kind: "legacy", retryable: false }, budget: run.budget ?? { used: "unavailable", remaining: "unavailable" }, cancellation: run.cancellation ?? { requested: invocation?.status === "cancellation-requested" }, target: invocation?.target ?? "unavailable", publicationVersion: invocation?.source && typeof invocation.source === "object" ? (invocation.source as Record<string, unknown>).publicationVersion ?? "unavailable" : "unavailable", policyPack: run.policyPack ?? "unavailable", nextAction: ACTIVE.has(status) ? "monitor" : status === "failed" ? "retry" : "none", evidence: run.evidence ?? ["prompt", "raw", "result", "events", "preflight", "checkpoint", "context", "output-validation"].map(kind => ({ kind, status: "unavailable" })), legacy };
+  const control = invocation?.control && typeof invocation.control === "object"
+    ? invocation.control as { allowedActions?: unknown }
+    : undefined;
+  const allowedActions = Array.isArray(control?.allowedActions)
+    ? control.allowedActions.filter((action): action is string => typeof action === "string")
+    : ACTIVE.has(String(invocation?.status ?? status)) ? ["monitor"] : status === "failed" ? ["retry-successor"] : ["view-evidence"];
+  return { runId: run.id ?? invocation?.runId, status, phase: run.phase ?? "unavailable", failure: run.failure ?? { category: "unavailable", kind: "legacy", retryable: false }, budget: run.budget ?? { used: "unavailable", remaining: "unavailable" }, cancellation: run.cancellation ?? { requested: invocation?.status === "cancellation-requested" }, target: invocation?.target ?? "unavailable", publicationVersion: invocation?.source && typeof invocation.source === "object" ? (invocation.source as Record<string, unknown>).publicationVersion ?? "unavailable" : "unavailable", policyPack: run.policyPack ?? "unavailable", nextAction: allowedActions[0] ?? "view-evidence", allowedActions, ...(control ? { control } : {}), evidence: run.evidence ?? ["prompt", "raw", "result", "events", "preflight", "checkpoint", "context", "output-validation"].map(kind => ({ kind, status: "unavailable" })), legacy };
 }
 
 export function assertSafeOutputPath(target: string, allowedRoot: string): string {

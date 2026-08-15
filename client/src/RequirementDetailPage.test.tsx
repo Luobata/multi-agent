@@ -21,6 +21,8 @@ const project: Project = {
     config: {
       requirementAdvancement: {
         entrancePolicyId: "default-task-entrance-policy",
+        triggerMode: "explicit-delivery",
+        deliveryTargets: ["小米汪"],
         candidateUrl: "http://127.0.0.1:4319",
         polling: { enabled: false, intervalMs: 15_000 }
       }
@@ -116,6 +118,15 @@ function button(label: string): HTMLButtonElement {
   return found;
 }
 
+function enterDeliveryCommand(value = "交付领队"): void {
+  const input = document.querySelector<HTMLInputElement>('[aria-describedby="delivery-command-hint"]');
+  if (!input) throw new Error("delivery command input not found");
+  act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 describe("RequirementDetailPage advancement launch", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -170,6 +181,8 @@ describe("RequirementDetailPage advancement launch", () => {
     />));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
 
+    expect(button("开始推进").disabled).toBe(true);
+    enterDeliveryCommand();
     expect(button("开始推进").disabled).toBe(false);
     await act(async () => { button("开始推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(evaluate).toHaveBeenCalledOnce();
@@ -188,7 +201,7 @@ describe("RequirementDetailPage advancement launch", () => {
       new RegExp(`^requirement:${project.id}:${requirement.id}:advance:1:`)
     );
     expect(dispatch.mock.calls[0]![1].source.contextId).toBe(
-      `requirement-run:${dispatch.mock.calls[0]![1].source.idempotencyKey}`
+      `requirement-lineage:${(await service.getRequirement(requirement.id)).advancement?.lineageId}`
     );
     expect(await service.getRequirement(requirement.id)).toMatchObject({
       lane: "queued",
@@ -230,6 +243,7 @@ describe("RequirementDetailPage advancement launch", () => {
       gateway={{ evaluate, dispatch: vi.fn(), refreshWorkflowReferences }}
     />));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    enterDeliveryCommand();
     await act(async () => { button("开始推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
 
     expect(refreshWorkflowReferences).toHaveBeenCalledWith(workflow.id);
@@ -368,6 +382,7 @@ describe("RequirementDetailPage advancement launch", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
 
     expect(button("查看上次 Run")).toBeTruthy();
+    enterDeliveryCommand();
     expect(button("重新推进").disabled).toBe(false);
     await act(async () => { button("重新推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(gateway.evaluate).toHaveBeenCalledOnce();
@@ -413,6 +428,7 @@ describe("RequirementDetailPage advancement launch", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
 
     expect(button("查看上次 Run")).toBeTruthy();
+    enterDeliveryCommand();
     expect(button("重新推进").disabled).toBe(false);
     await act(async () => { button("重新推进").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(gateway.evaluate).toHaveBeenCalledOnce();
