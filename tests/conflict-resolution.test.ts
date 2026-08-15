@@ -7,6 +7,9 @@ import {
   buildConflictPlanningRequest,
   buildLeaderRevalidationRequest,
   hasExplicitDeliveryPass,
+  classifyConflictRetestFailure,
+  validateCandidateWorkspaceState,
+  validateConflictRetestEvidence,
   selectConflictExecutionRole
 } from "../src/workbench/conflictResolution.js";
 
@@ -57,5 +60,29 @@ describe("merge conflict leader protocol", () => {
     expect(prompt).toContain(LEADER_REVALIDATION_PASS);
     expect(hasExplicitDeliveryPass(undefined, `done\n${LEADER_REVALIDATION_PASS}`, LEADER_REVALIDATION_PASS)).toBe(true);
     expect(hasExplicitDeliveryPass({ verdict: "block" }, "looks fine", LEADER_REVALIDATION_PASS)).toBe(false);
+  });
+
+  it("deterministically rejects evidence from main or another revision", () => {
+    const expected = { url: "http://127.0.0.1:49231/", sourceCommit: "source-1", candidateRevision: "revision-1" };
+    expect(validateConflictRetestEvidence({ ...expected, verdict: "pass" }, expected)).toEqual([]);
+    const issues = validateConflictRetestEvidence({ ...expected, url: "http://127.0.0.1:4318/", candidateRevision: "main" }, expected);
+    expect(issues).toHaveLength(2);
+    expect(classifyConflictRetestFailure("passed", issues)).toBe("evidence-incomplete");
+    expect(classifyConflictRetestFailure("browser environment unavailable", [])).toBe("environment-blocked");
+    expect(classifyConflictRetestFailure("breadcrumb is missing", [])).toBe("product-failed");
+    expect(classifyConflictRetestFailure("browser shows missing checkout button", [])).toBe("product-failed");
+    expect(classifyConflictRetestFailure("browser failed to launch", ["url 未证明"])).toBe("environment-blocked");
+    expect(classifyConflictRetestFailure("leader says evidence is insufficient", [])).toBe("evidence-incomplete");
+  });
+
+  it("binds pre-test and post-test workspace state to the persisted source commit", () => {
+    const clean = { revision: "sha256:one", baseCommit: "source-1", changedFiles: [] };
+    expect(validateCandidateWorkspaceState(clean, { sourceCommit: "source-1" })).toEqual([]);
+    expect(validateCandidateWorkspaceState({ ...clean, baseCommit: "source-2" }, { sourceCommit: "source-1" })[0]).toContain("HEAD");
+    expect(validateCandidateWorkspaceState({ ...clean, changedFiles: ["client/src/App.tsx"] }, { sourceCommit: "source-1" })[0]).toContain("未提交改动");
+    expect(validateCandidateWorkspaceState({ ...clean, revision: "sha256:two" }, {
+      sourceCommit: "source-1",
+      revision: "sha256:one"
+    })[0]).toContain("测试期间变化");
   });
 });

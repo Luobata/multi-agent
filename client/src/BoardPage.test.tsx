@@ -1041,4 +1041,83 @@ describe("BoardPage AI requirement creation", () => {
     expect(notify).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("polls active merge delivery into an exact terminal blocker and then stops polling", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    const project = connectedProject();
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id,
+      title: "候选环境失败可见",
+      summary: "待合入卡片必须显示服务端真实终态",
+      priority: "high",
+      rawRequirement: "不要永久显示等待串行合入",
+      acceptanceCriteria: ["失败后看板显示候选环境阻塞"]
+    });
+    const runId = "run-conflict-poll";
+    await service.submitRequirementForAcceptance(requirement.id, {
+      runId,
+      eligible: true,
+      worktreePath: `/repo/.multi-agent/worktrees/${runId}`,
+      testGate: { gateId: "quality-test", status: "passed" },
+      reviewGate: { gateId: "independent-review", status: "passed" },
+      mediaCount: 1,
+      structuredE2eCount: 1,
+      diffFiles: ["client/src/BoardPage.tsx"],
+      capturedAt: "2026-08-15T07:00:00.000Z"
+    });
+    await service.syncRequirementDelivery(requirement.id, runId, "queued-for-merge");
+    const preview: RunMergePreview = {
+      runId,
+      status: "conflict",
+      eligible: false,
+      reasons: ["AI 冲突处理未通过"],
+      acceptanceReadiness: { ready: false, reasons: ["交付仍在冲突阶段"] },
+      worktreePath: `/repo/.multi-agent/worktrees/${runId}`,
+      repositoryRoot: "/repo",
+      targetBranch: "main",
+      targetClean: true,
+      changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 1024 } },
+      safeGitCommands: [],
+      evidence: { assets: [], structuredE2eCount: 1, acceptedVerdict: true, gates: [] },
+      delivery: {
+        runId,
+        status: "conflict",
+        updatedAt: "2026-08-15T07:01:00.000Z",
+        message: "受管候选预览启动失败；候选仍在待合入队列。",
+        conflictResolution: {
+          status: "failed",
+          targetCommit: "target-commit",
+          updatedAt: "2026-08-15T07:01:00.000Z",
+          failureClass: "environment-blocked",
+          message: "Vite 启动超时"
+        }
+      },
+      confirmationToken: `MERGE ${runId}`,
+      discardConfirmationToken: `DISCARD ${runId}`
+    };
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ data: preview }) });
+
+    act(() => root.render(<BoardPage
+      spaceId={project.id}
+      go={vi.fn()}
+      notify={vi.fn()}
+      service={service}
+      projects={[project]}
+    />));
+    for (let attempt = 0; attempt < 20 && (await service.getRequirement(requirement.id)).delivery?.conflictResolution?.status !== "failed"; attempt += 1) {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    }
+
+    expect(await service.getRequirement(requirement.id)).toMatchObject({
+      lane: "merging",
+      exception: "blocked",
+      delivery: { status: "conflict", conflictResolution: { status: "failed", failureClass: "environment-blocked" } }
+    });
+    const chip = [...container.querySelectorAll<HTMLElement>('[role="status"]')].find((item) => item.textContent === "候选环境阻塞");
+    expect(chip?.title).toBe("Vite 启动超时");
+    const callsAfterFailure = fetchMock.mock.calls.length;
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    expect(fetchMock).toHaveBeenCalledTimes(callsAfterFailure);
+  });
 });

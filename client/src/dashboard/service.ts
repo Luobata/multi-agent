@@ -16,6 +16,7 @@ import type {
   RequirementAdvancement,
   RequirementAdvancementStatus,
   RequirementDetail,
+  RequirementDeliveryProgress,
   RequirementEvidenceCapture,
   RequirementLane,
   RunAcceptanceSnapshot,
@@ -104,7 +105,8 @@ export interface DashboardService {
   syncRequirementDelivery(
     requirementId: string,
     runId: string,
-    status: "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance"
+    status: "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance",
+    observation?: Partial<Pick<RequirementDeliveryProgress, "serverUpdatedAt" | "conflictResolution" | "message">>
   ): Promise<Requirement>;
   /** 补采任务的持久化需求投影；不覆盖已经固定的 acceptance snapshot。 */
   syncRequirementEvidenceCapture(
@@ -890,7 +892,7 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         return { ...summary };
       });
     },
-    syncRequirementDelivery(requirementId, runId, status) {
+    syncRequirementDelivery(requirementId, runId, status, observation) {
       return respond(() => {
         const requirement = store.requirements.find((candidate) => candidate.id === requirementId);
         if (!requirement || requirement.archivedAt) throw failure("没有找到这条需求", "请回到需求看板重新选择", "未写入任何变更");
@@ -902,6 +904,16 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
             "需求列和验收快照均未改变"
           );
         }
+        const currentDelivery = requirement.delivery?.runId === runId ? requirement.delivery : undefined;
+        const effectiveServerUpdatedAt = observation?.serverUpdatedAt ?? currentDelivery?.serverUpdatedAt;
+        const currentServerTime = Date.parse(currentDelivery?.serverUpdatedAt ?? "");
+        const incomingServerTime = Date.parse(observation?.serverUpdatedAt ?? "");
+        if (Number.isFinite(currentServerTime) && Number.isFinite(incomingServerTime) && incomingServerTime < currentServerTime) {
+          return requirementSummary(requirement);
+        }
+        // A merged delivery is irreversible. A late queued/conflict response must
+        // never resurrect it even if a legacy caller omitted the server timestamp.
+        if (currentDelivery?.status === "merged" && status !== "merged") return requirementSummary(requirement);
         const lane: RequirementLane = status === "merged"
           ? "done"
           : status === "returned-to-acceptance"
@@ -911,12 +923,21 @@ export function createDashboardService(options: DashboardServiceOptions = {}): D
         if (requirement.lane === lane
           && requirement.exception === nextException
           && requirement.delivery?.runId === runId
-          && requirement.delivery.status === status) return requirementSummary(requirement);
+          && requirement.delivery.status === status
+          && requirement.delivery.serverUpdatedAt === effectiveServerUpdatedAt
+          && JSON.stringify(requirement.delivery.conflictResolution) === JSON.stringify(observation?.conflictResolution)
+          && requirement.delivery.message === observation?.message) return requirementSummary(requirement);
         const from = requirementLaneLabel(requirement.lane);
         requirement.lane = lane;
         requirement.exception = nextException;
         requirement.updatedAt = touch();
-        requirement.delivery = { runId, status, updatedAt: requirement.updatedAt };
+        requirement.delivery = {
+          runId,
+          status,
+          updatedAt: requirement.updatedAt,
+          ...(effectiveServerUpdatedAt ? { serverUpdatedAt: effectiveServerUpdatedAt } : {}),
+          ...observation
+        };
         record(
           status === "merged" ? "完成合入" : status === "conflict" ? "合入冲突" : lane === "acceptance" ? "退回验收" : "进入待合入",
           requirement.code,

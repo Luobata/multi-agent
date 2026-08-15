@@ -154,6 +154,14 @@ export interface RequirementDeliveryProgress {
   runId: string;
   status: "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance";
   updatedAt: string;
+  /** Authoritative delivery.json timestamp used to reject out-of-order poll responses. */
+  serverUpdatedAt?: string;
+  conflictResolution?: {
+    status: "resolving" | "retesting" | "leader-review" | "passed" | "failed";
+    failureClass?: "environment-blocked" | "evidence-incomplete" | "product-failed";
+    message?: string;
+  };
+  message?: string;
 }
 
 export interface RequirementEvidenceCapture {

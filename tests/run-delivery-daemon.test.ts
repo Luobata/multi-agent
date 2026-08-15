@@ -12,7 +12,8 @@ import {
   queueAcceptedRun,
   transitionRunDelivery,
   updateRunDelivery,
-  type RunMergePreview
+  type RunMergePreview,
+  type RunMergeQueueResult
 } from "../src/runtime/worktreeDelivery.js";
 import { WorkbenchService } from "../src/workbench/service.js";
 
@@ -309,7 +310,7 @@ describe("run delivery daemon routes", () => {
       body: { confirmation: "MERGE another-run", targetBranch: "main" }
     });
     expect(rejected.status).toBe(400);
-    expect(rejected.json).toMatchObject({ error: { message: expect.stringContaining("明确合并确认") } });
+    expect(rejected.json).toMatchObject({ error: { message: expect.stringContaining("直接合入接口已停用") } });
     expect(git(repo, "rev-parse", "HEAD")).toBe(headBefore);
 
     const queued = await invokeRoute(app, "post", "/api/runs/:id/merge-queue", {
@@ -464,5 +465,118 @@ describe("run delivery daemon routes", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     expect(fs.existsSync(worktree!.path)).toBe(false);
+  }, 15_000);
+
+  it("retries a failed rebased conflict at retesting instead of bypassing candidate validation", async () => {
+    const dataRoot = temporaryRoot("multi-agent-delivery-conflict-retry-data-");
+    const repo = repository();
+    const runId = "run-delivery-conflict-retry-1";
+    const worktree = await createRunWorktree(repo, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), "rebased candidate\n", "utf8");
+
+    const runDir = path.join(dataRoot, "artifacts", "runs", runId);
+    fs.mkdirSync(path.join(runDir, "evidence"), { recursive: true });
+    fs.writeFileSync(path.join(runDir, "evidence", "acceptance.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const run: WorkflowRunRecord = {
+      id: runId,
+      workflow: "delivery-conflict-retry",
+      architecture: "supervisor",
+      manifestPath: path.join(runDir, "multi-agent.yaml"),
+      artifactDir: runDir,
+      status: "passed",
+      createdAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      isolation: { mode: "worktree", worktreePath: worktree!.path, baseCommit: worktree!.baseCommit },
+      output: { gates: [
+        { gateId: "quality-test", requiredCapability: "quality.test", mode: "before-completion", required: true, status: "passed" },
+        { gateId: "quality-audit", requiredCapability: "quality.audit", mode: "before-completion", required: true, status: "passed" }
+      ] },
+      nodes: { tester: {
+        nodeId: "tester", roleId: "test-engineer", status: "passed", attempts: 1,
+        output: { verdict: "pass", e2eEvidence: [{ method: "browser", steps: "validate", observed: "passed" }] }
+      } }
+    };
+    fs.writeFileSync(path.join(runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`, "utf8");
+    const queued = await queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      actor: "daemon-reviewer"
+    });
+    await updateRunDelivery(runDir, runId, (current) => ({
+      ...current!,
+      runId,
+      status: "conflict",
+      updatedAt: new Date().toISOString(),
+      message: "Candidate environment validation failed.",
+      conflictResolution: {
+        status: "failed",
+        targetCommit: queued.delivery.baseCommit!,
+        updatedAt: new Date().toISOString(),
+        failureClass: "environment-blocked",
+        testRunId: "stale-test-run",
+        testedSourceCommit: queued.delivery.sourceCommit,
+        testedCandidateRevision: "sha256:stale",
+        testedUrl: "http://127.0.0.1:4318/",
+        leaderReviewRunId: "stale-leader-run",
+        message: "Managed preview was unavailable."
+      },
+      mergeValidation: {
+        required: true,
+        status: "failed",
+        runId: "stale-validation-run",
+        targetCommit: queued.delivery.baseCommit,
+        message: "Stale validation failure.",
+        updatedAt: new Date().toISOString()
+      }
+    }));
+
+    const service = await WorkbenchService.open({ dataRoot });
+    const app = createDaemonApp(service, { staticDir: path.join(dataRoot, "missing-client") });
+    const retried = await invokeRoute(app, "post", "/api/runs/:id/merge-conflict-retry", {
+      params: { id: runId },
+      body: { actor: "daemon-reviewer" }
+    });
+    expect(retried.status).toBe(202);
+    expect(retried.json).toMatchObject({ data: {
+      status: "retesting",
+      delivery: {
+        status: "retesting",
+        sourceCommit: queued.delivery.sourceCommit,
+        baseCommit: queued.delivery.baseCommit,
+        queuedTargetCommit: queued.delivery.queuedTargetCommit,
+        conflictResolution: { status: "retesting", targetCommit: queued.delivery.baseCommit }
+      }
+    } });
+    const retriedDelivery = (retried.json as { data: RunMergeQueueResult }).data.delivery;
+    expect(retriedDelivery.conflictResolution?.testRunId).toBeUndefined();
+    expect(retriedDelivery.conflictResolution?.testedSourceCommit).toBeUndefined();
+    expect(retriedDelivery.conflictResolution?.testedCandidateRevision).toBeUndefined();
+    expect(retriedDelivery.conflictResolution?.testedUrl).toBeUndefined();
+    expect(retriedDelivery.conflictResolution?.leaderReviewRunId).toBeUndefined();
+    expect(retriedDelivery.mergeValidation).toMatchObject({
+      required: true,
+      status: "running",
+      targetCommit: queued.delivery.baseCommit,
+      message: expect.stringContaining("已失效")
+    });
+    expect(retriedDelivery.mergeValidation?.runId).toBeUndefined();
+
+    let stopped: RunMergePreview | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const response = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
+      stopped = (response.json as { data: RunMergePreview }).data;
+      if (stopped.status === "conflict" && stopped.delivery?.conflictResolution?.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(stopped).toMatchObject({
+      status: "conflict",
+      delivery: {
+        sourceCommit: queued.delivery.sourceCommit,
+        conflictResolution: { status: "failed", targetCommit: queued.delivery.baseCommit },
+        message: expect.stringContaining("候选仍在待合入队列")
+      }
+    });
+    expect(git(repo, "rev-parse", "HEAD")).toBe(queued.delivery.baseCommit);
   }, 15_000);
 });

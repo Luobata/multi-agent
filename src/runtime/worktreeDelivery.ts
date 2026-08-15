@@ -27,6 +27,7 @@ export type DeliveryStatus =
 
 export type EvidenceRerunStatus = "queued" | "running" | "passed" | "failed";
 export type ConflictResolutionStatus = "resolving" | "retesting" | "leader-review" | "passed" | "failed";
+export type ConflictRetestFailure = "environment-blocked" | "evidence-incomplete" | "product-failed";
 
 export interface RunEvidenceAsset {
   id: string;
@@ -72,6 +73,10 @@ export interface RunDeliveryRecord {
     executionRoleId?: string;
     resolutionRunId?: string;
     testRunId?: string;
+    testedSourceCommit?: string;
+    testedCandidateRevision?: string;
+    testedUrl?: string;
+    failureClass?: ConflictRetestFailure;
     leaderReviewRunId?: string;
     message?: string;
   };
@@ -192,8 +197,15 @@ export interface RunMergeResult {
 }
 
 export interface RunMergeQueueResult {
-  status: "queued-for-merge";
+  status: "queued-for-merge" | "retesting" | "conflict";
   delivery: RunDeliveryRecord;
+}
+
+export class TargetChangedAfterValidationError extends Error {
+  constructor() {
+    super("目标分支 commit 在验证后再次变化，禁止合入未经测试的新组合");
+    this.name = "TargetChangedAfterValidationError";
+  }
 }
 
 export interface QueuedRunAssessment {
@@ -1079,7 +1091,13 @@ export async function removeMergeValidationWorktree(input: MergeValidationWorktr
 export async function mergeAcceptedRun(
   run: WorkflowRunRecord,
   runDir: string,
-  input: { confirmation: string; targetBranch: string }
+  input: {
+    confirmation: string;
+    targetBranch: string;
+    expectedTargetCommit: string;
+    /** Deterministic synchronization point for the target-ref race regression. Production callers omit it. */
+    beforeTargetCompareAndSwap?: () => void | Promise<void>;
+  }
 ): Promise<RunMergeResult> {
   if (input.confirmation !== confirmationToken(run.id)) throw new Error("缺少本次 Run 的明确合并确认");
   const preview = await previewRunMerge(run, runDir);
@@ -1089,6 +1107,9 @@ export async function mergeAcceptedRun(
   if (input.targetBranch !== preview.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
   const before = await currentTargetState(preview.repositoryRoot);
   if (before.branch !== input.targetBranch) throw new Error("目标分支已变化，请重新打开预览确认");
+  if (before.commit !== input.expectedTargetCommit) {
+    throw new TargetChangedAfterValidationError();
+  }
 
   const delivery = await ensureDeliverySource(run, runDir, preview, before);
   if (!delivery.baseCommit || !delivery.sourceBranch || !delivery.sourceCommit || !delivery.targetBranch) {
@@ -1113,26 +1134,48 @@ export async function mergeAcceptedRun(
 
   const ready = await currentTargetState(preview.repositoryRoot);
   if (ready.branch !== before.branch || ready.commit !== before.commit) {
-    throw new Error("目标分支或 commit 已变化，请重新打开预览确认");
+    throw new TargetChangedAfterValidationError();
   }
 
-  const merged = await runGit(preview.repositoryRoot, [
-    "merge", "--no-ff", "--no-edit", "--no-verify", delivery.sourceCommit
+  const tree = mergeCheck.stdout.split("\n", 1)[0]?.trim();
+  if (!tree || !FULL_COMMIT.test(tree)) throw new Error("合入预检没有生成可验证的 tree object");
+  const prepared = await runGit(preview.repositoryRoot, [
+    "commit-tree", tree,
+    "-p", before.commit,
+    "-p", delivery.sourceCommit,
+    "-m", `Merge ${delivery.sourceBranch} into ${before.branch}`
   ]);
-  if (merged.code !== 0) {
-    const mergeHead = await runGit(preview.repositoryRoot, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
-    if (mergeHead.code === 0) await runGit(preview.repositoryRoot, ["merge", "--abort"]);
-    const conflict: RunDeliveryRecord = {
-      ...delivery,
-      status: "conflict",
-      updatedAt: new Date().toISOString(),
-      targetBranch: before.branch,
-      targetCommitBeforeMerge: before.commit,
-      message: (merged.stderr.trim() || merged.stdout.trim() || "合并失败，目标分支已恢复").slice(0, 8_000)
-    };
-    await writeRunDelivery(runDir, conflict);
-    return { status: "conflict", delivery: conflict };
+  if (prepared.code !== 0) {
+    throw new Error(prepared.stderr.trim() || prepared.stdout.trim() || "无法构造受验证的 merge commit");
   }
+  const mergeCommit = prepared.stdout.trim();
+  if (!FULL_COMMIT.test(mergeCommit)) throw new Error("构造的 merge commit 不是完整 commit");
+  const parents = (await git(preview.repositoryRoot, ["rev-list", "--parents", "-n", "1", mergeCommit])).split(" ");
+  if (parents.length !== 3 || parents[1] !== input.expectedTargetCommit || parents[2] !== delivery.sourceCommit) {
+    throw new Error("构造的 merge commit 双亲与已验证 target/source 不一致");
+  }
+
+  await input.beforeTargetCompareAndSwap?.();
+  const targetRef = `refs/heads/${before.branch}`;
+  const updated = await runGit(preview.repositoryRoot, [
+    "update-ref", targetRef, mergeCommit, input.expectedTargetCommit
+  ]);
+  if (updated.code !== 0) throw new TargetChangedAfterValidationError();
+
+  // update-ref supplies the atomic compare-and-swap guarantee; read-tree only
+  // synchronizes the already checked-out target worktree and never rewrites the ref.
+  const synchronized = await runGit(preview.repositoryRoot, ["read-tree", "--reset", "-u", mergeCommit]);
+  if (synchronized.code !== 0) {
+    const rolledBack = await runGit(preview.repositoryRoot, [
+      "update-ref", targetRef, input.expectedTargetCommit, mergeCommit
+    ]);
+    if (rolledBack.code === 0) {
+      await runGit(preview.repositoryRoot, ["read-tree", "--reset", "-u", input.expectedTargetCommit]);
+    }
+    throw new Error(synchronized.stderr.trim() || synchronized.stdout.trim() || "目标 ref 已更新但工作区同步失败");
+  }
+  const appliedTarget = await git(preview.repositoryRoot, ["rev-parse", targetRef]);
+  if (appliedTarget !== mergeCommit) throw new TargetChangedAfterValidationError();
 
   const record: RunDeliveryRecord = {
     ...delivery,
@@ -1140,7 +1183,7 @@ export async function mergeAcceptedRun(
     updatedAt: new Date().toISOString(),
     targetBranch: before.branch,
     targetCommitBeforeMerge: before.commit,
-    mergeCommit: await git(preview.repositoryRoot, ["rev-parse", "HEAD"]),
+    mergeCommit,
     message: "用户确认后已合并；源分支保留作为交付证据。"
   };
   await writeRunDelivery(runDir, record);

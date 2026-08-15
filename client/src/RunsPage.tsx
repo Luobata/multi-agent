@@ -416,7 +416,7 @@ function RunDeliveryPanel({
                     : undefined;
   const diff = preview.changes.unifiedDiff;
   return <div className="run-delivery-panel">
-    {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>{conflictResolution?.status === "resolving" ? "原领队正在规划并委派冲突修复" : conflictResolution?.status === "retesting" ? "冲突已解决，正在回跑测试" : conflictResolution?.status === "leader-review" ? "测试已通过，等待原领队放行" : conflictResolution?.status === "failed" ? "AI 冲突处理需要介入" : "目标分支存在合并冲突"}</strong><p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p>{conflictResolution?.leaderPlanRunId && <small>领队计划 Run：<code>{conflictResolution.leaderPlanRunId}</code></small>}{conflictResolution?.executionRoleId && <small>执行角色：<code>{conflictResolution.executionRoleId}</code></small>}{conflictResolution?.resolutionRunId && <small>工程修复 Run：<code>{conflictResolution.resolutionRunId}</code></small>}{conflictResolution?.testRunId && <small>复测 Run：<code>{conflictResolution.testRunId}</code></small>}{conflictResolution?.leaderReviewRunId && <small>领队复验 Run：<code>{conflictResolution.leaderReviewRunId}</code></small>}{conflictResolution?.status === "failed" && <button type="button" className="button secondary" disabled={conflictRetrying} aria-busy={conflictRetrying} onClick={onRetryConflict}>{conflictRetrying ? "正在重新排队…" : "重新让原领队处理冲突"}</button>}{conflictRetryError && <small className="inline-error">{conflictRetryError}</small>}</div>}
+    {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>{conflictResolution?.status === "resolving" ? "原领队正在规划并委派冲突修复" : conflictResolution?.status === "retesting" ? "冲突已解决，正在回跑测试" : conflictResolution?.status === "leader-review" ? "测试已通过，等待原领队放行" : conflictResolution?.status === "failed" ? (conflictResolution.failureClass === "environment-blocked" ? "候选环境阻塞，可重试验收" : conflictResolution.failureClass === "evidence-incomplete" ? "候选证据不完整，不得放行" : "候选产品回归失败") : "目标分支存在合并冲突"}</strong><p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p>{conflictResolution?.leaderPlanRunId && <small>领队计划 Run：<code>{conflictResolution.leaderPlanRunId}</code></small>}{conflictResolution?.executionRoleId && <small>执行角色：<code>{conflictResolution.executionRoleId}</code></small>}{conflictResolution?.resolutionRunId && <small>工程修复 Run：<code>{conflictResolution.resolutionRunId}</code></small>}{conflictResolution?.testRunId && <small>复测 Run：<code>{conflictResolution.testRunId}</code></small>}{conflictResolution?.testedUrl && <small>受管候选：<code>{conflictResolution.testedUrl}</code></small>}{conflictResolution?.leaderReviewRunId && <small>领队复验 Run：<code>{conflictResolution.leaderReviewRunId}</code></small>}{conflictResolution?.status === "failed" && <button type="button" className="button secondary" disabled={conflictRetrying} aria-busy={conflictRetrying} onClick={onRetryConflict}>{conflictRetrying ? "正在重新排队…" : "重新让原领队处理冲突"}</button>}{conflictRetryError && <small className="inline-error">{conflictRetryError}</small>}</div>}
     {queued && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>已进入待合入队列</strong><p>{preview.delivery?.message ?? "同一目标分支上的候选会按批准顺序串行处理。"}</p></div>}
     {retesting && <div className="run-delivery-callout run-delivery-callout--retesting" role="status"><strong>{conflictResolution ? "冲突处理 2/3 · 正在重新验收" : "合入检查 1/2 · 目标变化后正在重测"}</strong><p>{preview.delivery?.message ?? "系统正在隔离环境执行独立回归。"}</p><small>{conflictResolution ? "当前尚未写入目标分支；独立测试通过后还需原领队复验，放行后才会自动合入。" : "当前尚未写入目标分支；独立回归通过后才会进入真正的合入阶段。"}</small></div>}
     {merging && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>合入处理 3/3 · 正在写入目标分支</strong><p>{preview.delivery?.message ?? "测试与复验已经通过，正在写入已批准的目标分支。"}</p></div>}
@@ -844,9 +844,18 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     void dashboard.syncRequirementDelivery(
       selected.taskId,
       selected.id,
-      status as "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance"
+      status as "queued-for-merge" | "retesting" | "merging" | "merged" | "conflict" | "returned-to-acceptance",
+      {
+        serverUpdatedAt: mergePreview.delivery.updatedAt,
+        ...(mergePreview.delivery.message ? { message: mergePreview.delivery.message } : {}),
+        ...(mergePreview.delivery.conflictResolution ? { conflictResolution: {
+          status: mergePreview.delivery.conflictResolution.status,
+          ...(mergePreview.delivery.conflictResolution.failureClass ? { failureClass: mergePreview.delivery.conflictResolution.failureClass } : {}),
+          ...(mergePreview.delivery.conflictResolution.message ? { message: mergePreview.delivery.conflictResolution.message } : {})
+        } } : {})
+      }
     ).then((updated) => onDashboardSyncRef.current?.(updated)).catch(() => undefined);
-  }, [dashboard, selected?.taskId, selected?.id, mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt]);
+  }, [dashboard, selected?.taskId, selected?.id, mergePreview?.delivery?.status, mergePreview?.delivery?.updatedAt, mergePreview?.delivery?.message, mergePreview?.delivery?.conflictResolution?.status, mergePreview?.delivery?.conflictResolution?.failureClass, mergePreview?.delivery?.conflictResolution?.message]);
   useEffect(() => {
     const capture = mergePreview?.delivery?.evidenceRerun;
     if (!dashboard || !selected?.taskId || acceptanceRunId !== selected.id || !capture) return;
@@ -946,7 +955,10 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
       });
       setMergeOpen(false);
       if (dashboard && selected.taskId) {
-        const updated = await dashboard.syncRequirementDelivery(selected.taskId, selected.id, result.status);
+        const updated = await dashboard.syncRequirementDelivery(selected.taskId, selected.id, result.status, {
+          serverUpdatedAt: result.delivery.updatedAt,
+          ...(result.delivery.message ? { message: result.delivery.message } : {})
+        });
         onDashboardSyncRef.current?.(updated);
       }
       setDeliveryRevision((value) => value + 1);
@@ -984,7 +996,19 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     setConflictRetrying(true);
     setConflictRetryError("");
     try {
-      await api<RunMergeQueueResult>(`/api/runs/${encodeURIComponent(selected.id)}/merge-conflict-retry`, writeBody({ actor: "workbench-operator" }));
+      const result = await api<RunMergeQueueResult>(`/api/runs/${encodeURIComponent(selected.id)}/merge-conflict-retry`, writeBody({ actor: "workbench-operator" }));
+      if (dashboard && selected.taskId) {
+        const updated = await dashboard.syncRequirementDelivery(selected.taskId, selected.id, result.status, {
+          serverUpdatedAt: result.delivery.updatedAt,
+          ...(result.delivery.message ? { message: result.delivery.message } : {}),
+          ...(result.delivery.conflictResolution ? { conflictResolution: {
+            status: result.delivery.conflictResolution.status,
+            ...(result.delivery.conflictResolution.failureClass ? { failureClass: result.delivery.conflictResolution.failureClass } : {}),
+            ...(result.delivery.conflictResolution.message ? { message: result.delivery.conflictResolution.message } : {})
+          } } : {})
+        });
+        onDashboardSyncRef.current?.(updated);
+      }
       setDeliveryRevision((value) => value + 1);
       notify(`Run ${selected.id} 已重新进入冲突处理队列，原领队会继续使用保留的 worktree。`, "success");
     } catch (error) {

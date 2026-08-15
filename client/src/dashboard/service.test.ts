@@ -784,15 +784,36 @@ describe("listBoard / getRequirement / updateRequirementLane", () => {
       lane: "merging",
       delivery: { runId, status: "queued-for-merge" }
     });
-    const conflict = await service.syncRequirementDelivery("req-102", runId, "conflict");
+    const conflictObservation = {
+      serverUpdatedAt: "2026-08-09T06:03:00.000Z",
+      message: "受管候选预览启动失败；候选仍保留。",
+      conflictResolution: {
+        status: "failed" as const,
+        failureClass: "environment-blocked" as const,
+        message: "Vite 端口不可用"
+      }
+    };
+    const conflict = await service.syncRequirementDelivery("req-102", runId, "conflict", conflictObservation);
     expect(conflict.lane).toBe("merging");
     expect(conflict.exception).toBe("blocked");
-    const retesting = await service.syncRequirementDelivery("req-102", runId, "retesting");
+    expect(conflict.delivery).toMatchObject(conflictObservation);
+    const activityCount = (await service.getDashboardSummary()).activities.length;
+    await service.syncRequirementDelivery("req-102", runId, "conflict", conflictObservation);
+    expect((await service.getDashboardSummary()).activities).toHaveLength(activityCount);
+    expect(await service.syncRequirementDelivery("req-102", runId, "queued-for-merge", {
+      serverUpdatedAt: "2026-08-09T06:02:00.000Z",
+      message: "stale queued response"
+    })).toMatchObject({ delivery: { status: "conflict", serverUpdatedAt: conflictObservation.serverUpdatedAt } });
+    expect((await service.getDashboardSummary()).activities).toHaveLength(activityCount);
+    const retesting = await service.syncRequirementDelivery("req-102", runId, "retesting", {
+      serverUpdatedAt: "2026-08-09T06:04:00.000Z"
+    });
     expect(retesting.lane).toBe("merging");
     expect(retesting.exception).toBeNull();
     expect(retesting.delivery).toMatchObject({ runId, status: "retesting" });
     expect((await service.syncRequirementDelivery("req-102", runId, "returned-to-acceptance")).lane).toBe("acceptance");
-    expect((await service.syncRequirementDelivery("req-102", runId, "merged")).lane).toBe("done");
+    expect((await service.syncRequirementDelivery("req-102", runId, "merged", { serverUpdatedAt: "2026-08-09T06:06:00.000Z" })).lane).toBe("done");
+    expect(await service.syncRequirementDelivery("req-102", runId, "queued-for-merge")).toMatchObject({ lane: "done", delivery: { status: "merged" } });
     expect(await expectFailure(service.syncRequirementDelivery("req-102", "run-other", "merged"))).toContain("不一致");
   });
 

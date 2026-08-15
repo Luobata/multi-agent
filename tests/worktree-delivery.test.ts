@@ -282,18 +282,23 @@ describe("worktree delivery merge gate", () => {
 
     await expect(mergeAcceptedRun(run, runDir, {
       confirmation: "MERGE another-run",
-      targetBranch: "main"
+      targetBranch: "main",
+      expectedTargetCommit: headBefore
     })).rejects.toThrow(/明确合并确认/);
     expect(git(root, "rev-parse", "HEAD")).toBe(headBefore);
 
     const result = await mergeAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
-      targetBranch: "main"
+      targetBranch: "main",
+      expectedTargetCommit: headBefore
     });
 
     expect(result.status).toBe("merged");
     expect(fs.readFileSync(path.join(root, "feature.txt"), "utf8")).toBe("accepted\n");
     expect(git(root, "rev-parse", "HEAD")).not.toBe(headBefore);
+    const mergeParents = git(root, "rev-list", "--parents", "-n", "1", result.delivery.mergeCommit!).split(" ");
+    expect(mergeParents[1]).toBe(headBefore);
+    expect(mergeParents[2]).toBe(result.delivery.sourceCommit);
     expect(fs.existsSync(worktree!.path)).toBe(false);
     await expect(readRunDelivery(runDir)).resolves.toMatchObject({
       runId,
@@ -301,6 +306,37 @@ describe("worktree delivery merge gate", () => {
       targetBranch: "main",
       mergeCommit: expect.any(String)
     });
+  }, 15_000);
+
+  it("rejects a target commit that advanced after validation instead of merging an untested combination", async () => {
+    const root = repository();
+    const runId = "run-delivery-post-validation-drift-1";
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), "validated candidate\n", "utf8");
+    const runDir = artifactDirectory();
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+    const queued = await queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      actor: "delivery-reviewer"
+    });
+    const validatedTarget = queued.delivery.queuedTargetCommit!;
+
+    await expect(mergeAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      expectedTargetCommit: validatedTarget,
+      beforeTargetCompareAndSwap: () => {
+        fs.writeFileSync(path.join(root, "advanced-after-validation.txt"), "new target change\n", "utf8");
+        git(root, "add", "advanced-after-validation.txt");
+        git(root, "commit", "-m", "advance target during final target CAS");
+      }
+    })).rejects.toThrow(/验证后再次变化/);
+    const advancedTarget = git(root, "rev-parse", "HEAD");
+    expect(git(root, "rev-parse", "HEAD")).toBe(advancedTarget);
+    expect(fs.existsSync(path.join(root, "candidate.txt"))).toBe(false);
+    expect(fs.existsSync(worktree!.path)).toBe(true);
   }, 15_000);
 
   it("preflights conflicts without changing the target branch and preserves the worktree", async () => {
@@ -318,7 +354,8 @@ describe("worktree delivery merge gate", () => {
 
     const result = await mergeAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
-      targetBranch: "main"
+      targetBranch: "main",
+      expectedTargetCommit: targetHead
     });
 
     expect(result.status).toBe("conflict");
@@ -380,7 +417,8 @@ describe("worktree delivery merge gate", () => {
     });
     const merged = await mergeAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
-      targetBranch: "main"
+      targetBranch: "main",
+      expectedTargetCommit: targetCommit
     });
     expect(merged.status).toBe("merged");
     expect(fs.readFileSync(path.join(root, "README.md"), "utf8")).toBe("target change\nsource change\n");
@@ -600,7 +638,8 @@ describe("worktree delivery merge gate", () => {
 
     await expect(mergeAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
-      targetBranch: "main"
+      targetBranch: "main",
+      expectedTargetCommit: headBefore
     })).rejects.toThrow(/交付记录与当前 Run 不匹配/);
     expect(git(root, "rev-parse", "HEAD")).toBe(headBefore);
     expect(fs.existsSync(worktree!.path)).toBe(true);

@@ -681,6 +681,10 @@ export interface RunDeliveryRecord {
     executionRoleId?: string;
     resolutionRunId?: string;
     testRunId?: string;
+    testedSourceCommit?: string;
+    testedCandidateRevision?: string;
+    testedUrl?: string;
+    failureClass?: "environment-blocked" | "evidence-incomplete" | "product-failed";
     leaderReviewRunId?: string;
     message?: string;
   };

@@ -124,7 +124,14 @@ function deliveryProgressChip(requirement: Requirement) {
     conflict: "冲突处理中",
     "returned-to-acceptance": "已退回验收"
   };
-  return <span className="board-evidence-capture" role="status">{labels[requirement.delivery.status]}</span>;
+  const resolution = requirement.delivery.conflictResolution;
+  const detail = requirement.delivery.message?.includes("目标仓库存在未提交改动") ? "等待目标仓库洁净"
+    : resolution?.status === "resolving" ? "冲突处理中"
+    : resolution?.status === "retesting" ? "候选复测中"
+      : resolution?.status === "leader-review" ? "领队复验"
+        : resolution?.status === "failed" ? (resolution.failureClass === "environment-blocked" ? "候选环境阻塞" : resolution.failureClass === "evidence-incomplete" ? "证据不完整" : resolution.failureClass === "product-failed" ? "产品回归失败" : "冲突处理失败")
+          : labels[requirement.delivery.status];
+  return <span className="board-evidence-capture" role="status" title={resolution?.message ?? requirement.delivery.message}>{detail}</span>;
 }
 
 export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", sourceReady = true, sourceError, onRetrySource, projects: connectedProjects = EMPTY_PROJECTS, projectBindings, invocations = EMPTY_INVOCATIONS, humanDecisionRequests = EMPTY_HUMAN_DECISION_REQUESTS, onOpenRun }: {
@@ -290,7 +297,10 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
         try {
           const preview = await api<RunMergePreview>(`/api/runs/${encodeURIComponent(invocation.runId)}/merge-preview`);
           if (preview.status === "merged" || preview.delivery?.status === "merged") {
-            return service.syncRequirementDelivery(requirement.id, invocation.runId, "merged");
+            return service.syncRequirementDelivery(requirement.id, invocation.runId, "merged", {
+              ...(preview.delivery?.updatedAt ? { serverUpdatedAt: preview.delivery.updatedAt } : {}),
+              ...(preview.delivery?.message ? { message: preview.delivery.message } : {})
+            });
           }
           if (!isRunAcceptanceReady(preview)) {
             const warning = `${requirement.code} 已完成，但交付证据尚未满足自动待验收门禁：${preview.reasons.join("；") || "交付预览未就绪"}`;
@@ -330,6 +340,45 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     })();
     return () => { cancelled = true; };
   }, [connectedProjects, data, invocations, notify, service, setData]);
+
+  useEffect(() => {
+    if (!data) return;
+    const pending = data.requirements.filter((requirement) => requirement.lane === "merging"
+      && requirement.delivery
+      && requirement.delivery.status !== "merged"
+      && requirement.delivery.status !== "returned-to-acceptance"
+      && requirement.delivery.conflictResolution?.status !== "failed");
+    if (pending.length === 0) return;
+    let cancelled = false;
+    const poll = async () => {
+      const results = await Promise.allSettled(pending.map(async (requirement) => {
+        const preview = await api<RunMergePreview>(`/api/runs/${encodeURIComponent(requirement.delivery!.runId)}/merge-preview`);
+        const status = preview.delivery?.status ?? preview.status;
+        if (!["queued-for-merge", "retesting", "merging", "merged", "conflict", "returned-to-acceptance"].includes(status)) return requirement;
+        const targetBlocker = !preview.targetClean
+          ? preview.reasons.find((reason) => reason.includes("目标仓库存在未提交改动"))
+          : undefined;
+        return service.syncRequirementDelivery(requirement.id, requirement.delivery!.runId, status as NonNullable<Requirement["delivery"]>["status"], {
+          ...(preview.delivery?.updatedAt ? { serverUpdatedAt: preview.delivery.updatedAt } : {}),
+          ...(targetBlocker || preview.delivery?.message ? { message: targetBlocker ?? preview.delivery!.message } : {}),
+          ...(preview.delivery?.conflictResolution ? { conflictResolution: {
+            status: preview.delivery.conflictResolution.status,
+            ...(preview.delivery.conflictResolution.failureClass ? { failureClass: preview.delivery.conflictResolution.failureClass } : {}),
+            ...(preview.delivery.conflictResolution.message ? { message: preview.delivery.conflictResolution.message } : {})
+          } } : {})
+        });
+      }));
+      if (cancelled) return;
+      const updated = new Map<string, Requirement>();
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled" && JSON.stringify(result.value.delivery) !== JSON.stringify(pending[index]?.delivery)) updated.set(result.value.id, result.value);
+      });
+      if (updated.size) setData({ ...data, requirements: data.requirements.map((requirement) => updated.get(requirement.id) ?? requirement) });
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [data, service, setData]);
 
   const openCreate = () => {
     setCreateProjectId(defaultCreateProjectId());

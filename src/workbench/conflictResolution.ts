@@ -4,6 +4,61 @@ export const CONFLICT_PLAN_READY = "CONFLICT_PLAN: READY";
 export const CONFLICT_EXECUTION_PASS = "CONFLICT_EXECUTION: PASS";
 export const LEADER_REVALIDATION_PASS = "LEADER_REVALIDATION: PASS";
 
+export interface ConflictRetestEvidence {
+  url: string;
+  sourceCommit: string;
+  candidateRevision: string;
+}
+
+export interface CandidateWorkspaceState {
+  revision: string;
+  baseCommit: string;
+  changedFiles: string[];
+}
+
+function stringsForKey(value: JsonValue | undefined, key: string, found: string[] = []): string[] {
+  if (Array.isArray(value)) for (const item of value) stringsForKey(item, key, found);
+  else if (value && typeof value === "object") for (const [entryKey, entryValue] of Object.entries(value)) {
+    if (entryKey === key && typeof entryValue === "string") found.push(entryValue);
+    stringsForKey(entryValue, key, found);
+  }
+  return found;
+}
+
+export function validateConflictRetestEvidence(output: JsonValue | undefined, expected: ConflictRetestEvidence): string[] {
+  const issues: string[] = [];
+  for (const key of ["url", "sourceCommit", "candidateRevision"] as const) {
+    const values = stringsForKey(output, key);
+    if (!values.includes(expected[key])) issues.push(`${key} 未证明为受管候选值 ${expected[key]}`);
+  }
+  return issues;
+}
+
+export function validateCandidateWorkspaceState(
+  snapshot: CandidateWorkspaceState,
+  expected: { sourceCommit: string; revision?: string }
+): string[] {
+  const issues: string[] = [];
+  if (snapshot.baseCommit !== expected.sourceCommit) {
+    issues.push(`候选 HEAD ${snapshot.baseCommit} 与待合入 sourceCommit ${expected.sourceCommit} 不一致`);
+  }
+  if (snapshot.changedFiles.length > 0) {
+    issues.push(`候选 worktree 存在未提交改动：${snapshot.changedFiles.join("、")}`);
+  }
+  if (expected.revision && snapshot.revision !== expected.revision) {
+    issues.push(`候选 revision 在测试期间变化：${expected.revision} → ${snapshot.revision}`);
+  }
+  return issues;
+}
+
+export function classifyConflictRetestFailure(message: string, evidenceIssues: string[]): "environment-blocked" | "evidence-incomplete" | "product-failed" {
+  if (/econnrefused|eaddrinuse|enotfound|eacces|eperm|permission denied|sandbox|provider [^\n]{0,30}unavailable|socket|preview (?:server )?(?:unavailable|failed)|browser [^\n]{0,40}(?:unavailable|failed to (?:start|launch|connect))|health.?check|timeout|timed out|端口|环境(?:不可用|异常|失败)|预览(?:服务)?(?:不可用|失败|提前退出|超时)|无法.*预览|启动(?:失败|超时)|连接(?:失败|超时)/i.test(message)) {
+    return "environment-blocked";
+  }
+  if (evidenceIssues.length > 0 || /evidence|证据|无法证明|identity|revision|sourcecommit|worktree.*未提交/i.test(message)) return "evidence-incomplete";
+  return "product-failed";
+}
+
 function evidenceText(output: JsonValue | undefined, message: string): string {
   return `${message}\n${output === undefined ? "" : JSON.stringify(output)}`.toUpperCase();
 }

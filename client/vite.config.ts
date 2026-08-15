@@ -44,6 +44,7 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 4319,
+    strictPort: true,
     proxy: {
       "/api": "http://127.0.0.1:4318",
       "/a2a": "http://127.0.0.1:4318"
