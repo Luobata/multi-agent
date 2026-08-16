@@ -136,11 +136,11 @@ function WorkInstanceCard({ instance, invocation, clock }: {
     {instance.error && <div className="instance-error">{instance.error}</div>}
     {instance.status === "failed" && <div className="instance-failure-kind"><strong>{failureLabel(instance)}</strong><span>{instance.failure?.retryable ? "可在条件恢复后重试" : "需要调整配置或输出后再推进"}</span></div>}
     {instance.status === "failed" && <div className="instance-evidence">
-      <button type="button" className="instance-evidence-action" onClick={() => { window.location.hash = "runs"; }}>查看运行证据 →</button>
+      <button type="button" className="instance-evidence-action" disabled={!instance.runId} title={instance.runId ? undefined : "运行卷宗尚未生成"} onClick={() => { if (instance.runId) window.location.hash = `runs/${encodeURIComponent(instance.runId)}`; }}>查看运行证据 →</button>
     </div>}
     <footer>
       <span>{phaseLabel(instance.phase)}</span>
-      <button type="button" onClick={() => { window.location.hash = "runs"; }}>查看运行证据 →</button>
+      <button type="button" disabled={!instance.runId} title={instance.runId ? undefined : "运行卷宗尚未生成"} onClick={() => { if (instance.runId) window.location.hash = `runs/${encodeURIComponent(instance.runId)}`; }}>查看运行证据 →</button>
     </footer>
   </article>;
 }
@@ -374,7 +374,7 @@ export function OfficePage({ data, streamStatus, onOpenRun }: OfficePageProps) {
             const leaderEmployeeId = invocation.executionSnapshot?.employees[0]?.employeeId;
             const leader = data.employees.find((employee) => employee.id === leaderEmployeeId);
             const workflowName = invocation.executionSnapshot?.workflow.id ?? invocation.target.id;
-            return <button type="button" key={invocation.id} className={`studio-card studio-card--${tone}`} data-run-id={invocation.runId || undefined} disabled={!invocation.runId} aria-label={invocation.runId ? `查看运行详情：${workflowName}，${invocation.requestSummary}，Run ${invocation.runId}` : `运行卷宗尚未生成：${workflowName}`} onClick={() => invocation.runId && onOpenRun?.(invocation.runId)}>
+            return <button type="button" key={invocation.id} className={`studio-card studio-card--${tone}`} data-run-id={invocation.runId || undefined} aria-disabled={!invocation.runId || undefined} aria-label={invocation.runId ? `查看运行详情：${workflowName}，${invocation.requestSummary}，Run ${invocation.runId}` : `运行卷宗尚未生成：${workflowName}；生成后此卡片才可进入`} onClick={() => invocation.runId && onOpenRun?.(invocation.runId)}>
               <header className="studio-card-head">
                 <div className="studio-card-title"><span title={invocation.executionSnapshot?.workflow.id ?? invocation.target.id}>{invocation.executionSnapshot?.workflow.id ?? invocation.target.id}</span><strong title={invocation.requestSummary}>{invocation.requestSummary}</strong></div>
                 <span className="studio-round">Round {progress?.round ?? invocation.executionSnapshot?.workflow.version ?? 1}</span>
@@ -425,7 +425,7 @@ export function OfficePage({ data, streamStatus, onOpenRun }: OfficePageProps) {
         <div className="dispatch-list">
           {recentInvocations.map((invocation) => {
             const children = invocationInstances(invocation, data.activity.instances);
-            return <button type="button" key={invocation.id} className={`dispatch-ticket dispatch-ticket--${invocation.status}`} onClick={() => setSelectedEmployeeId(children[0]?.employeeId)}>
+            return <button type="button" key={invocation.id} className={`dispatch-ticket dispatch-ticket--${invocation.status}`} disabled={!children[0]?.employeeId} title={children[0]?.employeeId ? undefined : "尚无出勤实例；可查看的员工工作台尚未生成"} onClick={() => { const employeeId = children[0]?.employeeId; if (employeeId) setSelectedEmployeeId(employeeId); }}>
               <div className="dispatch-ticket-top"><span>{sourceCode(invocation)}</span><time>{formatTime(invocation.createdAt)}</time></div>
               <strong>{sourceName(invocation)}</strong>
               <p>{invocation.requestSummary}</p>

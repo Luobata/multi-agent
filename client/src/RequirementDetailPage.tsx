@@ -314,7 +314,7 @@ export function RequirementDetailPage({
     {state.status === "ready" && !detail && <EmptyState title="没有找到这条需求" action={<button type="button" className="button secondary" onClick={() => go("board")}>返回需求看板</button>}><p>它可能已被移除；看板数据未受影响。</p></EmptyState>}
     {state.status === "ready" && detail && <nav className="requirement-lifecycle-nav" aria-label="需求生命周期">
       {(["overview", "run", "acceptance"] as const).map((item, index) => <button key={item} type="button" aria-current={section === item ? "page" : undefined} className={section === item ? "active" : ""} onClick={() => go(`requirements/${encodeURIComponent(detail.id)}?section=${item}`)}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item === "overview" ? "需求定义" : item === "run" ? "执行与决策" : "验收与合入"}</strong><small>{item === "overview" ? requirementLaneLabel(detail.lane) : item === "run" ? detail.advancement?.runId ? "真实 Run 已绑定" : "等待启动" : detail.evidence.acceptance ? "验收快照已固定" : "等待交付"}</small></button>)}
-      {focusedRunId && <button type="button" className="standalone-run-link" onClick={() => go(`runs?run=${encodeURIComponent(focusedRunId)}`)}>独立运行卷宗 ↗</button>}
+      {focusedRunId && <button type="button" className="standalone-run-link" onClick={() => go(`runs/${encodeURIComponent(focusedRunId)}`)}>独立运行卷宗 ↗</button>}
     </nav>}
     {state.status === "ready" && detail && (detail.advancement?.status === "blocked" || detail.advancement?.status === "failed") && <section className="requirement-blocker-callout" role="alert" aria-live="polite">
       <div className="requirement-blocker-callout__head">
@@ -333,7 +333,10 @@ export function RequirementDetailPage({
       {detail.advancement.runId && <button type="button" className="button secondary" onClick={() => go(`requirements/${encodeURIComponent(detail.id)}?section=run`)}>查看阻塞现场与完整证据 →</button>}
     </section>}
     {state.status === "ready" && detail && section === "acceptance" && runBindingMismatch && <section className="requirement-blocker-callout" role="status"><strong>验收 Run 与最新推进 Run 不同</strong><p>本区固定展示验收快照 Run <code>{acceptanceRunId}</code>；最新推进 Run 为 <code>{detail.advancement?.runId}</code>。</p></section>}
-    {state.status === "ready" && detail && (section === "run" || section === "acceptance") && focusedRunId && <RunsPage mode="embedded" view={section === "acceptance" ? "acceptance" : "all"} focusedRunId={focusedRunId} notify={notify} dashboard={service} onDashboardSync={syncDashboardProjection} />}
+    {state.status === "ready" && detail && (section === "run" || section === "acceptance") && focusedRunId && <RunsPage mode="embedded" view={section === "acceptance" ? "acceptance" : "all"} focusedRunId={focusedRunId} notify={notify} dashboard={service} onDashboardSync={syncDashboardProjection} onOpenRequirement={(requirementId, targetSection = "overview") => go(requirementId === detail.id && targetSection === "run"
+      // 已在本需求卷宗内：终态 Run 的「核对交付与验收」直达验收幕，而不是绕回当前 run 幕。
+      ? `requirements/${encodeURIComponent(requirementId)}?section=acceptance`
+      : `requirements/${encodeURIComponent(requirementId)}${targetSection === "overview" ? "" : `?section=${targetSection}`}`)} />}
     {state.status === "ready" && detail && (section === "run" || section === "acceptance") && !focusedRunId && <EmptyState title="尚未绑定 Run">开始推进后，完整决策、证据、验收与合入操作会在这里出现。</EmptyState>}
     {state.status === "ready" && detail && section === "overview" && <div className="dash-dossier dash-dossier--overview">
       <div className="dash-panel dash-req-cover">

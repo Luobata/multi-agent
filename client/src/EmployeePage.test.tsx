@@ -2,10 +2,10 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmployeePage } from "./EmployeePage";
 import { DaemonGate } from "./components";
-import type { Bootstrap, Employee, Skill, WorkInstanceRecord, WorkInstanceStatus } from "./types";
+import type { Bootstrap, Employee, InvocationStatus, Session, Skill, WorkInstanceRecord, WorkInstanceStatus } from "./types";
 
 const timestamp = "2026-07-31T00:00:00.000Z";
 
@@ -339,5 +339,348 @@ describe("Employee runtime clock", () => {
       container.remove();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("DirectDesk async turn", () => {
+  const receipt = {
+    invocation: {
+      id: "inv-1",
+      target: { kind: "employee", id: employee.id, version: 1 },
+      source: { kind: "workbench" },
+      status: "queued",
+      phase: "排队",
+      requestSummary: "测试工单",
+      runId: "run-1",
+      sessionId: "sess-1",
+      instanceIds: [],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      transitions: []
+    },
+    runId: "run-1",
+    statusUrl: "/api/invocations/inv-1",
+    progressUrl: "/api/invocations/inv-1/progress",
+    streamUrl: "/api/invocations/inv-1/stream",
+    monitor: {
+      mode: "long-poll",
+      tool: "wait_workflow_progress",
+      initialCursor: "inv-1:0",
+      defaultTimeoutMs: 20_000,
+      maxTimeoutMs: 60_000,
+      instructions: "long poll",
+      waitUrl: "/api/invocations/inv-1/progress/wait"
+    }
+  };
+
+  const progressPayload = (status: InvocationStatus, terminal: boolean) => ({
+    invocationId: "inv-1",
+    runId: "run-1",
+    workflowId: "wf-1",
+    architecture: "graph",
+    status,
+    phase: "执行",
+    terminal,
+    updatedAt: "2026-08-15T01:00:00.000Z",
+    round: 1,
+    tally: {},
+    steps: [],
+    leaderReport: { available: false, rounds: 0, delegations: 0, entries: [], gates: [] }
+  });
+
+  const waitResponse = (overrides: Record<string, unknown>) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: {
+      invocationId: "inv-1",
+      nextCursor: "inv-1:1",
+      changed: false,
+      terminal: false,
+      reason: "heartbeat",
+      progressReport: "",
+      progress: progressPayload("running", false),
+      ...overrides
+    } })
+  });
+
+  const hydratedSession: Session = {
+    id: "sess-1",
+    employeeId: employee.id,
+    employeeVersion: 1,
+    title: "测试会话",
+    status: "active",
+    messages: [
+      { id: "m1", role: "user", content: "帮我写一份方案", at: timestamp },
+      { id: "m2", role: "employee", content: "方案已完成", at: timestamp, runId: "run-1" }
+    ],
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+
+  interface Deferred<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (reason?: unknown) => void;
+  }
+
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  let container: HTMLElement;
+  let root: ReturnType<typeof createRoot>;
+  let waitQueue: Array<Deferred<unknown>>;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  let refresh: ReturnType<typeof vi.fn>;
+  let notify: ReturnType<typeof vi.fn>;
+
+  const flush = async (ms = 30) => { await act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); }); };
+  const click = (element: Element) => { act(() => element.dispatchEvent(new MouseEvent("click", { bubbles: true }))); };
+  const setText = (control: HTMLTextAreaElement, value: string) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(control, value);
+    control.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const pendingPanel = () => container.querySelector<HTMLElement>('[aria-label="工单执行中"]');
+  const postCalls = () => fetchMock.mock.calls.filter((call) => (call[1] as RequestInit | undefined)?.method === "POST");
+  const startCalls = () => postCalls().filter((call) => String(call[0]).endsWith(`/api/employees/${employee.id}/start`));
+  const waitCalls = () => fetchMock.mock.calls.filter((call) => String(call[0]).includes("/progress/wait"));
+
+  const submitMessage = async (text: string) => {
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="交办事项"]');
+    if (!textarea) throw new Error("composer textarea not found");
+    act(() => setText(textarea, text));
+    const submit = container.querySelector<HTMLButtonElement>('.work-order .composer button[type="submit"]');
+    if (!submit) throw new Error("composer submit not found");
+    await act(async () => {
+      submit.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  };
+
+  beforeEach(() => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    waitQueue = [];
+    fetchMock = vi.fn((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith(`/api/employees/${employee.id}/start`)) {
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: receipt }) });
+      }
+      if (url.includes("/progress/wait")) {
+        const request = deferred<unknown>();
+        waitQueue.push(request);
+        return request.promise;
+      }
+      if (url === "/api/sessions/sess-1") return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: hydratedSession }) });
+      if (url === "/api/invocations/inv-1/cancel") {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: { ...receipt.invocation, status: "cancellation-requested" } }) });
+      }
+      if (url === `/api/employees/${employee.id}`) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: { versions: [] } }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    refresh = vi.fn(async () => undefined);
+    notify = vi.fn();
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root.render(<EmployeePage data={bootstrap} refresh={refresh as () => Promise<void>} notify={notify} />));
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    document.body.replaceChildren();
+    vi.unstubAllGlobals();
+  });
+
+  it("returns the composer immediately after the receipt and shows the waiting panel with the run evidence link", async () => {
+    await submitMessage("帮我写一份方案");
+
+    expect(startCalls()).toHaveLength(1);
+    expect(JSON.parse(String(startCalls()[0]?.[1]?.body))).toEqual({ message: "帮我写一份方案" });
+    const headers = new Headers(startCalls()[0]?.[1]?.headers as HeadersInit);
+    expect(headers.get("x-multi-agent-source")).toBe("workbench");
+    expect(headers.get("x-multi-agent-source-label")).toBe(`utf8:${encodeURIComponent("直接交办调试台")}`);
+
+    const panel = pendingPanel();
+    expect(panel).toBeTruthy();
+    expect(panel?.textContent).toContain("帮我写一份方案");
+    const evidence = panel?.querySelector<HTMLAnchorElement>("a.pending-turn-evidence");
+    expect(evidence?.getAttribute("href")).toBe("#runs/run-1");
+    expect(evidence?.textContent).toBe("打开运行卷宗 #run-1");
+    // composer 已清空且没有发生第二次 POST。
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="交办事项"]')?.value).toBe("");
+    expect(postCalls()).toHaveLength(1);
+  });
+
+  it("keeps the surface usable on heartbeat responses with the latest state and a ticking elapsed clock", async () => {
+    await submitMessage("帮我写一份方案");
+    expect(pendingPanel()?.textContent).toContain("已受理，等待服务端进度");
+
+    act(() => waitQueue[0]?.resolve(waitResponse({ nextCursor: "inv-1:1", reason: "heartbeat" })));
+    await flush();
+
+    expect(pendingPanel()?.textContent).toContain("心跳");
+    expect(pendingPanel()?.textContent).toContain("取消");
+
+    const elapsed = () => pendingPanel()?.querySelector(".transcript-meta time")?.textContent;
+    expect(elapsed()).toBe("00:00");
+    await flush(1100);
+    expect(elapsed()).toBe("00:01");
+    // 监听器带着心跳返回的新游标继续下一轮长轮询。
+    expect(waitCalls().some((call) => String(call[0]).includes("cursor=inv-1%3A1"))).toBe(true);
+  });
+
+  it("hydrates the transcript from the session on a terminal result", async () => {
+    await submitMessage("帮我写一份方案");
+    act(() => waitQueue[0]?.resolve(waitResponse({
+      nextCursor: "inv-1:9",
+      terminal: true,
+      reason: "terminal",
+      progress: progressPayload("completed", true)
+    })));
+    await flush();
+    await flush();
+
+    expect(fetchMock.mock.calls.some((call) => String(call[0]) === "/api/sessions/sess-1")).toBe(true);
+    expect(pendingPanel()).toBeNull();
+    expect(container.querySelector(".transcript")?.textContent).toContain("方案已完成");
+    expect(notify).toHaveBeenCalledWith("工单已完成 · run-1");
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("posts an operator cancellation and settles on the server-driven cancelled terminal", async () => {
+    await submitMessage("帮我写一份方案");
+    const cancel = [...pendingPanel()!.querySelectorAll("button")].find((button) => button.textContent === "取消");
+    expect(cancel).toBeTruthy();
+    await act(async () => {
+      cancel!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const cancelCalls = postCalls().filter((call) => String(call[0]) === "/api/invocations/inv-1/cancel");
+    expect(cancelCalls).toHaveLength(1);
+    expect(JSON.parse(String(cancelCalls[0]?.[1]?.body))).toEqual({ actor: "workbench-operator" });
+    expect(pendingPanel()?.textContent).toContain("取消请求已送达");
+
+    act(() => waitQueue[0]?.resolve(waitResponse({
+      nextCursor: "inv-1:9",
+      terminal: true,
+      reason: "terminal",
+      progress: progressPayload("cancelled", true)
+    })));
+    await flush();
+    await flush();
+
+    expect(pendingPanel()).toBeNull();
+    expect(fetchMock.mock.calls.some((call) => String(call[0]) === "/api/sessions/sess-1")).toBe(true);
+    expect(notify).toHaveBeenCalledWith("工单已取消，证据保留在运行卷宗");
+    // 终态后监听停止，没有继续轮询。
+    expect(waitCalls()).toHaveLength(1);
+  });
+
+  it("re-attaches the monitor from the same receipt and cursor after an interruption without resubmitting", async () => {
+    await submitMessage("帮我写一份方案");
+    act(() => waitQueue[0]?.reject(new Error("network down")));
+    await flush();
+
+    expect(pendingPanel()?.textContent).toContain("监听通道中断（网络或服务暂时不可达）");
+    // 中断态同时提供重挂与取消两个出口。
+    const buttonLabels = [...pendingPanel()!.querySelectorAll("button")].map((button) => button.textContent);
+    expect(buttonLabels).toContain("重新挂载监听");
+    expect(buttonLabels).toContain("取消");
+    const retry = [...pendingPanel()!.querySelectorAll("button")].find((button) => button.textContent === "重新挂载监听");
+    expect(retry).toBeTruthy();
+
+    await act(async () => {
+      retry!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(waitCalls()).toHaveLength(2);
+    expect(String(waitCalls()[1]?.[0])).toContain("cursor=inv-1%3A0");
+
+    act(() => waitQueue[1]?.resolve(waitResponse({
+      nextCursor: "inv-1:9",
+      terminal: true,
+      reason: "terminal",
+      progress: progressPayload("completed", true)
+    })));
+    await flush();
+    await flush();
+
+    expect(startCalls()).toHaveLength(1);
+    const occurrences = container.textContent?.split("帮我写一份方案").length ?? 0;
+    expect(occurrences - 1).toBe(1);
+    expect(container.querySelector(".transcript")?.textContent).toContain("方案已完成");
+  });
+
+  it("cancels from the interrupted state on the same receipt and observes the cancelled terminal after remount", async () => {
+    await submitMessage("帮我写一份方案");
+    act(() => waitQueue[0]?.reject(new Error("network down")));
+    await flush();
+    expect(pendingPanel()?.textContent).toContain("监听通道中断");
+
+    // 中断态取消：同一回执的 cancel POST，不产生新的 /start。
+    const cancel = [...pendingPanel()!.querySelectorAll("button")].find((button) => button.textContent === "取消");
+    await act(async () => {
+      cancel!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const cancelCalls = postCalls().filter((call) => String(call[0]) === "/api/invocations/inv-1/cancel");
+    expect(cancelCalls).toHaveLength(1);
+    expect(JSON.parse(String(cancelCalls[0]?.[1]?.body))).toEqual({ actor: "workbench-operator" });
+    expect(startCalls()).toHaveLength(1);
+
+    // 取消已送达但监听未挂载：重挂按钮仍在，文案引导重挂以观察取消终态。
+    expect(pendingPanel()?.textContent).toContain("取消请求已送达；监听未挂载");
+    const retry = [...pendingPanel()!.querySelectorAll("button")].find((button) => button.textContent === "重新挂载监听");
+    expect(retry).toBeTruthy();
+    await act(async () => {
+      retry!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(waitCalls()).toHaveLength(2);
+    expect(String(waitCalls()[1]?.[0])).toContain("cursor=inv-1%3A0");
+
+    act(() => waitQueue[1]?.resolve(waitResponse({
+      nextCursor: "inv-1:9",
+      terminal: true,
+      reason: "terminal",
+      progress: progressPayload("cancelled", true)
+    })));
+    await flush();
+    await flush();
+
+    expect(pendingPanel()).toBeNull();
+    expect(fetchMock.mock.calls.some((call) => String(call[0]) === "/api/sessions/sess-1")).toBe(true);
+    expect(notify).toHaveBeenCalledWith("工单已取消，证据保留在运行卷宗");
+    expect(startCalls()).toHaveLength(1);
+  });
+
+  it("locks the composer and session controls to a single in-flight turn", async () => {
+    await submitMessage("帮我写一份方案");
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="交办事项"]')!;
+    const submit = container.querySelector<HTMLButtonElement>('.work-order .composer button[type="submit"]')!;
+    expect(textarea.disabled).toBe(true);
+    expect(submit.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="选择会话"]')?.disabled).toBe(true);
+    const newSession = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "新会话");
+    expect(newSession?.disabled).toBe(true);
+    // 取消与证据链接保持可用。
+    expect(pendingPanel()?.querySelector("a.pending-turn-evidence")).toBeTruthy();
+    expect([...pendingPanel()!.querySelectorAll("button")].some((button) => button.textContent === "取消")).toBe(true);
+
+    // 代码级兜底：强制派发提交也不会产生第二个 /start。
+    await act(async () => {
+      submit.closest("form")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(startCalls()).toHaveLength(1);
+    expect(postCalls()).toHaveLength(1);
   });
 });

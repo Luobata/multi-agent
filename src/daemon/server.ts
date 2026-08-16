@@ -14,6 +14,7 @@ import type {
   EntrancePolicyEvaluationInput,
   HumanDecisionRequestDecisionInput,
   HumanDecisionRequestStatus,
+  InvocationStartResult,
   InvocationSource,
   InvocationSourceKind
 } from "../workbench/types.js";
@@ -28,6 +29,20 @@ function asyncRoute(handler: AsyncHandler) {
 
 function send(response: Response, data: unknown, status = 200): void {
   response.status(status).json({ data });
+}
+
+function invocationStartPayload(started: InvocationStartResult) {
+  const invocationId = started.invocation.id;
+  return {
+    ...started,
+    statusUrl: `/api/invocations/${encodeURIComponent(invocationId)}`,
+    progressUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress`,
+    monitor: {
+      ...started.monitor,
+      waitUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress/wait`
+    },
+    streamUrl: "/api/activity/stream"
+  };
 }
 
 function booleanQuery(value: unknown): boolean {
@@ -243,6 +258,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
         configurationProposal: "review-items-v1",
         configurationConversation: "codex-mcp-v1",
         asyncWorkflowInvocations: "long-poll-v2",
+        asyncEmployeeInvocations: "long-poll-v1",
         supervisorWorkflows: "v1",
         humanDecisionGate: "supervisor-high-risk-v1",
         managementPolicies: "versioned-v1",
@@ -626,6 +642,14 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       invocationSource(request, "http")
     ));
   }));
+  app.post("/api/projects/:id/roles/:roleId/start", asyncRoute(async (request, response) => {
+    send(response, invocationStartPayload(await service.startProjectRole(
+      routeParam(request, "id"),
+      routeParam(request, "roleId"),
+      request.body,
+      invocationSource(request, "http")
+    )), 202);
+  }));
   app.post("/api/projects/:id/conversations/:roleId/invoke", asyncRoute(async (request, response) => {
     send(response, await service.invokeProjectConversation(
       routeParam(request, "id"),
@@ -633,6 +657,14 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       request.body,
       invocationSource(request, "http")
     ));
+  }));
+  app.post("/api/projects/:id/conversations/:roleId/start", asyncRoute(async (request, response) => {
+    send(response, invocationStartPayload(await service.startProjectConversation(
+      routeParam(request, "id"),
+      routeParam(request, "roleId"),
+      request.body,
+      invocationSource(request, "http")
+    )), 202);
   }));
 
   app.get("/api/employee-templates", (request, response) => {
@@ -724,6 +756,15 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       { providerCwd: mcpExecutionRoot(request, source) }
     ));
   }));
+  app.post("/api/employees/:id/start", asyncRoute(async (request, response) => {
+    const source = invocationSource(request, "http");
+    send(response, invocationStartPayload(await service.startEmployee(
+      routeParam(request, "id"),
+      request.body,
+      source,
+      { providerCwd: mcpExecutionRoot(request, source) }
+    )), 202);
+  }));
 
   app.get("/api/sessions", (request, response) => {
     send(response, service.listSessions(typeof request.query.employeeId === "string" ? request.query.employeeId : undefined));
@@ -802,16 +843,7 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       source,
       { providerCwd: mcpExecutionRoot(request, source) }
     );
-    send(response, {
-      ...started,
-      statusUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}`,
-      progressUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}/progress`,
-      monitor: {
-        ...started.monitor,
-        waitUrl: `/api/invocations/${encodeURIComponent(started.invocation.id)}/progress/wait`
-      },
-      streamUrl: "/api/activity/stream"
-    }, 202);
+    send(response, invocationStartPayload(started), 202);
   }));
 
   app.get("/api/management-policies", (request, response) => {
@@ -914,18 +946,8 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
     send(response, await service.listRuns(Number.isFinite(parsed) ? parsed : 50));
   }));
   app.get("/api/runs/:id/monitor", asyncRoute(async (request, response) => {
-    const receipt = await service.resumeWorkflowMonitor(routeParam(request, "id"));
-    const invocationId = receipt.invocation.id;
-    send(response, {
-      ...receipt,
-      statusUrl: `/api/invocations/${encodeURIComponent(invocationId)}`,
-      progressUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress`,
-      monitor: {
-        ...receipt.monitor,
-        waitUrl: `/api/invocations/${encodeURIComponent(invocationId)}/progress/wait`
-      },
-      streamUrl: "/api/activity/stream"
-    });
+    const receipt = await service.resumeInvocationMonitor(routeParam(request, "id"));
+    send(response, invocationStartPayload(receipt));
   }));
   app.get("/api/runs/:id/merge-preview", asyncRoute(async (request, response) => {
     send(response, await service.getRunMergePreview(routeParam(request, "id")));

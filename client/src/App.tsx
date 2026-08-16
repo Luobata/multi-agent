@@ -447,10 +447,7 @@ export function App() {
     </header>
     <nav className="side-nav" aria-label="主要导航">
       <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>双叶幼儿园</strong><small>CRAYON KINDERGARTEN DOSSIER</small></div></div>
-      <div className="nav-items">{nav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={pendingDecisionCount > 0 && (item.id === "board" || item.id === "runs") ? `${item.label} · ${pendingDecisionCount} 项待你决定` : item.label} key={item.id} onClick={() => {
-        if (item.id === "runs" && pendingDecisionInvocations[0]) go(`runs/${encodeURIComponent(pendingDecisionInvocations[0].runId)}`);
-        else navigate(item.id);
-      }}><Icon name={item.icon} /><span>{item.label}</span>{pendingDecisionCount > 0 && (item.id === "board" || item.id === "runs") && <span className="nav-attention-badge" aria-label={`${pendingDecisionCount} 项待你决定`}>{pendingDecisionCount}</span>}</button>)}</div>
+      <div className="nav-items">{nav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={pendingDecisionCount > 0 && item.id === "dashboard" ? `${item.label} · ${pendingDecisionCount} 项待你决定` : item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span>{pendingDecisionCount > 0 && item.id === "dashboard" && <span className="nav-attention-badge" aria-label={`${pendingDecisionCount} 项待你决定`}>{pendingDecisionCount}</span>}</button>)}</div>
       <div className="nav-items nav-utility">{utilityNav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
       <button type="button" className="mobile-more" aria-expanded={moreOpen} onClick={() => setMoreOpen(true)}><Icon name="command" /><span>更多</span></button>
       <button type="button" className="command-hint" title="命令入口" onClick={() => setCommandOpen(true)}><Icon name="command" /><span>命令面板</span><kbd>⌘K</kbd></button>
@@ -474,8 +471,8 @@ export function App() {
       {page === "skills" && <SkillsPage data={data} refresh={refresh} notify={notify} />}
       {page === "knowledge" && <KnowledgePage data={data} refresh={refresh} notify={notify} />}
       {page === "workflows" && <WorkflowPage data={data} refresh={refresh} notify={notify} />}
-      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} pendingRunId={route.runId ?? pendingRunId} onConsumePending={() => setPendingRunId("")} onSelectRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)} onOpenRequirement={(requirementId, section = "overview") => go(`requirements/${encodeURIComponent(requirementId)}${section === "overview" ? "" : `?section=${section}`}`)} dashboard={dashboardService} fromStudio={Boolean(studioOrigin.current && (route.runId ?? pendingRunId))} onReturnOffice={() => { if (studioOrigin.current && window.history.length > 1) window.history.back(); else window.location.hash = "office"; }} />}
-      {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => { setPendingRunId(runId); navigate("runs"); }} />}
+      {page === "runs" && <RunsPage notify={notify} activityRevision={activityRevision} focusedRunId={route.runId} pendingRunId={route.runId ?? pendingRunId} onConsumePending={() => setPendingRunId("")} onSelectRun={(runId) => go(`runs/${encodeURIComponent(runId)}`)} onOpenRequirement={(requirementId, section = "overview") => go(`requirements/${encodeURIComponent(requirementId)}${section === "overview" ? "" : `?section=${section}`}`)} dashboard={dashboardService} fromStudio={Boolean(studioOrigin.current && (route.runId ?? pendingRunId))} onReturnOffice={() => { if (studioOrigin.current && window.history.length > 1) window.history.back(); else window.location.hash = "office"; }} />}
+      {page === "memory" && <MemoryPage notify={notify} onOpenRun={(runId) => go(`runs/${encodeURIComponent(runId)}`)} />}
       {page === "publications" && <PublicationsPage data={data} refresh={refresh} notify={notify} />}
       {page === "dashboard" && <DashboardPage go={go} bootstrap={data} daemon={daemon} />}
       {page === "project" && route.spaceId && <ProjectDetailPage spaceId={route.spaceId} go={go} notify={notify} catalogRevision={[
@@ -494,7 +491,7 @@ export function App() {
         projectBindings={data.projectBindings}
         invocations={data.activity.invocations}
         humanDecisionRequests={data.humanDecisionRequests ?? []}
-        onOpenRun={(runId) => go(`runs?run=${encodeURIComponent(runId)}`)}
+        onOpenRun={(runId) => go(`runs/${encodeURIComponent(runId)}`)}
       />}
       {page === "requirement" && route.requirementId && <RequirementDetailPage
         requirementId={route.requirementId}

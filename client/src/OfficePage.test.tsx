@@ -249,7 +249,27 @@ describe("Office floor live announcements", () => {
     expect(evidenceButton).toBeDefined();
 
     act(() => evidenceButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    expect(window.location.hash).toBe("#runs");
+    // 证据入口必须保留精确 Run ID，而不是只落到卷宗列表。
+    expect(window.location.hash).toBe("#runs/run-i-1");
+  });
+
+  it("disables the run-evidence entry honestly when the instance has no Run yet", () => {
+    const mihuhu = employee("mihuhu-frontend-engineer", "米糊糊 · 前端");
+    const noRun = { ...instance("i-norun", mihuhu.id, "failed", timestamp, "mock 输出校验失败"), runId: "" };
+    act(() => root.render(<OfficePage data={bootstrapWith({
+      employees: [mihuhu],
+      activity: { invocations: [], instances: [noRun] }
+    })} streamStatus="live" />));
+
+    const seat = container.querySelector<HTMLButtonElement>(".office-employee");
+    act(() => seat?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>(".employee-activity-drawer button"))
+      .filter((candidate) => candidate.textContent?.includes("查看运行证据"));
+    expect(buttons.length).toBeGreaterThan(0);
+    for (const entry of buttons) {
+      expect(entry.disabled).toBe(true);
+      expect(entry.title).toContain("运行卷宗尚未生成");
+    }
   });
 
   it("explains progress-aware long-running phases in the instance drawer", () => {
@@ -383,6 +403,55 @@ describe("OfficePage supervisor studio", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     act(() => container.querySelector<HTMLButtonElement>("button.studio-card")?.click());
     expect(onOpenRun).toHaveBeenCalledWith("run-team-1");
+  });
+
+  it("keeps a studio card whose Run is not yet generated focusable and honestly unavailable", async () => {
+    const onOpenRun = vi.fn();
+    const noRun: InvocationRecord = { ...supervisorInvocation, id: "inv-team-norun", runId: "" };
+    act(() => root.render(<OfficePage
+      data={{ ...bootstrap, activity: { invocations: [noRun], instances: [] } } as unknown as Bootstrap}
+      streamStatus="live"
+      onOpenRun={onOpenRun}
+    />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    const card = container.querySelector<HTMLButtonElement>("button.studio-card");
+    expect(card).toBeTruthy();
+    // 不用 disabled：卡片保持可聚焦，屏幕阅读器能读到「尚未生成」的真实状态。
+    expect(card?.disabled).toBe(false);
+    expect(card?.getAttribute("aria-disabled")).toBe("true");
+    expect(card?.getAttribute("aria-label")).toContain("运行卷宗尚未生成");
+    expect(card?.textContent).toContain("运行卷宗尚未生成");
+    act(() => card?.click());
+    expect(onOpenRun).not.toHaveBeenCalled();
+  });
+
+  it("marks a dispatch ticket without child instances as explicitly unavailable instead of a silent no-op", async () => {
+    // supervisorInvocation has no child instances in this bootstrap.
+    const ticket = container.querySelector<HTMLButtonElement>(".dispatch-ticket");
+    expect(ticket).toBeTruthy();
+    expect(ticket?.disabled).toBe(true);
+    expect(ticket?.title).toContain("尚无出勤实例");
+
+    const withInstance = {
+      ...bootstrap,
+      employees: [employee("mihuhu-frontend-engineer", "米糊糊 · 前端")],
+      activity: {
+        invocations: [{ ...supervisorInvocation, instanceIds: ["inst-1"] }],
+        instances: [{
+          id: "inst-1", invocationId: supervisorInvocation.id, employeeId: "mihuhu-frontend-engineer",
+          employeeVersion: 1, workflowId: "team-flow", workflowVersion: 1, nodeId: "node-1",
+          runId: "run-team-1", providerId: "mock", source: { kind: "workbench" },
+          status: "running", phase: "执行", createdAt: timestamp, updatedAt: timestamp, transitions: []
+        }]
+      }
+    } as unknown as Bootstrap;
+    act(() => root.render(<OfficePage data={withInstance} streamStatus="live" />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    const activeTicket = container.querySelector<HTMLButtonElement>(".dispatch-ticket");
+    expect(activeTicket?.disabled).toBe(false);
+    act(() => activeTicket?.click());
+    expect(container.querySelector(".employee-activity-drawer")).toBeTruthy();
   });
 
   it("shows human confirmation separately and keeps recovered attempts out of delivery progress", async () => {

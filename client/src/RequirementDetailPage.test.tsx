@@ -299,7 +299,58 @@ describe("RequirementDetailPage advancement launch", () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/api/runs/run-accepted"))).toBe(true);
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/api/runs/run-new"))).toBe(false);
     act(() => button("独立运行卷宗").click());
-    expect(go).toHaveBeenCalledWith("runs?run=run-accepted");
+    expect(go).toHaveBeenCalledWith("runs/run-accepted");
+  });
+
+  it("routes the embedded terminal Run next action to the acceptance section", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty", now: () => new Date("2026-08-10T04:00:00.000Z"), idSeed: () => "req-deliver" });
+    service.syncConnectedProjects([project]);
+    const requirement = await service.createRequirement({
+      projectId: project.id, title: "终态卷宗下一步", summary: "内嵌卷宗也要给出验收入口", priority: "high",
+      rawRequirement: "终态 Run 有明确下一步", acceptanceCriteria: ["下一动作直达验收与合入"]
+    });
+    const config = { entrancePolicyId: entrancePolicy.id, autoPollEnabled: false, pollIntervalMs: 15_000 };
+    const reserved = await service.reserveRequirementAdvancement(requirement.id, config, "human");
+    await service.syncRequirementAdvancement(requirement.id, reserved.idempotencyKey, {
+      invocationId: "inv-deliver", runId: "run-deliver", status: "completed", observedAt: "2026-08-10T04:00:01.000Z"
+    }, config.pollIntervalMs);
+    const terminalRun = {
+      id: "run-deliver", workflow: workflow.id, architecture: "supervisor", artifactDir: "/deliver",
+      status: "passed", createdAt: "2026-08-10T04:00:00.000Z", nodes: {}, taskId: requirement.id,
+      invocation: {
+        id: "inv-deliver", status: "completed", requestSummary: "推进需求",
+        control: {
+          schemaVersion: 1,
+          attempt: { phase: "ended", outcome: "succeeded" },
+          goal: { state: "attention" },
+          owner: "user",
+          allowedActions: ["review-delivery"]
+        }
+      }
+    };
+    const fetchMock = vi.fn((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [terminalRun] }) });
+      if (url === "/api/runs/run-deliver") return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: terminalRun }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {
+        runId: "run-deliver", status: "not-ready", eligible: false, reasons: [],
+        acceptanceReadiness: { ready: false, reasons: [] }, targetClean: false,
+        changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 262_144 } },
+        safeGitCommands: [], evidence: { assets: [], structuredE2eCount: 0, acceptedVerdict: false, gates: [] },
+        confirmationToken: "MERGE run-deliver", discardConfirmationToken: "DISCARD run-deliver"
+      } }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const go = vi.fn();
+
+    act(() => root.render(<RequirementDetailPage requirementId={requirement.id} section="run" go={go} notify={vi.fn()} service={service} projects={[project]} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+
+    // 内嵌终态卷宗必须给出可用的下一动作，而不是只宣告「执行已结束」。
+    const next = button("核对交付与验收");
+    await act(async () => { next.click(); });
+    expect(go).toHaveBeenCalledWith(`requirements/${requirement.id}?section=acceptance`);
   });
 
   it("explains the pending decision and opens the exact Run as the primary action", async () => {

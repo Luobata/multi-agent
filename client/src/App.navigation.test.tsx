@@ -268,7 +268,10 @@ describe("App navigation freshness", () => {
     expect(labels).not.toContain("项目接入");
   });
 
-  it("surfaces pending human decisions globally and deep-links the Runs nav to the exact Run", async () => {
+  it("keeps the pending-decision attention signal on the dashboard nav only", async () => {
+    await import("./OfficePage");
+    await import("./BoardPage");
+    await import("./RunsPage");
     const awaiting: InvocationRecord = {
       id: "inv-global-decision",
       target: { kind: "workflow", id: "team-flow", version: 1 },
@@ -282,15 +285,59 @@ describe("App navigation freshness", () => {
       updatedAt: timestamp,
       transitions: []
     };
+    const run = { id: "run-global-decision", workflow: "team-flow", architecture: "graph", artifactDir: "/run", status: "running", createdAt: timestamp, nodes: {} };
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url === "/api/bootstrap") {
+        const request = deferred<unknown>();
+        bootstrapRequests.push(request);
+        return request.promise;
+      }
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, json: async () => ({ data: [run] }) });
+      if (url === "/api/runs/run-global-decision") return Promise.resolve({ ok: true, json: async () => ({ data: run }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, json: async () => ({ data: {
+        runId: "run-global-decision", status: "not-ready", eligible: false, reasons: [],
+        acceptanceReadiness: { ready: false, reasons: [] }, targetClean: false,
+        changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 262_144 } },
+        safeGitCommands: [], evidence: { assets: [], structuredE2eCount: 0, acceptedVerdict: false, gates: [] },
+        confirmationToken: "MERGE run-global-decision", discardConfirmationToken: "DISCARD run-global-decision"
+      } }) });
+      return Promise.resolve({ ok: true, json: async () => ({ data: [] }) });
+    });
     act(() => root.render(<App />));
     respond(0, bootstrapWith({ activity: { invocations: [awaiting], instances: [] } }));
     await flush();
 
-    expect(navButton("需求看板").querySelector(".nav-attention-badge")?.textContent).toBe("1");
-    const runsButton = navButton("运行卷宗");
-    expect(runsButton.getAttribute("title")).toContain("1 项待你决定");
-    click(runsButton);
+    // 工作台独占关注信号：badge 与 title 只挂在工作台导航项上。
+    const dashboardButton = navButton("工作台");
+    expect(dashboardButton.querySelector(".nav-attention-badge")?.textContent).toBe("1");
+    expect(dashboardButton.getAttribute("title")).toContain("1 项待你决定");
+    expect(navButton("需求看板").querySelector(".nav-attention-badge")).toBeNull();
+    expect(navButton("需求看板").getAttribute("title")).toBe("需求看板");
+    expect(navButton("运行卷宗").querySelector(".nav-attention-badge")).toBeNull();
+    expect(navButton("运行卷宗").getAttribute("title")).toBe("运行卷宗");
+
+    // 看板与卷宗导航保持平直跳转，不再劫持到某个具体 Run。
+    click(navButton("需求看板"));
+    respond(1, bootstrapWith({ activity: { invocations: [awaiting], instances: [] } }));
+    await flush();
+    expect(window.location.hash).toBe("#board");
+
+    click(navButton("运行卷宗"));
+    respond(2, bootstrapWith({ activity: { invocations: [awaiting], instances: [] } }));
+    await flush();
+    await flush();
+    expect(window.location.hash).toBe("#runs");
+    expect(window.location.hash).not.toContain("run-global-decision");
+
+    // 聚焦链接仍然直达指定 Run 卷宗。
+    act(() => {
+      window.history.pushState(null, "", "#runs/run-global-decision");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await flush();
     expect(window.location.hash).toBe("#runs/run-global-decision");
+    expect(fetchMock.mock.calls.some(([input]) => String(input) === "/api/runs/run-global-decision")).toBe(true);
   });
 
   it("enters read-only offline only when the very first bootstrap fails", async () => {
@@ -432,5 +479,115 @@ describe("App navigation freshness", () => {
 
     expect(document.documentElement.getAttribute("data-theme")).toBe("pixel");
     expect(localStorage.getItem("workbench-theme")).toBe("pixel");
+  });
+
+  it("writes the canonical #runs/<id> hash when the operator selects a run from the list", async () => {
+    await import("./OfficePage");
+    await import("./RunsPage");
+    const runA = { id: "run-a", workflow: "wf-a", architecture: "graph", artifactDir: "/a", status: "passed", createdAt: timestamp, nodes: {} };
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url === "/api/bootstrap") {
+        const request = deferred<unknown>();
+        bootstrapRequests.push(request);
+        return request.promise;
+      }
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, json: async () => ({ data: [runA] }) });
+      if (url === "/api/runs/run-a") return Promise.resolve({ ok: true, json: async () => ({ data: runA }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, json: async () => ({ data: {
+        runId: "run-a", status: "not-ready", eligible: false, reasons: [],
+        acceptanceReadiness: { ready: false, reasons: [] }, targetClean: false,
+        changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 262_144 } },
+        safeGitCommands: [], evidence: { assets: [], structuredE2eCount: 0, acceptedVerdict: false, gates: [] },
+        confirmationToken: "MERGE run-a", discardConfirmationToken: "DISCARD run-a"
+      } }) });
+      return Promise.resolve({ ok: true, json: async () => ({ data: [] }) });
+    });
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    click(navButton("运行卷宗"));
+    await flush();
+    const card = container.querySelector<HTMLButtonElement>("#run-a");
+    expect(card).toBeTruthy();
+    click(card!);
+    await flush();
+
+    expect(window.location.hash).toBe("#runs/run-a");
+    expect(window.location.hash).not.toContain("?run=");
+  });
+
+  it("opens the exact Run from memory with a canonical hash, ignoring any remembered older Run", async () => {
+    await import("./OfficePage");
+    await import("./MemoryPage");
+    await import("./RunsPage");
+    const runOld = { id: "run-old", workflow: "wf-old", architecture: "graph", artifactDir: "/old", status: "passed", createdAt: timestamp, nodes: {} };
+    const memoryRecord = {
+      id: "rec-1",
+      scope: { employeeId: "mihuhu-frontend-engineer", employeeVersion: 1 },
+      kind: "run-summary",
+      title: "运行记忆",
+      content: "一次完成的运行。",
+      provenance: { runId: "run-new", traceId: "trace-1" },
+      status: "active",
+      tokens: 10,
+      createdAt: timestamp,
+      supersedesId: null
+    };
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url === "/api/bootstrap") {
+        const request = deferred<unknown>();
+        bootstrapRequests.push(request);
+        return request.promise;
+      }
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, json: async () => ({ data: [runOld] }) });
+      if (url.startsWith("/api/runs/") && url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, json: async () => ({ data: {
+        runId: "run-old", status: "not-ready", eligible: false, reasons: [],
+        acceptanceReadiness: { ready: false, reasons: [] }, targetClean: false,
+        changes: { files: [], fileCount: 0, summary: "", unifiedDiff: { text: "", truncated: false, maxBytes: 262_144 } },
+        safeGitCommands: [], evidence: { assets: [], structuredE2eCount: 0, acceptedVerdict: false, gates: [] },
+        confirmationToken: "MERGE run-old", discardConfirmationToken: "DISCARD run-old"
+      } }) });
+      if (url.startsWith("/api/runs/")) return Promise.resolve({ ok: true, json: async () => ({ data: runOld }) });
+      if (url === "/api/memory/scopes") return Promise.resolve({ ok: true, json: async () => ({ data: { scopes: [{ scopeKey: "employee:mihuhu-frontend-engineer", count: 1 }] } }) });
+      if (url.startsWith("/api/memory/scope")) return Promise.resolve({ ok: true, json: async () => ({ data: { records: [memoryRecord] } }) });
+      return Promise.resolve({ ok: true, json: async () => ({ data: [] }) });
+    });
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    // 先看一份旧卷宗，让 runs 分组记住 run-old。
+    click(navButton("运行卷宗"));
+    await flush();
+    click(container.querySelector<HTMLButtonElement>("#run-old")!);
+    await flush();
+    expect(window.location.hash).toBe("#runs/run-old");
+
+    click(navButton("记忆档案"));
+    await flush();
+    const scope = [...container.querySelectorAll<HTMLButtonElement>(".memory-scope-card")]
+      .find((candidate) => candidate.textContent?.includes("employee:mihuhu-frontend-engineer"));
+    expect(scope).toBeTruthy();
+    click(scope!);
+    await flush();
+    const record = [...container.querySelectorAll<HTMLButtonElement>(".memory-record-card")]
+      .find((candidate) => candidate.textContent?.includes("运行记忆"));
+    expect(record).toBeTruthy();
+    click(record!);
+    await flush();
+    const expand = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((candidate) => candidate.textContent?.includes("展开完整详情"));
+    click(expand!);
+    await flush();
+    const link = container.querySelector<HTMLButtonElement>('[data-testid="memory-run-link"]');
+    expect(link?.textContent).toBe("run-new");
+    click(link!);
+    await flush();
+
+    // 记忆档案的选择必须直达 run-new，不能被记住的旧 Run 覆盖。
+    expect(window.location.hash).toBe("#runs/run-new");
   });
 });

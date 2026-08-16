@@ -92,12 +92,20 @@ Provider 故障统一归类为：
 
 这样可以区分“失败过一次后恢复”和“重复执行仍不会恢复”。
 
-### 4.3 异步 Workflow 入口
+### 4.3 异步 Invocation 入口
 
 新增首选 HTTP 调用：
 
 ```text
 POST /api/workflows/:id/start
+```
+
+员工与项目会话使用同一份 Invocation/Run 监控协议：
+
+```text
+POST /api/employees/:id/start
+POST /api/projects/:id/roles/:roleId/start
+POST /api/projects/:id/conversations/:roleId/start
 ```
 
 服务验证并建立 Invocation 后立即返回 `202 Accepted`，响应包含：
@@ -123,7 +131,9 @@ MCP 同步新增：
 - `resume_workflow_monitor`：已知 `runId` 时恢复 Invocation 与监听回执。
 - `get_invocation`：查询运行状态和最终证据。
 
-原 `/api/workflows/:id/run` 与 `run_workflow` 暂时保留为兼容入口，但新的长任务调用应默认使用异步入口。
+`GET /api/runs/:id/monitor` 可为 Workflow 或 Employee Invocation 恢复新的监听回执。原 `/api/workflows/:id/run`、`run_workflow` 以及员工/项目角色的 `/invoke` 暂时保留为兼容入口，但新的 Web 长任务调用应默认使用异步入口。
+
+当前 Employee Invocation 的“可恢复”含义是调用方可按原 Run 重挂并取得权威终态；它尚未具备跨 daemon 的 Provider 检查点续跑。daemon 重启时，未完成的 Employee Invocation 会以 `interrupted/failed` 收敛并推进 durable cancellation epoch，旧进程迟到结果不得覆盖该终态。只有具备持久检查点的 Supervisor Workflow 会自动续跑。
 
 ### 4.4 中止信号基础能力
 
@@ -137,7 +147,7 @@ Workflow 页面改为向异步入口提交。界面中的“运行中”只覆�
 
 对 Web 或 MCP 客户端，统一采用“启动—观察—取证”三步：
 
-1. 为一次逻辑启动生成稳定的 `idempotencyKey`，调用 `start_workflow`、`start_publication` 或对应的 `POST /start`，保存 `invocationId`、`runId` 与 `monitor.initialCursor`；网络重试必须复用原 key，新的逻辑运行必须使用新 key。
+1. Workflow 为一次逻辑启动生成稳定的 `idempotencyKey`；调用 `start_workflow`、`start_publication` 或对应的 `POST /start`，保存 `invocationId`、`runId` 与 `monitor.initialCursor`。网络或页面监控中断时必须按原回执重挂，不能重提业务消息来代替监控重试。
 2. MCP 会话立即循环 `wait_workflow_progress`，每次传入上次的 `nextCursor`；`terminal=false` 时不得结束当前回合。只有 changed/terminal 结果进入模型或向用户转述，heartbeat 仅作为 transport keepalive。Web 界面也可通过 SSE 观察整体活动。
 3. Invocation 进入终态后读取 Run 证据并交付规范化结果。连接中断时使用 `resume_workflow_monitor(runId)` 重挂，不能把 HTTP 连接存活视为任务存活。
 
@@ -151,7 +161,7 @@ Workflow 页面改为向异步入口提交。界面中的“运行中”只覆�
 - `maxConcurrency` 与 `failFast` 语义保持有效。
 - 预算耗尽和确定性失败不会重复 attempt。
 - 明确标记的瞬态错误仍会按配置重试。
-- 异步 HTTP 返回 202，随后可由 Invocation 查询得到运行中与最终状态。
+- Workflow、Employee 与项目会话的异步 HTTP 返回 202，随后可由 Invocation 查询得到运行中与最终状态。
 - MCP 暴露并可调用 `start_workflow`、`get_invocation`。
 - Workflow Publication 可通过 `start_publication` 异步启动，并能通过 `runId` 恢复监听。
 - 旧同步入口继续兼容。

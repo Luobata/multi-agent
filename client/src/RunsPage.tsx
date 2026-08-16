@@ -1000,7 +1000,10 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
     [runs, categoryFilter, projectFilter]
   );
   const directed = Boolean(requestedRunId);
-  const targetMissing = Boolean(pendingRunId) && !loading && !listError && !runs.some((run) => run.id === pendingRunId);
+  // 目标 Run 可能早于 /api/runs?limit=100 的窗口：只要详情端点能取回同 id 的卷宗，
+  // 就渲染它，而不是误报「正在建立」。详情 404 时仍保留原有的建立中/重试表达。
+  const targetMissing = Boolean(pendingRunId) && !loading && !listError && !runs.some((run) => run.id === pendingRunId)
+    && !detailLoading && detail?.id !== pendingRunId;
   const summary = visibleRuns.find((run) => run.id === selectedId) ?? (directed ? undefined : visibleRuns[0]);
   const selected = detail?.id === selectedId ? detail : summary;
   // Running dossiers refresh every two seconds. Keep the last complete dossier interactive

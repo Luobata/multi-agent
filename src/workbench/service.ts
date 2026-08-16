@@ -2190,6 +2190,16 @@ export class WorkbenchService {
         invocation.status = "failed";
         invocation.phase = "interrupted";
         invocation.error = "Local runtime restarted before this invocation completed.";
+        // An old daemon/provider process can outlive the listener during a rolling or failed
+        // restart. Advance the existing durable cancellation epoch so its late response cannot
+        // overwrite this fail-closed recovery decision.
+        invocation.cancellation = {
+          actor: "runtime-recovery",
+          reason: invocation.error,
+          epoch: (invocation.cancellation?.epoch ?? 0) + 1,
+          requestedAt: timestamp,
+          acknowledgedAt: timestamp
+        };
         invocation.updatedAt = timestamp;
         invocation.completedAt = timestamp;
         invocation.transitions.push({
@@ -3132,7 +3142,8 @@ export class WorkbenchService {
     const invocation = await this.store.mutate((state) => {
       const target = state.invocations[id];
       if (!target) throw new Error(`invocation not found: ${id}`);
-      if ((target.status === "cancellation-requested" || target.status === "cancelled")
+      if (isInvocationTerminal(target.status)) return target;
+      if (target.status === "cancellation-requested"
         && status !== "cancellation-requested" && status !== "cancelled") return target;
       target.status = status;
       target.phase = phase;
@@ -3147,7 +3158,7 @@ export class WorkbenchService {
       return target;
     });
     this.emitActivity({ type: "invocation.changed", at: timestamp, invocation });
-    if (isInvocationTerminal(status)) {
+    if (isInvocationTerminal(invocation.status)) {
       const retainedInstances = this.snapshot().invocations[id]?.instanceIds
         .map((instanceId) => this.snapshot().workInstances[instanceId])
         .filter((instance): instance is WorkInstanceRecord => (
@@ -3159,13 +3170,13 @@ export class WorkbenchService {
         await this.transitionInstance(
           id,
           instance.nodeId,
-          status === "completed" ? "completed" : "cancelled",
+          invocation.status === "completed" ? "completed" : "cancelled",
           "member-session-closed",
           "Run 已结束，成员会话已释放。"
         );
       }
     }
-    if (isInvocationTerminal(status) && invocation.executionSnapshot?.workflow.architecture === "supervisor") {
+    if (isInvocationTerminal(invocation.status) && invocation.executionSnapshot?.workflow.architecture === "supervisor") {
       await this.persistSupervisorSessionProgress(id);
     }
     return invocation;
@@ -3186,6 +3197,7 @@ export class WorkbenchService {
         .map((id) => state.workInstances[id])
         .find((candidate) => candidate?.nodeId === nodeId || candidate?.nodeIds?.includes(nodeId));
       if (!target) return undefined;
+      if (isInstanceTerminal(target.status)) return target;
       target.status = status;
       target.phase = phase;
       target.updatedAt = timestamp;
@@ -3329,7 +3341,10 @@ export class WorkbenchService {
     recovery?: { providerCwd: string; isolation?: WorkflowRunIsolation; manifestPath: string },
     signal?: AbortSignal
   ): Promise<RunWorkflowResult> {
-    await this.transitionInvocation(invocation.id, "running", recovery ? "recovering" : "materializing");
+    const started = await this.transitionInvocation(invocation.id, "running", recovery ? "recovering" : "materializing");
+    if (started.status !== "running") {
+      throw new Error(`invocation ${invocation.id} cannot start from terminal status ${started.status}`);
+    }
     try {
       const inputTaskTags = (Array.isArray(input.taskTags) ? input.taskTags : [])
         .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
@@ -6340,7 +6355,7 @@ export class WorkbenchService {
     };
   }
 
-  private async invokeResolvedEmployee(options: {
+  private async startResolvedEmployee(options: {
     employee: EmployeeDefinition;
     input: EmployeeInvocationInput;
     source: InvocationSource;
@@ -6349,7 +6364,7 @@ export class WorkbenchService {
     workflow?: { id: string; version: number; description: string };
     providerCwd?: string;
     entrance?: EntrancePolicyExecutionSnapshot;
-  }): Promise<EmployeeInvocationResult> {
+  }): Promise<{ receipt: InvocationStartResult; completion: Promise<EmployeeInvocationResult> }> {
     const { employee, input, source } = options;
     // 自动型系统员工（systemRole=automatic）只能由系统内部触发（source.caller 以 "system:" 前缀标记），
     // 不支持人工直接调用。守卫下沉到此汇聚点：invokeEmployee / invokePinnedEmployee / invokeProjectRole /
@@ -6419,7 +6434,8 @@ export class WorkbenchService {
       ...(effectiveAssignment ? { assignments: new Map([["respond", effectiveAssignment]]) } : {})
     });
     const sessionId = session.id;
-    return this.inSessionQueue(sessionId, async () => {
+    const controller = new AbortController();
+    const completion = this.inSessionQueue(sessionId, async () => {
       await this.transitionInstance(invocation.id, "respond", "waiting", "waiting-session");
     }, async () => {
       const latestSession = this.getSession(sessionId);
@@ -6432,7 +6448,7 @@ export class WorkbenchService {
         sessionHistory: history,
         ...(input.context ? { context: input.context } : {}),
         ...(promptEvidence ? { conversationEvidence: promptEvidence } : {})
-      }, options.providerCwd);
+      }, options.providerCwd, undefined, controller.signal);
       const node = result.run.nodes.respond;
       const responseMessage = invocationMessage(node?.output);
       const timestamp = now();
@@ -6485,6 +6501,32 @@ export class WorkbenchService {
         message: responseMessage
       };
     });
+    const settled = completion.then(() => undefined, () => undefined);
+    const tracked = { promise: settled, controller, epoch: invocation.cancellation?.epoch ?? 0 };
+    this.backgroundInvocations.set(invocation.id, tracked);
+    void settled.finally(() => {
+      if (this.backgroundInvocations.get(invocation.id) === tracked) {
+        this.backgroundInvocations.delete(invocation.id);
+      }
+    });
+    return {
+      receipt: await this.invocationReceipt(invocation),
+      completion
+    };
+  }
+
+  private async invokeResolvedEmployee(options: {
+    employee: EmployeeDefinition;
+    input: EmployeeInvocationInput;
+    source: InvocationSource;
+    session?: EmployeeSession;
+    assignment?: EmployeeSession["assignment"];
+    workflow?: { id: string; version: number; description: string };
+    providerCwd?: string;
+    entrance?: EntrancePolicyExecutionSnapshot;
+  }): Promise<EmployeeInvocationResult> {
+    const started = await this.startResolvedEmployee(options);
+    return started.completion;
   }
 
   private rejectRegisteredProjectEmployeeBypass(source: InvocationSource): void {
@@ -6518,6 +6560,39 @@ export class WorkbenchService {
     const employee = session ? this.getEmployee(employeeId, session.employeeVersion) : current;
     const providerCwd = await this.validatedProviderCwd(options.providerCwd);
     return this.invokeResolvedEmployee({ employee, input: { ...input, message: input.message.trim() }, source, session, providerCwd });
+  }
+
+  /**
+   * Start a direct Employee turn without tying its lifetime to the caller's HTTP connection.
+   * The durable Invocation/Run receipt is returned after validation and persistence; the
+   * existing synchronous `invokeEmployee` entry remains available for compatibility.
+   */
+  async startEmployee(
+    employeeId: string,
+    input: EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" },
+    options: { providerCwd?: string } = {}
+  ): Promise<InvocationStartResult> {
+    requireText(input.message, "message");
+    this.rejectRegisteredProjectEmployeeBypass(source);
+    const current = this.getEmployee(employeeId);
+    if (current.status !== "active") throw new Error(`employee ${employeeId} is archived`);
+    const scopedProjectId = internalProjectId(current);
+    if (scopedProjectId) throw new Error(`employee ${employeeId} is internal to project ${scopedProjectId}; invoke it through a project role`);
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    if (session && session.employeeId !== employeeId) throw new Error(`session ${session.id} belongs to another employee`);
+    if (session?.supervisor) throw new Error(`session ${session.id} is a Supervisor leader session; use continue_workflow_conversation`);
+    if (session?.assignment) throw new Error(`session ${session.id} belongs to project ${session.assignment.projectId}/${session.assignment.roleId}`);
+    const employee = session ? this.getEmployee(employeeId, session.employeeVersion) : current;
+    const providerCwd = await this.validatedProviderCwd(options.providerCwd);
+    const started = await this.startResolvedEmployee({
+      employee,
+      input: { ...input, message: input.message.trim() },
+      source,
+      session,
+      providerCwd
+    });
+    return started.receipt;
   }
 
   private async invokePinnedEmployee(
@@ -6677,6 +6752,57 @@ export class WorkbenchService {
     });
   }
 
+  /** Start one pinned Project Role turn asynchronously while preserving Session ordering. */
+  async startProjectRole(
+    projectId: string,
+    roleId: string,
+    input: EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<InvocationStartResult> {
+    requireText(input.message, "message");
+    const currentProject = this.getProject(projectId);
+    if (currentProject.status !== "active") throw new Error(`project ${projectId} is archived`);
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    if (session && (!session.assignment || session.assignment.projectId !== projectId || session.assignment.roleId !== roleId)) {
+      throw new Error(`session ${session.id} belongs to another project assignment`);
+    }
+    const resolved = session?.assignment
+      ? this.resolveProjectEmployee(
+          projectId,
+          roleId,
+          session.assignment.projectVersion,
+          session.assignment.projectBindingVersion
+        )
+      : this.resolveProjectEmployee(projectId, roleId);
+    const currentEmployee = this.getEmployee(resolved.employee.id);
+    if (currentEmployee.status !== "active") throw new Error(`employee ${resolved.employee.id} is archived`);
+    const assignment = session?.assignment ?? {
+      projectId,
+      projectVersion: resolved.project.version,
+      projectBindingVersion: resolved.binding.version,
+      roleId
+    };
+    const started = await this.startResolvedEmployee({
+      employee: resolved.employee,
+      input: { ...input, message: input.message.trim() },
+      source: {
+        ...source,
+        project: projectId,
+        projectRole: roleId,
+        projectBindingVersion: resolved.binding.version
+      },
+      session,
+      assignment,
+      providerCwd: resolved.project.rootPath,
+      workflow: {
+        id: `project-${projectId}-${roleId}`,
+        version: resolved.binding.version,
+        description: `${resolved.project.name} / ${resolved.project.roles.find((role) => role.id === roleId)?.displayName ?? roleId}`
+      }
+    });
+    return started.receipt;
+  }
+
   /**
    * Invoke a conversational role for a target project. Projects may intentionally
    * omit global intake roles from their own descriptor, so a compatible assigned
@@ -6725,6 +6851,59 @@ export class WorkbenchService {
       input.message.trim()
     ].join("\n");
     return this.invokeProjectRole(
+      hostProjectId,
+      roleId,
+      { ...input, message: contextualMessage },
+      { ...source, targetProject: targetProject.id }
+    );
+  }
+
+  /**
+   * Async counterpart of `invokeProjectConversation`; the target/host distinction and pinned
+   * project assignment remain identical to the synchronous compatibility path.
+   */
+  async startProjectConversation(
+    targetProjectId: string,
+    roleId: string,
+    input: EmployeeInvocationInput,
+    source: InvocationSource = { kind: "workbench" }
+  ): Promise<InvocationStartResult> {
+    requireText(input.message, "message");
+    const targetProject = this.getProject(targetProjectId);
+    if (targetProject.status !== "active") throw new Error(`project ${targetProjectId} is archived`);
+
+    const session = input.sessionId ? this.getSession(input.sessionId) : undefined;
+    let hostProjectId = session?.assignment?.projectId;
+    if (session) {
+      if (!session.assignment || session.assignment.roleId !== roleId) {
+        throw new Error(`session ${session.id} belongs to another project conversation`);
+      }
+    } else {
+      const bindings = new Map(this.listProjectBindings().map((binding) => [binding.projectId, binding]));
+      const candidates = this.listProjects()
+        .filter((project) => project.status === "active")
+        .filter((project) => project.roles.some((role) => role.id === roleId))
+        .filter((project) => bindings.get(project.id)?.roles.some((role) => role.roleId === roleId))
+        .sort((left, right) => {
+          if (left.id === targetProjectId) return -1;
+          if (right.id === targetProjectId) return 1;
+          return left.id.localeCompare(right.id);
+        });
+      hostProjectId = candidates[0]?.id;
+    }
+    if (!hostProjectId) {
+      throw new Error(`no active project assignment can host conversational role: ${roleId}`);
+    }
+
+    const contextualMessage = [
+      "【本轮对话归属项目】",
+      `项目 ID：${targetProject.id}`,
+      `项目名称：${targetProject.name}`,
+      "请只围绕该项目澄清或整理用户原话，不要创建、推进或修改任何需求记录。",
+      "【用户原话】",
+      input.message.trim()
+    ].join("\n");
+    return this.startProjectRole(
       hostProjectId,
       roleId,
       { ...input, message: contextualMessage },
@@ -7973,7 +8152,7 @@ export class WorkbenchService {
     return { invocation, workflow, employees };
   }
 
-  private async workflowInvocationReceipt(invocation: InvocationRecord): Promise<InvocationStartResult> {
+  private async invocationReceipt(invocation: InvocationRecord): Promise<InvocationStartResult> {
     const initialCursor = invocationProgressCursor(await this.getInvocationProgress(invocation.id));
     const projectedInvocation = withInvocationControl(invocation, Object.values(this.snapshot().invocations));
     return {
@@ -8015,7 +8194,7 @@ export class WorkbenchService {
         this.backgroundInvocations.delete(prepared.invocation.id);
       }
     });
-    return this.workflowInvocationReceipt(prepared.invocation);
+    return this.invocationReceipt(prepared.invocation);
   }
 
   async startWorkbenchWorkflow(
@@ -8051,7 +8230,7 @@ export class WorkbenchService {
       if (existing.idempotencyFingerprint !== fingerprint) {
         throw new Error(`idempotency key ${idempotencyKey} is already bound to a different workflow start request`);
       }
-      return this.workflowInvocationReceipt(existing);
+      return this.invocationReceipt(existing);
     }
 
     const pending = this.idempotentWorkflowStarts.get(idempotencyKey);
@@ -8125,16 +8304,18 @@ export class WorkbenchService {
     );
   }
 
-  /** Return a fresh long-poll receipt for a durable Workflow Invocation identified by Run id. */
-  async resumeWorkflowMonitor(runId: string): Promise<InvocationStartResult> {
+  /** Return a fresh long-poll receipt for any durable Invocation identified by Run id. */
+  async resumeInvocationMonitor(runId: string): Promise<InvocationStartResult> {
     if (!/^run-[A-Za-z0-9-]+$/.test(runId)) throw new Error("run id is invalid");
     const invocation = Object.values(this.snapshot().invocations)
       .find((candidate) => candidate.runId === runId);
-    if (!invocation) throw new Error(`workflow Invocation not found for Run: ${runId}`);
-    if (invocation.target.kind !== "workflow") {
-      throw new Error(`Run ${runId} belongs to an Employee Invocation and has no Workflow monitor`);
-    }
-    return this.workflowInvocationReceipt(invocation);
+    if (!invocation) throw new Error(`Invocation not found for Run: ${runId}`);
+    return this.invocationReceipt(invocation);
+  }
+
+  /** Backward-compatible name retained for existing Workflow MCP callers. */
+  async resumeWorkflowMonitor(runId: string): Promise<InvocationStartResult> {
+    return this.resumeInvocationMonitor(runId);
   }
 
   async archiveWorkflow(id: string): Promise<WorkbenchWorkflowDefinition> {

@@ -1134,6 +1134,13 @@ input[type="color"] { padding: var(--space-1); }
 .transcript-row > p { max-width: 68ch; margin: 0; padding: var(--space-4) var(--space-5); line-height: 1.65; white-space: pre-wrap; }
 .transcript-row--employee { background: var(--paper-raised); }
 .transcript-row--system { background: var(--paper-sunken); }
+.transcript-row--pending { background: var(--seal-amber-bg); }
+.pending-turn { display: grid; gap: var(--space-2); padding: var(--space-4) var(--space-5); }
+.pending-turn-message { max-width: 68ch; margin: 0; line-height: 1.65; white-space: pre-wrap; }
+.pending-turn-status { margin: 0; color: var(--ink-3); font-family: var(--font-machine); font-size: var(--text-xs); }
+.pending-turn-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+.pending-turn-evidence { font-size: var(--text-xs); }
+.pending-turn-error { margin: 0; color: var(--stamp-red-ink); font-size: var(--text-xs); }
 .composer { padding: var(--space-3); border-top: var(--rule) solid var(--line-strong); background: var(--paper-raised); }
 .composer textarea { display: block; border: var(--rule) solid var(--line-strong); background: var(--paper-sunken); resize: vertical; }
 .composer textarea:focus-visible { outline-offset: 1px; }
@@ -1792,7 +1799,8 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
 .studio-card:hover { border-color: var(--seal-blue); transform: translateY(-1px); }
 .studio-card:focus-visible { outline: 3px solid var(--seal-blue); outline-offset: 3px; }
 .studio-card:active { transform: translateY(1px); box-shadow: none; }
-.studio-card:disabled { cursor: not-allowed; opacity: .65; transform: none; }
+.studio-card:disabled, .studio-card[aria-disabled="true"] { cursor: not-allowed; opacity: .65; transform: none; }
+.studio-card[aria-disabled="true"]:hover { border-color: var(--line-strong); transform: none; }
 .studio-card--completed { border-left-color: var(--seal-green, #4c8c4a); }
 .studio-card--confirmation { border-left-color: var(--seal-amber, #c98a2b); }
 .studio-card--blocked { border-left-color: var(--seal-amber, #c98a2b); }
@@ -2164,7 +2172,7 @@ input[role="switch"]:disabled { cursor: not-allowed; opacity: .55; }
 /* B3 · 契约：滚动容器可聚焦，补即时焦点环；横滚仍在容器内 */
 .board-scroll { overflow-x: auto; padding-bottom: var(--space-3); scrollbar-color: var(--line-strong) transparent; }
 .board-scroll:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-.board-grid { min-width: 2160px; display: grid; grid-template-columns: repeat(8, minmax(250px, 1fr)); gap: var(--space-3); align-items: start; }
+.board-grid { min-width: 1798px; display: grid; grid-template-columns: repeat(7, minmax(250px, 1fr)); gap: var(--space-3); align-items: start; }
 .board-grid--loading { grid-template-columns: repeat(7, minmax(250px, 1fr)); }
 .board-lane--loading .dash-skeleton { border: 0; background: transparent; }
 /* B5 · 契约：列容器 radius-2 + 裁切 + 错位小阴影 + 4n 四季身份色 */

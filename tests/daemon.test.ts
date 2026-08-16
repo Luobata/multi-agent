@@ -171,6 +171,80 @@ describe("workbench daemon", () => {
     expect(JSON.stringify(detail.run)).toContain("Please clarify this vague request");
   });
 
+  it("starts Employee and project conversations with recoverable Invocation receipts", async () => {
+    const { base, service } = await fixture();
+    const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-async-conversation-target-"));
+    directories.push(targetRoot);
+    await service.createProject({
+      id: "async-conversation-target",
+      name: "Async Conversation Target",
+      rootPath: targetRoot,
+      descriptorPath: path.join(targetRoot, "multi-agent.project.yaml"),
+      roles: [{ id: "developer", displayName: "Developer" }]
+    });
+
+    const directResponse = await fetch(`${base}/api/employees/desk-agent/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "Start a direct durable turn" })
+    });
+    expect(directResponse.status).toBe(202);
+    const direct = await directResponse.json() as {
+      data: {
+        invocation: { id: string; sessionId: string; target: { kind: string; id: string } };
+        runId: string;
+        statusUrl: string;
+        progressUrl: string;
+        monitor: { initialCursor: string; waitUrl: string };
+      };
+    };
+    expect(direct.data).toMatchObject({
+      invocation: { target: { kind: "employee", id: "desk-agent" } },
+      statusUrl: `/api/invocations/${direct.data.invocation.id}`,
+      progressUrl: `/api/invocations/${direct.data.invocation.id}/progress`,
+      monitor: { waitUrl: `/api/invocations/${direct.data.invocation.id}/progress/wait` }
+    });
+    await service.waitForInvocation(direct.data.invocation.id);
+    expect(service.getSession(direct.data.invocation.sessionId).messages).toEqual([
+      expect.objectContaining({ role: "user", content: "Start a direct durable turn", runId: direct.data.runId }),
+      expect.objectContaining({ role: "employee", runId: direct.data.runId })
+    ]);
+
+    const conversationResponse = await fetch(
+      `${base}/api/projects/async-conversation-target/conversations/reviewer/start`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: "Clarify asynchronously" })
+      }
+    );
+    expect(conversationResponse.status).toBe(202);
+    const conversation = await conversationResponse.json() as {
+      data: {
+        invocation: { id: string; sessionId: string; source: { project?: string; targetProject?: string; projectRole?: string } };
+        runId: string;
+        monitor: { waitUrl: string };
+      };
+    };
+    expect(conversation.data.invocation.source).toMatchObject({
+      project: "desk-project",
+      targetProject: "async-conversation-target",
+      projectRole: "reviewer"
+    });
+    await service.waitForInvocation(conversation.data.invocation.id);
+    const recoveredResponse = await fetch(`${base}/api/runs/${encodeURIComponent(conversation.data.runId)}/monitor`);
+    expect(recoveredResponse.status).toBe(200);
+    await expect(recoveredResponse.json()).resolves.toMatchObject({
+      data: {
+        invocation: { id: conversation.data.invocation.id, target: { kind: "employee" } },
+        runId: conversation.data.runId,
+        monitor: { waitUrl: conversation.data.monitor.waitUrl }
+      }
+    });
+    expect(JSON.stringify(await service.getInvocationDetail(conversation.data.invocation.id)))
+      .toContain("Async Conversation Target");
+  });
+
   it("repins a project-scoped Employee through the live daemon after a project descriptor upgrade", async () => {
     const { base, service } = await fixture();
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-repin-project-"));

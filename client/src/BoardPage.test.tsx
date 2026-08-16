@@ -28,6 +28,82 @@ function connectedProjectB(): Project {
   return { ...connectedProject(), id: "connected-b", name: "真实项目 B", rootPath: "/workspace/connected-b", descriptorPath: "/workspace/connected-b/multi-agent.project.yaml" };
 }
 
+/** 需求管家 /start 202 回执夹具（client 侧 InvocationStartReceipt 形状）。 */
+function stewardReceiptFixture(sessionId: string, runId: string) {
+  return {
+    invocation: {
+      id: "inv-steward-1",
+      target: { kind: "workflow", id: "team-flow", version: 1 },
+      source: { kind: "workbench", project: "connected-a" },
+      status: "queued",
+      phase: "排队",
+      requestSummary: "需求整理",
+      runId,
+      sessionId,
+      instanceIds: [],
+      createdAt: "2026-08-09T00:00:00.000Z",
+      updatedAt: "2026-08-09T00:00:00.000Z",
+      transitions: []
+    },
+    runId,
+    statusUrl: "/api/invocations/inv-steward-1",
+    progressUrl: "/api/invocations/inv-steward-1/progress",
+    streamUrl: "/api/invocations/inv-steward-1/stream",
+    monitor: {
+      mode: "long-poll",
+      tool: "wait_workflow_progress",
+      initialCursor: "inv-steward-1:0",
+      defaultTimeoutMs: 20_000,
+      maxTimeoutMs: 60_000,
+      instructions: "long poll",
+      waitUrl: "/api/invocations/inv-steward-1/progress/wait"
+    }
+  };
+}
+
+function stewardProgressPayload(runId: string, status: string, terminal: boolean) {
+  return {
+    invocationId: "inv-steward-1",
+    runId,
+    workflowId: "team-flow",
+    architecture: "graph",
+    status,
+    phase: "整理",
+    terminal,
+    updatedAt: "2026-08-09T00:00:02.000Z",
+    round: 1,
+    tally: {},
+    steps: [],
+    leaderReport: { available: false, rounds: 0, delegations: 0, entries: [], gates: [] }
+  };
+}
+
+function stewardWaitResponse(overrides: Record<string, unknown>) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({ data: {
+      invocationId: "inv-steward-1",
+      nextCursor: "inv-steward-1:1",
+      changed: false,
+      terminal: false,
+      reason: "heartbeat",
+      progressReport: "",
+      progress: stewardProgressPayload("run-steward-1", "running", false),
+      ...overrides
+    } })
+  };
+}
+
+function stewardTerminalWait(runId: string, status = "completed") {
+  return stewardWaitResponse({
+    nextCursor: "inv-steward-1:9",
+    terminal: true,
+    reason: "terminal",
+    progress: stewardProgressPayload(runId, status, true)
+  });
+}
+
 function button(label: string): HTMLButtonElement {
   const found = [...document.querySelectorAll("button")].find((candidate) => candidate.textContent?.includes(label));
   if (!(found instanceof HTMLButtonElement)) throw new Error(`button not found: ${label}`);
@@ -79,6 +155,31 @@ describe("BoardPage AI requirement creation", () => {
   let root: Root;
   const fetchMock = vi.fn();
 
+  const stewardSession: Session = {
+    id: "session-requirement-1",
+    employeeId: "xiaomiwang-product-manager",
+    employeeVersion: 1,
+    assignment: { projectId: "connected-a", projectVersion: 1, projectBindingVersion: 1, roleId: "requirement-steward" },
+    title: "首条真实需求",
+    status: "active",
+    messages: [
+      { id: "m1", role: "user", content: "购物车空态增加优惠推荐", at: "2026-08-09T00:00:00.000Z" },
+      { id: "m2", role: "employee", content: "我已整理成草稿，请确认。", at: "2026-08-09T00:00:01.000Z", output: {
+        message: "我已整理成草稿，请确认。",
+        nextAction: "draft",
+        draft: {
+          title: "购物车空态优惠推荐",
+          summary: "为空购物车提供优惠推荐",
+          priority: "high",
+          rawRequirement: "Agent 不应覆盖成这句",
+          acceptanceCriteria: ["空态可以看到推荐", "点击可进入商品详情"]
+        }
+      } }
+    ],
+    createdAt: "2026-08-09T00:00:00.000Z",
+    updatedAt: "2026-08-09T00:00:01.000Z"
+  };
+
   beforeEach(async () => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
@@ -89,42 +190,14 @@ describe("BoardPage AI requirement creation", () => {
       configurable: true,
       value(this: HTMLDialogElement) { this.removeAttribute("open"); }
     });
-    const session: Session = {
-      id: "session-requirement-1",
-      employeeId: "xiaomiwang-product-manager",
-      employeeVersion: 1,
-      assignment: { projectId: "connected-a", projectVersion: 1, projectBindingVersion: 1, roleId: "requirement-steward" },
-      title: "首条真实需求",
-      status: "active",
-      messages: [
-        { id: "m1", role: "user", content: "购物车空态增加优惠推荐", at: "2026-08-09T00:00:00.000Z" },
-        { id: "m2", role: "employee", content: "我已整理成草稿，请确认。", at: "2026-08-09T00:00:01.000Z" }
-      ],
-      createdAt: "2026-08-09T00:00:00.000Z",
-      updatedAt: "2026-08-09T00:00:01.000Z"
-    };
-    fetchMock.mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        data: {
-          session,
-          runId: "run-requirement-1",
-          status: "passed",
-          message: "我已整理成草稿，请确认。",
-          output: {
-            message: "我已整理成草稿，请确认。",
-            nextAction: "draft",
-            draft: {
-              title: "购物车空态优惠推荐",
-              summary: "为空购物车提供优惠推荐",
-              priority: "high",
-              rawRequirement: "Agent 不应覆盖成这句",
-              acceptanceCriteria: ["空态可以看到推荐", "点击可进入商品详情"]
-            }
-          }
-        }
-      })
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.includes("/conversations/requirement-steward/start")) {
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: stewardReceiptFixture("session-requirement-1", "run-requirement-1") }) });
+      }
+      if (url.includes("/progress/wait")) return Promise.resolve(stewardTerminalWait("run-requirement-1"));
+      if (url.startsWith("/api/sessions/")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: stewardSession }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
     });
     vi.stubGlobal("fetch", fetchMock);
     container = document.createElement("div");
@@ -139,6 +212,9 @@ describe("BoardPage AI requirement creation", () => {
     fetchMock.mockReset();
     vi.unstubAllGlobals();
   });
+
+  const settle = async (ms = 30) => { await act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); }); };
+  const stewardStartCalls = () => fetchMock.mock.calls.filter((call) => String(call[0]).includes("/conversations/requirement-steward/start"));
 
   it("snapshots the current board project independently whenever either creation entry opens", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
@@ -161,7 +237,7 @@ describe("BoardPage AI requirement creation", () => {
     const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')!;
     act(() => setText(textarea, "项目 B 的需求"));
     await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
-    expect(String(fetchMock.mock.calls[0]![0])).toContain("/api/projects/connected-b/");
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/api/projects/connected-b/conversations/requirement-steward/start");
     expect(new Headers(fetchMock.mock.calls[0]![1]?.headers).get("x-multi-agent-project")).toBe("connected-b");
   });
 
@@ -245,6 +321,38 @@ describe("BoardPage AI requirement creation", () => {
     expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')?.disabled).toBe(false);
   });
 
+  it("keeps the genuine empty-board copy when no requirements exist", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    service.syncConnectedProjects([connectedProject()]);
+    act(() => root.render(<BoardPage go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(container.textContent).toContain("看板还没有需求");
+    expect(container.textContent).not.toContain("无匹配需求");
+  });
+
+  it("distinguishes zero filter matches from a genuinely empty board and clears filters", async () => {
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    service.syncConnectedProjects([connectedProject()]);
+    await service.createRequirement({
+      projectId: "connected-a", title: "真实需求甲", summary: "看板筛选诚实性", priority: "medium",
+      rawRequirement: "原始需求", acceptanceCriteria: []
+    });
+    act(() => root.render(<BoardPage go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(container.textContent).toContain("真实需求甲");
+
+    const search = container.querySelector<HTMLInputElement>('input[type="search"]');
+    expect(search).toBeTruthy();
+    act(() => setText(search!, "不存在的关键词"));
+    // 有需求但筛选无命中时，不能说「看板还没有需求」。
+    expect(container.textContent).toContain("无匹配需求");
+    expect(container.textContent).not.toContain("看板还没有需求");
+
+    await act(async () => { button("清除筛选").click(); });
+    expect(container.textContent).toContain("真实需求甲");
+    expect(search!.value).toBe("");
+  });
+
   it("uses manual and AI project overrides and clears an AI draft when its project changes", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
     service.syncConnectedProjects([connectedProject(), connectedProjectB()]);
@@ -263,13 +371,15 @@ describe("BoardPage AI requirement creation", () => {
     const composer = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')!;
     act(() => setText(composer, "AI 需求"));
     await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await settle();
     expect(container.querySelector(".board-ai-draft-fields")).toBeTruthy();
     await chooseSelect("AI 需求所属项目", "真实项目 A");
     expect(container.querySelector(".board-ai-draft-fields")).toBeNull();
     expect(container.textContent).not.toContain("我已整理成草稿，请确认。");
     act(() => setText(composer, "切换后的 AI 需求"));
     await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
-    expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain("/api/projects/connected-a/");
+    await settle();
+    expect(String(stewardStartCalls().at(-1)?.[0])).toContain("/api/projects/connected-a/");
     await act(async () => { button("确认创建并进入收件箱").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(createSpy).toHaveBeenLastCalledWith(expect.objectContaining({ projectId: "connected-a" }));
   });
@@ -297,10 +407,11 @@ describe("BoardPage AI requirement creation", () => {
       button("交给需求管家").click();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
+    await settle();
 
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(String(fetchMock.mock.calls[0]![0])).toContain("/conversations/requirement-steward/invoke");
-    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toMatchObject({
+    expect(stewardStartCalls()).toHaveLength(1);
+    expect(String(stewardStartCalls()[0]![0])).toContain("/conversations/requirement-steward/start");
+    expect(JSON.parse(String(stewardStartCalls()[0]![1]?.body))).toMatchObject({
       message: "购物车空态增加优惠推荐"
     });
     expect(await service.listBoard()).toEqual([]);
@@ -325,29 +436,51 @@ describe("BoardPage AI requirement creation", () => {
     expect(await service.getRequirement(created!.id)).toMatchObject({ rawRequirement: "购物车空态增加优惠推荐" });
   });
 
-  it("shows an animated waiting bubble only while the steward request is pending", async () => {
+  it("keeps the composer content on a failed start and shows the waiting bubble only after the receipt", async () => {
     const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
     service.syncConnectedProjects([connectedProject()]);
-    let resolveRequest!: (value: unknown) => void;
-    fetchMock.mockReset().mockReturnValue(new Promise((resolve) => { resolveRequest = resolve; }));
+    let startAttempts = 0;
+    let resolveWait!: (value: unknown) => void;
+    fetchMock.mockReset().mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.includes("/conversations/requirement-steward/start")) {
+        startAttempts += 1;
+        if (startAttempts === 1) return Promise.resolve({ ok: false, status: 500, json: async () => ({ error: { message: "失败" } }) });
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: stewardReceiptFixture("session-requirement-1", "run-requirement-1") }) });
+      }
+      if (url.includes("/progress/wait")) return new Promise((resolve) => { resolveWait = resolve; });
+      if (url.startsWith("/api/sessions/")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: stewardSession }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    });
     act(() => root.render(<BoardPage spaceId="connected-a" go={vi.fn()} notify={vi.fn()} service={service} />));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
     act(() => button("和 AI 说需求").click());
     const textarea = document.querySelector('textarea[aria-label="描述需求"]') as HTMLTextAreaElement;
     act(() => setText(textarea, "等待中的需求"));
-    act(() => button("交给需求管家").click());
 
-    expect(document.querySelector('[aria-label="需求管家整理中"]')).toBeTruthy();
-    expect(document.querySelector(".composer-loading")).toBeTruthy();
-    expect(textarea.disabled).toBe(true);
-
-    await act(async () => {
-      resolveRequest({ ok: false, status: 500, json: async () => ({ error: "失败" }) });
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
+    // /start 本身失败：没有回执就没有等待气泡，正文与附件全部保留。
+    await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(document.querySelector('[aria-label="需求管家整理中"]')).toBeNull();
     expect(document.querySelector(".composer-loading")).toBeNull();
     expect(textarea.value).toBe("等待中的需求");
+    expect(container.textContent).toContain("失败");
+
+    // 拿到回执后立即进入等待气泡，composer 清空，证据链接随即可用。
+    await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(document.querySelector(".composer-loading")).toBeNull();
+    expect(textarea.value).toBe("");
+    const bubble = document.querySelector('[aria-label="需求管家整理中"]');
+    expect(bubble).toBeTruthy();
+    expect(bubble?.querySelector("a.board-ai-waiting-evidence")?.getAttribute("href")).toBe("#runs/run-requirement-1");
+
+    // 服务端终态到达后气泡消失，会话证据进入对话区。
+    await act(async () => {
+      resolveWait(stewardTerminalWait("run-requirement-1"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await settle();
+    expect(document.querySelector('[aria-label="需求管家整理中"]')).toBeNull();
+    expect(container.textContent).toContain("我已整理成草稿，请确认。");
   });
 
   it("keeps an unclear requirement in the same session until the user answers the Agent question", async () => {
@@ -362,55 +495,48 @@ describe("BoardPage AI requirement creation", () => {
       status: "active" as const,
       createdAt: "2026-08-09T00:00:00.000Z"
     };
-    fetchMock.mockReset()
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ data: {
-          session: {
-            ...sessionBase,
-            messages: [
-              { id: "c1", role: "user", content: "做个推荐", at: "2026-08-09T00:00:00.000Z" },
-              { id: "c2", role: "employee", content: "推荐出现在哪个页面？", at: "2026-08-09T00:00:01.000Z" }
-            ],
-            updatedAt: "2026-08-09T00:00:01.000Z"
-          },
-          runId: "run-clarify-1",
-          status: "passed",
-          message: "推荐出现在哪个页面？",
-          output: { message: "推荐出现在哪个页面？", nextAction: "clarify", draft: null }
-        } })
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ data: {
-          session: {
-            ...sessionBase,
-            messages: [
-              { id: "c1", role: "user", content: "做个推荐", at: "2026-08-09T00:00:00.000Z" },
-              { id: "c2", role: "employee", content: "推荐出现在哪个页面？", at: "2026-08-09T00:00:01.000Z" },
-              { id: "c3", role: "user", content: "购物车空态", at: "2026-08-09T00:00:02.000Z" },
-              { id: "c4", role: "employee", content: "已经可以形成草稿。", at: "2026-08-09T00:00:03.000Z" }
-            ],
-            updatedAt: "2026-08-09T00:00:03.000Z"
-          },
-          runId: "run-clarify-2",
-          status: "passed",
+    const clarifySession: Session = {
+      ...sessionBase,
+      messages: [
+        { id: "c1", role: "user", content: "做个推荐", at: "2026-08-09T00:00:00.000Z" },
+        { id: "c2", role: "employee", content: "推荐出现在哪个页面？", at: "2026-08-09T00:00:01.000Z", output: { message: "推荐出现在哪个页面？", nextAction: "clarify", draft: null } }
+      ],
+      updatedAt: "2026-08-09T00:00:01.000Z"
+    };
+    const draftSession: Session = {
+      ...sessionBase,
+      messages: [
+        { id: "c1", role: "user", content: "做个推荐", at: "2026-08-09T00:00:00.000Z" },
+        { id: "c2", role: "employee", content: "推荐出现在哪个页面？", at: "2026-08-09T00:00:01.000Z", output: { message: "推荐出现在哪个页面？", nextAction: "clarify", draft: null } },
+        { id: "c3", role: "user", content: "购物车空态", at: "2026-08-09T00:00:02.000Z" },
+        { id: "c4", role: "employee", content: "已经可以形成草稿。", at: "2026-08-09T00:00:03.000Z", output: {
           message: "已经可以形成草稿。",
-          output: {
-            message: "已经可以形成草稿。",
-            nextAction: "draft",
-            draft: {
-              title: "购物车空态推荐",
-              summary: "空购物车展示推荐",
-              priority: "medium",
-              rawRequirement: "Agent rewrite",
-              acceptanceCriteria: ["空态显示推荐"]
-            }
+          nextAction: "draft",
+          draft: {
+            title: "购物车空态推荐",
+            summary: "空购物车展示推荐",
+            priority: "medium",
+            rawRequirement: "Agent rewrite",
+            acceptanceCriteria: ["空态显示推荐"]
           }
-        } })
-      });
+        } }
+      ],
+      updatedAt: "2026-08-09T00:00:03.000Z"
+    };
+    let sessionFetches = 0;
+    fetchMock.mockReset().mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.includes("/conversations/requirement-steward/start")) {
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: stewardReceiptFixture("session-clarify-1", "run-clarify-1") }) });
+      }
+      if (url.includes("/progress/wait")) return Promise.resolve(stewardTerminalWait("run-clarify-1"));
+      if (url.startsWith("/api/sessions/")) {
+        sessionFetches += 1;
+        const session = sessionFetches === 1 ? clarifySession : draftSession;
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: session }) });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    });
 
     act(() => root.render(<BoardPage spaceId="connected-a" go={vi.fn()} notify={vi.fn()} service={service} />));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
@@ -418,6 +544,7 @@ describe("BoardPage AI requirement creation", () => {
     const textarea = document.querySelector('textarea[aria-label="描述需求"]') as HTMLTextAreaElement;
     act(() => setText(textarea, "做个推荐"));
     await act(async () => { button("交给需求管家").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await settle();
 
     expect(container.textContent).toContain("需要你补充一点");
     expect(container.textContent).toContain("推荐出现在哪个页面？");
@@ -427,8 +554,9 @@ describe("BoardPage AI requirement creation", () => {
     const followupTextarea = document.querySelector('textarea[aria-label="描述需求"]') as HTMLTextAreaElement;
     act(() => setText(followupTextarea, "购物车空态"));
     await act(async () => { button("继续说明").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await settle();
 
-    expect(JSON.parse(String(fetchMock.mock.calls[1]![1]?.body))).toMatchObject({
+    expect(JSON.parse(String(stewardStartCalls()[1]![1]?.body))).toMatchObject({
       message: "购物车空态",
       sessionId: "session-clarify-1"
     });
@@ -1119,5 +1247,282 @@ describe("BoardPage AI requirement creation", () => {
     const callsAfterFailure = fetchMock.mock.calls.length;
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     expect(fetchMock).toHaveBeenCalledTimes(callsAfterFailure);
+  });
+});
+
+describe("BoardPage requirement steward async monitor", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  const fetchMock = vi.fn();
+
+  interface Deferred<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (reason?: unknown) => void;
+  }
+
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  let waitQueue: Array<Deferred<unknown>>;
+
+  const stewardSession: Session = {
+    id: "sess-steward-1",
+    employeeId: "xiaomiwang-product-manager",
+    employeeVersion: 1,
+    assignment: { projectId: "connected-a", projectVersion: 1, projectBindingVersion: 1, roleId: "requirement-steward" },
+    title: "整理一个需求",
+    status: "active",
+    messages: [
+      { id: "s1", role: "user", content: "整理一个需求", at: "2026-08-09T00:00:00.000Z" },
+      { id: "s2", role: "employee", content: "草稿已整理。", at: "2026-08-09T00:00:01.000Z", output: {
+        message: "草稿已整理。",
+        nextAction: "draft",
+        draft: {
+          title: "空态推荐草稿",
+          summary: "摘要",
+          priority: "medium",
+          rawRequirement: "Agent rewrite",
+          acceptanceCriteria: ["可验收"]
+        }
+      } }
+    ],
+    createdAt: "2026-08-09T00:00:00.000Z",
+    updatedAt: "2026-08-09T00:00:01.000Z"
+  };
+
+  const settle = async (ms = 30) => { await act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); }); };
+  const startCalls = () => fetchMock.mock.calls.filter((call) => String(call[0]).includes("/conversations/requirement-steward/start"));
+  const postCalls = () => fetchMock.mock.calls.filter((call) => (call[1] as RequestInit | undefined)?.method === "POST");
+  const waitCalls = () => fetchMock.mock.calls.filter((call) => String(call[0]).includes("/progress/wait"));
+  const waitingBubble = () => document.querySelector<HTMLElement>('[aria-label="需求管家整理中"]');
+
+  const submitSteward = async (text: string) => {
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]');
+    if (!textarea) throw new Error("composer textarea not found");
+    act(() => setText(textarea, text));
+    await act(async () => {
+      button("交给需求管家").click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  };
+
+  beforeEach(async () => {
+    (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute("open", ""); }
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, "close", {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute("open"); }
+    });
+    waitQueue = [];
+    fetchMock.mockReset().mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.includes("/conversations/requirement-steward/start")) {
+        return Promise.resolve({ ok: true, status: 202, json: async () => ({ data: stewardReceiptFixture("sess-steward-1", "run-steward-1") }) });
+      }
+      if (url.includes("/progress/wait")) {
+        const request = deferred<unknown>();
+        waitQueue.push(request);
+        return request.promise;
+      }
+      if (url === "/api/sessions/sess-steward-1") return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: stewardSession }) });
+      if (url.includes("/api/invocations/inv-steward-1/cancel")) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: { id: "inv-steward-1", status: "cancellation-requested" } }) });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const service = createDashboardService({ delayMs: () => 0, initialData: "empty" });
+    service.syncConnectedProjects([connectedProject()]);
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root.render(<BoardPage spaceId="connected-a" go={vi.fn()} notify={vi.fn()} service={service} />));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    await act(async () => { button("和 AI 说需求").click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    document.body.replaceChildren();
+    fetchMock.mockReset();
+    vi.unstubAllGlobals();
+  });
+
+  it("clears the composer on the receipt and shows the waiting bubble with the evidence link immediately", async () => {
+    await submitSteward("整理一个需求");
+
+    expect(startCalls()).toHaveLength(1);
+    expect(String(startCalls()[0]?.[0])).toContain("/api/projects/connected-a/conversations/requirement-steward/start");
+    expect(JSON.parse(String(startCalls()[0]?.[1]?.body))).toEqual({ message: "整理一个需求" });
+    const headers = new Headers(startCalls()[0]?.[1]?.headers as HeadersInit);
+    expect(headers.get("x-multi-agent-project")).toBe("connected-a");
+    expect(headers.get("x-multi-agent-source")).toBe("workbench");
+
+    const bubble = waitingBubble();
+    expect(bubble).toBeTruthy();
+    expect(bubble?.querySelector<HTMLAnchorElement>("a.board-ai-waiting-evidence")?.getAttribute("href")).toBe("#runs/run-steward-1");
+    expect(bubble?.textContent).toContain("取消");
+    // composer 已清空且没有第二次 POST。
+    expect(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')?.value).toBe("");
+    expect(postCalls()).toHaveLength(1);
+
+    // 单在途锁定：composer 与所属项目选择器都禁用，并用 offlineHint 说明原因。
+    const lockedTextarea = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="描述需求"]')!;
+    const projectSelect = document.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="AI 需求所属项目"]')!;
+    const submitButton = lockedTextarea.closest("form")!.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    expect(lockedTextarea.disabled).toBe(true);
+    expect(submitButton.disabled).toBe(true);
+    expect(projectSelect.disabled).toBe(true);
+    expect(container.textContent).toContain("需求管家整理中，结束后才能继续说明");
+    // 代码级兜底：强制派发提交也不会产生第二个 /start。
+    await act(async () => {
+      lockedTextarea.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(startCalls()).toHaveLength(1);
+    expect(postCalls()).toHaveLength(1);
+  });
+
+  it("keeps waiting on heartbeat with the latest state and a ticking elapsed clock", async () => {
+    await submitSteward("整理一个需求");
+    expect(waitingBubble()?.textContent).toContain("已受理，等待服务端进度");
+
+    act(() => waitQueue[0]?.resolve(stewardWaitResponse({ nextCursor: "inv-steward-1:1", reason: "heartbeat" })));
+    await settle();
+
+    expect(waitingBubble()?.textContent).toContain("心跳");
+    const elapsed = () => waitingBubble()?.querySelector("time")?.textContent;
+    expect(elapsed()).toBe("00:00");
+    await settle(1100);
+    expect(elapsed()).toBe("00:01");
+    expect(waitCalls().some((call) => String(call[0]).includes("cursor=inv-steward-1%3A1"))).toBe(true);
+    expect(startCalls()).toHaveLength(1);
+  });
+
+  it("hydrates the draft from the last employee message output on terminal completion", async () => {
+    await submitSteward("整理一个需求");
+    act(() => waitQueue[0]?.resolve(stewardTerminalWait("run-steward-1")));
+    await settle();
+    await settle();
+
+    expect(fetchMock.mock.calls.some((call) => String(call[0]) === "/api/sessions/sess-steward-1")).toBe(true);
+    expect(waitingBubble()).toBeNull();
+    expect(container.textContent).toContain("草稿已整理。");
+    expect((document.querySelector('input[value="空态推荐草稿"]') as HTMLInputElement | null)?.value).toBe("空态推荐草稿");
+    // 原始需求保留用户原话，而不是 Agent 的改写。
+    const raw = [...document.querySelectorAll("textarea")].find((candidate) => candidate.value === "整理一个需求");
+    expect(raw).toBeTruthy();
+    expect(button("确认创建并进入收件箱").disabled).toBe(false);
+  });
+
+  it("posts an operator cancellation and settles on the server-driven cancelled terminal", async () => {
+    await submitSteward("整理一个需求");
+    const cancel = [...waitingBubble()!.querySelectorAll("button")].find((item) => item.textContent === "取消");
+    expect(cancel).toBeTruthy();
+    await act(async () => {
+      cancel!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const cancelCalls = postCalls().filter((call) => String(call[0]) === "/api/invocations/inv-steward-1/cancel");
+    expect(cancelCalls).toHaveLength(1);
+    expect(JSON.parse(String(cancelCalls[0]?.[1]?.body))).toEqual({ actor: "workbench-operator" });
+    expect(waitingBubble()?.textContent).toContain("取消中");
+
+    act(() => waitQueue[0]?.resolve(stewardTerminalWait("run-steward-1", "cancelled")));
+    await settle();
+    await settle();
+
+    expect(waitingBubble()).toBeNull();
+    expect(fetchMock.mock.calls.some((call) => String(call[0]) === "/api/sessions/sess-steward-1")).toBe(true);
+    expect(container.textContent).toContain("已取消本次整理；取消与执行证据保留在运行卷宗 #run-steward-1");
+    // 终态后监听停止，没有继续轮询。
+    expect(waitCalls()).toHaveLength(1);
+    expect(startCalls()).toHaveLength(1);
+  });
+
+  it("re-attaches the monitor from the same receipt and cursor after an interruption without resubmitting", async () => {
+    await submitSteward("整理一个需求");
+    act(() => waitQueue[0]?.reject(new Error("network down")));
+    await settle();
+
+    expect(waitingBubble()?.textContent).toContain("监听通道中断（网络或服务暂时不可达）");
+    // 中断态同时提供重挂与取消两个出口（证据链接是 <a>，不计入按钮）。
+    const actions = [...waitingBubble()!.querySelectorAll(".board-ai-waiting-actions button")].map((item) => item.textContent);
+    expect(actions).toEqual(["重新挂载监听", "取消"]);
+    const retry = [...waitingBubble()!.querySelectorAll("button")].find((item) => item.textContent === "重新挂载监听");
+    expect(retry).toBeTruthy();
+
+    await act(async () => {
+      retry!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(waitCalls()).toHaveLength(2);
+    expect(String(waitCalls()[1]?.[0])).toContain("cursor=inv-steward-1%3A0");
+
+    act(() => waitQueue[1]?.resolve(stewardTerminalWait("run-steward-1")));
+    await settle();
+    await settle();
+
+    expect(startCalls()).toHaveLength(1);
+    // 用户原话只在对话区出现一次（草稿 textarea 的 value 不参与此计数）。
+    const transcript = container.querySelector(".board-ai-transcript")?.textContent ?? "";
+    expect(transcript.split("整理一个需求").length - 1).toBe(1);
+    expect(container.textContent).toContain("草稿已整理。");
+  });
+
+  it("keeps the pending turn across modal close/reopen and re-attaches from the last seen cursor", async () => {
+    await submitSteward("整理一个需求");
+    // 先推进一次心跳，把游标前进到 inv-steward-1:1；第二次 wait 永远挂着（关闭时脱钩）。
+    act(() => waitQueue[0]?.resolve(stewardWaitResponse({ reason: "heartbeat" })));
+    await settle(300);
+    expect(waitCalls()).toHaveLength(2);
+
+    // 关闭弹窗：监听脱钩、工单继续，pending 与会话都不重置。
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('button[aria-label="关闭弹窗"]')!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(document.querySelector("dialog")).toBeNull();
+
+    // 重新打开：同一个 pending 气泡还在，证据链接与脱钩提示都在，且没有重新 /start。
+    await act(async () => {
+      button("和 AI 说需求").click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const bubble = waitingBubble();
+    expect(bubble).toBeTruthy();
+    expect(bubble?.querySelector<HTMLAnchorElement>("a.board-ai-waiting-evidence")?.getAttribute("href")).toBe("#runs/run-steward-1");
+    expect(bubble?.textContent).toContain("监听已断开");
+    expect(startCalls()).toHaveLength(1);
+
+    // 重挂监听：从最后见过的游标 inv-steward-1:1 续上，而不是从头开始。
+    const remount = [...bubble!.querySelectorAll("button")].find((item) => item.textContent === "重新挂载监听");
+    expect(remount).toBeTruthy();
+    await act(async () => {
+      remount!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(waitCalls()).toHaveLength(3);
+    expect(String(waitCalls()[2]?.[0])).toContain("cursor=inv-steward-1%3A1");
+
+    act(() => waitQueue[2]?.resolve(stewardTerminalWait("run-steward-1")));
+    await settle();
+    await settle();
+
+    // 关闭/重开没有重置会话：用户原话在对话区仍只出现一次。
+    const transcript = container.querySelector(".board-ai-transcript")?.textContent ?? "";
+    expect(transcript.split("整理一个需求").length - 1).toBe(1);
+    expect(container.textContent).toContain("草稿已整理。");
+    expect(startCalls()).toHaveLength(1);
   });
 });

@@ -370,6 +370,32 @@ describe("RunsPage focused hash selection", () => {
     expect(container.querySelector("#run-single-1")?.classList.contains("selected")).toBe(false);
   });
 
+  it("renders a pending older Run fetched by id instead of the false establishing state", async () => {
+    const historicalRun: Run = {
+      ...runs[1],
+      id: "run-historical-209",
+      workflow: "req-209-delivery",
+      artifactDir: "/historical/req-209"
+    };
+    fetchMock.mockImplementation((input: RequestInfo) => {
+      const url = String(input);
+      if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: runs }) });
+      if (url === `/api/runs/${historicalRun.id}`) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: historicalRun }) });
+      if (url.endsWith("/merge-preview")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: unavailablePreview(historicalRun.id) }) });
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: {} }) });
+    });
+
+    await act(async () => {
+      root.render(<RunsPage notify={vi.fn()} focusedRunId={historicalRun.id} pendingRunId={historicalRun.id} />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // 列表窗口（limit=100）之外的直链 Run 必须渲染真实卷宗，而不是误报「正在建立」。
+    expect(container.textContent).not.toContain("运行卷宗正在建立");
+    expect(container.querySelector(".dossier-cover code")?.textContent).toBe(historicalRun.id);
+    expect(container.textContent).toContain("req-209-delivery");
+  });
+
   it("shows the focused target error and never falls back when its detail request fails", async () => {
     const missingRunId = "run-missing-focused-103";
     fetchMock.mockImplementation((input: RequestInfo) => {

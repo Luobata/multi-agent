@@ -1,6 +1,6 @@
 /** 需求看板：九列数据契约、七列可见视图 + 三种正交异常态。列迁移走详情页。 */
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, writeBody } from "./api";
+import { api, cancelInvocation, getSession, monitorInvocation, startInvocation, type InvocationStartReceipt } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
 import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
 import { requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
@@ -134,6 +134,26 @@ function deliveryProgressChip(requirement: Requirement) {
   return <span className="board-evidence-capture" role="status" title={resolution?.message ?? requirement.delivery.message}>{detail}</span>;
 }
 
+interface AgentPendingTurn {
+  receipt: InvocationStartReceipt;
+  message: string;
+  startedAt: number;
+  cursor: string;
+  phase: "waiting" | "cancelling" | "interrupted";
+  /** False once the monitor loop has died (interrupted); remount sets it back. */
+  monitorLive: boolean;
+  lastReason?: "changed" | "heartbeat";
+  lastUpdateAt?: string;
+  lastStatus?: string;
+  lastPhase?: string;
+  error?: string;
+}
+
+function formatAgentElapsedMs(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
 export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", sourceReady = true, sourceError, onRetrySource, projects: connectedProjects = EMPTY_PROJECTS, projectBindings, invocations = EMPTY_INVOCATIONS, humanDecisionRequests = EMPTY_HUMAN_DECISION_REQUESTS, onOpenRun }: {
   spaceId?: string;
   go: (hash: string) => void;
@@ -179,9 +199,13 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   const [agentProjectId, setAgentProjectId] = useState(spaceId ?? "");
   const [agentSession, setAgentSession] = useState<Session>();
   const [agentDraft, setAgentDraft] = useState<AgentRequirementDraft>();
-  const [agentPhase, setAgentPhase] = useState<"idle" | "waiting" | "clarify" | "draft">("idle");
+  const [agentPhase, setAgentPhase] = useState<"idle" | "waiting" | "interrupted" | "clarify" | "draft">("idle");
   const [agentSourceMessages, setAgentSourceMessages] = useState<string[]>([]);
   const [agentError, setAgentError] = useState("");
+  const [agentPending, setAgentPending] = useState<AgentPendingTurn>();
+  const [agentNow, setAgentNow] = useState(() => Date.now());
+  const agentGenerationRef = useRef(0);
+  const agentAbortRef = useRef<AbortController | undefined>(undefined);
 
   const data = state.status === "ready" ? state.data : undefined;
   const project = data?.nodes.find((node) => node.id === spaceId && node.kind === "project");
@@ -387,7 +411,23 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     setCreateOpen(true);
   };
 
+  const stopAgentMonitor = () => {
+    agentGenerationRef.current += 1;
+    agentAbortRef.current?.abort();
+    agentAbortRef.current = undefined;
+  };
+
+  useEffect(() => () => stopAgentMonitor(), []);
+
+  useEffect(() => {
+    if (!agentPending) return;
+    const timer = window.setInterval(() => setAgentNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [agentPending?.startedAt]);
+
   const resetAgentConversation = (projectId = "") => {
+    stopAgentMonitor();
+    setAgentPending(undefined);
     setAgentProjectId(projectId);
     setAgentSession(undefined);
     setAgentDraft(undefined);
@@ -397,37 +437,98 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
   };
 
   const openAgentCreate = () => {
-    resetAgentConversation(defaultAgentProjectId());
+    // A pending turn survives close/reopen: same receipt, same cursor, reattach offered.
+    if (!agentPending) resetAgentConversation(defaultAgentProjectId());
     setAgentOpen(true);
   };
 
-  const talkToRequirementSteward = async (draft: ComposerDraft): Promise<boolean> => {
-    if (!agentProjectId || !requirementStewardProjectIds.has(agentProjectId)) return false;
-    setAgentError("");
-    // A follow-up invalidates the visible draft immediately. The user must never be able to
-    // confirm an older draft while the Agent is reconsidering scope or asking a new question.
-    setAgentDraft(undefined);
-    setAgentPhase("waiting");
+  const closeAgentModal = () => {
+    // Closing the window detaches the monitor only; the invocation keeps running
+    // server-side and can be re-attached from the same receipt after reopening.
+    if (agentPending && agentPending.monitorLive) {
+      stopAgentMonitor();
+      setAgentPending({ ...agentPending, phase: agentPending.phase === "cancelling" ? "cancelling" : "interrupted", monitorLive: false, error: "窗口关闭期间监听已断开；工单仍在服务端执行" });
+      if (agentPending.phase !== "cancelling") setAgentPhase("interrupted");
+    }
+    setAgentOpen(false);
+  };
+
+  const runAgentMonitor = async (pending: AgentPendingTurn, generation: number, controller: AbortController) => {
+    const { receipt } = pending;
     try {
-      const result = await api<{ session: Session; runId: string; status: string; message: string; output?: JsonValue }>(
-        `/api/projects/${encodeURIComponent(agentProjectId)}/conversations/${REQUIREMENT_STEWARD_ROLE_ID}/invoke`,
-        {
-          ...writeBody({
-            message: draft.message,
-            sessionId: agentSession?.id,
-            ...(draft.attachments.length > 0 ? { attachments: draft.attachments } : {})
-          }),
-          headers: {
-            "x-multi-agent-source": "workbench",
-            "x-multi-agent-source-label": "需求看板 · AI 对话创建",
-            "x-multi-agent-project": agentProjectId
-          }
+      const terminal = await monitorInvocation(receipt, {
+        signal: controller.signal,
+        startCursor: pending.cursor,
+        onUpdate: (result) => {
+          if (agentGenerationRef.current !== generation) return;
+          setAgentPending((current) => current && current.receipt.invocation.id === receipt.invocation.id ? {
+            ...current,
+            cursor: result.nextCursor,
+            lastReason: result.reason === "terminal" ? current.lastReason : result.reason,
+            lastUpdateAt: result.progress.updatedAt,
+            lastStatus: result.progress.status,
+            lastPhase: result.progress.phase
+          } : current);
         }
-      );
-      const sourceMessages = [...agentSourceMessages, draft.message];
-      setAgentSession(result.session);
+      });
+      if (!terminal || agentGenerationRef.current !== generation) return;
+      await finishAgentTurn(pending, terminal.progress.status, generation);
+    } catch (error) {
+      if (controller.signal.aborted || agentGenerationRef.current !== generation) return;
+      setAgentPending((current) => current ? {
+        ...current,
+        phase: current.phase === "cancelling" ? "cancelling" : "interrupted",
+        monitorLive: false,
+        error: `监听通道中断（${error instanceof Error ? error.message : String(error)}）`
+      } : current);
+      setAgentPhase((phase) => phase === "waiting" ? "interrupted" : phase);
+    }
+  };
+
+  const finishAgentTurn = async (pending: AgentPendingTurn, status: string, generation: number) => {
+    const { receipt } = pending;
+    const current = () => agentGenerationRef.current === generation;
+    if (status === "cancelled") {
+      // 合约要求终态后仍拉取会话快照，看到什么显示什么；但取消场景后端不保证
+      // 追加 Session 消息——确定保留的是 Invocation/Run 证据，文案必须指向卷宗。
+      let session: Session | undefined;
+      if (receipt.invocation.sessionId) {
+        try {
+          session = await getSession(receipt.invocation.sessionId);
+        } catch {
+          // 会话快照拉取失败不影响取消结论本身。
+        }
+      }
+      if (!current()) return;
+      if (session) setAgentSession(session);
+      setAgentPending(undefined);
+      setAgentPhase("idle");
+      setAgentError(`已取消本次整理；取消与执行证据保留在运行卷宗 #${receipt.runId}`);
+      return;
+    }
+    if (status !== "completed" && status !== "blocked") {
+      if (!current()) return;
+      setAgentPending(undefined);
+      setAgentPhase("idle");
+      setAgentError(`本次整理未成功（${status}）；证据已保留，请打开运行卷宗 #${receipt.runId} 核对`);
+      return;
+    }
+    if (!receipt.invocation.sessionId) {
+      if (!current()) return;
+      setAgentPending(undefined);
+      setAgentPhase("idle");
+      setAgentError(`工单已结束（${status}）但回执缺少会话编号；请打开运行卷宗 #${receipt.runId} 核对证据`);
+      return;
+    }
+    try {
+      const session = await getSession(receipt.invocation.sessionId);
+      if (!current()) return;
+      const sourceMessages = [...agentSourceMessages, pending.message];
+      setAgentPending(undefined);
+      setAgentSession(session);
       setAgentSourceMessages(sourceMessages);
-      const output = requirementStewardOutput(result.output);
+      const lastEmployeeMessage = [...session.messages].reverse().find((message) => message.role === "employee");
+      const output = requirementStewardOutput(lastEmployeeMessage?.output);
       if (output?.nextAction === "draft" && output.draft) {
         setAgentDraft({
           ...output.draft,
@@ -442,12 +543,85 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
         setAgentPhase("idle");
         setAgentError("Agent 已回复，但没有返回可识别的需求草稿；你可以继续说明，当前输入和附件证据都已保留在会话中。");
       }
-      return true;
+    } catch (error) {
+      if (!current()) return;
+      setAgentPending(undefined);
+      setAgentPhase("idle");
+      setAgentError(`会话证据拉取失败（${error instanceof Error ? error.message : String(error)}）；请打开运行卷宗 #${receipt.runId} 核对`);
+    }
+  };
+
+  const talkToRequirementSteward = async (draft: ComposerDraft): Promise<boolean> => {
+    if (!agentProjectId || !requirementStewardProjectIds.has(agentProjectId)) return false;
+    // 同一时刻只允许一张在途整理工单；控件已禁用，这里再做代码级兜底。
+    if (agentPending) return false;
+    setAgentError("");
+    // A follow-up invalidates the visible draft immediately. The user must never be able to
+    // confirm an older draft while the Agent is reconsidering scope or asking a new question.
+    setAgentDraft(undefined);
+    let receipt: InvocationStartReceipt;
+    try {
+      receipt = await startInvocation(
+        `/api/projects/${encodeURIComponent(agentProjectId)}/conversations/${REQUIREMENT_STEWARD_ROLE_ID}/start`,
+        {
+          message: draft.message,
+          sessionId: agentSession?.id,
+          ...(draft.attachments.length > 0 ? { attachments: draft.attachments } : {})
+        },
+        {
+          "x-multi-agent-source": "workbench",
+          "x-multi-agent-source-label": "需求看板 · AI 对话创建",
+          "x-multi-agent-project": agentProjectId
+        }
+      );
     } catch (error) {
       setAgentPhase("idle");
       setAgentError(error instanceof Error ? error.message : String(error));
       return false;
     }
+    const generation = ++agentGenerationRef.current;
+    agentAbortRef.current?.abort();
+    const controller = new AbortController();
+    agentAbortRef.current = controller;
+    const pending: AgentPendingTurn = {
+      receipt,
+      message: draft.message,
+      startedAt: Date.now(),
+      cursor: receipt.monitor.initialCursor,
+      phase: "waiting",
+      monitorLive: true
+    };
+    setAgentPending(pending);
+    setAgentPhase("waiting");
+    void runAgentMonitor(pending, generation, controller);
+    return true;
+  };
+
+  const cancelAgentTurn = async () => {
+    if (!agentPending || agentPending.phase === "cancelling") return;
+    try {
+      await cancelInvocation(agentPending.receipt.invocation.id);
+      setAgentPending((current) => current ? { ...current, phase: "cancelling", error: undefined } : current);
+    } catch (error) {
+      setAgentPending((current) => current ? { ...current, error: `取消请求未送达（${error instanceof Error ? error.message : String(error)}）；工单仍在等待终态` } : current);
+    }
+  };
+
+  const remountAgentMonitor = () => {
+    if (!agentPending || agentPending.monitorLive) return;
+    agentAbortRef.current?.abort();
+    const controller = new AbortController();
+    agentAbortRef.current = controller;
+    const pending: AgentPendingTurn = {
+      ...agentPending,
+      phase: agentPending.phase === "interrupted" ? "waiting" : agentPending.phase,
+      monitorLive: true,
+      error: undefined
+    };
+    setAgentPending(pending);
+    setAgentPhase("waiting");
+    setAgentError("");
+    void runAgentMonitor(pending, agentGenerationRef.current, controller);
   };
 
   const confirmAgentRequirement = async () => {
@@ -519,7 +693,9 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
     {!sourceError && state.status === "loading" && <div className="board-scroll" role="status" aria-label="正在加载需求看板"><div className="board-grid board-grid--loading">{VISIBLE_REQUIREMENT_LANES.map((lane) => <section className="board-lane board-lane--loading" key={lane.id} aria-hidden="true"><header className="board-lane-head"><h2>{lane.label}</h2></header><SkeletonBlock rows={3} /></section>)}</div></div>}
     {!sourceError && state.status === "error" && <ErrorBlock message={state.error ?? "加载失败"} onRetry={reload} />}
     {state.status === "ready" && data && (filtered.length === 0
-      ? <EmptyState title={projects.length === 0 ? "还没有可承接需求的项目" : "看板还没有需求"} action={projects.length === 0 ? <button type="button" className="button primary" onClick={() => go("projects")}>前往项目</button> : undefined}><p>{projects.length === 0 ? "只有正式接入且 active 的项目可以创建需求；被动 MCP 记录需要先升级。" : "需求会按列出现在这里；先由产品经理登记第一批需求。"}</p></EmptyState>
+      ? data.requirements.length > 0
+        ? <EmptyState title="无匹配需求" action={<button type="button" className="button secondary" onClick={() => { setQuery(""); setProjectFilter(spaceId ?? "all"); setPriority("all"); setException("all"); }}>清除筛选</button>}><p>当前搜索或筛选没有命中任何需求；清除后恢复完整看板，需求数据未受影响。</p></EmptyState>
+        : <EmptyState title={projects.length === 0 ? "还没有可承接需求的项目" : "看板还没有需求"} action={projects.length === 0 ? <button type="button" className="button primary" onClick={() => go("projects")}>前往项目</button> : undefined}><p>{projects.length === 0 ? "只有正式接入且 active 的项目可以创建需求；被动 MCP 记录需要先升级。" : "需求会按列出现在这里；先由产品经理登记第一批需求。"}</p></EmptyState>
       : <div className="board-scroll" role="region" aria-label="需求看板（可横向滚动）" tabIndex={0}>
         <div className="board-grid">
           {VISIBLE_REQUIREMENT_LANES.map((lane) => {
@@ -615,11 +791,11 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
         <div className="modal-actions"><button type="button" className="button secondary" onClick={() => setCreateOpen(false)}>取消</button><button type="submit" className="button primary" disabled={saving || !createProjectId}>{saving ? "创建中…" : "创建并进入收件箱"}</button></div>
       </form>
     </Modal>}
-    {agentOpen && <Modal title="和 AI 说需求" eyebrow="REQUIREMENT STEWARD · DRAFT ONLY" onClose={() => setAgentOpen(false)} wide className="board-ai-modal">
+    {agentOpen && <Modal title="和 AI 说需求" eyebrow="REQUIREMENT STEWARD · DRAFT ONLY" onClose={closeAgentModal} wide className="board-ai-modal">
       <div className="board-ai-layout">
         <section className="board-ai-conversation" aria-label="需求管家对话">
           <header><div><span className="ai-content-badge">AI 生成内容</span><h3>先描述，再决定怎么推进</h3></div><p>文字、粘贴图片和飞书文档都会进入同一份会话证据；Agent 只整理草稿，不会替你创建需求。</p></header>
-          <Field label="所属项目"><SelectControl ariaLabel="AI 需求所属项目" value={agentProjectId} placeholder="请选择所属项目" options={agentProjects.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => resetAgentConversation(value)} /></Field>
+          <Field label="所属项目"><SelectControl ariaLabel="AI 需求所属项目" value={agentProjectId} placeholder="请选择所属项目" disabled={Boolean(agentPending)} options={agentProjects.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => { if (!agentPending) resetAgentConversation(value); }} /></Field>
           {!agentProjectId && <p className="muted">请先选择归属项目，再向需求管家描述需求。</p>}
           <div className="board-ai-transcript" aria-live="polite">
             {!agentSession && <div className="board-ai-welcome"><strong>把现在知道的都说出来</strong><p>可以是零散描述、界面截图或飞书 docx / wiki 链接。信息不足时我会先追问；足够时才给出可编辑草稿。</p></div>}
@@ -628,16 +804,32 @@ export function BoardPage({ spaceId, go, notify, service = dashboardService, cat
               <ConversationMessageContent content={message.content} />
               <ConversationMessageEvidence attachments={message.attachments} documents={message.documents} />
             </article>)}
-            {agentPhase === "waiting" && <article className="board-ai-message board-ai-message--employee board-ai-message--waiting" aria-live="polite" aria-label="需求管家整理中">
-              <div><strong>需求管家</strong><span>整理中</span></div>
+            {(agentPhase === "waiting" || agentPhase === "interrupted") && agentPending && <article className="board-ai-message board-ai-message--employee board-ai-message--waiting" aria-live="polite" aria-label="需求管家整理中">
+              <div><strong>需求管家</strong><span>{agentPending.phase === "cancelling" ? "取消中" : agentPhase === "interrupted" ? "监听中断" : "整理中"}</span><time>{formatAgentElapsedMs(agentNow - agentPending.startedAt)}</time></div>
               <div className="board-ai-waiting-dots" aria-hidden="true"><span /><span /><span /></div>
+              <p className="board-ai-waiting-status" role="status">{agentPending.phase === "cancelling"
+                ? agentPending.monitorLive ? "取消请求已送达，等待服务端确认终态…" : "取消请求已送达；监听未挂载，可重新挂载以观察取消终态"
+                : agentPhase === "interrupted"
+                  ? "监听通道中断（网络或服务暂时不可达）；工单回执与进度仍保留在服务端"
+                  : agentPending.lastReason === "heartbeat"
+                    ? `心跳 · 最近更新 ${formatTime(agentPending.lastUpdateAt)}`
+                    : agentPending.lastStatus || agentPending.lastPhase
+                      ? `${agentPending.lastStatus ?? "等待"} · ${agentPending.lastPhase ?? "排队中"}`
+                      : "已受理，等待服务端进度…"}</p>
+              <div className="board-ai-waiting-actions">
+                <a className="board-ai-waiting-evidence" href={`#runs/${encodeURIComponent(agentPending.receipt.runId)}`}>打开运行卷宗 #{agentPending.receipt.runId}</a>
+                {!agentPending.monitorLive && <button type="button" className="button secondary" onClick={remountAgentMonitor}>重新挂载监听</button>}
+                <button type="button" className="button secondary" disabled={agentPending.phase === "cancelling"} onClick={() => void cancelAgentTurn()}>取消</button>
+              </div>
+              {agentPending.error && <p className="board-ai-waiting-error" role="alert">{agentPending.error}</p>}
             </article>}
           </div>
           {agentError && <p className="dash-form-error" role="alert">{agentError}</p>}
           <ConversationComposer
             ariaLabel="描述需求"
             placeholder="例如：购物车空态需要增加优惠推荐；这里是截图和飞书 PRD…"
-            disabled={!daemonAvailable || !agentProjectId}
+            disabled={!daemonAvailable || !agentProjectId || Boolean(agentPending)}
+            offlineHint={agentPending ? "需求管家整理中，结束后才能继续说明" : undefined}
             submitLabel={agentSession ? "继续说明" : "交给需求管家"}
             sendingLabel="需求管家整理中…"
             onSend={talkToRequirementSteward}

@@ -165,6 +165,7 @@ describe("block human direct-invocation of automatic system employees", () => {
     await svc.createEmployee({ id: "sys-auto2", identity: { displayName: "Auto", background: "b", responsibilities: ["r"] }, systemRole: "automatic" });
     // 人工来源（默认 workbench，无 system: caller）应被拒
     await expect(svc.invokeEmployee("sys-auto2", { message: "hi" })).rejects.toThrow(/系统员工|自动|not.*directly/);
+    await expect(svc.startEmployee("sys-auto2", { message: "hi async" })).rejects.toThrow(/系统员工|自动|not.*directly/);
   });
 
   it("allows internal system-caller invocation of an automatic employee", async () => {
@@ -173,6 +174,12 @@ describe("block human direct-invocation of automatic system employees", () => {
     // 内部来源标记豁免；mock provider 会正常返回
     const r = await svc.invokeEmployee("sys-auto3", { message: "hi" }, { kind: "workbench", caller: "system:memory-extractor" });
     expect(r.runId).toBeTruthy();
+    const receipt = await svc.startEmployee(
+      "sys-auto3",
+      { message: "hi async" },
+      { kind: "workbench", caller: "system:memory-extractor" }
+    );
+    expect((await svc.waitForInvocation(receipt.invocation.id)).invocation.status).toBe("completed");
   });
 
   it("allows human invocation of a conversational system employee", async () => {
