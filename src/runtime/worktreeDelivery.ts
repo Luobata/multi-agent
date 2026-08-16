@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { JsonValue, WorkflowRunRecord } from "../core/types.js";
 import { removeRunWorktree } from "./worktree.js";
 
@@ -105,6 +106,195 @@ export interface RunDeliveryRecord {
   };
 }
 
+export type DeliveryOutcome = "merged" | "not-merged" | "unknown";
+
+export interface DeliveryCleanupEvidence {
+  checkedAt: string;
+  worktree: "removed" | "missing" | "unregistered" | "present" | "unknown";
+  sourceBranch: "removed" | "missing" | "present" | "unknown";
+  detail?: string;
+}
+
+export interface DeliveryDispatch {
+  state: "ready" | "leased" | "waiting" | "settled";
+  attempt: number;
+  queueKey: `sha256:${string}`;
+  order: { approvedAt: string; runId: string };
+  lease?: {
+    id: string;
+    ownerEpoch: string;
+    fencingToken: number;
+    acquiredAt: string;
+    heartbeatAt: string;
+    expiresAt: string;
+  };
+  lastFailure?: { at: string; code: string; message: string };
+}
+
+export interface DeliverySideEffects {
+  discard?: {
+    intentId: string;
+    requestedBy: string;
+    requestedAt: string;
+    expectedSourceCommit?: string;
+    phase: "prepared" | "cleanup-complete";
+  };
+  merge?: {
+    intentId: string;
+    targetRef: string;
+    expectedTargetCommit: string;
+    sourceCommit: string;
+    preparedMergeCommit: string;
+    phase: "prepared" | "ref-updated" | "worktree-synchronized";
+  };
+}
+
+export interface DeliveryEventRef {
+  id: string;
+  type: DeliveryEvent["type"];
+  actor: string;
+  at: string;
+  fromRevision: number;
+  toRevision: number;
+  leaseId?: string;
+}
+
+export interface RunDeliveryRecordV2 extends RunDeliveryRecord {
+  schemaVersion: 2;
+  revision: number;
+  cleanupVerified?: boolean;
+  cleanup?: DeliveryCleanupEvidence;
+  outcome?: DeliveryOutcome;
+  dispatch?: DeliveryDispatch;
+  sideEffects?: DeliverySideEffects;
+  lastEvent: DeliveryEventRef;
+}
+
+export type DeliveryReadResult =
+  | { kind: "absent"; revision: 0 }
+  | { kind: "valid"; revision: number; record: RunDeliveryRecordV2 }
+  | { kind: "corrupt"; revision: number; rawSha256: `sha256:${string}`; reason: string };
+
+export type DeliveryStateSelector =
+  | { kind: "absent" }
+  | { kind: "corrupt"; rawSha256: `sha256:${string}` }
+  | {
+      kind: "record";
+      status: DeliveryStatus;
+      conflictStatus?: ConflictResolutionStatus;
+      dispatchState?: DeliveryDispatch["state"];
+      leaseId?: string;
+    };
+
+interface DeliveryEventBase<T extends string, P> {
+  type: T;
+  actor: string;
+  payload: P;
+}
+
+interface DeliveryStagePayload {
+  message: string;
+  leaseId?: string;
+}
+
+export type DeliveryEvent =
+  | DeliveryEventBase<"source.prepared", {
+      baseCommit: string;
+      sourceBranch: string;
+      sourceCommit: string;
+      targetBranch: string;
+      targetCommitBeforeMerge: string;
+      message?: string;
+    }>
+  | DeliveryEventBase<"merge.approved", {
+      targetBranch: string;
+      queuedTargetCommit: string;
+      message: string;
+    }>
+  | DeliveryEventBase<"dispatch.claimed", {
+      queueKey: `sha256:${string}`;
+      approvedAt: string;
+      leaseId: string;
+      ownerEpoch: string;
+      fencingToken: number;
+      expiresAt: string;
+    }>
+  | DeliveryEventBase<"dispatch.heartbeat", { leaseId: string; expiresAt: string }>
+  | DeliveryEventBase<"dispatch.failed", { leaseId: string; code: string; message: string }>
+  | DeliveryEventBase<"conflict.started", DeliveryStagePayload & {
+      targetCommit: string;
+      conflictMessage?: string;
+      targetBranch?: string;
+      targetCommitBeforeMerge?: string;
+      retry?: "rebase" | "retest";
+    }>
+  | DeliveryEventBase<"conflict.stage-completed", DeliveryStagePayload & (
+      | { stage: "planned"; leaderPlanRunId: string; executionRoleId: string; detailMessage?: string }
+      | { stage: "executed"; leaderPlanRunId: string; executionRoleId: string; resolutionRunId?: string; detailMessage?: string }
+      | { stage: "rebased"; targetCommit: string; sourceCommit: string }
+      | {
+          stage: "tested";
+          testRunId: string;
+          testedSourceCommit: string;
+          testedCandidateRevision: string;
+          testedUrl: string;
+          detailMessage?: string;
+        }
+      | { stage: "leader-approved"; leaderReviewRunId: string; detailMessage?: string }
+    )>
+  | DeliveryEventBase<"conflict.failed", DeliveryStagePayload & {
+      targetCommit: string;
+      failureClass: ConflictRetestFailure;
+      detailMessage?: string;
+    }>
+  | DeliveryEventBase<"validation.started", DeliveryStagePayload & {
+      targetCommit?: string;
+      retryAfterTargetDrift?: boolean;
+    }>
+  | DeliveryEventBase<"validation.passed", DeliveryStagePayload & {
+      required: boolean;
+      targetCommit: string;
+      runId?: string;
+    }>
+  | DeliveryEventBase<"validation.failed", DeliveryStagePayload & {
+      targetCommit?: string;
+      runId?: string;
+    }>
+  | DeliveryEventBase<"merge.intent-prepared", DeliveryStagePayload & {
+      intentId: string;
+      targetRef: string;
+      expectedTargetCommit: string;
+      sourceCommit: string;
+      preparedMergeCommit: string;
+    }>
+  | DeliveryEventBase<"merge.ref-updated", DeliveryStagePayload & { intentId: string }>
+  | DeliveryEventBase<"merge.completed", DeliveryStagePayload & {
+      intentId: string;
+      targetBranch: string;
+      targetCommitBeforeMerge: string;
+      mergeCommit: string;
+    }>
+  | DeliveryEventBase<"keep.recorded", {
+      baseCommit: string;
+      targetBranch: string;
+      note?: string;
+      message: string;
+    }>
+  | DeliveryEventBase<"discard.intent-prepared", {
+      intentId: string;
+      baseCommit: string;
+      sourceBranch?: string;
+      sourceCommit: string;
+      targetBranch: string;
+      note?: string;
+      message: string;
+    }>
+  | DeliveryEventBase<"discard.completed", { intentId: string; message: string }>
+  | DeliveryEventBase<"evidence.queued" | "evidence.running" | "evidence.completed", {
+      evidenceRerun: NonNullable<RunDeliveryRecord["evidenceRerun"]>;
+    }>
+  | DeliveryEventBase<"terminal.outcome-adjudicated", { outcome: DeliveryOutcome; message: string }>;
+
 export interface RunMergePreview {
   runId: string;
   status: "not-ready" | DeliveryStatus;
@@ -137,7 +327,7 @@ export interface RunMergePreview {
   };
   confirmationToken: string;
   discardConfirmationToken: string;
-  delivery?: RunDeliveryRecord;
+  delivery?: RunDeliveryRecordV2;
 }
 
 const FULL_COMMIT = /^[0-9a-f]{40}$/;
@@ -193,12 +383,12 @@ async function mergedCommitEvidence(
 
 export interface RunMergeResult {
   status: "merged" | "conflict";
-  delivery: RunDeliveryRecord;
+  delivery: RunDeliveryRecordV2;
 }
 
 export interface RunMergeQueueResult {
   status: "queued-for-merge" | "retesting" | "conflict";
-  delivery: RunDeliveryRecord;
+  delivery: RunDeliveryRecordV2;
 }
 
 export class TargetChangedAfterValidationError extends Error {
@@ -229,7 +419,7 @@ export interface MergeValidationWorktree {
 
 export interface RunDeliveryActionResult {
   status: "kept" | "discarded";
-  delivery: RunDeliveryRecord;
+  delivery: RunDeliveryRecordV2;
 }
 
 export interface RunWorktreeOpenResult {
@@ -288,57 +478,1007 @@ function deliveryPath(runDir: string): string {
   return path.join(runDir, DELIVERY_FILE);
 }
 
-export async function readRunDelivery(runDir: string): Promise<RunDeliveryRecord | undefined> {
+const DELIVERY_REVISIONS_DIRECTORY = "delivery-revisions";
+const SNAPSHOT_NAME = /^([0-9]{20})\.json$/;
+const DELIVERY_STATUSES = new Set<DeliveryStatus>([
+  "awaiting-acceptance",
+  "queued-for-merge",
+  "retesting",
+  "merging",
+  "returned-to-acceptance",
+  "conflict",
+  "merged",
+  "kept",
+  "discarded"
+]);
+const TERMINAL_DELIVERY_STATUSES = new Set<DeliveryStatus>(["merged", "discarded"]);
+const BUSY_DELIVERY_EVENTS = new Set<DeliveryEvent["type"]>([
+  "conflict.started",
+  "conflict.stage-completed",
+  "conflict.failed",
+  "validation.started",
+  "validation.passed",
+  "validation.failed",
+  "merge.intent-prepared",
+  "merge.ref-updated",
+  "merge.completed"
+]);
+
+type PersistedDeliveryEvent = DeliveryEvent & {
+  id: string;
+  at: string;
+  fromRevision: number;
+  toRevision: number;
+};
+
+interface DeliveryRevisionSnapshot {
+  schemaVersion: 2;
+  revision: number;
+  record: RunDeliveryRecordV2;
+  event: PersistedDeliveryEvent;
+}
+
+export class DeliveryRevisionConflict extends Error {
+  constructor(
+    readonly runId: string,
+    readonly expectedRevision: number,
+    readonly actualRevision: number
+  ) {
+    super(`delivery revision conflict for ${runId}: expected ${expectedRevision}, actual ${actualRevision}`);
+    this.name = "DeliveryRevisionConflict";
+  }
+}
+
+export class DeliveryTransitionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeliveryTransitionError";
+  }
+}
+
+export class DeliveryCorruptError extends Error {
+  constructor(readonly result: Extract<DeliveryReadResult, { kind: "corrupt" }>) {
+    super(`delivery record is corrupt: ${result.reason}`);
+    this.name = "DeliveryCorruptError";
+  }
+}
+
+function sha256(value: string): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function legacyAsV2(record: RunDeliveryRecord, digest: `sha256:${string}`): RunDeliveryRecordV2 {
+  return {
+    ...record,
+    schemaVersion: 2,
+    revision: 0,
+    lastEvent: {
+      id: `legacy:${digest.slice("sha256:".length, "sha256:".length + 20)}`,
+      type: "source.prepared",
+      actor: "runtime",
+      at: record.updatedAt,
+      fromRevision: 0,
+      toRevision: 0
+    }
+  };
+}
+
+function validateDeliveryRecord(
+  value: unknown,
+  runId: string
+): { valid: true; record: RunDeliveryRecordV2; legacy: boolean } | { valid: false; reason: string } {
+  if (!isRecord(value)) return { valid: false, reason: "delivery JSON root is not an object" };
+  if (value.runId !== runId) return { valid: false, reason: "delivery runId does not match its run directory" };
+  if (typeof value.status !== "string" || !DELIVERY_STATUSES.has(value.status as DeliveryStatus)) {
+    return { valid: false, reason: "delivery status is invalid" };
+  }
+  if (typeof value.updatedAt !== "string" || !value.updatedAt.trim()) {
+    return { valid: false, reason: "delivery updatedAt is invalid" };
+  }
+  const hasSchemaVersion = Object.hasOwn(value, "schemaVersion");
+  const hasRevision = Object.hasOwn(value, "revision");
+  const hasLastEvent = Object.hasOwn(value, "lastEvent");
+  if (!hasSchemaVersion && !hasRevision && !hasLastEvent) {
+    const serialized = JSON.stringify(value);
+    return { valid: true, record: legacyAsV2(value as unknown as RunDeliveryRecord, sha256(serialized)), legacy: true };
+  }
+  if (value.schemaVersion !== 2 || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1) {
+    return { valid: false, reason: "delivery schemaVersion/revision is invalid" };
+  }
+  if (!isRecord(value.lastEvent)
+    || typeof value.lastEvent.id !== "string"
+    || typeof value.lastEvent.type !== "string"
+    || typeof value.lastEvent.actor !== "string"
+    || typeof value.lastEvent.at !== "string"
+    || value.lastEvent.fromRevision !== (value.revision as number) - 1
+    || value.lastEvent.toRevision !== value.revision) {
+    return { valid: false, reason: "delivery lastEvent does not match revision" };
+  }
+  return { valid: true, record: value as unknown as RunDeliveryRecordV2, legacy: false };
+}
+
+async function readTextIfPresent(filePath: string): Promise<string | undefined> {
   try {
-    return JSON.parse(await fs.readFile(deliveryPath(runDir), "utf8")) as RunDeliveryRecord;
+    return await fs.readFile(filePath, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
 }
 
-async function writeRunDelivery(runDir: string, record: RunDeliveryRecord): Promise<void> {
-  const destination = deliveryPath(runDir);
-  const temporary = `${destination}.${randomUUID()}.tmp`;
-  await fs.writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await fs.rename(temporary, destination);
+function revisionFileName(revision: number): string {
+  return `${String(revision).padStart(20, "0")}.json`;
 }
 
-export async function updateRunDelivery(
-  runDir: string,
-  runId: string,
-  update: (current: RunDeliveryRecord | undefined) => RunDeliveryRecord
-): Promise<RunDeliveryRecord> {
-  assertRunId(runId);
-  const current = await readRunDelivery(runDir);
-  if (current?.runId && current.runId !== runId) {
-    throw new Error("交付记录与当前 Run 不匹配，请检查 Run Store 完整性");
+async function highestSnapshotPath(runDir: string): Promise<string | undefined> {
+  const directory = path.join(runDir, DELIVERY_REVISIONS_DIRECTORY);
+  let entries: string[];
+  try {
+    entries = await fs.readdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
-  const next = update(current);
-  if (next.runId !== runId) throw new Error("交付记录更新不能改变 Run ID");
-  await writeRunDelivery(runDir, next);
+  const latest = entries.filter((entry) => SNAPSHOT_NAME.test(entry)).sort().at(-1);
+  return latest ? path.join(directory, latest) : undefined;
+}
+
+function validateSnapshot(raw: string, runId: string, filePath: string): DeliveryReadResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return {
+      kind: "corrupt",
+      revision: Number(path.basename(filePath).slice(0, 20)) || 0,
+      rawSha256: sha256(raw),
+      reason: `delivery snapshot JSON is invalid: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+  if (!isRecord(parsed) || parsed.schemaVersion !== 2 || !Number.isSafeInteger(parsed.revision)) {
+    return { kind: "corrupt", revision: 0, rawSha256: sha256(raw), reason: "delivery snapshot envelope is invalid" };
+  }
+  const revision = parsed.revision as number;
+  if (path.basename(filePath) !== revisionFileName(revision)) {
+    return { kind: "corrupt", revision, rawSha256: sha256(raw), reason: "delivery snapshot filename does not match revision" };
+  }
+  const validated = validateDeliveryRecord(parsed.record, runId);
+  if (!validated.valid || validated.legacy || validated.record.revision !== revision) {
+    return {
+      kind: "corrupt",
+      revision,
+      rawSha256: sha256(raw),
+      reason: validated.valid ? "delivery snapshot record revision is invalid" : validated.reason
+    };
+  }
+  if (!isRecord(parsed.event)
+    || parsed.event.id !== validated.record.lastEvent.id
+    || parsed.event.type !== validated.record.lastEvent.type
+    || parsed.event.actor !== validated.record.lastEvent.actor
+    || parsed.event.at !== validated.record.lastEvent.at
+    || parsed.event.fromRevision !== revision - 1
+    || parsed.event.toRevision !== revision) {
+    return { kind: "corrupt", revision, rawSha256: sha256(raw), reason: "delivery snapshot event does not match record" };
+  }
+  return { kind: "valid", revision, record: validated.record };
+}
+
+async function fsyncDirectory(directory: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    handle = await fs.open(directory, "r");
+    await handle.sync();
+  } catch (error) {
+    if (!["EINVAL", "ENOTSUP", "EISDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function writeSyncedFile(filePath: string, value: string): Promise<void> {
+  const handle = await fs.open(filePath, "wx", 0o600);
+  try {
+    await handle.writeFile(value, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function replaceProjection(runDir: string, record: RunDeliveryRecordV2): Promise<void> {
+  const destination = deliveryPath(runDir);
+  const temporary = path.join(runDir, `.${DELIVERY_FILE}.${randomUUID()}.tmp`);
+  try {
+    await writeSyncedFile(temporary, `${JSON.stringify(record, null, 2)}\n`);
+    await fs.rename(temporary, destination);
+    await fsyncDirectory(runDir);
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+const deliveryMutexTails = new Map<string, Promise<void>>();
+
+async function withDeliveryMutex<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = deliveryMutexTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  deliveryMutexTails.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (deliveryMutexTails.get(key) === tail) deliveryMutexTails.delete(key);
+  }
+}
+
+function eventLeaseId(event: DeliveryEvent): string | undefined {
+  return "leaseId" in event.payload && typeof event.payload.leaseId === "string"
+    ? event.payload.leaseId
+    : undefined;
+}
+
+function selectorMatches(
+  selector: DeliveryStateSelector,
+  current: RunDeliveryRecordV2 | undefined
+): boolean {
+  if (selector.kind === "absent") return current === undefined;
+  if (selector.kind === "corrupt") return false;
+  if (!current || current.status !== selector.status) return false;
+  if (selector.conflictStatus !== undefined && current.conflictResolution?.status !== selector.conflictStatus) return false;
+  if (selector.dispatchState !== undefined && current.dispatch?.state !== selector.dispatchState) return false;
+  if (selector.leaseId !== undefined && current.dispatch?.lease?.id !== selector.leaseId) return false;
+  return true;
+}
+
+function eventPolicyAllows(current: RunDeliveryRecordV2 | undefined, event: DeliveryEvent): boolean {
+  const status = current?.status;
+  const conflictStatus = current?.conflictResolution?.status;
+  switch (event.type) {
+    case "source.prepared":
+      return current === undefined || ["awaiting-acceptance", "kept", "returned-to-acceptance"].includes(status ?? "")
+        || (status === "conflict" && conflictStatus === "failed");
+    case "merge.approved":
+      return ["awaiting-acceptance", "kept", "returned-to-acceptance"].includes(status ?? "")
+        || (status === "conflict" && conflictStatus === "failed");
+    case "keep.recorded":
+      return current === undefined || ["awaiting-acceptance", "returned-to-acceptance"].includes(status ?? "")
+        || (status === "conflict" && conflictStatus === "failed");
+    case "discard.intent-prepared":
+      return current === undefined || ["awaiting-acceptance", "returned-to-acceptance", "kept"].includes(status ?? "")
+        || (status === "conflict" && conflictStatus === "failed");
+    case "discard.completed":
+      return Boolean(current?.sideEffects?.discard?.phase === "prepared"
+        && current.sideEffects.discard.intentId === event.payload.intentId);
+    case "evidence.queued":
+      return current === undefined || ["awaiting-acceptance", "returned-to-acceptance", "kept"].includes(status ?? "")
+        || (status === "conflict" && conflictStatus === "failed");
+    case "evidence.running":
+      return current?.evidenceRerun?.status === "queued";
+    case "evidence.completed":
+      return current?.evidenceRerun?.status === "queued" || current?.evidenceRerun?.status === "running";
+    case "conflict.started":
+      return event.payload.retry
+        ? status === "conflict" && conflictStatus === "failed"
+        : ["queued-for-merge", "merging"].includes(status ?? "");
+    case "conflict.stage-completed":
+      if (["planned", "executed", "rebased"].includes(event.payload.stage)) {
+        return status === "conflict" && conflictStatus === "resolving";
+      }
+      if (event.payload.stage === "tested") {
+        return status === "retesting" && conflictStatus === "retesting"
+          && event.payload.testedSourceCommit === current?.sourceCommit;
+      }
+      return status === "retesting" && conflictStatus === "leader-review"
+        && Boolean(current?.conflictResolution?.testRunId)
+        && Boolean(current?.sourceCommit)
+        && current?.conflictResolution?.testedSourceCommit === current?.sourceCommit;
+    case "conflict.failed":
+      return ["conflict", "retesting", "merging"].includes(status ?? "")
+        && Boolean(current?.conflictResolution);
+    case "validation.started":
+      return ["queued-for-merge", "retesting", "merging"].includes(status ?? "");
+    case "validation.passed":
+      return event.payload.required
+        ? ["queued-for-merge", "retesting"].includes(status ?? "")
+          && current?.mergeValidation?.status === "running"
+          && current.mergeValidation.targetCommit === event.payload.targetCommit
+        : status === "queued-for-merge";
+    case "validation.failed":
+      return ["queued-for-merge", "retesting", "merging"].includes(status ?? "")
+        || (status === "conflict" && !current?.conflictResolution);
+    case "merge.intent-prepared":
+      return status === "merging"
+        && !current?.sideEffects?.merge
+        && current?.sourceCommit === event.payload.sourceCommit
+        && current.mergeValidation?.targetCommit === event.payload.expectedTargetCommit
+        && ["passed", "not-required"].includes(current.mergeValidation.status);
+    case "merge.ref-updated":
+      return status === "merging"
+        && current?.sideEffects?.merge?.phase === "prepared"
+        && current.sideEffects.merge.intentId === event.payload.intentId;
+    case "merge.completed":
+      return status === "merging"
+        && current?.sideEffects?.merge?.phase === "ref-updated"
+        && current.sideEffects.merge.intentId === event.payload.intentId;
+    case "dispatch.claimed":
+      return Boolean(current && !TERMINAL_DELIVERY_STATUSES.has(current.status)
+        && (!current.dispatch || current.dispatch.state === "ready" || current.dispatch.state === "waiting"));
+    case "dispatch.heartbeat":
+    case "dispatch.failed":
+      return current?.dispatch?.state === "leased" && current.dispatch.lease?.id === event.payload.leaseId;
+    case "terminal.outcome-adjudicated":
+      return Boolean(current
+        && TERMINAL_DELIVERY_STATUSES.has(current.status)
+        && (current.outcome === undefined
+          || current.outcome === "unknown"
+          || current.outcome === event.payload.outcome
+          || (current.status === "discarded" && event.payload.outcome === "merged")));
+  }
+}
+
+function assertReducerPreconditions(current: RunDeliveryRecordV2 | undefined, event: DeliveryEvent): void {
+  if (current && TERMINAL_DELIVERY_STATUSES.has(current.status) && event.type !== "terminal.outcome-adjudicated") {
+    throw new DeliveryTransitionError(`terminal delivery ${current.status} cannot process ${event.type}`);
+  }
+  if (current?.sideEffects?.discard?.phase === "prepared" && event.type !== "discard.completed") {
+    throw new DeliveryTransitionError("delivery has an active discard intent");
+  }
+  if (current?.sideEffects?.merge
+    && current.sideEffects.merge.phase !== "worktree-synchronized"
+    && !["merge.ref-updated", "merge.completed"].includes(event.type)
+    && !(event.type === "validation.started" && event.payload.retryAfterTargetDrift)) {
+    throw new DeliveryTransitionError("delivery has an active merge intent");
+  }
+  if (BUSY_DELIVERY_EVENTS.has(event.type) && current?.dispatch?.state === "leased") {
+    if (eventLeaseId(event) !== current.dispatch.lease?.id) {
+      throw new DeliveryTransitionError("busy delivery event does not match the active leaseId");
+    }
+  }
+  if (!eventPolicyAllows(current, event)) {
+    throw new DeliveryTransitionError(`event ${event.type} is not allowed from ${current?.status ?? "absent"}`);
+  }
+}
+
+function requireConflictResolution(current: RunDeliveryRecordV2): NonNullable<RunDeliveryRecord["conflictResolution"]> {
+  if (!current.conflictResolution) throw new DeliveryTransitionError("delivery conflict event requires conflictResolution");
+  return current.conflictResolution;
+}
+
+function reduceDelivery(
+  runId: string,
+  current: RunDeliveryRecordV2 | undefined,
+  event: PersistedDeliveryEvent
+): RunDeliveryRecordV2 {
+  assertReducerPreconditions(current, event);
+  const lastEvent: DeliveryEventRef = {
+    id: event.id,
+    type: event.type,
+    actor: event.actor,
+    at: event.at,
+    fromRevision: event.fromRevision,
+    toRevision: event.toRevision,
+    ...(eventLeaseId(event) ? { leaseId: eventLeaseId(event) } : {})
+  };
+  let next: RunDeliveryRecordV2 = {
+    ...(current ?? { runId, status: "awaiting-acceptance" as const, updatedAt: event.at }),
+    schemaVersion: 2,
+    revision: event.toRevision,
+    updatedAt: event.at,
+    lastEvent
+  };
+  const message = "message" in event.payload && typeof event.payload.message === "string"
+    ? event.payload.message.slice(0, 8_000)
+    : undefined;
+  switch (event.type) {
+    case "source.prepared":
+      next = {
+        ...next,
+        baseCommit: event.payload.baseCommit,
+        sourceBranch: event.payload.sourceBranch,
+        sourceCommit: event.payload.sourceCommit,
+        targetBranch: event.payload.targetBranch,
+        targetCommitBeforeMerge: current?.targetCommitBeforeMerge ?? event.payload.targetCommitBeforeMerge,
+        ...(message ? { message } : {})
+      };
+      break;
+    case "merge.approved":
+      next = {
+        ...next,
+        status: "queued-for-merge",
+        targetBranch: event.payload.targetBranch,
+        queuedTargetCommit: event.payload.queuedTargetCommit,
+        message,
+        conflictResolution: undefined,
+        mergeValidation: undefined,
+        humanDecision: { action: "merge", actor: event.actor, at: event.at }
+      };
+      break;
+    case "dispatch.claimed": {
+      const previousAttempt = current?.dispatch?.attempt ?? 0;
+      next = {
+        ...next,
+        dispatch: {
+          state: "leased",
+          attempt: previousAttempt + 1,
+          queueKey: event.payload.queueKey,
+          order: { approvedAt: event.payload.approvedAt, runId },
+          lease: {
+            id: event.payload.leaseId,
+            ownerEpoch: event.payload.ownerEpoch,
+            fencingToken: event.payload.fencingToken,
+            acquiredAt: event.at,
+            heartbeatAt: event.at,
+            expiresAt: event.payload.expiresAt
+          }
+        }
+      };
+      break;
+    }
+    case "dispatch.heartbeat":
+      next = {
+        ...next,
+        dispatch: {
+          ...current!.dispatch!,
+          lease: { ...current!.dispatch!.lease!, heartbeatAt: event.at, expiresAt: event.payload.expiresAt }
+        }
+      };
+      break;
+    case "dispatch.failed":
+      next = {
+        ...next,
+        dispatch: {
+          ...current!.dispatch!,
+          state: "waiting",
+          lease: undefined,
+          lastFailure: { at: event.at, code: event.payload.code, message: event.payload.message.slice(0, 8_000) }
+        }
+      };
+      break;
+    case "conflict.started": {
+      if (event.payload.retry) {
+        const resolution = requireConflictResolution(current!);
+        const rebased = event.payload.retry === "retest";
+        next = {
+          ...next,
+          status: rebased ? "retesting" : "conflict",
+          message,
+          conflictResolution: {
+            ...resolution,
+            status: rebased ? "retesting" : "resolving",
+            updatedAt: event.at,
+            failureClass: undefined,
+            testRunId: undefined,
+            testedSourceCommit: undefined,
+            testedCandidateRevision: undefined,
+            testedUrl: undefined,
+            leaderReviewRunId: undefined,
+            message
+          },
+          mergeValidation: {
+            required: true,
+            status: "running",
+            targetCommit: resolution.targetCommit,
+            message: "上一轮合入验证证据已失效，等待重新验证。",
+            updatedAt: event.at
+          }
+        };
+      } else {
+        next = {
+          ...next,
+          status: "conflict",
+          ...(event.payload.targetBranch ? { targetBranch: event.payload.targetBranch } : {}),
+          ...(event.payload.targetCommitBeforeMerge
+            ? { targetCommitBeforeMerge: event.payload.targetCommitBeforeMerge }
+            : {}),
+          message,
+          conflictResolution: {
+            status: "resolving",
+            targetCommit: event.payload.targetCommit,
+            ...(event.payload.conflictMessage ? { conflictMessage: event.payload.conflictMessage } : {}),
+            updatedAt: event.at,
+            message
+          }
+        };
+      }
+      break;
+    }
+    case "conflict.stage-completed": {
+      const resolution = requireConflictResolution(current!);
+      switch (event.payload.stage) {
+        case "planned":
+          next = {
+            ...next,
+            status: "conflict",
+            message,
+            conflictResolution: {
+              ...resolution,
+              status: "resolving",
+              leaderPlanRunId: event.payload.leaderPlanRunId,
+              executionRoleId: event.payload.executionRoleId,
+              updatedAt: event.at,
+              message: event.payload.detailMessage ?? message
+            }
+          };
+          break;
+        case "executed":
+          next = {
+            ...next,
+            status: "conflict",
+            message,
+            conflictResolution: {
+              ...resolution,
+              status: "resolving",
+              leaderPlanRunId: event.payload.leaderPlanRunId,
+              executionRoleId: event.payload.executionRoleId,
+              ...(event.payload.resolutionRunId ? { resolutionRunId: event.payload.resolutionRunId } : {}),
+              updatedAt: event.at,
+              message: event.payload.detailMessage ?? message
+            }
+          };
+          break;
+        case "rebased":
+          next = {
+            ...next,
+            status: "retesting",
+            baseCommit: event.payload.targetCommit,
+            sourceCommit: event.payload.sourceCommit,
+            queuedTargetCommit: event.payload.targetCommit,
+            targetCommitBeforeMerge: event.payload.targetCommit,
+            message,
+            conflictResolution: {
+              ...resolution,
+              status: "retesting",
+              targetCommit: event.payload.targetCommit,
+              updatedAt: event.at,
+              message
+            }
+          };
+          break;
+        case "tested":
+          next = {
+            ...next,
+            status: "retesting",
+            message,
+            conflictResolution: {
+              ...resolution,
+              status: "leader-review",
+              testRunId: event.payload.testRunId,
+              testedSourceCommit: event.payload.testedSourceCommit,
+              testedCandidateRevision: event.payload.testedCandidateRevision,
+              testedUrl: event.payload.testedUrl,
+              failureClass: undefined,
+              updatedAt: event.at,
+              message: event.payload.detailMessage ?? message
+            },
+            mergeValidation: {
+              required: true,
+              status: "running",
+              runId: event.payload.testRunId,
+              targetCommit: resolution.targetCommit,
+              message: event.payload.detailMessage ?? message,
+              updatedAt: event.at
+            }
+          };
+          break;
+        case "leader-approved":
+          next = {
+            ...next,
+            status: "merging",
+            message,
+            conflictResolution: {
+              ...resolution,
+              status: "passed",
+              leaderReviewRunId: event.payload.leaderReviewRunId,
+              updatedAt: event.at,
+              message: event.payload.detailMessage ?? message
+            },
+            mergeValidation: {
+              required: true,
+              status: "passed",
+              runId: resolution.testRunId,
+              targetCommit: resolution.targetCommit,
+              message: `独立测试与原领队复验通过：${event.payload.detailMessage ?? message}`,
+              updatedAt: event.at
+            }
+          };
+          break;
+      }
+      break;
+    }
+    case "conflict.failed": {
+      const resolution = requireConflictResolution(current!);
+      next = {
+        ...next,
+        status: "conflict",
+        message,
+        conflictResolution: {
+          ...resolution,
+          status: "failed",
+          targetCommit: event.payload.targetCommit,
+          failureClass: event.payload.failureClass,
+          updatedAt: event.at,
+          message: event.payload.detailMessage ?? message
+        },
+        mergeValidation: {
+          required: true,
+          status: "failed",
+          targetCommit: event.payload.targetCommit,
+          message: event.payload.detailMessage ?? message,
+          updatedAt: event.at
+        }
+      };
+      break;
+    }
+    case "validation.started":
+      next = {
+        ...next,
+        status: event.payload.retryAfterTargetDrift ? "queued-for-merge" : "retesting",
+        message,
+        ...(event.payload.retryAfterTargetDrift && current?.sideEffects
+          ? { sideEffects: { ...current.sideEffects, merge: undefined } }
+          : {}),
+        mergeValidation: {
+          required: true,
+          status: "running",
+          ...(event.payload.targetCommit ? { targetCommit: event.payload.targetCommit } : {}),
+          message,
+          updatedAt: event.at
+        }
+      };
+      break;
+    case "validation.passed":
+      next = {
+        ...next,
+        status: "merging",
+        message,
+        mergeValidation: {
+          required: event.payload.required,
+          status: event.payload.required ? "passed" : "not-required",
+          ...(event.payload.runId ? { runId: event.payload.runId } : {}),
+          targetCommit: event.payload.targetCommit,
+          message,
+          updatedAt: event.at
+        }
+      };
+      break;
+    case "validation.failed":
+      next = {
+        ...next,
+        status: "returned-to-acceptance",
+        message,
+        mergeValidation: {
+          required: true,
+          status: "failed",
+          ...(event.payload.runId ? { runId: event.payload.runId } : {}),
+          ...(event.payload.targetCommit ? { targetCommit: event.payload.targetCommit } : {}),
+          message,
+          updatedAt: event.at
+        }
+      };
+      break;
+    case "merge.intent-prepared":
+      next = {
+        ...next,
+        status: "merging",
+        message,
+        sideEffects: {
+          ...current?.sideEffects,
+          merge: {
+            intentId: event.payload.intentId,
+            targetRef: event.payload.targetRef,
+            expectedTargetCommit: event.payload.expectedTargetCommit,
+            sourceCommit: event.payload.sourceCommit,
+            preparedMergeCommit: event.payload.preparedMergeCommit,
+            phase: "prepared"
+          }
+        }
+      };
+      break;
+    case "merge.ref-updated":
+      next = {
+        ...next,
+        message,
+        sideEffects: {
+          ...current!.sideEffects,
+          merge: { ...current!.sideEffects!.merge!, phase: "ref-updated" }
+        }
+      };
+      break;
+    case "merge.completed":
+      next = {
+        ...next,
+        status: "merged",
+        targetBranch: event.payload.targetBranch,
+        targetCommitBeforeMerge: event.payload.targetCommitBeforeMerge,
+        mergeCommit: event.payload.mergeCommit,
+        message,
+        outcome: "merged",
+        ...(current?.dispatch ? { dispatch: { ...current.dispatch, state: "settled", lease: undefined } } : {}),
+        sideEffects: {
+          ...current!.sideEffects,
+          merge: { ...current!.sideEffects!.merge!, phase: "worktree-synchronized" }
+        }
+      };
+      break;
+    case "keep.recorded":
+      next = {
+        ...next,
+        status: "kept",
+        baseCommit: event.payload.baseCommit,
+        targetBranch: event.payload.targetBranch,
+        message,
+        humanDecision: {
+          action: "keep",
+          actor: event.actor,
+          at: event.at,
+          ...(event.payload.note ? { note: event.payload.note } : {})
+        }
+      };
+      break;
+    case "discard.intent-prepared":
+      next = {
+        ...next,
+        baseCommit: event.payload.baseCommit,
+        ...(event.payload.sourceBranch ? { sourceBranch: event.payload.sourceBranch } : {}),
+        sourceCommit: event.payload.sourceCommit,
+        targetBranch: event.payload.targetBranch,
+        message,
+        humanDecision: {
+          action: "discard",
+          actor: event.actor,
+          at: event.at,
+          ...(event.payload.note ? { note: event.payload.note } : {})
+        },
+        sideEffects: {
+          ...current?.sideEffects,
+          discard: {
+            intentId: event.payload.intentId,
+            requestedBy: event.actor,
+            requestedAt: event.at,
+            expectedSourceCommit: event.payload.sourceCommit,
+            phase: "prepared"
+          }
+        }
+      };
+      break;
+    case "discard.completed":
+      next = {
+        ...next,
+        status: "discarded",
+        message,
+        cleanupVerified: true,
+        cleanup: {
+          checkedAt: event.at,
+          worktree: "removed",
+          sourceBranch: "removed"
+        },
+        outcome: "not-merged",
+        ...(current?.dispatch ? { dispatch: { ...current.dispatch, state: "settled", lease: undefined } } : {}),
+        sideEffects: {
+          ...current!.sideEffects,
+          discard: { ...current!.sideEffects!.discard!, phase: "cleanup-complete" }
+        }
+      };
+      break;
+    case "evidence.queued":
+    case "evidence.running":
+    case "evidence.completed":
+      next = { ...next, evidenceRerun: event.payload.evidenceRerun };
+      break;
+    case "terminal.outcome-adjudicated":
+      next = { ...next, outcome: event.payload.outcome, message };
+      break;
+  }
+  if (current && TERMINAL_DELIVERY_STATUSES.has(current.status) && next.status !== current.status) {
+    throw new DeliveryTransitionError("terminal delivery status cannot regress");
+  }
   return next;
 }
 
-export async function transitionRunDelivery(
+function defaultAllowedFrom(event: DeliveryEvent): DeliveryStateSelector[] {
+  if (event.type === "source.prepared" || event.type === "keep.recorded"
+    || event.type === "discard.intent-prepared" || event.type === "evidence.queued") {
+    return [
+      { kind: "absent" },
+      { kind: "record", status: "awaiting-acceptance" },
+      { kind: "record", status: "returned-to-acceptance" },
+      { kind: "record", status: "kept" },
+      { kind: "record", status: "conflict", conflictStatus: "failed" }
+    ];
+  }
+  return [...DELIVERY_STATUSES].map((status) => ({ kind: "record" as const, status }));
+}
+
+export interface RunDeliveryStoreOptions {
+  afterSnapshotPublish?: (snapshot: DeliveryRevisionSnapshot) => void | Promise<void>;
+}
+
+export class RunDeliveryStore {
+  private readonly runsRoot: string;
+
+  constructor(runsRoot: string, private readonly options: RunDeliveryStoreOptions = {}) {
+    this.runsRoot = path.resolve(runsRoot);
+  }
+
+  static forRunDirectory(runDir: string, runId: string, options: RunDeliveryStoreOptions = {}): RunDeliveryStore {
+    assertRunId(runId);
+    const resolved = path.resolve(runDir);
+    if (path.basename(resolved) !== runId) {
+      throw new Error("run directory must be the canonical runsRoot/runId path");
+    }
+    return new RunDeliveryStore(path.dirname(resolved), options);
+  }
+
+  private runDirectory(runId: string): string {
+    assertRunId(runId);
+    return path.join(this.runsRoot, runId);
+  }
+
+  async readDelivery(runId: string): Promise<DeliveryReadResult> {
+    const runDir = this.runDirectory(runId);
+    const snapshotPath = await highestSnapshotPath(runDir);
+    if (snapshotPath) {
+      const snapshotRaw = await fs.readFile(snapshotPath, "utf8");
+      const snapshot = validateSnapshot(snapshotRaw, runId, snapshotPath);
+      if (snapshot.kind !== "valid") return snapshot;
+      const projectionRaw = await readTextIfPresent(deliveryPath(runDir));
+      if (projectionRaw === undefined) return snapshot;
+      let projectionValue: unknown;
+      try {
+        projectionValue = JSON.parse(projectionRaw);
+      } catch {
+        return snapshot;
+      }
+      const projection = validateDeliveryRecord(projectionValue, runId);
+      if (!projection.valid || projection.legacy || projection.record.revision < snapshot.revision) return snapshot;
+      if (projection.record.revision > snapshot.revision) {
+        return {
+          kind: "corrupt",
+          revision: projection.record.revision,
+          rawSha256: sha256(projectionRaw),
+          reason: "delivery projection is ahead of the highest immutable snapshot"
+        };
+      }
+      if (!isDeepStrictEqual(projection.record, snapshot.record)) {
+        return {
+          kind: "corrupt",
+          revision: snapshot.revision,
+          rawSha256: sha256(projectionRaw),
+          reason: "mixed-writer-detected: projection changed without a new immutable revision"
+        };
+      }
+      return snapshot;
+    }
+
+    const projectionRaw = await readTextIfPresent(deliveryPath(runDir));
+    if (projectionRaw === undefined) return { kind: "absent", revision: 0 };
+    let projectionValue: unknown;
+    try {
+      projectionValue = JSON.parse(projectionRaw);
+    } catch (error) {
+      return {
+        kind: "corrupt",
+        revision: 0,
+        rawSha256: sha256(projectionRaw),
+        reason: `delivery JSON is invalid: ${error instanceof Error ? error.message : String(error)}`
+      };
+    }
+    const projection = validateDeliveryRecord(projectionValue, runId);
+    if (!projection.valid) {
+      return { kind: "corrupt", revision: 0, rawSha256: sha256(projectionRaw), reason: projection.reason };
+    }
+    if (!projection.legacy) {
+      return {
+        kind: "corrupt",
+        revision: projection.record.revision,
+        rawSha256: sha256(projectionRaw),
+        reason: "v2 delivery projection has no immutable revision snapshot"
+      };
+    }
+    return { kind: "valid", revision: 0, record: projection.record };
+  }
+
+  async advanceDelivery(
+    runId: string,
+    expectedRevision: number,
+    allowedFrom: readonly DeliveryStateSelector[],
+    event: DeliveryEvent
+  ): Promise<RunDeliveryRecordV2> {
+    const runDir = this.runDirectory(runId);
+    return withDeliveryMutex(runDir, async () => {
+      const read = await this.readDelivery(runId);
+      if (read.kind === "corrupt") throw new DeliveryCorruptError(read);
+      if (read.revision !== expectedRevision) {
+        throw new DeliveryRevisionConflict(runId, expectedRevision, read.revision);
+      }
+      const current = read.kind === "valid" ? read.record : undefined;
+      if (!allowedFrom.some((selector) => selectorMatches(selector, current))) {
+        throw new DeliveryTransitionError(`delivery state is not in allowedFrom for ${event.type}`);
+      }
+      const persistedEvent: PersistedDeliveryEvent = {
+        ...event,
+        id: randomUUID(),
+        at: new Date().toISOString(),
+        fromRevision: expectedRevision,
+        toRevision: expectedRevision + 1
+      };
+      const next = reduceDelivery(runId, current, persistedEvent);
+      const snapshot: DeliveryRevisionSnapshot = {
+        schemaVersion: 2,
+        revision: next.revision,
+        record: next,
+        event: persistedEvent
+      };
+      const revisionsDirectory = path.join(runDir, DELIVERY_REVISIONS_DIRECTORY);
+      await fs.mkdir(revisionsDirectory, { recursive: true });
+      const temporary = path.join(revisionsDirectory, `.${revisionFileName(next.revision)}.${randomUUID()}.tmp`);
+      const destination = path.join(revisionsDirectory, revisionFileName(next.revision));
+      try {
+        await writeSyncedFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`);
+        try {
+          await fs.link(temporary, destination);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            const actual = await this.readDelivery(runId);
+            throw new DeliveryRevisionConflict(runId, expectedRevision, actual.revision);
+          }
+          throw error;
+        }
+        await fsyncDirectory(revisionsDirectory);
+      } finally {
+        await fs.rm(temporary, { force: true });
+      }
+      await this.options.afterSnapshotPublish?.(snapshot);
+      await replaceProjection(runDir, next);
+      return next;
+    });
+  }
+}
+
+export async function readRunDelivery(runDir: string, runId?: string): Promise<RunDeliveryRecordV2 | undefined> {
+  const directoryRunId = path.basename(path.resolve(runDir));
+  let resolvedRunId = runId ?? (RUN_ID_PATTERN.test(directoryRunId) ? directoryRunId : undefined);
+  if (!resolvedRunId) {
+    const projectionRaw = await readTextIfPresent(deliveryPath(runDir));
+    if (projectionRaw) {
+      try {
+        const candidate = JSON.parse(projectionRaw) as { runId?: unknown };
+        if (typeof candidate.runId === "string") resolvedRunId = candidate.runId;
+      } catch {
+        throw new DeliveryCorruptError({
+          kind: "corrupt",
+          revision: 0,
+          rawSha256: sha256(projectionRaw),
+          reason: "delivery JSON is invalid"
+        });
+      }
+    }
+  }
+  if (!resolvedRunId) return undefined;
+  const read = await RunDeliveryStore.forRunDirectory(runDir, resolvedRunId).readDelivery(resolvedRunId);
+  if (read.kind === "corrupt") throw new DeliveryCorruptError(read);
+  return read.kind === "valid" ? read.record : undefined;
+}
+
+export async function advanceDeliveryEvent(
   runDir: string,
   runId: string,
-  status: DeliveryStatus,
-  input: {
-    message?: string;
-    mergeValidation?: RunDeliveryRecord["mergeValidation"];
-    conflictResolution?: RunDeliveryRecord["conflictResolution"];
-  } = {}
-): Promise<RunDeliveryRecord> {
-  return updateRunDelivery(runDir, runId, (current) => ({
-    ...current,
+  expectedRevision: number,
+  event: DeliveryEvent
+): Promise<RunDeliveryRecordV2> {
+  return RunDeliveryStore.forRunDirectory(runDir, runId).advanceDelivery(
     runId,
-    status,
-    updatedAt: new Date().toISOString(),
-    ...(input.message !== undefined ? { message: input.message.slice(0, 8_000) } : {}),
-    ...(input.mergeValidation ? { mergeValidation: input.mergeValidation } : {}),
-    ...(input.conflictResolution ? { conflictResolution: input.conflictResolution } : {})
-  }));
+    expectedRevision,
+    defaultAllowedFrom(event),
+    event
+  );
 }
 
 async function managedRunRebaseContext(
@@ -348,7 +1488,7 @@ async function managedRunRebaseContext(
 ): Promise<{ worktreePath: string; repositoryRoot: string; sourceBranch: string }> {
   assertRunId(run.id);
   const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
-  const delivery = await readRunDelivery(runDir);
+  const delivery = await readRunDelivery(runDir, run.id);
   if (!worktreePath || !delivery?.sourceBranch || !delivery.targetBranch) {
     throw new Error("冲突修复缺少受管 worktree、交付源分支或目标分支");
   }
@@ -449,9 +1589,9 @@ export async function acceptRebasedRunSource(
   run: WorkflowRunRecord,
   runDir: string,
   targetCommit: string
-): Promise<RunDeliveryRecord> {
+): Promise<RunDeliveryRecordV2> {
   const preview = await previewRunMerge(run, runDir);
-  const delivery = await readRunDelivery(runDir);
+  const delivery = await readRunDelivery(runDir, run.id);
   if (!preview.repositoryRoot || !preview.worktreePath || !delivery?.sourceBranch) {
     throw new Error("冲突修复缺少受管 worktree、目标仓库或交付源分支");
   }
@@ -468,41 +1608,31 @@ export async function acceptRebasedRunSource(
   if (mergeCheck.code !== 0) {
     throw new Error((mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "冲突仍未解决").slice(0, 8_000));
   }
-  return updateRunDelivery(runDir, run.id, (current) => {
-    if (!current?.conflictResolution) throw new Error("缺少冲突修复审计记录");
-    return {
-      ...current,
-      runId: run.id,
-      status: "retesting",
-      baseCommit: targetCommit,
+  if (!delivery?.conflictResolution) throw new Error("缺少冲突修复审计记录");
+  return advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+    type: "conflict.stage-completed",
+    actor: "runtime",
+    payload: {
+      stage: "rebased",
+      targetCommit,
       sourceCommit,
-      queuedTargetCommit: targetCommit,
-      targetCommitBeforeMerge: targetCommit,
-      updatedAt: new Date().toISOString(),
-      message: "AI 已在原 worktree 完成 rebase 并通过 Git 完整性检查；正在回跑独立测试与原领队复验。",
-      conflictResolution: {
-        ...current.conflictResolution,
-        status: "retesting",
-        targetCommit,
-        updatedAt: new Date().toISOString(),
-        message: "rebase 结果已由运行核心验证。"
-      }
-    };
+      message: "AI 已在原 worktree 完成 rebase 并通过 Git 完整性检查；正在回跑独立测试与原领队复验。"
+    }
   });
 }
 
-export async function updateRunEvidenceRerun(
+export async function advanceRunEvidenceRerun(
   runDir: string,
   runId: string,
+  expectedRevision: number,
+  type: "evidence.queued" | "evidence.running" | "evidence.completed",
   evidenceRerun: NonNullable<RunDeliveryRecord["evidenceRerun"]>
-): Promise<RunDeliveryRecord> {
-  return updateRunDelivery(runDir, runId, (current) => ({
-    ...current,
-    runId,
-    status: current?.status ?? "awaiting-acceptance",
-    updatedAt: new Date().toISOString(),
-    evidenceRerun
-  }));
+): Promise<RunDeliveryRecordV2> {
+  return advanceDeliveryEvent(runDir, runId, expectedRevision, {
+    type,
+    actor: evidenceRerun.actor,
+    payload: { evidenceRerun }
+  });
 }
 
 const EVIDENCE_MEDIA: Record<string, { kind: RunEvidenceAsset["kind"]; mediaType: string }> = {
@@ -762,7 +1892,7 @@ export async function previewRunMerge(
   assertRunId(run.id);
   const reasons: string[] = [];
   const acceptanceReasons: string[] = [];
-  const delivery = await readRunDelivery(runDir);
+  const delivery = await readRunDelivery(runDir, run.id);
   const assets = await discoverRunEvidenceAssets(runDir, run.id);
   const structuredValues: JsonValue[] = [run.output ?? null, ...Object.values(run.nodes).map((node) => node.output ?? null)];
   const structured = structuredValues.reduce<{ e2eCount: number; acceptedVerdict: boolean }>((total, value) => {
@@ -913,9 +2043,9 @@ async function ensureDeliverySource(
   runDir: string,
   preview: RunMergePreview,
   before: { branch: string; commit: string }
-): Promise<RunDeliveryRecord> {
+): Promise<RunDeliveryRecordV2> {
   if (!preview.repositoryRoot || !preview.worktreePath) throw new Error("该 Run 当前不能准备交付来源");
-  let delivery = await readRunDelivery(runDir);
+  const delivery = await readRunDelivery(runDir, run.id);
   if (delivery?.sourceCommit) {
     const expectedSourceBranch = deliveryBranch(run.id);
     if (
@@ -967,19 +2097,18 @@ async function ensureDeliverySource(
       "commit", "--no-verify", "-m", `chore: deliver ${run.id}`
     ]);
   }
-  delivery = {
-    ...delivery,
-    runId: run.id,
-    status: delivery?.status ?? "awaiting-acceptance",
-    updatedAt: new Date().toISOString(),
-    baseCommit,
-    sourceBranch,
-    sourceCommit: await git(preview.worktreePath, ["rev-parse", "HEAD"]),
-    targetBranch: before.branch,
-    targetCommitBeforeMerge: delivery?.targetCommitBeforeMerge ?? before.commit
-  };
-  await writeRunDelivery(runDir, delivery);
-  return delivery;
+  const sourceCommit = await git(preview.worktreePath, ["rev-parse", "HEAD"]);
+  return advanceDeliveryEvent(runDir, run.id, delivery?.revision ?? 0, {
+    type: "source.prepared",
+    actor: "runtime",
+    payload: {
+      baseCommit,
+      sourceBranch,
+      sourceCommit,
+      targetBranch: before.branch,
+      targetCommitBeforeMerge: delivery?.targetCommitBeforeMerge ?? before.commit
+    }
+  });
 }
 
 export async function queueAcceptedRun(
@@ -1003,22 +2132,17 @@ export async function queueAcceptedRun(
   if (delivery.status === "merged" || delivery.status === "discarded") {
     throw new Error(delivery.status === "merged" ? "该交付已经合并" : "该交付已经丢弃");
   }
-  const queued: RunDeliveryRecord = {
-    ...delivery,
-    status: "queued-for-merge",
-    updatedAt: new Date().toISOString(),
-    targetBranch: before.branch,
-    queuedTargetCommit: ["queued-for-merge", "retesting", "merging"].includes(delivery.status)
-      ? delivery.queuedTargetCommit ?? before.commit
-      : before.commit,
-    message: "人工验收已通过，正在等待目标分支的串行合入协调。",
-    humanDecision: {
-      action: "merge",
-      actor,
-      at: new Date().toISOString()
+  const queued = await advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+    type: "merge.approved",
+    actor,
+    payload: {
+      targetBranch: before.branch,
+      queuedTargetCommit: ["queued-for-merge", "retesting", "merging"].includes(delivery.status)
+        ? delivery.queuedTargetCommit ?? before.commit
+        : before.commit,
+      message: "人工验收已通过，正在等待目标分支的串行合入协调。"
     }
-  };
-  await writeRunDelivery(runDir, queued);
+  });
   return { status: "queued-for-merge", delivery: queued };
 }
 
@@ -1027,7 +2151,7 @@ export async function assessQueuedRun(
   runDir: string
 ): Promise<QueuedRunAssessment> {
   const preview = await previewRunMerge(run, runDir);
-  const delivery = await readRunDelivery(runDir);
+  const delivery = await readRunDelivery(runDir, run.id);
   if (!preview.repositoryRoot || !preview.worktreePath || !delivery?.sourceCommit || !delivery.targetBranch || !delivery.queuedTargetCommit) {
     throw new Error("待合入记录缺少候选来源、目标分支或队列基线");
   }
@@ -1061,7 +2185,7 @@ export async function createMergeValidationWorktree(
 ): Promise<MergeValidationWorktree> {
   const assessment = await assessQueuedRun(run, runDir);
   if (assessment.conflict) throw new Error(assessment.conflictMessage ?? "合并冲突");
-  const delivery = await readRunDelivery(runDir);
+  const delivery = await readRunDelivery(runDir, run.id);
   if (!delivery?.sourceCommit) throw new Error("待合入记录缺少候选 commit");
   const parent = path.join(assessment.repositoryRoot, ".multi-agent", "merge-validation");
   await fs.mkdir(parent, { recursive: true });
@@ -1120,15 +2244,18 @@ export async function mergeAcceptedRun(
     "merge-tree", "--write-tree", before.commit, delivery.sourceCommit
   ]);
   if (mergeCheck.code !== 0) {
-    const conflict: RunDeliveryRecord = {
-      ...delivery,
-      status: "conflict",
-      updatedAt: new Date().toISOString(),
-      targetBranch: before.branch,
-      targetCommitBeforeMerge: before.commit,
-      message: (mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "合并冲突").slice(0, 8_000)
-    };
-    await writeRunDelivery(runDir, conflict);
+    const conflictMessage = (mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "合并冲突").slice(0, 8_000);
+    const conflict = await advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+      type: "conflict.started",
+      actor: "runtime",
+      payload: {
+        targetCommit: before.commit,
+        targetBranch: before.branch,
+        targetCommitBeforeMerge: before.commit,
+        conflictMessage,
+        message: conflictMessage
+      }
+    });
     return { status: "conflict", delivery: conflict };
   }
 
@@ -1155,12 +2282,34 @@ export async function mergeAcceptedRun(
     throw new Error("构造的 merge commit 双亲与已验证 target/source 不一致");
   }
 
-  await input.beforeTargetCompareAndSwap?.();
+  const intentId = randomUUID();
   const targetRef = `refs/heads/${before.branch}`;
+  const intent = await advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+    type: "merge.intent-prepared",
+    actor: "runtime",
+    payload: {
+      intentId,
+      targetRef,
+      expectedTargetCommit: input.expectedTargetCommit,
+      sourceCommit: delivery.sourceCommit,
+      preparedMergeCommit: mergeCommit,
+      message: "已持久化受验证的 merge intent；正在以目标 commit 执行 Git CAS。"
+    }
+  });
+  await input.beforeTargetCompareAndSwap?.();
   const updated = await runGit(preview.repositoryRoot, [
     "update-ref", targetRef, mergeCommit, input.expectedTargetCommit
   ]);
   if (updated.code !== 0) throw new TargetChangedAfterValidationError();
+
+  const refUpdated = await advanceDeliveryEvent(runDir, run.id, intent.revision, {
+    type: "merge.ref-updated",
+    actor: "runtime",
+    payload: {
+      intentId,
+      message: "目标 ref 已按预期 commit 完成 CAS，正在同步目标 worktree。"
+    }
+  });
 
   // update-ref supplies the atomic compare-and-swap guarantee; read-tree only
   // synchronizes the already checked-out target worktree and never rewrites the ref.
@@ -1177,16 +2326,17 @@ export async function mergeAcceptedRun(
   const appliedTarget = await git(preview.repositoryRoot, ["rev-parse", targetRef]);
   if (appliedTarget !== mergeCommit) throw new TargetChangedAfterValidationError();
 
-  const record: RunDeliveryRecord = {
-    ...delivery,
-    status: "merged",
-    updatedAt: new Date().toISOString(),
-    targetBranch: before.branch,
-    targetCommitBeforeMerge: before.commit,
-    mergeCommit,
-    message: "用户确认后已合并；源分支保留作为交付证据。"
-  };
-  await writeRunDelivery(runDir, record);
+  const record = await advanceDeliveryEvent(runDir, run.id, refUpdated.revision, {
+    type: "merge.completed",
+    actor: "runtime",
+    payload: {
+      intentId,
+      targetBranch: before.branch,
+      targetCommitBeforeMerge: before.commit,
+      mergeCommit,
+      message: "用户确认后已合并；源分支保留作为交付证据。"
+    }
+  });
   await removeRunWorktree(preview.repositoryRoot, preview.worktreePath);
   return { status: "merged", delivery: record };
 }
@@ -1204,7 +2354,7 @@ export async function keepRunWorktree(
 ): Promise<RunDeliveryActionResult> {
   assertRunId(run.id);
   const actor = humanActor(input.actor);
-  const existing = await readRunDelivery(runDir);
+  const existing = await readRunDelivery(runDir, run.id);
   if (existing?.runId && existing.runId !== run.id) throw new Error("交付记录与当前 Run 不匹配");
   if (existing?.status === "merged") throw new Error("已合并的交付不能再标记为保留");
   if (existing?.status === "discarded") throw new Error("已丢弃的交付不能再标记为保留");
@@ -1212,25 +2362,18 @@ export async function keepRunWorktree(
   const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
   if (!worktreePath) throw new Error("该 Run 没有可保留的 worktree");
   const repositoryRoot = await registeredRepositoryRoot(worktreePath, run.id);
-  const timestamp = new Date().toISOString();
   const targetBranch = await git(repositoryRoot, ["branch", "--show-current"]);
   if (!targetBranch) throw new Error("目标仓库当前不在命名分支上");
-  const record: RunDeliveryRecord = {
-    ...existing,
-    runId: run.id,
-    status: "kept",
-    updatedAt: timestamp,
-    baseCommit: existing?.baseCommit ?? run.isolation?.baseCommit ?? await git(worktreePath, ["rev-parse", "HEAD"]),
-    targetBranch: existing?.targetBranch ?? targetBranch,
-    message: "人工选择保留候选 worktree；未执行 merge 或 push。",
-    humanDecision: {
-      action: "keep",
-      actor,
-      at: timestamp,
-      ...(input.note?.trim() ? { note: input.note.trim() } : {})
+  const record = await advanceDeliveryEvent(runDir, run.id, existing?.revision ?? 0, {
+    type: "keep.recorded",
+    actor,
+    payload: {
+      baseCommit: existing?.baseCommit ?? run.isolation?.baseCommit ?? await git(worktreePath, ["rev-parse", "HEAD"]),
+      targetBranch: existing?.targetBranch ?? targetBranch,
+      ...(input.note?.trim() ? { note: input.note.trim() } : {}),
+      message: "人工选择保留候选 worktree；未执行 merge 或 push。"
     }
-  };
-  await writeRunDelivery(runDir, record);
+  });
   return { status: "kept", delivery: record };
 }
 
@@ -1255,7 +2398,7 @@ export async function discardRunWorktree(
     throw new Error("缺少本次 Run 的精确丢弃确认");
   }
   const actor = humanActor(input.actor);
-  const existing = await readRunDelivery(runDir);
+  const existing = await readRunDelivery(runDir, run.id);
   if (existing?.runId && existing.runId !== run.id) throw new Error("交付记录与当前 Run 不匹配");
   if (existing?.status === "merged") throw new Error("已合并的交付不能丢弃");
   if (existing?.status === "discarded") throw new Error("该交付已经丢弃，不能重复执行");
@@ -1278,6 +2421,21 @@ export async function discardRunWorktree(
     throw new Error("候选交付已经合并到目标分支，拒绝丢弃");
   }
 
+  const intentId = randomUUID();
+  const intent = await advanceDeliveryEvent(runDir, run.id, existing?.revision ?? 0, {
+    type: "discard.intent-prepared",
+    actor,
+    payload: {
+      intentId,
+      baseCommit,
+      ...(sourceBranchExists ? { sourceBranch: expectedSourceBranch } : {}),
+      sourceCommit,
+      targetBranch,
+      ...(input.note?.trim() ? { note: input.note.trim() } : {}),
+      message: "已持久化人工丢弃意图；正在清理受管候选 worktree 与来源分支。"
+    }
+  });
+
   const removal = await runGit(repositoryRoot, ["worktree", "remove", "--force", worktreePath]);
   if (removal.code !== 0) {
     throw new Error(removal.stderr.trim() || removal.stdout.trim() || "清理候选 worktree 失败");
@@ -1299,24 +2457,13 @@ export async function discardRunWorktree(
     throw new Error("本 Run 的交付分支清理后仍然存在");
   }
 
-  const timestamp = new Date().toISOString();
-  const record: RunDeliveryRecord = {
-    ...existing,
-    runId: run.id,
-    status: "discarded",
-    updatedAt: timestamp,
-    baseCommit,
-    ...(sourceBranchExists ? { sourceBranch: expectedSourceBranch } : {}),
-    sourceCommit,
-    targetBranch,
-    message: "人工二次确认后已清理候选 worktree 与未合并的本 Run 交付分支；未修改 run.json。",
-    humanDecision: {
-      action: "discard",
-      actor,
-      at: timestamp,
-      ...(input.note?.trim() ? { note: input.note.trim() } : {})
+  const record = await advanceDeliveryEvent(runDir, run.id, intent.revision, {
+    type: "discard.completed",
+    actor,
+    payload: {
+      intentId,
+      message: "人工二次确认后已清理候选 worktree 与未合并的本 Run 交付分支；未修改 run.json。"
     }
-  };
-  await writeRunDelivery(runDir, record);
+  });
   return { status: "discarded", delivery: record };
 }

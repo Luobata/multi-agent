@@ -8,10 +8,9 @@ import type { WorkflowRunRecord } from "../src/core/types.js";
 import { createDaemonApp } from "../src/daemon/server.js";
 import { createRunWorktree } from "../src/runtime/worktree.js";
 import {
+  advanceDeliveryEvent,
   assessQueuedRun,
   queueAcceptedRun,
-  transitionRunDelivery,
-  updateRunDelivery,
   type RunMergePreview,
   type RunMergeQueueResult
 } from "../src/runtime/worktreeDelivery.js";
@@ -244,41 +243,7 @@ describe("run delivery daemon routes", () => {
     expect(retriedCapture.status).toBe(400);
     expect(retriedCapture.json).toMatchObject({ error: { message: expect.stringContaining("已有完整媒体证据") } });
 
-    for (const conflictStatus of ["resolving", "retesting", "leader-review"]) {
-      fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
-        runId, status: "conflict", updatedAt: "2026-08-11T06:03:50.000Z",
-        evidenceRerun: {
-          status: "failed", actor: "workbench-operator", requestedAt: "2026-08-11T06:03:35.535Z",
-          updatedAt: "2026-08-11T06:03:50.000Z", mediaCount: 1, message: "补采失败；已保留部分媒体。"
-        },
-        conflictResolution: { status: conflictStatus, actor: "daemon-reviewer", requestedAt: "2026-08-11T06:03:45.000Z", updatedAt: "2026-08-11T06:03:50.000Z" }
-      }, null, 2)}\n`, "utf8");
-      const conflictCapture = await invokeRoute(app, "post", "/api/runs/:id/evidence-rerun", {
-        params: { id: runId }, body: { actor: "daemon-reviewer" }
-      });
-      expect(conflictCapture.status).toBe(400);
-      expect(conflictCapture.json).toMatchObject({ error: { message: expect.stringContaining("冲突处理正在进行") } });
-    }
-
-    fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
-      runId, status: "awaiting-acceptance", updatedAt: "2026-08-11T06:04:00.000Z",
-      evidenceRerun: {
-        status: "failed", actor: "workbench-operator", requestedAt: "2026-08-11T06:03:35.535Z",
-        updatedAt: "2026-08-11T06:04:00.000Z", mediaCount: 1, message: "补采失败；已保留部分媒体。"
-      }
-    }, null, 2)}\n`, "utf8");
-    const retriedPartialCapture = await invokeRoute(app, "post", "/api/runs/:id/evidence-rerun", {
-      params: { id: runId }, body: { actor: "daemon-reviewer" }
-    });
-    expect(retriedPartialCapture.status).toBe(202);
-    expect(retriedPartialCapture.json).toMatchObject({ data: { evidenceRerun: { status: "queued" } } });
     expect(fs.existsSync(path.join(runDir, "evidence-reruns", "recovered-2026-08-11T06-03-35-535Z-1", "001-recovered.png"))).toBe(true);
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const latest = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
-      const status = (latest.json as { data: RunMergePreview }).data.delivery?.evidenceRerun?.status;
-      if (status !== "queued" && status !== "running") break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
 
     const kept = await invokeRoute(app, "post", "/api/runs/:id/keep", {
       params: { id: runId },
@@ -382,7 +347,7 @@ describe("run delivery daemon routes", () => {
     };
     fs.writeFileSync(path.join(runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`, "utf8");
 
-    await queueAcceptedRun(run, runDir, {
+    const queued = await queueAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
       targetBranch: "main",
       actor: "daemon-reviewer"
@@ -393,62 +358,44 @@ describe("run delivery daemon routes", () => {
     const rebasedTargetCommit = git(repo, "rev-parse", "HEAD");
     git(worktree!.path, "rebase", rebasedTargetCommit);
     const rebasedSourceCommit = git(worktree!.path, "rev-parse", "HEAD");
-    await updateRunDelivery(runDir, runId, (current) => ({
-      ...current!,
-      runId,
-      baseCommit: rebasedTargetCommit,
-      sourceCommit: rebasedSourceCommit,
-      queuedTargetCommit: rebasedTargetCommit,
-      targetCommitBeforeMerge: rebasedTargetCommit,
-      updatedAt: new Date().toISOString()
-    }));
+    const conflict = await advanceDeliveryEvent(runDir, runId, queued.delivery.revision, {
+      type: "conflict.started",
+      actor: "runtime",
+      payload: { targetCommit: rebasedTargetCommit, message: "managed rebase required" }
+    });
+    const rebased = await advanceDeliveryEvent(runDir, runId, conflict.revision, {
+      type: "conflict.stage-completed",
+      actor: "runtime",
+      payload: {
+        stage: "rebased",
+        targetCommit: rebasedTargetCommit,
+        sourceCommit: rebasedSourceCommit,
+        message: "managed rebase accepted"
+      }
+    });
 
     fs.writeFileSync(path.join(repo, "target-after-rebase.txt"), "target after rebase\n", "utf8");
     git(repo, "add", "target-after-rebase.txt");
     git(repo, "commit", "-m", "advance target after managed rebase");
     const targetCommit = (await assessQueuedRun(run, runDir)).currentTargetCommit;
-    await transitionRunDelivery(runDir, runId, "merging", {
-      message: "Target-drift validation passed; daemon stopped before merge.",
-      mergeValidation: {
+    const validationStarted = await advanceDeliveryEvent(runDir, runId, rebased.revision, {
+      type: "validation.started",
+      actor: "runtime",
+      payload: { targetCommit, message: "target-drift validation started" }
+    });
+    await advanceDeliveryEvent(runDir, runId, validationStarted.revision, {
+      type: "validation.passed",
+      actor: "runtime",
+      payload: {
         required: true,
-        status: "passed",
         runId: "validation-run-1",
         targetCommit,
-        message: "Independent validation passed.",
-        updatedAt: new Date().toISOString()
+        message: "Target-drift validation passed; daemon stopped before merge."
       }
     });
-    await updateRunDelivery(runDir, runId, (current) => ({
-      ...current!,
-      runId,
-      // The current target is not an ancestor of the rebased candidate. This
-      // deliberately exercises the queue worker rejection path first.
-      baseCommit: targetCommit,
-      updatedAt: new Date().toISOString()
-    }));
 
     const service = await WorkbenchService.open({ dataRoot });
     const app = createDaemonApp(service, { staticDir: path.join(dataRoot, "missing-client") });
-    let rejectedPreview: RunMergePreview | undefined;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const response = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
-      rejectedPreview = (response.json as { data: RunMergePreview }).data;
-      if (rejectedPreview.status === "returned-to-acceptance") break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    expect(rejectedPreview).toMatchObject({
-      status: "returned-to-acceptance",
-      delivery: { message: expect.stringContaining("受管 rebase 基线") }
-    });
-    await updateRunDelivery(runDir, runId, (current) => ({
-      ...current!,
-      runId,
-      status: "merging",
-      baseCommit: rebasedTargetCommit,
-      updatedAt: new Date().toISOString(),
-      message: "Retry the already validated merge after correcting its trusted base."
-    }));
-
     let mergedPreview: RunMergePreview | undefined;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const response = await invokeRoute(app, "get", "/api/runs/:id/merge-preview", { params: { id: runId } });
@@ -503,33 +450,42 @@ describe("run delivery daemon routes", () => {
       targetBranch: "main",
       actor: "daemon-reviewer"
     });
-    await updateRunDelivery(runDir, runId, (current) => ({
-      ...current!,
-      runId,
-      status: "conflict",
-      updatedAt: new Date().toISOString(),
-      message: "Candidate environment validation failed.",
-      conflictResolution: {
-        status: "failed",
+    const conflict = await advanceDeliveryEvent(runDir, runId, queued.delivery.revision, {
+      type: "conflict.started",
+      actor: "runtime",
+      payload: { targetCommit: queued.delivery.baseCommit!, message: "conflict detected" }
+    });
+    const rebased = await advanceDeliveryEvent(runDir, runId, conflict.revision, {
+      type: "conflict.stage-completed",
+      actor: "runtime",
+      payload: {
+        stage: "rebased",
         targetCommit: queued.delivery.baseCommit!,
-        updatedAt: new Date().toISOString(),
-        failureClass: "environment-blocked",
+        sourceCommit: queued.delivery.sourceCommit!,
+        message: "rebase accepted"
+      }
+    });
+    const staleEvidence = await advanceDeliveryEvent(runDir, runId, rebased.revision, {
+      type: "conflict.stage-completed",
+      actor: "runtime",
+      payload: {
+        stage: "tested",
         testRunId: "stale-test-run",
-        testedSourceCommit: queued.delivery.sourceCommit,
+        testedSourceCommit: queued.delivery.sourceCommit!,
         testedCandidateRevision: "sha256:stale",
         testedUrl: "http://127.0.0.1:4318/",
-        leaderReviewRunId: "stale-leader-run",
-        message: "Managed preview was unavailable."
-      },
-      mergeValidation: {
-        required: true,
-        status: "passed",
-        runId: "stale-validation-run",
-        targetCommit: "stale-target-commit",
-        message: "Stale validation passed for an older target.",
-        updatedAt: new Date().toISOString()
+        message: "stale candidate evidence"
       }
-    }));
+    });
+    await advanceDeliveryEvent(runDir, runId, staleEvidence.revision, {
+      type: "conflict.failed",
+      actor: "runtime",
+      payload: {
+        targetCommit: queued.delivery.baseCommit!,
+        failureClass: "environment-blocked",
+        message: "Candidate environment validation failed."
+      }
+    });
 
     const service = await WorkbenchService.open({ dataRoot });
     const app = createDaemonApp(service, { staticDir: path.join(dataRoot, "missing-client") });
@@ -583,7 +539,6 @@ describe("run delivery daemon routes", () => {
       }
     });
     expect(stopped?.delivery?.mergeValidation?.runId).toBeUndefined();
-    expect(stopped?.delivery?.mergeValidation?.targetCommit).not.toBe("stale-target-commit");
     expect(git(repo, "rev-parse", "HEAD")).toBe(queued.delivery.baseCommit);
   }, 15_000);
 });

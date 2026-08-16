@@ -19,7 +19,7 @@ import {
   queueAcceptedRun,
   removeMergeValidationWorktree,
   readRunDelivery,
-  transitionRunDelivery
+  advanceDeliveryEvent
 } from "../src/runtime/worktreeDelivery.js";
 
 const roots: string[] = [];
@@ -85,11 +85,12 @@ function runRecord(runId: string, runDir: string, worktreePath: string, baseComm
   };
 }
 
-function artifactDirectory(): string {
+function artifactDirectory(runId: string): string {
   const root = temporaryRoot("multi-agent-delivery-artifact-");
-  fs.mkdirSync(path.join(root, "evidence"), { recursive: true });
-  fs.writeFileSync(path.join(root, "evidence", "acceptance.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-  return root;
+  const runDir = path.join(root, "artifacts", "runs", runId);
+  fs.mkdirSync(path.join(runDir, "evidence"), { recursive: true });
+  fs.writeFileSync(path.join(runDir, "evidence", "acceptance.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  return runDir;
 }
 
 afterEach(() => {
@@ -109,7 +110,7 @@ describe("worktree delivery merge gate", () => {
     fs.writeFileSync(path.join(worktree!.path, "later.txt"), "must not enter historical preview\n", "utf8");
     git(worktree!.path, "add", "later.txt");
     git(worktree!.path, "commit", "-m", "later worktree state");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
       runId, status: "merged", updatedAt: new Date().toISOString(), baseCommit: worktree!.baseCommit,
@@ -144,7 +145,7 @@ describe("worktree delivery merge gate", () => {
     git(worktree!.path, "add", "candidate.txt");
     git(worktree!.path, "commit", "-m", "candidate");
     const sourceCommit = git(worktree!.path, "rev-parse", "HEAD");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
       runId, status: "merged", updatedAt: new Date().toISOString(), baseCommit: worktree!.baseCommit,
@@ -164,7 +165,8 @@ describe("worktree delivery merge gate", () => {
     const runId = "run-delivery-history-incomplete-1";
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
-    const runDir = temporaryRoot("multi-agent-delivery-history-incomplete-");
+    const artifactRoot = temporaryRoot("multi-agent-delivery-history-incomplete-");
+    const runDir = path.join(artifactRoot, "artifacts", "runs", runId);
     fs.mkdirSync(runDir, { recursive: true });
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     run.output = { gates: [] };
@@ -187,7 +189,7 @@ describe("worktree delivery merge gate", () => {
     const runId = "run-delivery-open-1";
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     const opened: string[] = [];
 
@@ -208,7 +210,7 @@ describe("worktree delivery merge gate", () => {
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "README.md"), "unstaged change\n", "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
 
     const preview = await previewRunMerge(run, runDir);
@@ -223,7 +225,7 @@ describe("worktree delivery merge gate", () => {
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "feature.txt"), "accepted\n", "utf8");
     fs.writeFileSync(path.join(worktree!.path, "browser-report.html"), "x".repeat(5 * 1024 * 1024), "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
 
     const preview = await previewRunMerge(run, runDir);
@@ -249,7 +251,7 @@ describe("worktree delivery merge gate", () => {
     fs.writeFileSync(path.join(worktree!.path, "feature.txt"), "accepted\n", "utf8");
     git(worktree!.path, "add", "feature.txt");
     git(worktree!.path, "commit", "-m", "agent committed feature");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     const headBefore = git(root, "rev-parse", "HEAD");
     const refsBefore = git(root, "show-ref");
@@ -287,6 +289,21 @@ describe("worktree delivery merge gate", () => {
     })).rejects.toThrow(/明确合并确认/);
     expect(git(root, "rev-parse", "HEAD")).toBe(headBefore);
 
+    const queued = await queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      actor: "delivery-reviewer"
+    });
+    await advanceDeliveryEvent(runDir, runId, queued.delivery.revision, {
+      type: "validation.passed",
+      actor: "runtime",
+      payload: {
+        required: false,
+        targetCommit: headBefore,
+        message: "target unchanged"
+      }
+    });
+
     const result = await mergeAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
       targetBranch: "main",
@@ -314,7 +331,7 @@ describe("worktree delivery merge gate", () => {
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), "validated candidate\n", "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     const queued = await queueAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
@@ -322,6 +339,16 @@ describe("worktree delivery merge gate", () => {
       actor: "delivery-reviewer"
     });
     const validatedTarget = queued.delivery.queuedTargetCommit!;
+    const merging = await advanceDeliveryEvent(runDir, runId, queued.delivery.revision, {
+      type: "validation.passed",
+      actor: "runtime",
+      payload: {
+        required: false,
+        targetCommit: validatedTarget,
+        message: "target validated"
+      }
+    });
+    expect(merging.status).toBe("merging");
 
     await expect(mergeAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
@@ -349,8 +376,22 @@ describe("worktree delivery merge gate", () => {
     git(root, "add", "README.md");
     git(root, "commit", "-m", "target change");
     const targetHead = git(root, "rev-parse", "HEAD");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+    const queued = await queueAcceptedRun(run, runDir, {
+      confirmation: `MERGE ${runId}`,
+      targetBranch: "main",
+      actor: "delivery-reviewer"
+    });
+    await advanceDeliveryEvent(runDir, runId, queued.delivery.revision, {
+      type: "validation.passed",
+      actor: "runtime",
+      payload: {
+        required: false,
+        targetCommit: targetHead,
+        message: "target validated"
+      }
+    });
 
     const result = await mergeAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
@@ -372,7 +413,7 @@ describe("worktree delivery merge gate", () => {
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "README.md"), "source change\n", "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     await queueAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
@@ -385,12 +426,15 @@ describe("worktree delivery merge gate", () => {
     const targetCommit = git(root, "rev-parse", "HEAD");
     const assessment = await assessQueuedRun(run, runDir);
     expect(assessment.conflict).toBe(true);
-    await transitionRunDelivery(runDir, runId, "conflict", {
-      conflictResolution: {
-        status: "resolving",
+    const queuedDelivery = await readRunDelivery(runDir, runId);
+    expect(queuedDelivery).toBeDefined();
+    await advanceDeliveryEvent(runDir, runId, queuedDelivery!.revision, {
+      type: "conflict.started",
+      actor: "runtime",
+      payload: {
         targetCommit,
-        conflictMessage: assessment.conflictMessage,
-        updatedAt: new Date().toISOString()
+        ...(assessment.conflictMessage ? { conflictMessage: assessment.conflictMessage } : {}),
+        message: "conflict detected"
       }
     });
 
@@ -408,11 +452,25 @@ describe("worktree delivery merge gate", () => {
     expect(git(worktree!.path, "status", "--porcelain")).toBe("");
     expect(git(worktree!.path, "merge-base", "--is-ancestor", targetCommit, "HEAD")).toBe("");
 
-    await transitionRunDelivery(runDir, runId, "merging", {
-      conflictResolution: {
-        ...accepted.conflictResolution!,
-        status: "passed",
-        updatedAt: new Date().toISOString()
+    const tested = await advanceDeliveryEvent(runDir, runId, accepted.revision, {
+      type: "conflict.stage-completed",
+      actor: "runtime",
+      payload: {
+        stage: "tested",
+        testRunId: "run-independent-test-1",
+        testedSourceCommit: accepted.sourceCommit!,
+        testedCandidateRevision: "candidate-revision-1",
+        testedUrl: "http://127.0.0.1:4318",
+        message: "independent test passed"
+      }
+    });
+    await advanceDeliveryEvent(runDir, runId, tested.revision, {
+      type: "conflict.stage-completed",
+      actor: "runtime",
+      payload: {
+        stage: "leader-approved",
+        leaderReviewRunId: "run-leader-review-1",
+        message: "leader approved"
       }
     });
     const merged = await mergeAcceptedRun(run, runDir, {
@@ -430,7 +488,7 @@ describe("worktree delivery merge gate", () => {
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "README.md"), "source change\n", "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     await queueAcceptedRun(run, runDir, {
       confirmation: `MERGE ${runId}`,
@@ -441,11 +499,14 @@ describe("worktree delivery merge gate", () => {
     git(root, "add", "README.md");
     git(root, "commit", "-m", "target conflict");
     const targetCommit = git(root, "rev-parse", "HEAD");
-    await transitionRunDelivery(runDir, runId, "conflict", {
-      conflictResolution: {
-        status: "resolving",
+    const queuedDelivery = await readRunDelivery(runDir, runId);
+    expect(queuedDelivery).toBeDefined();
+    await advanceDeliveryEvent(runDir, runId, queuedDelivery!.revision, {
+      type: "conflict.started",
+      actor: "runtime",
+      payload: {
         targetCommit,
-        updatedAt: new Date().toISOString()
+        message: "conflict detected"
       }
     });
 
@@ -466,7 +527,7 @@ describe("worktree delivery merge gate", () => {
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), "candidate\n", "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
 
     fs.writeFileSync(path.join(root, "target-before-queue.txt"), "target drift before queue\n", "utf8");
@@ -509,7 +570,9 @@ describe("worktree delivery merge gate", () => {
     const runId = "run-delivery-not-ready-1";
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
-    const runDir = temporaryRoot("multi-agent-delivery-empty-artifact-");
+    const artifactRoot = temporaryRoot("multi-agent-delivery-empty-artifact-");
+    const runDir = path.join(artifactRoot, "artifacts", "runs", runId);
+    fs.mkdirSync(runDir, { recursive: true });
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     run.status = "blocked";
     run.output = {
@@ -541,7 +604,7 @@ describe("worktree delivery merge gate", () => {
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "feature.txt"), "candidate\n", "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     const gates = (run.output as { gates: Array<{ requiredCapability: string; status: string }> }).gates;
     gates.find((gate) => gate.requiredCapability === "quality.audit")!.status = "blocked";
@@ -563,7 +626,7 @@ describe("worktree delivery merge gate", () => {
     fs.writeFileSync(path.join(worktree!.path, "feature.txt"), "discard me\n", "utf8");
     git(worktree!.path, "add", "feature.txt");
     git(worktree!.path, "commit", "-m", "candidate to discard");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     const runJson = `${JSON.stringify(run, null, 2)}\n`;
     fs.writeFileSync(path.join(runDir, "run.json"), runJson, "utf8");
@@ -606,7 +669,7 @@ describe("worktree delivery merge gate", () => {
     git(worktree!.path, "add", "feature.txt");
     git(worktree!.path, "commit", "-m", "merged candidate");
     git(root, "merge", "--no-ff", "--no-edit", sourceBranch);
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
 
     await expect(discardRunWorktree(run, runDir, {
@@ -623,7 +686,7 @@ describe("worktree delivery merge gate", () => {
     const worktree = await createRunWorktree(root, runId);
     expect(worktree).not.toBeNull();
     fs.writeFileSync(path.join(worktree!.path, "feature.txt"), "candidate\n", "utf8");
-    const runDir = artifactDirectory();
+    const runDir = artifactDirectory(runId);
     const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
     fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
       runId,
