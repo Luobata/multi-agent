@@ -19,3 +19,7 @@ playwright-report/
 test-results/
 .vitest/
 .vite-cache/
+
+# Local machine config (never commit)
+.claude/settings.local.json
+.gsb-local/agents.conf
