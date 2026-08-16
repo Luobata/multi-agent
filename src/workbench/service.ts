@@ -132,6 +132,7 @@ import {
   continueManagedRunRebase,
   assessQueuedRun,
   createMergeValidationWorktree,
+  discardRunUnverified,
   discardRunWorktree,
   keepRunWorktree,
   mergeAcceptedRun,
@@ -139,12 +140,19 @@ import {
   previewRunMerge,
   queueAcceptedRun,
   readRunDelivery,
+  reconcileRunDeliverySideEffects,
   removeMergeValidationWorktree,
   resolveRunEvidenceAsset,
+  deliveryQueueKey,
+  DeliveryBranchLeaseRevisionConflict,
+  DeliveryBranchLeaseStore,
+  DeliveryLeaseHandle,
   DeliveryRevisionConflict,
   DeliveryTransitionError,
+  RunDeliveryStore,
   TargetChangedAfterValidationError,
   type RunDeliveryActionResult,
+  type DeliveryMissingReason,
   type RunDeliveryRecordV2,
   type RunEvidenceAsset,
   type RunMergePreview,
@@ -1804,7 +1812,10 @@ export class WorkbenchService {
   private readonly backgroundInvocations = new Map<string, { promise: Promise<void>; controller: AbortController; epoch: number }>();
   private readonly evidenceReruns = new Map<string, Promise<void>>();
   private readonly activeMergeRuns = new Map<string, Promise<void>>();
-  private readonly mergeBranchQueues = new Map<string, Promise<void>>();
+  private readonly deliveryBranchLeases: DeliveryBranchLeaseStore;
+  private readonly deliveryOwnerEpoch = randomUUID();
+  private deliveryWake: Promise<void> | undefined;
+  private deliveryWakeTimer: NodeJS.Timeout | undefined;
   private readonly runtimeResources = new ExclusiveRuntimeResourceQueue();
   /**
    * Closes the small race between two callers that dispatch the same durable task cycle at once.
@@ -1840,6 +1851,7 @@ export class WorkbenchService {
     this.larkDocumentFetcher = options.larkDocumentFetcher ?? new LarkCliDocumentFetcher();
     this.capabilityBroker = options.capabilityBroker;
     this.executionBudget = options.executionBudget;
+    this.deliveryBranchLeases = new DeliveryBranchLeaseStore(store.dataRoot);
   }
 
   static defaultDataRoot(): string {
@@ -8840,56 +8852,317 @@ export class WorkbenchService {
     return queued;
   }
 
-  private scheduleQueuedMerge(id: string, preview?: RunMergePreview): void {
-    if (this.activeMergeRuns.has(id)) return;
-    const start = async (): Promise<void> => {
-      const currentPreview = preview ?? await (async () => {
-        const { run, runDir } = await this.getRunDeliveryContext(id);
-        return previewRunMerge(run, runDir);
-      })();
-      if (!currentPreview.repositoryRoot || !currentPreview.targetBranch) {
-        throw new Error("待合入记录缺少目标仓库或目标分支");
+  private deliveryIsActive(delivery: RunDeliveryRecordV2): boolean {
+    if (["queued-for-merge", "retesting", "merging"].includes(delivery.status)) return true;
+    if (delivery.status !== "conflict") return false;
+    if (["resolving", "retesting", "leader-review"].includes(delivery.conflictResolution?.status ?? "")) return true;
+    return !delivery.conflictResolution && delivery.humanDecision?.action === "merge";
+  }
+
+  private async scanDeliveryRecords(): Promise<Array<{ runId: string; runDir: string; delivery: RunDeliveryRecordV2 }>> {
+    const runsRoot = path.join(this.store.dataRoot, "artifacts", "runs");
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(runsRoot, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const store = new RunDeliveryStore(runsRoot);
+    const records: Array<{ runId: string; runDir: string; delivery: RunDeliveryRecordV2 }> = [];
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory() || !/^run-[A-Za-z0-9-]+$/.test(entry.name)) continue;
+      const read = await store.readDelivery(entry.name);
+      if (read.kind !== "valid") continue;
+      records.push({ runId: entry.name, runDir: path.join(runsRoot, entry.name), delivery: read.record });
+    }
+    return records;
+  }
+
+  async recoverDeliveryDispatches(): Promise<{
+    scanned: number;
+    ready: number;
+    leased: number;
+    waiting: number;
+    incidents: Array<{ runId: string; reason: string }>;
+  }> {
+    const runsRoot = path.join(this.store.dataRoot, "artifacts", "runs");
+    let entries: Dirent[] = [];
+    try {
+      entries = await fs.readdir(runsRoot, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const store = new RunDeliveryStore(runsRoot);
+    const incidents: Array<{ runId: string; reason: string }> = [];
+    const queueKeys = new Set<`sha256:${string}`>();
+    let scanned = 0;
+    let ready = 0;
+    let leased = 0;
+    let waiting = 0;
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory() || !/^run-[A-Za-z0-9-]+$/.test(entry.name)) continue;
+      scanned += 1;
+      const runId = entry.name;
+      const runDir = path.join(runsRoot, runId);
+      await store.repairProjectionFromSnapshot(runId);
+      const read = await store.readDelivery(runId);
+      if (read.kind === "corrupt") {
+        incidents.push({ runId, reason: read.reason });
+        waiting += 1;
+        continue;
       }
-      const queueKey = `${currentPreview.repositoryRoot}\u0000${currentPreview.targetBranch}`;
-      const previous = this.mergeBranchQueues.get(queueKey) ?? Promise.resolve();
-      const worker = previous.catch(() => undefined).then(() => this.processQueuedMerge(id));
-      const tail = worker.catch(() => undefined).finally(() => {
-        if (this.mergeBranchQueues.get(queueKey) === tail) this.mergeBranchQueues.delete(queueKey);
-      });
-      this.mergeBranchQueues.set(queueKey, tail);
-      await worker;
-    };
-    const job = start().catch(async (error) => {
-      if (error instanceof DeliveryRevisionConflict || error instanceof DeliveryTransitionError) return;
-      const { run, runDir } = await this.getRunDeliveryContext(id);
-      const latest = await previewRunMerge(run, runDir);
-      if (!["queued-for-merge", "retesting", "merging"].includes(latest.status) || !latest.delivery) return;
-      const workerExpectedRevision = (error as { deliveryExpectedRevision?: number }).deliveryExpectedRevision;
-      if (workerExpectedRevision !== undefined && latest.delivery.revision !== workerExpectedRevision) return;
-      try {
-        await advanceDeliveryEvent(runDir, id, latest.delivery.revision, {
-          type: "validation.failed",
-          actor: "runtime",
-          payload: {
-            message: `自动合入意外终止：${error instanceof Error ? error.message : String(error)}；候选 worktree 已保留。`
+      if (read.kind !== "valid") continue;
+      let delivery = read.record;
+      if (delivery.sideEffects?.discard?.phase === "prepared") {
+        try {
+          const { run } = await this.getRunDeliveryContext(runId);
+          const reconciled = await reconcileRunDeliverySideEffects(run, runDir);
+          if (reconciled.delivery) delivery = reconciled.delivery;
+          if (reconciled.action === "attention") {
+            incidents.push({ runId, reason: reconciled.reason ?? "discard cleanup requires owner attention" });
+            waiting += 1;
           }
-        });
-      } catch (writeError) {
-        if (!(writeError instanceof DeliveryRevisionConflict) && !(writeError instanceof DeliveryTransitionError)) {
-          throw writeError;
+        } catch (error) {
+          incidents.push({ runId, reason: `discard reconciliation failed: ${error instanceof Error ? error.message : String(error)}` });
+          waiting += 1;
         }
       }
-    }).finally(() => {
-      if (this.activeMergeRuns.get(id) === job) this.activeMergeRuns.delete(id);
-    });
-    this.activeMergeRuns.set(id, job);
+      if (delivery.evidenceRerun && ["queued", "running"].includes(delivery.evidenceRerun.status)) {
+        try {
+          const { run } = await this.getRunDeliveryContext(runId);
+          const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
+          if (worktreePath) {
+            await this.recoverInterruptedEvidenceRerun(runDir, runId, worktreePath, delivery);
+            const refreshed = await store.readDelivery(runId);
+            if (refreshed.kind === "valid") delivery = refreshed.record;
+          }
+        } catch (error) {
+          incidents.push({ runId, reason: `evidence recovery failed: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      }
+      if (!this.deliveryIsActive(delivery)) continue;
+      const approvedAt = delivery.dispatch?.order.approvedAt ?? delivery.humanDecision?.at;
+      if (!approvedAt) {
+        waiting += 1;
+        incidents.push({ runId, reason: "active legacy delivery has no durable approval order" });
+        continue;
+      }
+      if (delivery.dispatch?.state === "leased") {
+        const expiresAt = Date.parse(delivery.dispatch.lease?.expiresAt ?? "");
+        if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
+          leased += 1;
+          this.scheduleDeliveryWake(expiresAt - Date.now() + 5);
+          continue;
+        }
+        if (delivery.dispatch.lease) {
+          try {
+            delivery = await store.advanceDelivery(runId, delivery.revision, [{
+              kind: "record",
+              status: delivery.status,
+              dispatchState: "leased",
+              leaseId: delivery.dispatch.lease.id
+            }], {
+              type: "dispatch.failed",
+              actor: "runtime-recovery",
+              payload: {
+                leaseId: delivery.dispatch.lease.id,
+                code: "lease-expired",
+                message: "daemon restart found an expired delivery lease; item returned to durable ready state."
+              }
+            });
+          } catch (error) {
+            if (error instanceof DeliveryRevisionConflict || error instanceof DeliveryTransitionError) continue;
+            throw error;
+          }
+        }
+      }
+      if (!delivery.dispatch
+        || (delivery.dispatch.state === "waiting" && delivery.dispatch.lastFailure?.code === "lease-expired")) {
+        try {
+          const { run } = await this.getRunDeliveryContext(runId);
+          const preview = await previewRunMerge(run, runDir);
+          if (!preview.repositoryRoot || !preview.targetBranch) {
+            waiting += 1;
+            incidents.push({ runId, reason: "active delivery lacks a verifiable repository/target queue key" });
+            continue;
+          }
+          delivery = await store.advanceDelivery(runId, delivery.revision, [{
+            kind: "record",
+            status: delivery.status,
+            ...(delivery.dispatch?.state ? { dispatchState: delivery.dispatch.state } : {})
+          }], {
+            type: "dispatch.ready",
+            actor: "runtime-recovery",
+            payload: {
+              queueKey: deliveryQueueKey(preview.repositoryRoot, preview.targetBranch),
+              approvedAt,
+              message: "startup recovery made the approved delivery durably ready for dispatch."
+            }
+          });
+        } catch (error) {
+          if (error instanceof DeliveryRevisionConflict || error instanceof DeliveryTransitionError) continue;
+          incidents.push({ runId, reason: `dispatch recovery failed: ${error instanceof Error ? error.message : String(error)}` });
+          waiting += 1;
+          continue;
+        }
+      }
+      if (delivery.dispatch?.state === "ready") {
+        ready += 1;
+        queueKeys.add(delivery.dispatch.queueKey);
+      } else if (delivery.dispatch?.state === "waiting") {
+        waiting += 1;
+        incidents.push({
+          runId,
+          reason: delivery.dispatch.lastFailure?.message ?? "delivery dispatcher requires explicit owner resume"
+        });
+      }
+    }
+    await this.dispatchReadyDeliveries(queueKeys);
+    return { scanned, ready, leased, waiting, incidents };
+  }
+
+  wakeDeliveryDispatcher(_runId?: string): void {
+    if (this.deliveryWake) return;
+    const wake = Promise.resolve()
+      .then(() => this.recoverDeliveryDispatches())
+      .then(() => undefined)
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.deliveryWake === wake) this.deliveryWake = undefined;
+      });
+    this.deliveryWake = wake;
+  }
+
+  private scheduleDeliveryWake(delayMs: number): void {
+    if (this.deliveryWakeTimer) return;
+    this.deliveryWakeTimer = setTimeout(() => {
+      this.deliveryWakeTimer = undefined;
+      this.wakeDeliveryDispatcher();
+    }, Math.max(1, delayMs));
+    this.deliveryWakeTimer.unref();
+  }
+
+  private async dispatchReadyDeliveries(queueKeys: Iterable<`sha256:${string}`>): Promise<void> {
+    for (const queueKey of [...queueKeys].sort()) {
+      const handle = await this.claimNextDelivery(queueKey, this.deliveryOwnerEpoch);
+      if (!handle || this.activeMergeRuns.has(handle.runId)) continue;
+      let job!: Promise<void>;
+      job = (async () => {
+        const heartbeat = setInterval(() => { void handle.renew().catch(() => undefined); }, 10_000);
+        heartbeat.unref();
+        try {
+          await this.processClaimedDelivery(handle);
+        } catch (error) {
+          let stage = "unknown-stage";
+          try {
+            stage = (await handle.assertActive()).lastEvent.type;
+          } catch {
+            // The stale worker is already fenced; fail() will intentionally become a no-op.
+          }
+          try {
+            await handle.fail(
+              `${stage}-${error instanceof Error ? error.name : "failure"}`,
+              error instanceof Error ? error.message : String(error)
+            );
+          } catch {
+            // The durable scan will surface unreadable storage as an incident on the next wake/startup.
+          }
+        } finally {
+          clearInterval(heartbeat);
+          try {
+            await handle.releaseBranch();
+          } catch {
+            // A branch-only lease is intentionally fail-closed until expiry/reconciliation.
+          }
+          if (this.activeMergeRuns.get(handle.runId) === job) this.activeMergeRuns.delete(handle.runId);
+          this.wakeDeliveryDispatcher();
+        }
+      })();
+      this.activeMergeRuns.set(handle.runId, job);
+    }
+  }
+
+  async claimNextDelivery(
+    queueKey: `sha256:${string}`,
+    ownerEpoch: string
+  ): Promise<DeliveryLeaseHandle | undefined> {
+    const candidates = (await this.scanDeliveryRecords())
+      .filter(({ delivery }) => this.deliveryIsActive(delivery)
+        && delivery.dispatch?.state === "ready"
+        && delivery.dispatch.queueKey === queueKey)
+      .sort((left, right) => {
+        const byTime = left.delivery.dispatch!.order.approvedAt.localeCompare(right.delivery.dispatch!.order.approvedAt);
+        return byTime || left.runId.localeCompare(right.runId);
+      });
+    const head = candidates[0];
+    if (!head) return undefined;
+    const currentBranch = await this.deliveryBranchLeases.read(queueKey);
+    if (currentBranch?.state === "leased" && currentBranch.lease
+      && Date.parse(currentBranch.lease.expiresAt) > Date.now()) {
+      this.scheduleDeliveryWake(Date.parse(currentBranch.lease.expiresAt) - Date.now() + 5);
+      return undefined;
+    }
+    const leaseId = randomUUID();
+    const expiresAt = new Date(Date.now() + 30_000).toISOString();
+    let branch;
+    try {
+      branch = await this.deliveryBranchLeases.claim(queueKey, currentBranch?.revision ?? 0, {
+        runId: head.runId,
+        leaseId,
+        ownerEpoch,
+        expiresAt
+      });
+    } catch (error) {
+      if (error instanceof DeliveryBranchLeaseRevisionConflict || error instanceof DeliveryTransitionError) return undefined;
+      throw error;
+    }
+    try {
+      const claimed = await RunDeliveryStore.forRunDirectory(head.runDir, head.runId).advanceDelivery(
+        head.runId,
+        head.delivery.revision,
+        [{ kind: "record", status: head.delivery.status, dispatchState: "ready" }],
+        {
+          type: "dispatch.claimed",
+          actor: "runtime",
+          payload: {
+            queueKey,
+            approvedAt: head.delivery.dispatch!.order.approvedAt,
+            leaseId,
+            ownerEpoch,
+            fencingToken: branch.lease!.fencingToken,
+            expiresAt
+          }
+        }
+      );
+      return new DeliveryLeaseHandle(
+        head.runId,
+        head.runDir,
+        queueKey,
+        leaseId,
+        ownerEpoch,
+        branch.lease!.fencingToken,
+        claimed.revision,
+        branch.revision,
+        this.deliveryBranchLeases
+      );
+    } catch (error) {
+      try {
+        await this.deliveryBranchLeases.release(queueKey, branch.revision, leaseId);
+      } catch {
+        // A branch-only lease is fail-closed until expiry if release loses its CAS.
+      }
+      if (error instanceof DeliveryRevisionConflict || error instanceof DeliveryTransitionError) return undefined;
+      throw error;
+    }
   }
 
   private async completeConflictRevalidation(
     id: string,
     run: WorkflowRunRecord,
     runDir: string,
-    preview: RunMergePreview
+    preview: RunMergePreview,
+    handle: DeliveryLeaseHandle
   ): Promise<void> {
     let current = preview;
     let resolution = current.delivery?.conflictResolution;
@@ -8929,7 +9202,7 @@ export class WorkbenchService {
       }
       const executionRoleId = selectConflictExecutionRole(resolution.conflictMessage ?? current.delivery?.message ?? "");
       if (!current.delivery) throw new Error("冲突计划完成时交付记录丢失");
-      const planned = await advanceDeliveryEvent(runDir, id, current.delivery.revision, {
+      const planned = await handle.advance({
         type: "conflict.stage-completed",
         actor: "runtime",
         payload: {
@@ -8943,7 +9216,7 @@ export class WorkbenchService {
       workerRevision = planned.revision;
       current = { ...current, status: planned.status, delivery: planned };
       resolution = planned.conflictResolution!;
-      let rebaseStep = await beginManagedRunRebase(run, runDir, resolution.targetCommit);
+      let rebaseStep = await beginManagedRunRebase(run, runDir, resolution.targetCommit, handle);
       let executionRunId: string | undefined;
       let executionMessage = rebaseStep.message;
       for (let round = 1; rebaseStep.status === "conflict"; round += 1) {
@@ -8971,9 +9244,9 @@ export class WorkbenchService {
         }
         executionRunId = executionResult.runId;
         executionMessage = executionResult.message;
-        rebaseStep = await continueManagedRunRebase(run, runDir, resolution.targetCommit);
+        rebaseStep = await continueManagedRunRebase(run, runDir, resolution.targetCommit, handle);
       }
-      const executed = await advanceDeliveryEvent(runDir, id, planned.revision, {
+      const executed = await handle.advance({
         type: "conflict.stage-completed",
         actor: "runtime",
         payload: {
@@ -8988,7 +9261,7 @@ export class WorkbenchService {
       workerRevision = executed.revision;
       current = { ...current, status: executed.status, delivery: executed };
       resolution = executed.conflictResolution!;
-      await acceptRebasedRunSource(run, runDir, resolution.targetCommit);
+      await acceptRebasedRunSource(run, runDir, resolution.targetCommit, handle);
       current = await previewRunMerge(run, runDir);
       resolution = current.delivery?.conflictResolution;
       workerRevision = current.delivery?.revision;
@@ -9070,7 +9343,7 @@ export class WorkbenchService {
         );
       }
       if (!current.delivery) throw new Error("独立测试完成时交付记录丢失");
-      const tested = await advanceDeliveryEvent(runDir, id, current.delivery.revision, {
+      const tested = await handle.advance({
         type: "conflict.stage-completed",
         actor: "runtime",
         payload: {
@@ -9117,7 +9390,7 @@ export class WorkbenchService {
         );
       }
       if (!current.delivery) throw new Error("原领队复验完成时交付记录丢失");
-      const approved = await advanceDeliveryEvent(runDir, id, current.delivery.revision, {
+      const approved = await handle.advance({
         type: "conflict.stage-completed",
         actor: "runtime",
         payload: {
@@ -9142,7 +9415,8 @@ export class WorkbenchService {
     run: WorkflowRunRecord,
     runDir: string,
     error: unknown,
-    expectedRevision: number
+    expectedRevision: number,
+    handle: DeliveryLeaseHandle
   ): Promise<void> {
     const preview = await previewRunMerge(run, runDir);
     const resolution = preview.delivery?.conflictResolution;
@@ -9151,7 +9425,7 @@ export class WorkbenchService {
       ?? classifyConflictRetestFailure(message, []);
     if (!preview.delivery) return;
     if (!resolution) {
-      await advanceDeliveryEvent(runDir, id, expectedRevision, {
+      await handle.advance({
         type: "validation.failed",
         actor: "runtime",
         payload: {
@@ -9160,7 +9434,7 @@ export class WorkbenchService {
       });
       return;
     }
-    await advanceDeliveryEvent(runDir, id, expectedRevision, {
+    await handle.advance({
       type: "conflict.failed",
       actor: "runtime",
       payload: {
@@ -9178,18 +9452,20 @@ export class WorkbenchService {
     runDir: string,
     preview: RunMergePreview,
     expectedTargetCommit: string,
-    targetDriftRetries: number
+    targetDriftRetries: number,
+    handle: DeliveryLeaseHandle
   ): Promise<void> {
     if (!preview.targetBranch) throw new Error("合入前无法解析目标分支");
     try {
       const merged = await mergeAcceptedRun(run, runDir, {
         confirmation: preview.confirmationToken,
         targetBranch: preview.targetBranch,
-        expectedTargetCommit
+        expectedTargetCommit,
+        leaseHandle: handle
       });
       if (merged.status === "conflict" && merged.delivery.conflictResolution) {
         const conflictMessage = merged.delivery.message ?? "最终合入发生冲突";
-        await advanceDeliveryEvent(runDir, id, merged.delivery.revision, {
+        await handle.advance({
           type: "conflict.failed",
           actor: "runtime",
           payload: {
@@ -9204,7 +9480,7 @@ export class WorkbenchService {
       if (!(error instanceof TargetChangedAfterValidationError) || targetDriftRetries >= 3) throw error;
       const latest = await previewRunMerge(run, runDir);
       if (!latest.delivery) throw new Error("目标漂移后交付记录丢失");
-      await advanceDeliveryEvent(runDir, id, latest.delivery.revision, {
+      await handle.advance({
         type: "validation.started",
         actor: "runtime",
         payload: {
@@ -9212,13 +9488,22 @@ export class WorkbenchService {
           message: "目标分支在验证后再次变化；旧验证已失效，正在自动重新进入冲突/漂移验证。"
         }
       });
-      await this.processQueuedMerge(id, targetDriftRetries + 1);
+      await this.processClaimedDelivery(handle, targetDriftRetries + 1);
     }
   }
 
-  private async processQueuedMerge(id: string, targetDriftRetries = 0): Promise<void> {
+  private async processClaimedDelivery(handle: DeliveryLeaseHandle, targetDriftRetries = 0): Promise<void> {
+    const id = handle.runId;
     const { run, runDir } = await this.getRunDeliveryContext(id);
     let delivery = await previewRunMerge(run, runDir);
+    const sideEffectRecovery = await reconcileRunDeliverySideEffects(run, runDir, handle);
+    if (sideEffectRecovery.action === "merge-completed") return;
+    if (sideEffectRecovery.action === "attention") {
+      throw new Error(sideEffectRecovery.reason ?? "delivery side-effect reconciliation requires owner attention");
+    }
+    if (sideEffectRecovery.action === "merge-revalidation") {
+      delivery = await previewRunMerge(run, runDir);
+    }
     const activeConflict = ["conflict", "retesting"].includes(delivery.status)
       && ["resolving", "retesting", "leader-review"].includes(delivery.delivery?.conflictResolution?.status ?? "");
     const legacyConflict = delivery.status === "conflict"
@@ -9228,14 +9513,14 @@ export class WorkbenchService {
     let conflictRevalidated = false;
     if (activeConflict) {
       try {
-        await this.completeConflictRevalidation(id, run, runDir, delivery);
+        await this.completeConflictRevalidation(id, run, runDir, delivery, handle);
         conflictRevalidated = true;
       } catch (error) {
         if (error instanceof DeliveryRevisionConflict || error instanceof DeliveryTransitionError) return;
         const expectedRevision = (error as { deliveryExpectedRevision?: number }).deliveryExpectedRevision
           ?? delivery.delivery?.revision;
         if (expectedRevision === undefined) return;
-        await this.failConflictRevalidation(id, run, runDir, error, expectedRevision);
+        await this.failConflictRevalidation(id, run, runDir, error, expectedRevision, handle);
         return;
       }
       delivery = await previewRunMerge(run, runDir);
@@ -9251,7 +9536,8 @@ export class WorkbenchService {
         runDir,
         delivery,
         completedValidation.targetCommit,
-        targetDriftRetries
+        targetDriftRetries,
+        handle
       );
       return;
     }
@@ -9263,7 +9549,7 @@ export class WorkbenchService {
     }
     if (assessment.conflict && !conflictRevalidated) {
       if (!delivery.delivery) throw new Error("冲突预检完成时交付记录丢失");
-      const conflictStarted = await advanceDeliveryEvent(runDir, id, delivery.delivery.revision, {
+      const conflictStarted = await handle.advance({
         type: "conflict.started",
         actor: "runtime",
         payload: {
@@ -9273,13 +9559,13 @@ export class WorkbenchService {
         }
       });
       try {
-        await this.completeConflictRevalidation(id, run, runDir, await previewRunMerge(run, runDir));
+        await this.completeConflictRevalidation(id, run, runDir, await previewRunMerge(run, runDir), handle);
         conflictRevalidated = true;
       } catch (error) {
         if (error instanceof DeliveryRevisionConflict || error instanceof DeliveryTransitionError) return;
         const expectedRevision = (error as { deliveryExpectedRevision?: number }).deliveryExpectedRevision
           ?? conflictStarted.revision;
-        await this.failConflictRevalidation(id, run, runDir, error, expectedRevision);
+        await this.failConflictRevalidation(id, run, runDir, error, expectedRevision, handle);
         return;
       }
     }
@@ -9289,7 +9575,7 @@ export class WorkbenchService {
       const projectId = invocation?.source.project;
       if (!projectId) throw new Error("原 Run 缺少项目来源，目标分支变化后无法路由独立重测");
       if (!delivery.delivery) throw new Error("目标漂移重测开始时交付记录丢失");
-      const validationStarted = await advanceDeliveryEvent(runDir, id, delivery.delivery.revision, {
+      const validationStarted = await handle.advance({
         type: "validation.started",
         actor: "runtime",
         payload: {
@@ -9297,6 +9583,8 @@ export class WorkbenchService {
           message: "目标分支在排队期间发生变化，正在临时集成 worktree 上执行独立回归。"
         }
       });
+      await handle.renew();
+      await handle.assertActive();
       const validation = await createMergeValidationWorktree(run, runDir);
       try {
         const result = await this.invokeProjectTestRoleAtPath(
@@ -9316,7 +9604,7 @@ export class WorkbenchService {
           "system:merge-queue-retest"
         );
         if (result.status !== "passed") {
-          await advanceDeliveryEvent(runDir, id, validationStarted.revision, {
+          await handle.advance({
             type: "validation.failed",
             actor: "runtime",
             payload: {
@@ -9327,7 +9615,7 @@ export class WorkbenchService {
           });
           return;
         }
-        await advanceDeliveryEvent(runDir, id, validationStarted.revision, {
+        await handle.advance({
           type: "validation.passed",
           actor: "runtime",
           payload: {
@@ -9342,7 +9630,7 @@ export class WorkbenchService {
       }
     } else if (!conflictRevalidated) {
       if (!delivery.delivery) throw new Error("无漂移合入开始时交付记录丢失");
-      await advanceDeliveryEvent(runDir, id, delivery.delivery.revision, {
+      await handle.advance({
         type: "validation.passed",
         actor: "runtime",
         payload: {
@@ -9362,26 +9650,14 @@ export class WorkbenchService {
       runDir,
       latest,
       validatedTargetCommit,
-      targetDriftRetries
+      targetDriftRetries,
+      handle
     );
   }
 
   async getRunMergePreview(id: string): Promise<RunMergePreview> {
     const { run, runDir } = await this.getRunDeliveryContext(id);
-    let preview = await previewRunMerge(run, runDir);
-    if (preview.worktreePath
-      && await this.recoverInterruptedEvidenceRerun(runDir, id, preview.worktreePath, preview.delivery)) {
-      preview = await previewRunMerge(run, runDir);
-    }
-    const activeConflict = ["conflict", "retesting"].includes(preview.status)
-      && ["resolving", "retesting", "leader-review"].includes(preview.delivery?.conflictResolution?.status ?? "");
-    const legacyConflict = preview.status === "conflict"
-      && !preview.delivery?.conflictResolution
-      && preview.delivery?.humanDecision?.action === "merge";
-    if (["queued-for-merge", "retesting", "merging"].includes(preview.status) || activeConflict || legacyConflict) {
-      this.scheduleQueuedMerge(id, preview);
-    }
-    return preview;
+    return previewRunMerge(run, runDir);
   }
 
   async queueRunMerge(
@@ -9390,7 +9666,7 @@ export class WorkbenchService {
   ): Promise<RunMergeQueueResult> {
     const { run, runDir } = await this.getRunDeliveryContext(id);
     const queued = await queueAcceptedRun(run, runDir, input);
-    this.scheduleQueuedMerge(id);
+    this.wakeDeliveryDispatcher(id);
     return queued;
   }
 
@@ -9407,7 +9683,7 @@ export class WorkbenchService {
     const rebased = preview.delivery.sourceCommit !== undefined
       && preview.delivery.baseCommit === resolution.targetCommit
       && preview.delivery.queuedTargetCommit === resolution.targetCommit;
-    const queued = await advanceDeliveryEvent(runDir, id, preview.delivery.revision, {
+    let queued = await advanceDeliveryEvent(runDir, id, preview.delivery.revision, {
       type: "conflict.started",
       actor,
       payload: {
@@ -9418,7 +9694,21 @@ export class WorkbenchService {
           : `${actor} 已要求原领队从失败的冲突处理阶段安全恢复。`
       }
     });
-    this.scheduleQueuedMerge(id);
+    if (!queued.dispatch) {
+      if (!preview.repositoryRoot || !preview.targetBranch || !queued.humanDecision?.at) {
+        throw new Error("冲突重试缺少持久队列身份或批准顺序");
+      }
+      queued = await advanceDeliveryEvent(runDir, id, queued.revision, {
+        type: "dispatch.ready",
+        actor,
+        payload: {
+          queueKey: deliveryQueueKey(preview.repositoryRoot, preview.targetBranch),
+          approvedAt: queued.humanDecision.at,
+          message: "冲突重试已持久化，等待 delivery dispatcher claim。"
+        }
+      });
+    }
+    this.wakeDeliveryDispatcher(id);
     if (queued.status !== "retesting" && queued.status !== "conflict") throw new Error("冲突重试恢复到了非法阶段");
     return { status: queued.status, delivery: queued };
   }
@@ -9446,6 +9736,21 @@ export class WorkbenchService {
   ): Promise<RunDeliveryActionResult> {
     const { run, runDir } = await this.getRunDeliveryContext(id);
     return discardRunWorktree(run, runDir, input);
+  }
+
+  async discardRunUnverified(
+    id: string,
+    input: {
+      confirmation: string;
+      actor: string;
+      reason: DeliveryMissingReason;
+      note?: string;
+      expectedRevision: number;
+      expectedRawSha256?: `sha256:${string}`;
+    }
+  ): Promise<RunDeliveryActionResult> {
+    const { run, runDir } = await this.getRunDeliveryContext(id);
+    return discardRunUnverified(run, runDir, input, { kind: "local-owner" });
   }
 
   async openRunWorktree(id: string): Promise<{ runId: string; worktreePath: string; repositoryRoot: string }> {

@@ -108,6 +108,24 @@ export interface RunDeliveryRecord {
 
 export type DeliveryOutcome = "merged" | "not-merged" | "unknown";
 
+export type DeliveryMissingReason =
+  | "delivery-absent"
+  | "delivery-corrupt"
+  | "worktree-missing"
+  | "worktree-unregistered";
+
+export interface DeliveryRecoveryEvidence {
+  kind: "unverified-discard" | "attention";
+  reason: DeliveryMissingReason | "discard-cleanup-incomplete" | "merge-reconciliation-required";
+  actor: string;
+  at: string;
+  note?: string;
+  fingerprint: string;
+  rawSha256?: `sha256:${string}`;
+  archivePath?: string;
+  detail?: string;
+}
+
 export interface DeliveryCleanupEvidence {
   checkedAt: string;
   worktree: "removed" | "missing" | "unregistered" | "present" | "unknown";
@@ -165,6 +183,7 @@ export interface RunDeliveryRecordV2 extends RunDeliveryRecord {
   cleanupVerified?: boolean;
   cleanup?: DeliveryCleanupEvidence;
   outcome?: DeliveryOutcome;
+  recovery?: DeliveryRecoveryEvidence;
   dispatch?: DeliveryDispatch;
   sideEffects?: DeliverySideEffects;
   lastEvent: DeliveryEventRef;
@@ -209,6 +228,12 @@ export type DeliveryEvent =
   | DeliveryEventBase<"merge.approved", {
       targetBranch: string;
       queuedTargetCommit: string;
+      queueKey?: `sha256:${string}`;
+      message: string;
+    }>
+  | DeliveryEventBase<"dispatch.ready", {
+      queueKey: `sha256:${string}`;
+      approvedAt: string;
       message: string;
     }>
   | DeliveryEventBase<"dispatch.claimed", {
@@ -290,6 +315,20 @@ export type DeliveryEvent =
       message: string;
     }>
   | DeliveryEventBase<"discard.completed", { intentId: string; message: string }>
+  | DeliveryEventBase<"discard.unverified", {
+      reason: DeliveryMissingReason;
+      fingerprint: string;
+      outcome: DeliveryOutcome;
+      cleanup: DeliveryCleanupEvidence;
+      note?: string;
+      rawSha256?: `sha256:${string}`;
+      archivePath?: string;
+      baseCommit?: string;
+      sourceBranch?: string;
+      sourceCommit?: string;
+      targetBranch?: string;
+      message: string;
+    }>
   | DeliveryEventBase<"evidence.queued" | "evidence.running" | "evidence.completed", {
       evidenceRerun: NonNullable<RunDeliveryRecord["evidenceRerun"]>;
     }>
@@ -328,6 +367,11 @@ export interface RunMergePreview {
   confirmationToken: string;
   discardConfirmationToken: string;
   delivery?: RunDeliveryRecordV2;
+  recoveryRequired?: {
+    reason: string;
+    fingerprint: string;
+    rawSha256?: `sha256:${string}`;
+  };
 }
 
 const FULL_COMMIT = /^[0-9a-f]{40}$/;
@@ -420,6 +464,19 @@ export interface MergeValidationWorktree {
 export interface RunDeliveryActionResult {
   status: "kept" | "discarded";
   delivery: RunDeliveryRecordV2;
+}
+
+export interface UnverifiedDiscardInput {
+  confirmation: string;
+  actor: string;
+  reason: DeliveryMissingReason;
+  note?: string;
+  expectedRevision: number;
+  expectedRawSha256?: `sha256:${string}`;
+}
+
+export interface LocalOwnerPrincipal {
+  kind: "local-owner";
 }
 
 export interface RunWorktreeOpenResult {
@@ -543,8 +600,25 @@ export class DeliveryCorruptError extends Error {
   }
 }
 
-function sha256(value: string): `sha256:${string}` {
+export class DeliveryRecoveryConflict extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeliveryRecoveryConflict";
+  }
+}
+
+function sha256(value: string | Uint8Array): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+export function deliveryReadFingerprint(read: DeliveryReadResult): string {
+  if (read.kind === "absent") return "absent";
+  const digest = read.kind === "corrupt" ? read.rawSha256 : sha256(JSON.stringify(read.record));
+  return digest.slice("sha256:".length, "sha256:".length + 16);
+}
+
+export function deliveryQueueKey(repositoryRoot: string, targetBranch: string): `sha256:${string}` {
+  return sha256(`${path.resolve(repositoryRoot)}\0${targetBranch}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -598,12 +672,48 @@ function validateDeliveryRecord(
     || value.lastEvent.toRevision !== value.revision) {
     return { valid: false, reason: "delivery lastEvent does not match revision" };
   }
+  if (value.cleanupVerified !== undefined && typeof value.cleanupVerified !== "boolean") {
+    return { valid: false, reason: "delivery cleanupVerified is invalid" };
+  }
+  if (value.outcome !== undefined && !["merged", "not-merged", "unknown"].includes(String(value.outcome))) {
+    return { valid: false, reason: "delivery outcome is invalid" };
+  }
+  if (value.dispatch !== undefined) {
+    if (!isRecord(value.dispatch)
+      || !["ready", "leased", "waiting", "settled"].includes(String(value.dispatch.state))
+      || !Number.isSafeInteger(value.dispatch.attempt)
+      || (value.dispatch.attempt as number) < 0
+      || typeof value.dispatch.queueKey !== "string"
+      || !/^sha256:[0-9a-f]{64}$/.test(value.dispatch.queueKey)
+      || !isRecord(value.dispatch.order)
+      || typeof value.dispatch.order.approvedAt !== "string"
+      || value.dispatch.order.runId !== runId) {
+      return { valid: false, reason: "delivery dispatch is invalid" };
+    }
+    if (value.dispatch.state === "leased"
+      && (!isRecord(value.dispatch.lease)
+        || typeof value.dispatch.lease.id !== "string"
+        || typeof value.dispatch.lease.ownerEpoch !== "string"
+        || !Number.isSafeInteger(value.dispatch.lease.fencingToken)
+        || typeof value.dispatch.lease.expiresAt !== "string")) {
+      return { valid: false, reason: "delivery leased dispatch is invalid" };
+    }
+  }
   return { valid: true, record: value as unknown as RunDeliveryRecordV2, legacy: false };
 }
 
 async function readTextIfPresent(filePath: string): Promise<string | undefined> {
   try {
     return await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function readBufferIfPresent(filePath: string): Promise<Buffer | undefined> {
+  try {
+    return await fs.readFile(filePath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -726,10 +836,15 @@ function eventLeaseId(event: DeliveryEvent): string | undefined {
 
 function selectorMatches(
   selector: DeliveryStateSelector,
+  read: DeliveryReadResult,
   current: RunDeliveryRecordV2 | undefined
 ): boolean {
-  if (selector.kind === "absent") return current === undefined;
-  if (selector.kind === "corrupt") return false;
+  if (selector.kind === "absent") return read.kind === "absent";
+  if (selector.kind === "corrupt") {
+    return read.kind === "corrupt"
+      && read.revision === 0
+      && read.rawSha256 === selector.rawSha256;
+  }
   if (!current || current.status !== selector.status) return false;
   if (selector.conflictStatus !== undefined && current.conflictResolution?.status !== selector.conflictStatus) return false;
   if (selector.dispatchState !== undefined && current.dispatch?.state !== selector.dispatchState) return false;
@@ -747,6 +862,11 @@ function eventPolicyAllows(current: RunDeliveryRecordV2 | undefined, event: Deli
     case "merge.approved":
       return ["awaiting-acceptance", "kept", "returned-to-acceptance"].includes(status ?? "")
         || (status === "conflict" && conflictStatus === "failed");
+    case "dispatch.ready":
+      return Boolean(current
+        && !TERMINAL_DELIVERY_STATUSES.has(current.status)
+        && current.humanDecision?.action === "merge"
+        && (!current.dispatch || current.dispatch.state === "waiting" || current.dispatch.state === "ready"));
     case "keep.recorded":
       return current === undefined || ["awaiting-acceptance", "returned-to-acceptance"].includes(status ?? "")
         || (status === "conflict" && conflictStatus === "failed");
@@ -756,6 +876,8 @@ function eventPolicyAllows(current: RunDeliveryRecordV2 | undefined, event: Deli
     case "discard.completed":
       return Boolean(current?.sideEffects?.discard?.phase === "prepared"
         && current.sideEffects.discard.intentId === event.payload.intentId);
+    case "discard.unverified":
+      return current === undefined || !TERMINAL_DELIVERY_STATUSES.has(current.status);
     case "evidence.queued":
       return current === undefined || ["awaiting-acceptance", "returned-to-acceptance", "kept"].includes(status ?? "")
         || (status === "conflict" && conflictStatus === "failed");
@@ -827,12 +949,17 @@ function assertReducerPreconditions(current: RunDeliveryRecordV2 | undefined, ev
   if (current && TERMINAL_DELIVERY_STATUSES.has(current.status) && event.type !== "terminal.outcome-adjudicated") {
     throw new DeliveryTransitionError(`terminal delivery ${current.status} cannot process ${event.type}`);
   }
-  if (current?.sideEffects?.discard?.phase === "prepared" && event.type !== "discard.completed") {
+  if (current?.sideEffects?.discard?.phase === "prepared"
+    && event.type !== "discard.completed"
+    && event.type !== "discard.unverified"
+    && event.type !== "dispatch.claimed"
+    && event.type !== "dispatch.heartbeat"
+    && event.type !== "dispatch.failed") {
     throw new DeliveryTransitionError("delivery has an active discard intent");
   }
   if (current?.sideEffects?.merge
     && current.sideEffects.merge.phase !== "worktree-synchronized"
-    && !["merge.ref-updated", "merge.completed"].includes(event.type)
+    && !["merge.ref-updated", "merge.completed", "dispatch.claimed", "dispatch.heartbeat", "dispatch.failed"].includes(event.type)
     && !(event.type === "validation.started" && event.payload.retryAfterTargetDrift)) {
     throw new DeliveryTransitionError("delivery has an active merge intent");
   }
@@ -897,7 +1024,28 @@ function reduceDelivery(
         message,
         conflictResolution: undefined,
         mergeValidation: undefined,
-        humanDecision: { action: "merge", actor: event.actor, at: event.at }
+        humanDecision: { action: "merge", actor: event.actor, at: event.at },
+        ...(event.payload.queueKey ? {
+          dispatch: {
+            state: "ready",
+            attempt: current?.dispatch?.attempt ?? 0,
+            queueKey: event.payload.queueKey,
+            order: { approvedAt: event.at, runId }
+          }
+        } : {})
+      };
+      break;
+    case "dispatch.ready":
+      next = {
+        ...next,
+        message,
+        dispatch: {
+          state: "ready",
+          attempt: current?.dispatch?.attempt ?? 0,
+          queueKey: event.payload.queueKey,
+          order: { approvedAt: event.payload.approvedAt, runId },
+          ...(current?.dispatch?.lastFailure ? { lastFailure: current.dispatch.lastFailure } : {})
+        }
       };
       break;
     case "dispatch.claimed": {
@@ -967,7 +1115,14 @@ function reduceDelivery(
             targetCommit: resolution.targetCommit,
             message: "上一轮合入验证证据已失效，等待重新验证。",
             updatedAt: event.at
-          }
+          },
+          ...(current?.dispatch ? {
+            dispatch: {
+              ...current.dispatch,
+              state: "ready",
+              lease: undefined
+            }
+          } : {})
         };
       } else {
         next = {
@@ -1112,7 +1267,8 @@ function reduceDelivery(
           targetCommit: event.payload.targetCommit,
           message: event.payload.detailMessage ?? message,
           updatedAt: event.at
-        }
+        },
+        ...(current?.dispatch ? { dispatch: { ...current.dispatch, state: "waiting", lease: undefined } } : {})
       };
       break;
     }
@@ -1160,7 +1316,8 @@ function reduceDelivery(
           ...(event.payload.targetCommit ? { targetCommit: event.payload.targetCommit } : {}),
           message,
           updatedAt: event.at
-        }
+        },
+        ...(current?.dispatch ? { dispatch: { ...current.dispatch, state: "waiting", lease: undefined } } : {})
       };
       break;
     case "merge.intent-prepared":
@@ -1267,6 +1424,37 @@ function reduceDelivery(
         }
       };
       break;
+    case "discard.unverified":
+      next = {
+        ...next,
+        status: "discarded",
+        ...(event.payload.baseCommit ? { baseCommit: event.payload.baseCommit } : {}),
+        ...(event.payload.sourceBranch ? { sourceBranch: event.payload.sourceBranch } : {}),
+        ...(event.payload.sourceCommit ? { sourceCommit: event.payload.sourceCommit } : {}),
+        ...(event.payload.targetBranch ? { targetBranch: event.payload.targetBranch } : {}),
+        message,
+        cleanupVerified: false,
+        cleanup: event.payload.cleanup,
+        outcome: event.payload.outcome,
+        recovery: {
+          kind: "unverified-discard",
+          reason: event.payload.reason,
+          actor: event.actor,
+          at: event.at,
+          fingerprint: event.payload.fingerprint,
+          ...(event.payload.note ? { note: event.payload.note } : {}),
+          ...(event.payload.rawSha256 ? { rawSha256: event.payload.rawSha256 } : {}),
+          ...(event.payload.archivePath ? { archivePath: event.payload.archivePath } : {})
+        },
+        humanDecision: {
+          action: "discard",
+          actor: event.actor,
+          at: event.at,
+          ...(event.payload.note ? { note: event.payload.note } : {})
+        },
+        ...(current?.dispatch ? { dispatch: { ...current.dispatch, state: "settled", lease: undefined } } : {})
+      };
+      break;
     case "evidence.queued":
     case "evidence.running":
     case "evidence.completed":
@@ -1291,6 +1479,18 @@ function defaultAllowedFrom(event: DeliveryEvent): DeliveryStateSelector[] {
       { kind: "record", status: "returned-to-acceptance" },
       { kind: "record", status: "kept" },
       { kind: "record", status: "conflict", conflictStatus: "failed" }
+    ];
+  }
+  if (event.type === "discard.unverified") {
+    return [
+      { kind: "absent" },
+      { kind: "record", status: "awaiting-acceptance" },
+      { kind: "record", status: "returned-to-acceptance" },
+      { kind: "record", status: "kept" },
+      { kind: "record", status: "queued-for-merge" },
+      { kind: "record", status: "retesting" },
+      { kind: "record", status: "merging" },
+      { kind: "record", status: "conflict" }
     ];
   }
   return [...DELIVERY_STATUSES].map((status) => ({ kind: "record" as const, status }));
@@ -1328,8 +1528,9 @@ export class RunDeliveryStore {
       const snapshotRaw = await fs.readFile(snapshotPath, "utf8");
       const snapshot = validateSnapshot(snapshotRaw, runId, snapshotPath);
       if (snapshot.kind !== "valid") return snapshot;
-      const projectionRaw = await readTextIfPresent(deliveryPath(runDir));
-      if (projectionRaw === undefined) return snapshot;
+      const projectionBytes = await readBufferIfPresent(deliveryPath(runDir));
+      if (projectionBytes === undefined) return snapshot;
+      const projectionRaw = projectionBytes.toString("utf8");
       let projectionValue: unknown;
       try {
         projectionValue = JSON.parse(projectionRaw);
@@ -1342,7 +1543,7 @@ export class RunDeliveryStore {
         return {
           kind: "corrupt",
           revision: projection.record.revision,
-          rawSha256: sha256(projectionRaw),
+          rawSha256: sha256(projectionBytes),
           reason: "delivery projection is ahead of the highest immutable snapshot"
         };
       }
@@ -1350,15 +1551,16 @@ export class RunDeliveryStore {
         return {
           kind: "corrupt",
           revision: snapshot.revision,
-          rawSha256: sha256(projectionRaw),
+          rawSha256: sha256(projectionBytes),
           reason: "mixed-writer-detected: projection changed without a new immutable revision"
         };
       }
       return snapshot;
     }
 
-    const projectionRaw = await readTextIfPresent(deliveryPath(runDir));
-    if (projectionRaw === undefined) return { kind: "absent", revision: 0 };
+    const projectionBytes = await readBufferIfPresent(deliveryPath(runDir));
+    if (projectionBytes === undefined) return { kind: "absent", revision: 0 };
+    const projectionRaw = projectionBytes.toString("utf8");
     let projectionValue: unknown;
     try {
       projectionValue = JSON.parse(projectionRaw);
@@ -1366,23 +1568,45 @@ export class RunDeliveryStore {
       return {
         kind: "corrupt",
         revision: 0,
-        rawSha256: sha256(projectionRaw),
+        rawSha256: sha256(projectionBytes),
         reason: `delivery JSON is invalid: ${error instanceof Error ? error.message : String(error)}`
       };
     }
     const projection = validateDeliveryRecord(projectionValue, runId);
     if (!projection.valid) {
-      return { kind: "corrupt", revision: 0, rawSha256: sha256(projectionRaw), reason: projection.reason };
+      return { kind: "corrupt", revision: 0, rawSha256: sha256(projectionBytes), reason: projection.reason };
     }
     if (!projection.legacy) {
       return {
         kind: "corrupt",
         revision: projection.record.revision,
-        rawSha256: sha256(projectionRaw),
+        rawSha256: sha256(projectionBytes),
         reason: "v2 delivery projection has no immutable revision snapshot"
       };
     }
     return { kind: "valid", revision: 0, record: projection.record };
+  }
+
+  async repairProjectionFromSnapshot(runId: string): Promise<boolean> {
+    const runDir = this.runDirectory(runId);
+    const snapshotPath = await highestSnapshotPath(runDir);
+    if (!snapshotPath) return false;
+    const snapshot = validateSnapshot(await fs.readFile(snapshotPath, "utf8"), runId, snapshotPath);
+    if (snapshot.kind !== "valid") return false;
+    const projectionBytes = await readBufferIfPresent(deliveryPath(runDir));
+    if (projectionBytes) {
+      try {
+        const parsed = validateDeliveryRecord(JSON.parse(projectionBytes.toString("utf8")), runId);
+        if (parsed.valid && !parsed.legacy) {
+          if (parsed.record.revision === snapshot.revision && isDeepStrictEqual(parsed.record, snapshot.record)) return false;
+          if (parsed.record.revision >= snapshot.revision) return false;
+        }
+      } catch {
+        // Invalid projection JSON is repaired only from the already validated immutable snapshot.
+      }
+    }
+    await replaceProjection(runDir, snapshot.record);
+    return true;
   }
 
   async advanceDelivery(
@@ -1394,12 +1618,15 @@ export class RunDeliveryStore {
     const runDir = this.runDirectory(runId);
     return withDeliveryMutex(runDir, async () => {
       const read = await this.readDelivery(runId);
-      if (read.kind === "corrupt") throw new DeliveryCorruptError(read);
+      if (read.kind === "corrupt"
+        && !(event.type === "discard.unverified" && expectedRevision === 0 && read.revision === 0)) {
+        throw new DeliveryCorruptError(read);
+      }
       if (read.revision !== expectedRevision) {
         throw new DeliveryRevisionConflict(runId, expectedRevision, read.revision);
       }
       const current = read.kind === "valid" ? read.record : undefined;
-      if (!allowedFrom.some((selector) => selectorMatches(selector, current))) {
+      if (!allowedFrom.some((selector) => selectorMatches(selector, read, current))) {
         throw new DeliveryTransitionError(`delivery state is not in allowedFrom for ${event.type}`);
       }
       const persistedEvent: PersistedDeliveryEvent = {
@@ -1438,6 +1665,358 @@ export class RunDeliveryStore {
       await this.options.afterSnapshotPublish?.(snapshot);
       await replaceProjection(runDir, next);
       return next;
+    });
+  }
+}
+
+export interface DeliveryBranchLeaseRecord {
+  schemaVersion: 1;
+  revision: number;
+  queueKey: `sha256:${string}`;
+  state: "leased" | "released";
+  runId?: string;
+  lastFencingToken: number;
+  updatedAt: string;
+  lease?: {
+    id: string;
+    ownerEpoch: string;
+    fencingToken: number;
+    acquiredAt: string;
+    heartbeatAt: string;
+    expiresAt: string;
+  };
+}
+
+export class DeliveryBranchLeaseRevisionConflict extends Error {
+  constructor(readonly expectedRevision: number, readonly actualRevision: number) {
+    super(`delivery branch lease revision conflict: expected ${expectedRevision}, actual ${actualRevision}`);
+    this.name = "DeliveryBranchLeaseRevisionConflict";
+  }
+}
+
+const QUEUE_KEY_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+export class DeliveryBranchLeaseStore {
+  private readonly dispatchRoot: string;
+  private readonly revisionsRoot: string;
+
+  constructor(dataRoot: string) {
+    const artifactsRoot = path.join(path.resolve(dataRoot), "artifacts");
+    this.dispatchRoot = path.join(artifactsRoot, "delivery-dispatch");
+    this.revisionsRoot = path.join(artifactsRoot, "delivery-dispatch-revisions");
+  }
+
+  private assertQueueKey(queueKey: `sha256:${string}`): void {
+    if (!QUEUE_KEY_PATTERN.test(queueKey)) throw new Error("delivery queueKey is invalid");
+  }
+
+  private revisionDirectory(queueKey: `sha256:${string}`): string {
+    return path.join(this.revisionsRoot, queueKey.slice("sha256:".length));
+  }
+
+  private projectionPath(queueKey: `sha256:${string}`): string {
+    return path.join(this.dispatchRoot, `${queueKey}.json`);
+  }
+
+  async read(queueKey: `sha256:${string}`): Promise<DeliveryBranchLeaseRecord | undefined> {
+    this.assertQueueKey(queueKey);
+    const directory = this.revisionDirectory(queueKey);
+    let entries: string[];
+    try {
+      entries = await fs.readdir(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    const latest = entries.filter((entry) => SNAPSHOT_NAME.test(entry)).sort().at(-1);
+    if (!latest) return undefined;
+    const parsed = JSON.parse(await fs.readFile(path.join(directory, latest), "utf8")) as DeliveryBranchLeaseRecord;
+    const revision = Number(latest.slice(0, 20));
+    if (parsed.schemaVersion !== 1 || parsed.revision !== revision || parsed.queueKey !== queueKey
+      || !["leased", "released"].includes(parsed.state)) {
+      throw new Error("delivery branch lease snapshot is corrupt");
+    }
+    return parsed;
+  }
+
+  private async publish(
+    queueKey: `sha256:${string}`,
+    expectedRevision: number,
+    next: DeliveryBranchLeaseRecord
+  ): Promise<DeliveryBranchLeaseRecord> {
+    return withDeliveryMutex(this.projectionPath(queueKey), async () => {
+      const current = await this.read(queueKey);
+      const actualRevision = current?.revision ?? 0;
+      if (actualRevision !== expectedRevision) {
+        throw new DeliveryBranchLeaseRevisionConflict(expectedRevision, actualRevision);
+      }
+      const directory = this.revisionDirectory(queueKey);
+      await fs.mkdir(directory, { recursive: true });
+      const destination = path.join(directory, revisionFileName(next.revision));
+      const temporary = path.join(directory, `.${revisionFileName(next.revision)}.${randomUUID()}.tmp`);
+      try {
+        await writeSyncedFile(temporary, `${JSON.stringify(next, null, 2)}\n`);
+        try {
+          await fs.link(temporary, destination);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            const actual = await this.read(queueKey);
+            throw new DeliveryBranchLeaseRevisionConflict(expectedRevision, actual?.revision ?? 0);
+          }
+          throw error;
+        }
+        await fsyncDirectory(directory);
+      } finally {
+        await fs.rm(temporary, { force: true });
+      }
+      await fs.mkdir(this.dispatchRoot, { recursive: true });
+      const projection = this.projectionPath(queueKey);
+      const projectionTemporary = `${projection}.${randomUUID()}.tmp`;
+      try {
+        await writeSyncedFile(projectionTemporary, `${JSON.stringify(next, null, 2)}\n`);
+        await fs.rename(projectionTemporary, projection);
+        await fsyncDirectory(this.dispatchRoot);
+      } finally {
+        await fs.rm(projectionTemporary, { force: true });
+      }
+      return next;
+    });
+  }
+
+  async claim(
+    queueKey: `sha256:${string}`,
+    expectedRevision: number,
+    input: { runId: string; leaseId: string; ownerEpoch: string; expiresAt: string }
+  ): Promise<DeliveryBranchLeaseRecord> {
+    this.assertQueueKey(queueKey);
+    assertRunId(input.runId);
+    const current = await this.read(queueKey);
+    const actualRevision = current?.revision ?? 0;
+    if (actualRevision !== expectedRevision) {
+      throw new DeliveryBranchLeaseRevisionConflict(expectedRevision, actualRevision);
+    }
+    if (current?.state === "leased" && current.lease && Date.parse(current.lease.expiresAt) > Date.now()) {
+      throw new DeliveryTransitionError("delivery branch already has an unexpired lease");
+    }
+    const at = new Date().toISOString();
+    const fencingToken = (current?.lastFencingToken ?? 0) + 1;
+    return this.publish(queueKey, expectedRevision, {
+      schemaVersion: 1,
+      revision: expectedRevision + 1,
+      queueKey,
+      state: "leased",
+      runId: input.runId,
+      lastFencingToken: fencingToken,
+      updatedAt: at,
+      lease: {
+        id: input.leaseId,
+        ownerEpoch: input.ownerEpoch,
+        fencingToken,
+        acquiredAt: at,
+        heartbeatAt: at,
+        expiresAt: input.expiresAt
+      }
+    });
+  }
+
+  async renew(
+    queueKey: `sha256:${string}`,
+    expectedRevision: number,
+    leaseId: string,
+    expiresAt: string
+  ): Promise<DeliveryBranchLeaseRecord> {
+    const current = await this.read(queueKey);
+    if (!current || current.revision !== expectedRevision || current.state !== "leased" || current.lease?.id !== leaseId) {
+      throw new DeliveryBranchLeaseRevisionConflict(expectedRevision, current?.revision ?? 0);
+    }
+    const at = new Date().toISOString();
+    return this.publish(queueKey, expectedRevision, {
+      ...current,
+      revision: expectedRevision + 1,
+      updatedAt: at,
+      lease: { ...current.lease, heartbeatAt: at, expiresAt }
+    });
+  }
+
+  async release(
+    queueKey: `sha256:${string}`,
+    expectedRevision: number,
+    leaseId: string
+  ): Promise<DeliveryBranchLeaseRecord> {
+    const current = await this.read(queueKey);
+    if (!current || current.revision !== expectedRevision || current.state !== "leased" || current.lease?.id !== leaseId) {
+      throw new DeliveryBranchLeaseRevisionConflict(expectedRevision, current?.revision ?? 0);
+    }
+    return this.publish(queueKey, expectedRevision, {
+      schemaVersion: 1,
+      revision: expectedRevision + 1,
+      queueKey,
+      state: "released",
+      lastFencingToken: current.lastFencingToken,
+      updatedAt: new Date().toISOString()
+    });
+  }
+}
+
+export class DeliveryLeaseHandle {
+  private itemRevision: number;
+  private branchRevision: number;
+  private released = false;
+  private operationTail: Promise<void> = Promise.resolve();
+
+  constructor(
+    readonly runId: string,
+    readonly runDir: string,
+    readonly queueKey: `sha256:${string}`,
+    readonly leaseId: string,
+    readonly ownerEpoch: string,
+    readonly fencingToken: number,
+    itemRevision: number,
+    branchRevision: number,
+    private readonly branchStore: DeliveryBranchLeaseStore,
+    private readonly leaseDurationMs = 30_000
+  ) {
+    this.itemRevision = itemRevision;
+    this.branchRevision = branchRevision;
+  }
+
+  get revision(): number {
+    return this.itemRevision;
+  }
+
+  private async serialized<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.operationTail;
+    let release!: () => void;
+    this.operationTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async assertActiveNow(): Promise<RunDeliveryRecordV2> {
+    if (this.released) throw new DeliveryTransitionError("delivery lease handle has been released");
+    const [item, branch] = await Promise.all([
+      RunDeliveryStore.forRunDirectory(this.runDir, this.runId).readDelivery(this.runId),
+      this.branchStore.read(this.queueKey)
+    ]);
+    if (item.kind !== "valid"
+      || item.record.revision !== this.itemRevision
+      || item.record.dispatch?.state !== "leased"
+      || item.record.dispatch.lease?.id !== this.leaseId
+      || item.record.dispatch.lease.fencingToken !== this.fencingToken
+      || Date.parse(item.record.dispatch.lease.expiresAt) <= Date.now()
+      || !branch
+      || branch.revision !== this.branchRevision
+      || branch.state !== "leased"
+      || branch.runId !== this.runId
+      || branch.lease?.id !== this.leaseId
+      || branch.lease.fencingToken !== this.fencingToken
+      || Date.parse(branch.lease.expiresAt) <= Date.now()) {
+      throw new DeliveryTransitionError("delivery lease was fenced by a newer owner or revision");
+    }
+    return item.record;
+  }
+
+  async assertActive(): Promise<RunDeliveryRecordV2> {
+    return this.serialized(() => this.assertActiveNow());
+  }
+
+  async renew(): Promise<RunDeliveryRecordV2> {
+    return this.serialized(async () => {
+      const active = await this.assertActiveNow();
+      const expiresAt = new Date(Date.now() + this.leaseDurationMs).toISOString();
+      const branch = await this.branchStore.renew(this.queueKey, this.branchRevision, this.leaseId, expiresAt);
+      this.branchRevision = branch.revision;
+      const current = await RunDeliveryStore.forRunDirectory(this.runDir, this.runId).advanceDelivery(
+        this.runId,
+        this.itemRevision,
+        [{
+          kind: "record",
+          status: active.status,
+          dispatchState: "leased",
+          leaseId: this.leaseId
+        }],
+        {
+          type: "dispatch.heartbeat",
+          actor: "runtime",
+          payload: { leaseId: this.leaseId, expiresAt }
+        }
+      );
+      this.itemRevision = current.revision;
+      return current;
+    });
+  }
+
+  private async currentRecord(): Promise<RunDeliveryRecordV2> {
+    const read = await RunDeliveryStore.forRunDirectory(this.runDir, this.runId).readDelivery(this.runId);
+    if (read.kind !== "valid") throw new DeliveryTransitionError("delivery record is unavailable to its lease owner");
+    return read.record;
+  }
+
+  async advance(event: DeliveryEvent): Promise<RunDeliveryRecordV2> {
+    return this.serialized(async () => {
+      const current = await this.assertActiveNow();
+      const fencedEvent = {
+        ...event,
+        payload: { ...event.payload, leaseId: this.leaseId }
+      } as DeliveryEvent;
+      const next = await RunDeliveryStore.forRunDirectory(this.runDir, this.runId).advanceDelivery(
+        this.runId,
+        this.itemRevision,
+        [{
+          kind: "record",
+          status: current.status,
+          ...(current.conflictResolution?.status ? { conflictStatus: current.conflictResolution.status } : {}),
+          dispatchState: "leased",
+          leaseId: this.leaseId
+        }],
+        fencedEvent
+      );
+      this.itemRevision = next.revision;
+      return next;
+    });
+  }
+
+  async fail(code: string, message: string): Promise<void> {
+    try {
+      await this.serialized(async () => {
+        const current = await this.assertActiveNow();
+        const next = await RunDeliveryStore.forRunDirectory(this.runDir, this.runId).advanceDelivery(
+          this.runId,
+          this.itemRevision,
+          [{ kind: "record", status: current.status, dispatchState: "leased", leaseId: this.leaseId }],
+          {
+            type: "dispatch.failed",
+            actor: "runtime",
+            payload: { leaseId: this.leaseId, code, message }
+          }
+        );
+        this.itemRevision = next.revision;
+      });
+    } catch (error) {
+      if (!(error instanceof DeliveryRevisionConflict) && !(error instanceof DeliveryTransitionError)) throw error;
+    } finally {
+      await this.releaseBranch();
+    }
+  }
+
+  async releaseBranch(): Promise<void> {
+    await this.serialized(async () => {
+      if (this.released) return;
+      this.released = true;
+      try {
+        const released = await this.branchStore.release(
+          this.queueKey,
+          this.branchRevision,
+          this.leaseId
+        );
+        this.branchRevision = released.revision;
+      } catch (error) {
+        if (!(error instanceof DeliveryBranchLeaseRevisionConflict) && !(error instanceof DeliveryTransitionError)) throw error;
+      }
     });
   }
 }
@@ -1520,7 +2099,8 @@ async function unmergedPaths(worktreePath: string): Promise<string[]> {
 export async function beginManagedRunRebase(
   run: WorkflowRunRecord,
   runDir: string,
-  targetCommit: string
+  targetCommit: string,
+  leaseHandle?: DeliveryLeaseHandle
 ): Promise<ManagedRunRebaseStep> {
   const { worktreePath, sourceBranch } = await managedRunRebaseContext(run, runDir, targetCommit);
   if (await rebaseStateExists(worktreePath)) {
@@ -1531,6 +2111,8 @@ export async function beginManagedRunRebase(
   const working = await git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
   if (working.length > 0) throw new Error("开始冲突修复前 worktree 存在未提交文件");
 
+  await leaseHandle?.renew();
+  await leaseHandle?.assertActive();
   const result = await runGit(worktreePath, ["rebase", targetCommit]);
   if (result.code === 0) {
     return { status: "completed", conflictPaths: [], message: "运行核心已完成无冲突 rebase。" };
@@ -1551,7 +2133,8 @@ export async function beginManagedRunRebase(
 export async function continueManagedRunRebase(
   run: WorkflowRunRecord,
   runDir: string,
-  targetCommit: string
+  targetCommit: string,
+  leaseHandle?: DeliveryLeaseHandle
 ): Promise<ManagedRunRebaseStep> {
   const { worktreePath } = await managedRunRebaseContext(run, runDir, targetCommit);
   const conflictPaths = await unmergedPaths(worktreePath);
@@ -1560,6 +2143,8 @@ export async function continueManagedRunRebase(
   if (check.code !== 0) {
     throw new Error((check.stderr.trim() || check.stdout.trim() || "冲突文件仍包含无效标记").slice(0, 8_000));
   }
+  await leaseHandle?.renew();
+  await leaseHandle?.assertActive();
   await git(worktreePath, ["add", "--", ...conflictPaths]);
   const result = await runGit(worktreePath, [
     "-c", "core.editor=true",
@@ -1588,7 +2173,8 @@ export async function continueManagedRunRebase(
 export async function acceptRebasedRunSource(
   run: WorkflowRunRecord,
   runDir: string,
-  targetCommit: string
+  targetCommit: string,
+  leaseHandle?: DeliveryLeaseHandle
 ): Promise<RunDeliveryRecordV2> {
   const preview = await previewRunMerge(run, runDir);
   const delivery = await readRunDelivery(runDir, run.id);
@@ -1609,7 +2195,7 @@ export async function acceptRebasedRunSource(
     throw new Error((mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "冲突仍未解决").slice(0, 8_000));
   }
   if (!delivery?.conflictResolution) throw new Error("缺少冲突修复审计记录");
-  return advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+  const event: DeliveryEvent = {
     type: "conflict.stage-completed",
     actor: "runtime",
     payload: {
@@ -1618,7 +2204,10 @@ export async function acceptRebasedRunSource(
       sourceCommit,
       message: "AI 已在原 worktree 完成 rebase 并通过 Git 完整性检查；正在回跑独立测试与原领队复验。"
     }
-  });
+  };
+  return leaseHandle
+    ? leaseHandle.advance(event)
+    : advanceDeliveryEvent(runDir, run.id, delivery.revision, event);
 }
 
 export async function advanceRunEvidenceRerun(
@@ -1892,7 +2481,26 @@ export async function previewRunMerge(
   assertRunId(run.id);
   const reasons: string[] = [];
   const acceptanceReasons: string[] = [];
-  const delivery = await readRunDelivery(runDir, run.id);
+  const deliveryRead = await RunDeliveryStore.forRunDirectory(runDir, run.id).readDelivery(run.id);
+  const delivery = deliveryRead.kind === "valid" ? deliveryRead.record : undefined;
+  let recoveryRequired: RunMergePreview["recoveryRequired"];
+  if (deliveryRead.kind === "corrupt") {
+    recoveryRequired = {
+      reason: deliveryRead.reason,
+      fingerprint: deliveryReadFingerprint(deliveryRead),
+      rawSha256: deliveryRead.rawSha256
+    };
+    reasons.push(`交付记录损坏，需要本机 owner 执行诚实恢复：${deliveryRead.reason}`);
+    acceptanceReasons.push("交付记录损坏，不能证明候选状态。");
+  }
+  if (delivery?.sideEffects?.discard?.phase === "prepared") {
+    recoveryRequired = {
+      reason: "discard-cleanup-incomplete",
+      fingerprint: deliveryReadFingerprint(deliveryRead)
+    };
+    reasons.push("人工丢弃 intent 已持久化，但清理完成证据尚未对账。");
+    acceptanceReasons.push("候选正在等待丢弃清理对账。");
+  }
   const assets = await discoverRunEvidenceAssets(runDir, run.id);
   const structuredValues: JsonValue[] = [run.output ?? null, ...Object.values(run.nodes).map((node) => node.output ?? null)];
   const structured = structuredValues.reduce<{ e2eCount: number; acceptedVerdict: boolean }>((total, value) => {
@@ -1940,6 +2548,9 @@ export async function previewRunMerge(
   if (!worktreePath) {
     reasons.push("该 Run 没有可交付的 worktree。");
     acceptanceReasons.push("该 Run 没有可验证的受管 worktree。");
+    if (deliveryRead.kind === "absent") {
+      recoveryRequired = { reason: "delivery-absent", fingerprint: deliveryReadFingerprint(deliveryRead) };
+    }
   } else if (delivery?.status !== "discarded") {
     try {
       repositoryRoot = await registeredRepositoryRoot(worktreePath, run.id);
@@ -1990,6 +2601,18 @@ export async function previewRunMerge(
         }
       } else {
         acceptanceReasons.push(`受管 worktree 不可验证：${error instanceof Error ? error.message : String(error)}`);
+        if (!recoveryRequired) {
+          let missingReason: DeliveryMissingReason = "worktree-unregistered";
+          try {
+            await fs.access(worktreePath);
+          } catch (accessError) {
+            if ((accessError as NodeJS.ErrnoException).code === "ENOENT") missingReason = "worktree-missing";
+          }
+          recoveryRequired = {
+            reason: missingReason,
+            fingerprint: deliveryReadFingerprint(deliveryRead)
+          };
+        }
       }
       reasons.push(`worktree 不可用：${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1997,7 +2620,7 @@ export async function previewRunMerge(
     acceptanceReasons.push("该交付已经丢弃。");
   }
 
-  const status = delivery?.status ?? (reasons.length === 0 ? "awaiting-acceptance" : "not-ready");
+  const status = recoveryRequired ? "not-ready" : delivery?.status ?? (reasons.length === 0 ? "awaiting-acceptance" : "not-ready");
   return {
     runId: run.id,
     status,
@@ -2021,7 +2644,8 @@ export async function previewRunMerge(
     },
     confirmationToken: confirmationToken(run.id),
     discardConfirmationToken: discardConfirmationToken(run.id),
-    ...(delivery ? { delivery } : {})
+    ...(delivery ? { delivery } : {}),
+    ...(recoveryRequired ? { recoveryRequired } : {})
   };
 }
 
@@ -2137,6 +2761,7 @@ export async function queueAcceptedRun(
     actor,
     payload: {
       targetBranch: before.branch,
+      queueKey: deliveryQueueKey(preview.repositoryRoot, before.branch),
       queuedTargetCommit: ["queued-for-merge", "retesting", "merging"].includes(delivery.status)
         ? delivery.queuedTargetCommit ?? before.commit
         : before.commit,
@@ -2221,6 +2846,7 @@ export async function mergeAcceptedRun(
     expectedTargetCommit: string;
     /** Deterministic synchronization point for the target-ref race regression. Production callers omit it. */
     beforeTargetCompareAndSwap?: () => void | Promise<void>;
+    leaseHandle?: DeliveryLeaseHandle;
   }
 ): Promise<RunMergeResult> {
   if (input.confirmation !== confirmationToken(run.id)) throw new Error("缺少本次 Run 的明确合并确认");
@@ -2245,7 +2871,7 @@ export async function mergeAcceptedRun(
   ]);
   if (mergeCheck.code !== 0) {
     const conflictMessage = (mergeCheck.stderr.trim() || mergeCheck.stdout.trim() || "合并冲突").slice(0, 8_000);
-    const conflict = await advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+    const conflictEvent: DeliveryEvent = {
       type: "conflict.started",
       actor: "runtime",
       payload: {
@@ -2255,7 +2881,10 @@ export async function mergeAcceptedRun(
         conflictMessage,
         message: conflictMessage
       }
-    });
+    };
+    const conflict = input.leaseHandle
+      ? await input.leaseHandle.advance(conflictEvent)
+      : await advanceDeliveryEvent(runDir, run.id, delivery.revision, conflictEvent);
     return { status: "conflict", delivery: conflict };
   }
 
@@ -2284,7 +2913,7 @@ export async function mergeAcceptedRun(
 
   const intentId = randomUUID();
   const targetRef = `refs/heads/${before.branch}`;
-  const intent = await advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+  const intentEvent: DeliveryEvent = {
     type: "merge.intent-prepared",
     actor: "runtime",
     payload: {
@@ -2295,21 +2924,29 @@ export async function mergeAcceptedRun(
       preparedMergeCommit: mergeCommit,
       message: "已持久化受验证的 merge intent；正在以目标 commit 执行 Git CAS。"
     }
-  });
+  };
+  const intent = input.leaseHandle
+    ? await input.leaseHandle.advance(intentEvent)
+    : await advanceDeliveryEvent(runDir, run.id, delivery.revision, intentEvent);
+  await input.leaseHandle?.renew();
   await input.beforeTargetCompareAndSwap?.();
+  await input.leaseHandle?.assertActive();
   const updated = await runGit(preview.repositoryRoot, [
     "update-ref", targetRef, mergeCommit, input.expectedTargetCommit
   ]);
   if (updated.code !== 0) throw new TargetChangedAfterValidationError();
 
-  const refUpdated = await advanceDeliveryEvent(runDir, run.id, intent.revision, {
+  const refUpdatedEvent: DeliveryEvent = {
     type: "merge.ref-updated",
     actor: "runtime",
     payload: {
       intentId,
       message: "目标 ref 已按预期 commit 完成 CAS，正在同步目标 worktree。"
     }
-  });
+  };
+  const refUpdated = input.leaseHandle
+    ? await input.leaseHandle.advance(refUpdatedEvent)
+    : await advanceDeliveryEvent(runDir, run.id, intent.revision, refUpdatedEvent);
 
   // update-ref supplies the atomic compare-and-swap guarantee; read-tree only
   // synchronizes the already checked-out target worktree and never rewrites the ref.
@@ -2326,7 +2963,7 @@ export async function mergeAcceptedRun(
   const appliedTarget = await git(preview.repositoryRoot, ["rev-parse", targetRef]);
   if (appliedTarget !== mergeCommit) throw new TargetChangedAfterValidationError();
 
-  const record = await advanceDeliveryEvent(runDir, run.id, refUpdated.revision, {
+  const completedEvent: DeliveryEvent = {
     type: "merge.completed",
     actor: "runtime",
     payload: {
@@ -2336,9 +2973,142 @@ export async function mergeAcceptedRun(
       mergeCommit,
       message: "用户确认后已合并；源分支保留作为交付证据。"
     }
-  });
+  };
+  const record = input.leaseHandle
+    ? await input.leaseHandle.advance(completedEvent)
+    : await advanceDeliveryEvent(runDir, run.id, refUpdated.revision, completedEvent);
   await removeRunWorktree(preview.repositoryRoot, preview.worktreePath);
   return { status: "merged", delivery: record };
+}
+
+export interface DeliverySideEffectRecoveryResult {
+  action: "none" | "discard-completed" | "attention" | "merge-completed" | "merge-retryable" | "merge-revalidation";
+  delivery?: RunDeliveryRecordV2;
+  reason?: string;
+}
+
+export async function reconcileRunDeliverySideEffects(
+  run: WorkflowRunRecord,
+  runDir: string,
+  leaseHandle?: DeliveryLeaseHandle
+): Promise<DeliverySideEffectRecoveryResult> {
+  const delivery = await readRunDelivery(runDir, run.id);
+  if (!delivery || TERMINAL_DELIVERY_STATUSES.has(delivery.status)) return { action: "none", ...(delivery ? { delivery } : {}) };
+  const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
+  const inferredRoot = worktreePath ? inferredRepositoryRoot(worktreePath, run.id) : undefined;
+  let repositoryRoot: string | undefined;
+  if (inferredRoot) {
+    try {
+      repositoryRoot = await fs.realpath(inferredRoot);
+    } catch {
+      repositoryRoot = undefined;
+    }
+  }
+
+  const discardIntent = delivery.sideEffects?.discard;
+  if (discardIntent?.phase === "prepared") {
+    if (!worktreePath || !repositoryRoot) {
+      return { action: "attention", delivery, reason: "discard intent repository/worktree identity cannot be resolved" };
+    }
+    const cleanup = await unverifiedCleanupObservation(worktreePath, repositoryRoot, delivery.sourceBranch);
+    const listed = await runGit(repositoryRoot, ["worktree", "list", "--porcelain"]);
+    const registered = listed.code !== 0
+      || listed.stdout.split("\n").some((line) => line === `worktree ${worktreePath}`);
+    if (cleanup.worktree !== "missing" || registered || cleanup.sourceBranch !== "missing") {
+      return {
+        action: "attention",
+        delivery,
+        reason: `discard cleanup is not fully verified (worktree=${cleanup.worktree}, registered=${registered}, branch=${cleanup.sourceBranch})`
+      };
+    }
+    const completed = await advanceDeliveryEvent(runDir, run.id, delivery.revision, {
+      type: "discard.completed",
+      actor: "runtime-recovery",
+      payload: {
+        intentId: discardIntent.intentId,
+        message: "startup reconciliation verified path, registry, and source branch cleanup; discard completed."
+      }
+    });
+    return { action: "discard-completed", delivery: completed };
+  }
+
+  const mergeIntent = delivery.sideEffects?.merge;
+  if (!mergeIntent || mergeIntent.phase === "worktree-synchronized") return { action: "none", delivery };
+  if (!repositoryRoot) {
+    return { action: "attention", delivery, reason: "merge intent repository root cannot be resolved" };
+  }
+  if (!leaseHandle) return { action: "merge-retryable", delivery };
+  const target = await runGit(repositoryRoot, ["rev-parse", "--verify", mergeIntent.targetRef]);
+  if (target.code !== 0) {
+    return { action: "attention", delivery, reason: "merge intent target ref cannot be resolved" };
+  }
+  const targetCommit = target.stdout.trim();
+  if (targetCommit !== mergeIntent.preparedMergeCommit && targetCommit !== mergeIntent.expectedTargetCommit) {
+    const revalidation = await leaseHandle.advance({
+      type: "validation.started",
+      actor: "runtime-recovery",
+      payload: {
+        retryAfterTargetDrift: true,
+        targetCommit,
+        message: "target ref differs from both persisted merge intent commits; returning to queued revalidation."
+      }
+    });
+    return { action: "merge-revalidation", delivery: revalidation };
+  }
+  let current = delivery;
+  if (targetCommit === mergeIntent.expectedTargetCommit) {
+    await leaseHandle.renew();
+    await leaseHandle.assertActive();
+    const updated = await runGit(repositoryRoot, [
+      "update-ref",
+      mergeIntent.targetRef,
+      mergeIntent.preparedMergeCommit,
+      mergeIntent.expectedTargetCommit
+    ]);
+    if (updated.code !== 0) {
+      throw new TargetChangedAfterValidationError();
+    }
+  }
+  if (mergeIntent.phase === "prepared") {
+    current = await leaseHandle.advance({
+      type: "merge.ref-updated",
+      actor: "runtime-recovery",
+      payload: {
+        intentId: mergeIntent.intentId,
+        message: "startup reconciliation verified the prepared merge commit at the target ref."
+      }
+    });
+  }
+  const targetBranch = mergeIntent.targetRef.startsWith("refs/heads/")
+    ? mergeIntent.targetRef.slice("refs/heads/".length)
+    : delivery.targetBranch;
+  if (!targetBranch) return { action: "attention", delivery: current, reason: "merge intent target branch is missing" };
+  const checkedOutBranch = await runGit(repositoryRoot, ["branch", "--show-current"]);
+  if (checkedOutBranch.code === 0 && checkedOutBranch.stdout.trim() === targetBranch) {
+    const synchronized = await runGit(repositoryRoot, ["read-tree", "--reset", "-u", mergeIntent.preparedMergeCommit]);
+    if (synchronized.code !== 0) {
+      throw new Error(synchronized.stderr.trim() || synchronized.stdout.trim() || "merge recovery could not synchronize target worktree");
+    }
+  }
+  const completed = await leaseHandle.advance({
+    type: "merge.completed",
+    actor: "runtime-recovery",
+    payload: {
+      intentId: mergeIntent.intentId,
+      targetBranch,
+      targetCommitBeforeMerge: mergeIntent.expectedTargetCommit,
+      mergeCommit: mergeIntent.preparedMergeCommit,
+      message: "startup reconciliation completed the persisted merge intent without rebuilding merge evidence."
+    }
+  });
+  if (worktreePath) {
+    try {
+      await removeRunWorktree(repositoryRoot, worktreePath);
+    } catch {
+      // Terminal merge evidence is already durable; cleanup remains safely retryable.
+    }
+  }
+  return { action: "merge-completed", delivery: completed };
 }
 
 function humanActor(value: string | undefined): string {
@@ -2386,6 +3156,181 @@ async function isAncestor(repositoryRoot: string, ancestor: string, descendant: 
   if (result.code === 0) return true;
   if (result.code === 1) return false;
   throw new Error(result.stderr.trim() || result.stdout.trim() || "git merge-base failed");
+}
+
+function inferredRepositoryRoot(worktreePath: string, runId: string): string | undefined {
+  const candidate = path.resolve(path.dirname(path.dirname(worktreePath)), "..");
+  return path.resolve(candidate, ".multi-agent", "worktrees", runId) === path.resolve(worktreePath)
+    ? candidate
+    : undefined;
+}
+
+async function archiveCorruptDelivery(
+  runDir: string,
+  expectedRawSha256: `sha256:${string}`
+): Promise<string> {
+  const raw = await fs.readFile(deliveryPath(runDir));
+  const actual = sha256(raw);
+  if (actual !== expectedRawSha256) {
+    throw new DeliveryRecoveryConflict("corrupt delivery bytes changed after confirmation");
+  }
+  const recoveryDirectory = path.join(runDir, "delivery-recovery");
+  await fs.mkdir(recoveryDirectory, { recursive: true });
+  const name = `corrupt-${expectedRawSha256.slice("sha256:".length)}.json`;
+  const destination = path.join(recoveryDirectory, name);
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    try {
+      handle = await fs.open(destination, "wx", 0o600);
+      await handle.writeFile(raw);
+      await handle.sync();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    } finally {
+      await handle?.close();
+    }
+    const archived = await fs.readFile(destination);
+    if (sha256(archived) !== expectedRawSha256) {
+      throw new Error("corrupt delivery archive digest verification failed");
+    }
+    await fsyncDirectory(recoveryDirectory);
+  } catch (error) {
+    throw new Error(`无法归档损坏的交付记录：${error instanceof Error ? error.message : String(error)}`);
+  }
+  return path.posix.join("delivery-recovery", name);
+}
+
+async function unverifiedCleanupObservation(
+  worktreePath: string | undefined,
+  repositoryRoot: string | undefined,
+  sourceBranch: string | undefined
+): Promise<DeliveryCleanupEvidence> {
+  let worktree: DeliveryCleanupEvidence["worktree"] = "unknown";
+  if (worktreePath) {
+    try {
+      await fs.access(worktreePath);
+      worktree = "present";
+      if (repositoryRoot) {
+        const listed = await runGit(repositoryRoot, ["worktree", "list", "--porcelain"]);
+        if (listed.code === 0 && !listed.stdout.split("\n").some((line) => line === `worktree ${worktreePath}`)) {
+          worktree = "unregistered";
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") worktree = "missing";
+    }
+  }
+  let branch: DeliveryCleanupEvidence["sourceBranch"] = "unknown";
+  if (repositoryRoot && sourceBranch) {
+    try {
+      branch = await branchExists(repositoryRoot, sourceBranch) ? "present" : "missing";
+    } catch {
+      branch = "unknown";
+    }
+  }
+  return { checkedAt: new Date().toISOString(), worktree, sourceBranch: branch };
+}
+
+async function adjudicateUnverifiedOutcome(
+  repositoryRoot: string | undefined,
+  sourceCommit: string | undefined,
+  targetBranch: string | undefined
+): Promise<DeliveryOutcome> {
+  if (!repositoryRoot || !sourceCommit || !targetBranch || !FULL_COMMIT.test(sourceCommit)) return "unknown";
+  try {
+    const source = await git(repositoryRoot, ["rev-parse", "--verify", `${sourceCommit}^{commit}`]);
+    const target = await git(repositoryRoot, ["rev-parse", "--verify", `${targetBranch}^{commit}`]);
+    if (source !== sourceCommit || !FULL_COMMIT.test(target)) return "unknown";
+    return await isAncestor(repositoryRoot, sourceCommit, target) ? "merged" : "not-merged";
+  } catch {
+    return "unknown";
+  }
+}
+
+export async function discardRunUnverified(
+  run: WorkflowRunRecord,
+  runDir: string,
+  input: UnverifiedDiscardInput,
+  principal: LocalOwnerPrincipal
+): Promise<RunDeliveryActionResult> {
+  assertRunId(run.id);
+  if (principal.kind !== "local-owner") throw new Error("discard-unverified requires the local owner principal");
+  const actor = humanActor(input.actor);
+  const store = RunDeliveryStore.forRunDirectory(runDir, run.id);
+  const read = await store.readDelivery(run.id);
+  if (read.kind === "valid" && TERMINAL_DELIVERY_STATUSES.has(read.record.status)) {
+    throw new Error(`已进入 ${read.record.status} 终态，不能执行未验证丢弃`);
+  }
+  if (read.revision !== input.expectedRevision) {
+    throw new DeliveryRevisionConflict(run.id, input.expectedRevision, read.revision);
+  }
+  const fingerprint = deliveryReadFingerprint(read);
+  if (input.confirmation !== `DISCARD UNVERIFIED ${run.id} ${fingerprint}`) {
+    throw new DeliveryRecoveryConflict("缺少与当前交付指纹匹配的未验证丢弃确认");
+  }
+  if (read.kind === "corrupt") {
+    if (input.reason !== "delivery-corrupt") throw new Error("损坏交付必须使用 delivery-corrupt reason");
+    if (!input.expectedRawSha256 || input.expectedRawSha256 !== read.rawSha256) {
+      throw new DeliveryRecoveryConflict("损坏交付的 raw SHA-256 已变化");
+    }
+  } else if (read.kind === "absent" && input.reason !== "delivery-absent") {
+    throw new Error("缺失交付必须使用 delivery-absent reason");
+  } else if (read.kind === "valid" && !["worktree-missing", "worktree-unregistered"].includes(input.reason)) {
+    throw new Error("合法交付的未验证丢弃只用于 worktree missing/unregistered 恢复");
+  }
+
+  const record = read.kind === "valid" ? read.record : undefined;
+  const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
+  const inferredRoot = worktreePath ? inferredRepositoryRoot(worktreePath, run.id) : undefined;
+  let repositoryRoot: string | undefined;
+  if (inferredRoot) {
+    try {
+      repositoryRoot = await fs.realpath(inferredRoot);
+    } catch {
+      repositoryRoot = undefined;
+    }
+  }
+  const cleanup = await unverifiedCleanupObservation(worktreePath, repositoryRoot, record?.sourceBranch);
+  if (read.kind === "valid") {
+    if (input.reason === "worktree-missing" && cleanup.worktree !== "missing") {
+      throw new Error("受管 worktree 仍存在，不能声明 worktree-missing");
+    }
+    if (input.reason === "worktree-unregistered" && cleanup.worktree !== "unregistered") {
+      throw new Error("受管 worktree 仍已注册，不能声明 worktree-unregistered");
+    }
+  }
+  const outcome = await adjudicateUnverifiedOutcome(repositoryRoot, record?.sourceCommit, record?.targetBranch);
+  const archivePath = read.kind === "corrupt" ? await archiveCorruptDelivery(runDir, read.rawSha256) : undefined;
+  const allowedFrom: DeliveryStateSelector[] = read.kind === "corrupt"
+    ? [{ kind: "corrupt", rawSha256: read.rawSha256 }]
+    : read.kind === "absent"
+      ? [{ kind: "absent" }]
+      : [{
+          kind: "record",
+          status: read.record.status,
+          ...(read.record.conflictResolution?.status ? { conflictStatus: read.record.conflictResolution.status } : {}),
+          ...(read.record.dispatch?.state ? { dispatchState: read.record.dispatch.state } : {}),
+          ...(read.record.dispatch?.lease?.id ? { leaseId: read.record.dispatch.lease.id } : {})
+        }];
+  const delivery = await store.advanceDelivery(run.id, read.revision, allowedFrom, {
+    type: "discard.unverified",
+    actor,
+    payload: {
+      reason: input.reason,
+      fingerprint,
+      outcome,
+      cleanup,
+      ...(input.note?.trim() ? { note: input.note.trim() } : {}),
+      ...(read.kind === "corrupt" ? { rawSha256: read.rawSha256 } : {}),
+      ...(archivePath ? { archivePath } : {}),
+      ...(record?.baseCommit ? { baseCommit: record.baseCommit } : {}),
+      ...(record?.sourceBranch ? { sourceBranch: record.sourceBranch } : {}),
+      ...(record?.sourceCommit ? { sourceCommit: record.sourceCommit } : {}),
+      ...(record?.targetBranch ? { targetBranch: record.targetBranch } : {}),
+      message: `本机 owner 已将不可验证候选诚实终止；未删除目录/分支，cleanupVerified=false，outcome=${outcome}。`
+    }
+  });
+  return { status: "discarded", delivery };
 }
 
 export async function discardRunWorktree(

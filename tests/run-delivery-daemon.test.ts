@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -125,6 +126,87 @@ afterEach(() => {
 });
 
 describe("run delivery daemon routes", () => {
+  it("protects corrupt discard recovery with capability, audit, fingerprint, and digest CAS", async () => {
+    const dataRoot = temporaryRoot("multi-agent-delivery-unverified-http-data-");
+    const repo = repository();
+    const runId = "run-delivery-unverified-http-1";
+    const runDir = path.join(dataRoot, "artifacts", "runs", runId);
+    fs.mkdirSync(runDir, { recursive: true });
+    const missingWorktree = path.join(repo, ".multi-agent", "worktrees", runId);
+    const run: WorkflowRunRecord = {
+      id: runId,
+      workflow: "delivery-unverified-http",
+      architecture: "supervisor",
+      manifestPath: path.join(runDir, "multi-agent.yaml"),
+      artifactDir: runDir,
+      status: "passed",
+      createdAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      isolation: { mode: "worktree", worktreePath: missingWorktree, baseCommit: git(repo, "rev-parse", "HEAD") },
+      nodes: {}
+    };
+    fs.writeFileSync(path.join(runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`, "utf8");
+    const raw = "{corrupt-delivery";
+    fs.writeFileSync(path.join(runDir, "delivery.json"), raw, "utf8");
+    const rawSha256 = `sha256:${createHash("sha256").update(raw).digest("hex")}`;
+    const targetBefore = git(repo, "rev-parse", "main");
+    const audit: Array<{ method: string; path: string }> = [];
+    const service = await WorkbenchService.open({ dataRoot });
+    const app = createDaemonApp(service, {
+      staticDir: path.join(dataRoot, "missing-client"),
+      capabilityToken: "recovery-capability",
+      allowedOrigins: ["http://127.0.0.1"],
+      auditSink: async (event) => { audit.push({ method: event.method, path: event.path }); }
+    });
+    const server = await new Promise<import("node:http").Server>((resolve) => {
+      const listener = app.listen(0, "127.0.0.1", () => resolve(listener));
+    });
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("expected TCP listener");
+      const base = `http://127.0.0.1:${address.port}`;
+      const previewResponse = await fetch(`${base}/api/runs/${runId}/merge-preview`);
+      expect(previewResponse.status).toBe(200);
+      const preview = await previewResponse.json() as { data: RunMergePreview };
+      expect(preview.data).toMatchObject({ status: "not-ready", recoveryRequired: { rawSha256 } });
+      const fingerprint = preview.data.recoveryRequired!.fingerprint;
+      const body = {
+        confirmation: `DISCARD UNVERIFIED ${runId} ${fingerprint}`,
+        actor: "local-owner-label",
+        reason: "delivery-corrupt",
+        expectedRevision: 0,
+        expectedRawSha256: rawSha256
+      };
+      const missingCapability = await fetch(`${base}/api/runs/${runId}/discard-unverified`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      expect(missingCapability.status).toBe(403);
+      const stale = await fetch(`${base}/api/runs/${runId}/discard-unverified`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-multi-agent-capability": "recovery-capability" },
+        body: JSON.stringify({ ...body, confirmation: `${body.confirmation}-stale` })
+      });
+      expect(stale.status).toBe(409);
+      const recovered = await fetch(`${base}/api/runs/${runId}/discard-unverified`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-multi-agent-capability": "recovery-capability" },
+        body: JSON.stringify(body)
+      });
+      expect(recovered.status).toBe(200);
+      expect(await recovered.json()).toMatchObject({ data: { status: "discarded", delivery: {
+        cleanupVerified: false,
+        outcome: "unknown",
+        recovery: { actor: "local-owner-label", rawSha256 }
+      } } });
+      expect(audit.filter((event) => event.path.endsWith("/discard-unverified"))).toHaveLength(2);
+      expect(git(repo, "rev-parse", "main")).toBe(targetBefore);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  }, 15_000);
+
   it("serves a read-only preview and inline evidence, then requires the exact confirmation token", async () => {
     const dataRoot = temporaryRoot("multi-agent-delivery-daemon-data-");
     const repo = repository();
@@ -176,6 +258,7 @@ describe("run delivery daemon routes", () => {
     fs.writeFileSync(path.join(runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`, "utf8");
 
     const service = await WorkbenchService.open({ dataRoot });
+    await service.recoverDeliveryDispatches();
     const app = createDaemonApp(service, { staticDir: path.join(dataRoot, "missing-client") });
     const headBefore = git(repo, "rev-parse", "HEAD");
 
@@ -395,6 +478,7 @@ describe("run delivery daemon routes", () => {
     });
 
     const service = await WorkbenchService.open({ dataRoot });
+    await service.recoverDeliveryDispatches();
     const app = createDaemonApp(service, { staticDir: path.join(dataRoot, "missing-client") });
     let mergedPreview: RunMergePreview | undefined;
     for (let attempt = 0; attempt < 100; attempt += 1) {

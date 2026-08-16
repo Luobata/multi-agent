@@ -8,6 +8,7 @@ import type { MemoryKind } from "../memory/types.js";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
+import { DeliveryRecoveryConflict, DeliveryRevisionConflict } from "../runtime/worktreeDelivery.js";
 import type {
   EmployeeInvocationInput,
   EntrancePolicyDispatchInput,
@@ -1011,6 +1012,35 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       ...(typeof body.note === "string" ? { note: body.note } : {})
     }));
   }));
+  app.post("/api/runs/:id/discard-unverified", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "run unverified discard input");
+    if (typeof body.confirmation !== "string") throw new Error("run unverified discard confirmation is required");
+    if (typeof body.actor !== "string" || !body.actor.trim()) throw new Error("run unverified discard actor is required");
+    if (!Number.isSafeInteger(body.expectedRevision) || (body.expectedRevision as number) < 0) {
+      throw new Error("run unverified discard expectedRevision is required");
+    }
+    if (typeof body.reason !== "string"
+      || !["delivery-absent", "delivery-corrupt", "worktree-missing", "worktree-unregistered"].includes(body.reason)) {
+      throw new Error("run unverified discard reason is invalid");
+    }
+    if (body.note !== undefined && typeof body.note !== "string") {
+      throw new Error("run unverified discard note must be a string");
+    }
+    if (body.expectedRawSha256 !== undefined
+      && (typeof body.expectedRawSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(body.expectedRawSha256))) {
+      throw new Error("run unverified discard expectedRawSha256 is invalid");
+    }
+    send(response, await service.discardRunUnverified(routeParam(request, "id"), {
+      confirmation: body.confirmation,
+      actor: body.actor,
+      reason: body.reason as "delivery-absent" | "delivery-corrupt" | "worktree-missing" | "worktree-unregistered",
+      expectedRevision: body.expectedRevision as number,
+      ...(typeof body.note === "string" ? { note: body.note } : {}),
+      ...(typeof body.expectedRawSha256 === "string"
+        ? { expectedRawSha256: body.expectedRawSha256 as `sha256:${string}` }
+        : {})
+    }));
+  }));
   app.get("/api/runs/:id/evidence/:assetId", asyncRoute(async (request, response) => {
     await sendRunEvidenceAsset(
       service,
@@ -1193,7 +1223,11 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   });
   app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
     const message = error instanceof Error ? error.message : String(error);
-    const status = /not found/.test(message) ? 404 : /already exists/.test(message) ? 409 : 400;
+    const status = /not found/.test(message)
+      ? 404
+      : error instanceof DeliveryRevisionConflict || error instanceof DeliveryRecoveryConflict || /already exists/.test(message)
+        ? 409
+        : 400;
     response.status(status).json({ error: { message } });
   });
 

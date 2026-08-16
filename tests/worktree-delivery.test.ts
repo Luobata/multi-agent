@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,8 @@ import {
   continueManagedRunRebase,
   assessQueuedRun,
   createMergeValidationWorktree,
+  deliveryReadFingerprint,
+  discardRunUnverified,
   discardRunWorktree,
   keepRunWorktree,
   mergeAcceptedRun,
@@ -19,6 +22,8 @@ import {
   queueAcceptedRun,
   removeMergeValidationWorktree,
   readRunDelivery,
+  RunDeliveryStore,
+  DeliveryRevisionConflict,
   advanceDeliveryEvent
 } from "../src/runtime/worktreeDelivery.js";
 
@@ -679,6 +684,128 @@ describe("worktree delivery merge gate", () => {
     expect(fs.existsSync(worktree!.path)).toBe(true);
     expect(git(root, "branch", "--list", sourceBranch)).toContain(sourceBranch);
   }, 15_000);
+
+  it("honestly terminates absent and corrupt delivery without deleting candidates or changing target refs", async () => {
+    for (const kind of ["absent", "corrupt"] as const) {
+      const root = repository();
+      const runId = `run-delivery-unverified-${kind}-1`;
+      const missingWorktree = path.join(root, ".multi-agent", "worktrees", runId);
+      const runDir = artifactDirectory(runId);
+      const run = runRecord(runId, runDir, missingWorktree, git(root, "rev-parse", "HEAD"));
+      const runJson = `${JSON.stringify(run, null, 2)}\n`;
+      fs.writeFileSync(path.join(runDir, "run.json"), runJson, "utf8");
+      const targetBefore = git(root, "rev-parse", "main");
+      let expectedRawSha256: `sha256:${string}` | undefined;
+      if (kind === "corrupt") {
+        const raw = "{not-json";
+        fs.writeFileSync(path.join(runDir, "delivery.json"), raw, "utf8");
+        expectedRawSha256 = `sha256:${createHash("sha256").update(raw).digest("hex")}`;
+        const preview = await previewRunMerge(run, runDir);
+        expect(preview).toMatchObject({
+          status: "not-ready",
+          recoveryRequired: { rawSha256: expectedRawSha256 }
+        });
+      }
+      const read = await RunDeliveryStore.forRunDirectory(runDir, runId).readDelivery(runId);
+      const fingerprint = deliveryReadFingerprint(read);
+      const result = await discardRunUnverified(run, runDir, {
+        confirmation: `DISCARD UNVERIFIED ${runId} ${fingerprint}`,
+        actor: "local-owner",
+        reason: kind === "corrupt" ? "delivery-corrupt" : "delivery-absent",
+        expectedRevision: 0,
+        ...(expectedRawSha256 ? { expectedRawSha256 } : {})
+      }, { kind: "local-owner" });
+      expect(result.delivery).toMatchObject({
+        status: "discarded",
+        revision: 1,
+        cleanupVerified: false,
+        outcome: "unknown",
+        recovery: { kind: "unverified-discard", reason: `delivery-${kind}` }
+      });
+      expect(git(root, "rev-parse", "main")).toBe(targetBefore);
+      expect(fs.readFileSync(path.join(runDir, "run.json"), "utf8")).toBe(runJson);
+      if (expectedRawSha256) {
+        const archive = path.join(runDir, "delivery-recovery", `corrupt-${expectedRawSha256.slice(7)}.json`);
+        expect(fs.readFileSync(archive, "utf8")).toBe("{not-json");
+      }
+    }
+  }, 15_000);
+
+  it.each([
+    { label: "merged", merge: true, targetBranch: "main", outcome: "merged" },
+    { label: "not-merged", merge: false, targetBranch: "main", outcome: "not-merged" },
+    { label: "unknown", merge: false, targetBranch: "missing-target", outcome: "unknown" }
+  ] as const)("adjudicates $label for a missing worktree from exact Git ancestry", async ({ merge, targetBranch, outcome }) => {
+    const root = repository();
+    const runId = `run-delivery-unverified-${outcome}-1`;
+    const worktree = await createRunWorktree(root, runId);
+    expect(worktree).not.toBeNull();
+    const sourceBranch = `codex/${runId}`;
+    git(worktree!.path, "switch", "-c", sourceBranch);
+    fs.writeFileSync(path.join(worktree!.path, "candidate.txt"), `${outcome}\n`, "utf8");
+    git(worktree!.path, "add", "candidate.txt");
+    git(worktree!.path, "commit", "-m", `candidate ${outcome}`);
+    const sourceCommit = git(worktree!.path, "rev-parse", "HEAD");
+    if (merge) git(root, "merge", "--no-ff", "--no-edit", sourceBranch);
+    const targetBefore = git(root, "rev-parse", "main");
+    git(root, "worktree", "remove", "--force", worktree!.path);
+    const runDir = artifactDirectory(runId);
+    const run = runRecord(runId, runDir, worktree!.path, worktree!.baseCommit);
+    fs.writeFileSync(path.join(runDir, "delivery.json"), `${JSON.stringify({
+      runId,
+      status: "awaiting-acceptance",
+      updatedAt: new Date().toISOString(),
+      baseCommit: worktree!.baseCommit,
+      sourceBranch,
+      sourceCommit,
+      targetBranch
+    })}\n`, "utf8");
+    const store = RunDeliveryStore.forRunDirectory(runDir, runId);
+    const read = await store.readDelivery(runId);
+    const result = await discardRunUnverified(run, runDir, {
+      confirmation: `DISCARD UNVERIFIED ${runId} ${deliveryReadFingerprint(read)}`,
+      actor: "local-owner",
+      reason: "worktree-missing",
+      expectedRevision: 0
+    }, { kind: "local-owner" });
+    expect(result.delivery).toMatchObject({ cleanupVerified: false, outcome });
+    expect(git(root, "rev-parse", "main")).toBe(targetBefore);
+    expect(git(root, "branch", "--list", sourceBranch)).toContain(sourceBranch);
+  }, 15_000);
+
+  it("linearizes two corrupt-recovery operators at one archived revision", async () => {
+    const root = repository();
+    const runId = "run-delivery-unverified-race-1";
+    const runDir = artifactDirectory(runId);
+    const run = runRecord(
+      runId,
+      runDir,
+      path.join(root, ".multi-agent", "worktrees", runId),
+      git(root, "rev-parse", "HEAD")
+    );
+    const raw = Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0xff]);
+    fs.writeFileSync(path.join(runDir, "delivery.json"), raw);
+    const expectedRawSha256 = `sha256:${createHash("sha256").update(raw).digest("hex")}` as const;
+    const read = await RunDeliveryStore.forRunDirectory(runDir, runId).readDelivery(runId);
+    const input = {
+      confirmation: `DISCARD UNVERIFIED ${runId} ${deliveryReadFingerprint(read)}`,
+      actor: "local-owner",
+      reason: "delivery-corrupt" as const,
+      expectedRevision: 0,
+      expectedRawSha256
+    };
+    const results = await Promise.allSettled([
+      discardRunUnverified(run, runDir, input, { kind: "local-owner" }),
+      discardRunUnverified(run, runDir, input, { kind: "local-owner" })
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const failure = results.find((result) => result.status === "rejected") as PromiseRejectedResult;
+    expect(failure.reason).toBeInstanceOf(DeliveryRevisionConflict);
+    const archive = path.join(runDir, "delivery-recovery", `corrupt-${expectedRawSha256.slice(7)}.json`);
+    expect(fs.readFileSync(archive)).toEqual(raw);
+    const final = await RunDeliveryStore.forRunDirectory(runDir, runId).readDelivery(runId);
+    expect(final).toMatchObject({ kind: "valid", revision: 1, record: { status: "discarded" } });
+  });
 
   it("rejects a delivery record whose source branch provenance was tampered with", async () => {
     const root = repository();
