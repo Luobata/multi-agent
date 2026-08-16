@@ -1,4 +1,6 @@
 import { Ajv, type ErrorObject } from "ajv";
+import fs from "node:fs";
+import path from "node:path";
 import { ManifestValidationError } from "../core/errors.js";
 import type {
   ExecutionPlan,
@@ -197,6 +199,8 @@ interface MemberSessionTurn {
   status: NodeRunResult["status"];
   output: JsonValue;
   error: string | null;
+  /** Best-effort handoff notes the member left for its next delegation; null when none were written. */
+  handoff: string | null;
 }
 
 interface MemberSessionState {
@@ -1286,6 +1290,30 @@ function memberSessionSnapshot(session: MemberSessionState | undefined): JsonVal
   };
 }
 
+const MEMBER_HANDOFF_MAX_CHARS = 8000;
+
+function memberHandoffPath(context: ArchitectureExecutionContext, sessionKey: string): string {
+  const sanitized = sessionKey.toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  return path.join(context.executionRoot(), ".multi-agent", "handoff", `${sanitized}.md`);
+}
+
+function latestMemberHandoff(session: MemberSessionState | undefined): string {
+  return session?.turns.at(-1)?.handoff ?? "";
+}
+
+/** Best-effort read of a member's handoff file; a missing or unreadable file yields null and never fails the Run. */
+async function readMemberHandoff(context: ArchitectureExecutionContext, sessionKey: string): Promise<string | null> {
+  try {
+    const content = await fs.promises.readFile(memberHandoffPath(context, sessionKey), "utf8");
+    if (content.length > MEMBER_HANDOFF_MAX_CHARS) {
+      return `${content.slice(0, MEMBER_HANDOFF_MAX_CHARS)}\n…[truncated]`;
+    }
+    return content;
+  } catch {
+    return null;
+  }
+}
+
 const REGRESSION_LEVEL_ORDER: Record<RegressionRiskLevel, number> = { low: 0, medium: 1, high: 2 };
 const REGRESSION_SCOPE_ORDER: Record<RegressionScope, number> = { none: 0, targeted: 1, package: 2, full: 3 };
 
@@ -1657,6 +1685,8 @@ async function executeGateActivation(
         __delegatedTask: gateTask,
         // Filled immediately before this serial shard executes so it includes every prior turn.
         __memberSession: gateMemberSession ? memberSessionSnapshot(gateMemberSession) : null,
+        __memberSessionHandoffPath: gateMemberSession ? memberHandoffPath(context, gateMemberSession.key) : "",
+        __memberSessionHandoff: latestMemberHandoff(gateMemberSession),
         __requiredCapabilities: [tracker.gate.requiredCapability],
         __workKind: gateWorkKind(tracker.gate),
         __changeSet: "",
@@ -1738,12 +1768,15 @@ async function executeGateActivation(
     }
     if (gateMemberSession) {
       node.with.__memberSession = memberSessionSnapshot(gateMemberSession);
+      node.with.__memberSessionHandoffPath = memberHandoffPath(context, gateMemberSession.key);
+      node.with.__memberSessionHandoff = latestMemberHandoff(gateMemberSession);
       await context.emit(index === 0 ? "supervisor.member-session.opened" : "supervisor.member-session.continued", node.id, {
         memberSessionId: gateMemberSession.id,
         sessionKey: gateMemberSession.key,
         roleId: gateMemberSession.roleId,
         todoId: executionGroups[index]!.id,
-        priorTurns: gateMemberSession.turns.length
+        priorTurns: gateMemberSession.turns.length,
+        handoff: Boolean(latestMemberHandoff(gateMemberSession))
       });
     }
     await context.scheduleNode(node);
@@ -1765,13 +1798,15 @@ async function executeGateActivation(
       }
     }
     if (gateMemberSession) {
+      const handoff = await readMemberHandoff(context, gateMemberSession.key);
       gateMemberSession.turns.push({
         todoId: executionGroups[index]!.id,
         nodeId: node.id,
         task: String(node.with.__delegatedTask ?? ""),
         status: result.status,
         output: result.output ?? null,
-        error: result.error ?? null
+        error: result.error ?? null,
+        handoff
       });
       if (index === nodes.length - 1) {
         gateMemberSession.status = "closed";
@@ -2950,7 +2985,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             memberSessionId: memberSession.id,
             sessionKey: memberSession.key,
             todoId: plannedTodo.id,
-            priorTurns: memberSession.turns.length
+            priorTurns: memberSession.turns.length,
+            handoff: Boolean(latestMemberHandoff(memberSession))
           });
         }
         const hasFutureSessionTodo = [...dynamicTodos!.values()].some((todo) => (
@@ -2986,6 +3022,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
             __todoId: plannedTodo?.id ?? "",
             __delegatedTask: delegatedTask,
             __memberSession: memberSessionSnapshot(memberSession),
+            __memberSessionHandoffPath: memberSession ? memberHandoffPath(context, memberSession.key) : "",
+            __memberSessionHandoff: latestMemberHandoff(memberSession),
             __requiredCapabilities: requiredCapabilities,
             __workKind: workKind,
             __changeSet: changeSet ?? "",
@@ -3101,13 +3139,15 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       if (!sessionId) continue;
       const session = [...memberSessions.values()].find((candidate) => candidate.id === sessionId);
       if (!session) continue;
+      const handoff = await readMemberHandoff(context, session.key);
       session.turns.push({
         todoId: typeof record.worker.metadata?.todoId === "string" ? record.worker.metadata.todoId : record.worker.id,
         nodeId: record.worker.id,
         task: record.assignment.task ?? "",
         status: record.result.status,
         output: record.result.output ?? null,
-        error: record.result.error ?? null
+        error: record.result.error ?? null,
+        handoff
       });
       if (record.worker.metadata?.memberSessionRetained !== true) {
         session.status = "closed";

@@ -860,6 +860,7 @@ export async function runWorkflow(
       },
       writeArtifact: (relativePath, value) => store.writeArtifact(relativePath, value),
       candidateSnapshot: () => candidateWorkspaceSnapshot(options.providerCwd ?? loaded.projectRoot),
+      executionRoot: () => providerCwd,
       executionPackageScripts: async () => {
         try {
           const value = JSON.parse(await fs.promises.readFile(

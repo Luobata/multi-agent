@@ -62,6 +62,8 @@ export interface ArchitectureExecutionContext {
   writeArtifact(relativePath: string, value: unknown): Promise<void>;
   /** Deterministic execution-root facts exposed through the runtime boundary. */
   candidateSnapshot(): Promise<CandidateWorkspaceSnapshot>;
+  /** Absolute execution root (resolved provider cwd) for runtime-owned working files such as member handoff notes. */
+  executionRoot(): string;
   executionPackageScripts(): Promise<Record<string, string>>;
   persist(): Promise<void>;
   emit(type: string, nodeId?: string, detail?: JsonValue): Promise<void>;
