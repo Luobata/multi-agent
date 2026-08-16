@@ -43,16 +43,33 @@ function hasCandidateIdentityAttestation(value: JsonValue | undefined, expected:
   });
 }
 
+function hasBrowserE2eEvidence(value: JsonValue | undefined): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const evidence = value.e2eEvidence;
+  return Array.isArray(evidence) && evidence.some((entry) => (
+    entry !== null
+    && typeof entry === "object"
+    && !Array.isArray(entry)
+    && entry.method === "browser"
+    && typeof entry.observed === "string"
+    && entry.observed.trim().length > 0
+  ));
+}
+
 export function validateConflictRetestEvidence(output: JsonValue | undefined, expected: ConflictRetestEvidence): string[] {
   // Project test roles use strict, versioned output schemas. Some schemas expose
   // identity fields directly; the standard tester schema intentionally allows
   // only verdict/summary/e2eEvidence/risks. A canonical identity attestation in
   // summary keeps that schema satisfiable while remaining exact and unambiguous.
-  if (hasCandidateIdentityAttestation(output, expected)) return [];
   const issues: string[] = [];
-  for (const key of ["url", "sourceCommit", "candidateRevision"] as const) {
-    const values = stringsForKey(output, key);
-    if (!values.includes(expected[key])) issues.push(`${key} 未证明为受管候选值 ${expected[key]}`);
+  if (!hasBrowserE2eEvidence(output)) {
+    issues.push("e2eEvidence 未包含 observed 非空的 browser 验收证据");
+  }
+  if (!hasCandidateIdentityAttestation(output, expected)) {
+    for (const key of ["url", "sourceCommit", "candidateRevision"] as const) {
+      const values = stringsForKey(output, key);
+      if (!values.includes(expected[key])) issues.push(`${key} 未证明为受管候选值 ${expected[key]}`);
+    }
   }
   return issues;
 }
@@ -75,6 +92,7 @@ export function validateCandidateWorkspaceState(
 }
 
 export function classifyConflictRetestFailure(message: string, evidenceIssues: string[]): "environment-blocked" | "evidence-incomplete" | "product-failed" {
+  if (/\bMIDSCENE_ENVIRONMENT_BLOCKED\b/i.test(message)) return "environment-blocked";
   if (/econnrefused|eaddrinuse|enotfound|eacces|eperm|permission denied|sandbox|provider [^\n]{0,30}unavailable|socket|preview (?:server )?(?:unavailable|failed)|browser [^\n]{0,40}(?:unavailable|failed to (?:start|launch|connect))|health.?check|timeout|timed out|端口|环境(?:不可用|异常|失败)|预览(?:服务)?(?:不可用|失败|提前退出|超时)|无法.*预览|启动(?:失败|超时)|连接(?:失败|超时)/i.test(message)) {
     return "environment-blocked";
   }

@@ -499,7 +499,7 @@ describe("RunsPage delivery acceptance", () => {
   let root: Root;
   const fetchMock = vi.fn();
   const notify = vi.fn();
-  let deliveryStatus: "base" | "conflict" | "conflict-failed" | "evidence-failed" | "evidence-queued" | "retesting" | "kept" | "discarded" | "merged" = "base";
+  let deliveryStatus: "base" | "conflict" | "conflict-failed" | "conflict-env-blocked" | "conflict-evidence-incomplete" | "evidence-failed" | "evidence-queued" | "retesting" | "kept" | "discarded" | "merged" = "base";
   let heldMergePreview: Promise<{ ok: boolean; status: number; json: () => Promise<{ data: RunMergePreview }> }> | undefined;
 
   beforeEach(async () => {
@@ -519,7 +519,10 @@ describe("RunsPage delivery acceptance", () => {
       if (url.startsWith("/api/runs?")) return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [deliveryRun] }) });
       if (url.endsWith("/merge-preview")) {
         if (heldMergePreview) return heldMergePreview;
-        const preview = deliveryStatus === "conflict" || deliveryStatus === "conflict-failed"
+        const failedConflict = deliveryStatus === "conflict-failed"
+          || deliveryStatus === "conflict-env-blocked"
+          || deliveryStatus === "conflict-evidence-incomplete";
+        const preview = deliveryStatus === "conflict" || failedConflict
           ? {
             ...eligiblePreview,
             status: "conflict" as const,
@@ -531,12 +534,24 @@ describe("RunsPage delivery acceptance", () => {
               sourceBranch: "codex/run-delivery-ui-1",
               sourceCommit: "source",
               targetBranch: "main",
-              ...(deliveryStatus === "conflict-failed" ? {
+              ...(failedConflict ? {
                 conflictResolution: {
                   status: "failed" as const,
                   targetCommit: "target",
                   updatedAt: "2026-08-06T06:05:00.000Z",
-                  message: "原领队没有完成冲突处理，候选仍保留在待合入队列。"
+                  message: "原领队没有完成冲突处理，候选仍保留在待合入队列。",
+                  ...(deliveryStatus === "conflict-env-blocked" ? {
+                    failureClass: "environment-blocked" as const,
+                    leaderPlanRunId: "run-leader-plan-1",
+                    executionRoleId: "fullstack-developer",
+                    resolutionRunId: "run-engineer-fix-1"
+                  } : {}),
+                  ...(deliveryStatus === "conflict-evidence-incomplete" ? {
+                    failureClass: "evidence-incomplete" as const,
+                    leaderPlanRunId: "run-leader-plan-1",
+                    executionRoleId: "fullstack-developer",
+                    resolutionRunId: "run-engineer-fix-1"
+                  } : {})
                 }
               } : {}),
               message: "CONFLICT (content): Merge conflict in client/src/RunsPage.tsx"
@@ -948,6 +963,77 @@ describe("RunsPage delivery acceptance", () => {
     await act(async () => { retry?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/merge-conflict-retry") && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("原领队"), "success");
+  });
+
+  it("bridges the terminal Run stamp with the still-open merge queue state", async () => {
+    deliveryStatus = "conflict-evidence-incomplete";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="conflict-evidence-incomplete" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.textContent).toContain("Run 已完成 ≠ 交付完成；候选仍在待合入队列，需要你的处理。");
+  });
+
+  it("does not show the delivery bridge once the delivery has reached a terminal state", async () => {
+    deliveryStatus = "merged";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="merged" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.textContent).not.toContain("Run 已完成 ≠ 交付完成");
+  });
+
+  it("labels an environment-blocked conflict retry as preview restart plus acceptance rerun", async () => {
+    deliveryStatus = "conflict-env-blocked";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="conflict-env-blocked" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector(".run-delivery-callout")?.textContent).toContain("候选预览环境不可用");
+    const retry = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent === "重启候选预览并重跑验收");
+    expect(retry).toBeTruthy();
+    await act(async () => { retry?.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(fetchMock.mock.calls.some(([input, init]) => String(input).endsWith("/merge-conflict-retry") && (init as RequestInit | undefined)?.method === "POST")).toBe(true);
+  });
+
+  it("labels an evidence-incomplete retry as evidence recollection and folds the raw technical message", async () => {
+    deliveryStatus = "conflict-evidence-incomplete";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="conflict-evidence-incomplete" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .some((button) => button.textContent === "重新收集证据并验收")).toBe(true);
+    expect(container.querySelector(".run-delivery-callout")?.textContent).toContain("验收证据不完整或与当前候选不一致");
+    const techDetail = container.querySelector(".run-delivery-callout details.run-delivery-tech-detail");
+    expect(techDetail?.querySelector("summary")?.textContent).toBe("技术详情");
+    expect(techDetail?.textContent).toContain("CONFLICT (content)");
+  });
+
+  it("links conflict-resolution runs to their dossiers and offers explicit keep/discard escape", async () => {
+    deliveryStatus = "conflict-evidence-incomplete";
+    await act(async () => {
+      root.render(<RunsPage notify={notify} activityRevision="conflict-evidence-incomplete" />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector('a[href="#/runs/run-leader-plan-1"]')).toBeTruthy();
+    expect(container.querySelector('a[href="#/runs/run-engineer-fix-1"]')).toBeTruthy();
+    const escape = container.querySelector(".run-delivery-escape");
+    expect(escape?.textContent).toContain("如果多次重试仍失败");
+    const keepLink = Array.from(escape?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .find((button) => button.textContent === "保留候选");
+    expect(keepLink).toBeTruthy();
+    await act(async () => { keepLink?.click(); });
+    expect(container.querySelector("dialog")?.textContent).toContain("人工保留候选交付");
+    const cancel = Array.from(container.querySelectorAll<HTMLButtonElement>("dialog button"))
+      .find((button) => button.textContent === "取消");
+    await act(async () => { cancel?.click(); });
+    const discardLink = Array.from(container.querySelectorAll<HTMLButtonElement>(".run-delivery-escape button"))
+      .find((button) => button.textContent === "丢弃候选");
+    expect(discardLink).toBeTruthy();
+    await act(async () => { discardLink?.click(); });
+    expect(container.querySelector("dialog")?.textContent).toContain("候选 worktree 将被物理清理");
   });
 
   it("derives board acceptance from the server eligible result, not the legacy acceptedVerdict", () => {

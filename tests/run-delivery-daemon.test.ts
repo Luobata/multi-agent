@@ -523,10 +523,10 @@ describe("run delivery daemon routes", () => {
       },
       mergeValidation: {
         required: true,
-        status: "failed",
+        status: "passed",
         runId: "stale-validation-run",
-        targetCommit: queued.delivery.baseCommit,
-        message: "Stale validation failure.",
+        targetCommit: "stale-target-commit",
+        message: "Stale validation passed for an older target.",
         updatedAt: new Date().toISOString()
       }
     }));
@@ -574,9 +574,16 @@ describe("run delivery daemon routes", () => {
       delivery: {
         sourceCommit: queued.delivery.sourceCommit,
         conflictResolution: { status: "failed", targetCommit: queued.delivery.baseCommit },
+        mergeValidation: {
+          required: true,
+          status: "failed",
+          targetCommit: queued.delivery.baseCommit
+        },
         message: expect.stringContaining("候选仍在待合入队列")
       }
     });
+    expect(stopped?.delivery?.mergeValidation?.runId).toBeUndefined();
+    expect(stopped?.delivery?.mergeValidation?.targetCommit).not.toBe("stale-target-commit");
     expect(git(repo, "rev-parse", "HEAD")).toBe(queued.delivery.baseCommit);
   }, 15_000);
 });

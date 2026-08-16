@@ -4144,6 +4144,14 @@ input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px
 .run-delivery-callout--discarded { border-color: var(--stamp-red-ink); background: var(--danger-bg); }
 .run-delivery-callout--queued { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--paper)); }
 .run-delivery-callout--retesting { border-color: var(--seal-amber); background: var(--seal-amber-bg); }
+/* 长 hash/URL/错误 token 无断点，callout 文本必须允许任意断行，否则 375px 下横向撑破。 */
+.run-delivery-callout p, .run-delivery-callout small, .run-delivery-callout code { overflow-wrap: anywhere; }
+.run-delivery-bridge { margin: var(--space-3) var(--space-6) 0; padding: var(--space-2) var(--space-3); border-left: 3px solid var(--seal-amber); background: var(--seal-amber-bg); color: var(--ink-2); font-size: var(--text-sm); line-height: 1.6; }
+.run-delivery-rootcause { font-weight: 600; color: var(--ink); }
+.run-delivery-tech-detail { margin-top: var(--space-2); }
+.run-delivery-tech-detail > summary { cursor: pointer; color: var(--ink-3); font-size: var(--text-xs); }
+.run-delivery-escape { font-size: var(--text-xs); color: var(--ink-3); }
+.run-delivery-escape-link { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 .run-delivery-path { display: grid; gap: var(--space-2); min-width: 0; }
 .run-delivery-path > code { overflow-wrap: anywhere; }
 .run-delivery-path-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }

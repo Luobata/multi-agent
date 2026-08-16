@@ -555,6 +555,26 @@ function CopyButton({ value, label, className = "button ghost" }: { value: strin
   </span>;
 }
 
+/** 冲突处理失败的一句人话根因，由服务端 failureClass 派生；技术细节另走折叠区。 */
+function conflictFailureRootCause(failureClass: string | undefined): string {
+  if (failureClass === "environment-blocked") return "根因：候选预览环境不可用（预览服务无法访问或已停止），验收拿不到真实页面。";
+  if (failureClass === "evidence-incomplete") return "根因：验收证据不完整或与当前候选不一致，系统无法证明这次交付可以放行。";
+  if (failureClass === "product-failed") return "根因：冲突修复后的独立回归发现了产品问题。";
+  return "根因：自动冲突处理未通过；候选 worktree 与证据已完整保留。";
+}
+
+/** 失败重试按钮文案与按钮实际行为对齐：环境阻塞时重试会重启候选预览并重跑验收。 */
+function conflictRetryLabel(failureClass: string | undefined): string {
+  if (failureClass === "environment-blocked") return "重启候选预览并重跑验收";
+  if (failureClass === "evidence-incomplete") return "重新收集证据并验收";
+  return "重新让原领队处理冲突";
+}
+
+/** 冲突处理链路上的 Run 引用一律给独立运行卷宗深链，而不是不可点击的纯文本。 */
+function ConflictRunLink({ label, runId }: { label: string; runId: string }) {
+  return <small>{label}<a href={`#/runs/${encodeURIComponent(runId)}`}><code>{runId}</code></a></small>;
+}
+
 function RunDeliveryPanel({
   preview,
   loading,
@@ -654,7 +674,22 @@ function RunDeliveryPanel({
                     : undefined;
   const diff = preview.changes.unifiedDiff;
   return <div className="run-delivery-panel">
-    {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert"><strong>{conflictResolution?.status === "resolving" ? "原领队正在规划并委派冲突修复" : conflictResolution?.status === "retesting" ? "冲突已解决，正在回跑测试" : conflictResolution?.status === "leader-review" ? "测试已通过，等待原领队放行" : conflictResolution?.status === "failed" ? (conflictResolution.failureClass === "environment-blocked" ? "候选环境阻塞，可重试验收" : conflictResolution.failureClass === "evidence-incomplete" ? "候选证据不完整，不得放行" : "候选产品回归失败") : "目标分支存在合并冲突"}</strong><p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p>{conflictResolution?.leaderPlanRunId && <small>领队计划 Run：<code>{conflictResolution.leaderPlanRunId}</code></small>}{conflictResolution?.executionRoleId && <small>执行角色：<code>{conflictResolution.executionRoleId}</code></small>}{conflictResolution?.resolutionRunId && <small>工程修复 Run：<code>{conflictResolution.resolutionRunId}</code></small>}{conflictResolution?.testRunId && <small>复测 Run：<code>{conflictResolution.testRunId}</code></small>}{conflictResolution?.testedUrl && <small>受管候选：<code>{conflictResolution.testedUrl}</code></small>}{conflictResolution?.leaderReviewRunId && <small>领队复验 Run：<code>{conflictResolution.leaderReviewRunId}</code></small>}{conflictResolution?.status === "failed" && <button type="button" className="button secondary" disabled={conflictRetrying} aria-busy={conflictRetrying} onClick={onRetryConflict}>{conflictRetrying ? "正在重新排队…" : "重新让原领队处理冲突"}</button>}{conflictRetryError && <small className="inline-error">{conflictRetryError}</small>}</div>}
+    {conflict && <div className="run-delivery-callout run-delivery-callout--conflict" role="alert">
+      <strong>{conflictResolution?.status === "resolving" ? "原领队正在规划并委派冲突修复" : conflictResolution?.status === "retesting" ? "冲突已解决，正在回跑测试" : conflictResolution?.status === "leader-review" ? "测试已通过，等待原领队放行" : conflictResolution?.status === "failed" ? (conflictResolution.failureClass === "environment-blocked" ? "候选环境阻塞，可重试验收" : conflictResolution.failureClass === "evidence-incomplete" ? "候选证据不完整，不得放行" : "候选产品回归失败") : "目标分支存在合并冲突"}</strong>
+      {conflictResolution?.status === "failed" && <p className="run-delivery-rootcause">{conflictFailureRootCause(conflictResolution.failureClass)}</p>}
+      {conflictResolution?.status === "failed"
+        ? <details className="run-delivery-tech-detail"><summary>技术详情</summary><p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p></details>
+        : <p>{preview.delivery?.message ?? "候选仍在待合入队列，原 worktree 与证据均已保留。"}</p>}
+      {conflictResolution?.leaderPlanRunId && <ConflictRunLink label="领队计划 Run：" runId={conflictResolution.leaderPlanRunId} />}
+      {conflictResolution?.executionRoleId && <small>执行角色：<code>{conflictResolution.executionRoleId}</code></small>}
+      {conflictResolution?.resolutionRunId && <ConflictRunLink label="工程修复 Run：" runId={conflictResolution.resolutionRunId} />}
+      {conflictResolution?.testRunId && <ConflictRunLink label="复测 Run：" runId={conflictResolution.testRunId} />}
+      {conflictResolution?.testedUrl && <small>受管候选：<code>{conflictResolution.testedUrl}</code></small>}
+      {conflictResolution?.leaderReviewRunId && <ConflictRunLink label="领队复验 Run：" runId={conflictResolution.leaderReviewRunId} />}
+      {conflictResolution?.status === "failed" && <button type="button" className="button secondary" disabled={conflictRetrying} aria-busy={conflictRetrying} onClick={onRetryConflict}>{conflictRetrying ? "正在重新排队…" : conflictRetryLabel(conflictResolution.failureClass)}</button>}
+      {conflictResolution?.status === "failed" && <p className="run-delivery-escape">如果多次重试仍失败，可以{actionable ? <button type="button" className="run-delivery-escape-link" onClick={onOpenKeep}>保留候选</button> : "保留候选"}或{actionable ? <button type="button" className="run-delivery-escape-link" onClick={onOpenDiscard}>丢弃候选</button> : "丢弃候选"}结束本次交付。</p>}
+      {conflictRetryError && <small className="inline-error">{conflictRetryError}</small>}
+    </div>}
     {queued && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>已进入待合入队列</strong><p>{preview.delivery?.message ?? "同一目标分支上的候选会按批准顺序串行处理。"}</p></div>}
     {retesting && <div className="run-delivery-callout run-delivery-callout--retesting" role="status"><strong>{conflictResolution ? "冲突处理 2/3 · 正在重新验收" : "合入检查 1/2 · 目标变化后正在重测"}</strong><p>{preview.delivery?.message ?? "系统正在隔离环境执行独立回归。"}</p><small>{conflictResolution ? "当前尚未写入目标分支；独立测试通过后还需原领队复验，放行后才会自动合入。" : "当前尚未写入目标分支；独立回归通过后才会进入真正的合入阶段。"}</small></div>}
     {merging && <div className="run-delivery-callout run-delivery-callout--queued" role="status"><strong>合入处理 3/3 · 正在写入目标分支</strong><p>{preview.delivery?.message ?? "测试与复验已经通过，正在写入已批准的目标分支。"}</p></div>}
@@ -1435,11 +1470,18 @@ export function RunsPage({ notify, activityRevision = "", focusedRunId = "", pen
   const canCancelInvocation = controlActions.includes("cancel");
   const needsGoalAction = controlActions.some((action) => action === "review-delivery"
     || action === "retry-successor" || action === "restart-successor" || action === "abandon-goal");
+  // 绿色「完成」Stamp 只陈述 Run 终态；交付仍在队列/处理中时，必须补一句桥接避免误读为全部结束。
+  const selectedDeliveryStatus = mergePreview && mergePreview.runId === selected?.id
+    ? (mergePreview.delivery?.status ?? mergePreview.status)
+    : undefined;
+  const deliveryNeedsHandling = Boolean(selectedDeliveryStatus
+    && ["queued-for-merge", "retesting", "merging", "conflict", "returned-to-acceptance"].includes(selectedDeliveryStatus));
   return <div className={`page-grid page-grid--runs${mode === "embedded" ? " page-grid--runs-embedded" : ""}`}>
     <aside className="record-list"><header className="list-header"><h1>运行卷宗</h1></header><div className="run-filter-bar"><div data-testid="run-type-filter"><SelectControl ariaLabel="按类型筛选运行卷宗" value={categoryFilter} options={[{ value: "all", label: "全部类型" }, { value: "single", label: "单任务" }, { value: "graph", label: "Graph 编排" }, { value: "supervisor", label: "领队协作" }]} onChange={(value) => setCategoryFilter(value as typeof categoryFilter)} /></div><div data-testid="run-project-filter"><SelectControl ariaLabel="按项目筛选运行卷宗" value={projectFilter} options={[{ value: "all", label: "全部项目" }, { value: "none", label: "无项目" }, ...projectOptions.map((project) => ({ value: project, label: project }))]} onChange={(value) => setProjectFilter(value)} /></div></div><div className="record-scroll run-list">{visibleRuns.map((run) => <button key={run.id} id={run.id} className={`run-card ${selected?.id === run.id ? "selected" : ""}`} onClick={() => { setSelectedId(run.id); onSelectRun?.(run.id); }}><div><code>{run.id}</code><strong>{run.workflow}</strong><small>{formatTime(run.createdAt)} · {run.architecture} · {Object.keys(run.nodes).length} 节点</small><div className="run-card-tags">{run.category && <span className={`run-category-tag run-category-tag--${run.category}`}>{CATEGORY_LABELS[run.category]}</span>}{run.project && <span className="run-project-chip">{run.project}</span>}</div></div><Stamp status={run.status} /></button>)}{!loading && visibleRuns.length === 0 && <div className="mini-empty">{runs.length === 0 ? "还没有 Run 证据。" : "没有符合筛选条件的卷宗。"}</div>}</div><footer className="list-footer"><span>{visibleRuns.length}/{runs.length} 份卷宗</span><span>READ ONLY</span></footer></aside>
     <main className="detail-pane">{showDossierSkeleton ? <div className="skeleton-page" aria-label="正在调取运行卷宗"><i /><i /><i /></div> : targetMissing ? <EmptyState title="运行卷宗正在建立" action={<><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</>}>Run {pendingRunId} 尚未出现在本地 Run Store，可稍后重试。</EmptyState> : listError || detailError ? <section className="run-detail-error" role="alert"><h2>运行卷宗加载失败</h2><p>{listError || detailError}</p><code>Run ID · {requestedRunId || selectedId || "未提供"}</code><div><button type="button" disabled={retrying} onClick={retry}>{retrying ? "重试中…" : "重试"}</button>{returnAction}</div></section> : !selected ? <EmptyState title={directed ? "无法定位运行卷宗" : "尚无运行卷宗"}>{directed ? `无法找到目标 Run ${requestedRunId}，且不会回退到其他运行卷宗。` : "直接交办员工或签发一次 Workflow 后，这里会出现不可变的执行记录。"}</EmptyState> : <div className="dossier run-dossier">
       {fromStudio && returnAction}
       <header className="dossier-cover"><div className="file-index"><span>RUN EVIDENCE RECORD</span><code>{selected.id}</code></div><div className="dossier-title-row"><div className="workflow-mark" aria-hidden="true">证</div><div><h2 ref={dossierTitleRef} tabIndex={-1} aria-label={`${selected.workflow}，Run ${selected.id} 运行卷宗`}>{selected.workflow}</h2><p>{selected.status === "blocked" ? "流程已完成，但存在业务阻塞结论。" : selected.status === "failed" ? "执行发生技术故障，可查看原始输出与错误证据。" : selected.status === "running" ? "执行仍在进行。" : "流程完成，证据已归档。"}</p></div><Stamp status={selected.status} /></div></header>
+      {deliveryNeedsHandling && <p className="run-delivery-bridge" role="status">Run 已完成 ≠ 交付完成；候选仍在待合入队列，需要你的处理。</p>}
       {(canCancelInvocation || needsGoalAction || selected.invocation?.status === "cancellation-requested") && <section className="run-control-bar" aria-label="本次运行的可用操作">
         <div><span>CONTROL PLANE · NEXT ACTION</span><strong>{selected.invocation?.status === "cancellation-requested"
           ? "正在安全停止"

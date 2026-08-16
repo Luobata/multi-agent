@@ -9115,6 +9115,7 @@ export class WorkbenchService {
     const message = error instanceof Error ? error.message : String(error);
     const failureClass = (error as { failureClass?: ConflictFailureClass }).failureClass
       ?? classifyConflictRetestFailure(message, []);
+    const timestamp = now();
     await transitionRunDelivery(runDir, id, "conflict", {
       message: `AI 冲突处理未通过：${message}；候选仍在待合入队列，原 worktree 与证据均已保留。`,
       ...(resolution ? {
@@ -9122,8 +9123,15 @@ export class WorkbenchService {
           ...resolution,
           status: "failed",
           failureClass,
-          updatedAt: now(),
+          updatedAt: timestamp,
           message
+        },
+        mergeValidation: {
+          required: true,
+          status: "failed",
+          targetCommit: resolution.targetCommit,
+          message,
+          updatedAt: timestamp
         }
       } : {})
     });

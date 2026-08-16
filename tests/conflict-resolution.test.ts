@@ -64,11 +64,21 @@ describe("merge conflict leader protocol", () => {
 
   it("deterministically rejects evidence from main or another revision", () => {
     const expected = { url: "http://127.0.0.1:49231/", sourceCommit: "source-1", candidateRevision: "revision-1" };
-    expect(validateConflictRetestEvidence({ ...expected, verdict: "pass" }, expected)).toEqual([]);
-    const issues = validateConflictRetestEvidence({ ...expected, url: "http://127.0.0.1:4318/", candidateRevision: "main" }, expected);
+    const browserEvidence = { e2eEvidence: [{ method: "browser", observed: "Candidate is visibly correct." }] };
+    expect(validateConflictRetestEvidence({ ...expected, ...browserEvidence, verdict: "pass" }, expected)).toEqual([]);
+    const issues = validateConflictRetestEvidence({
+      ...expected,
+      ...browserEvidence,
+      url: "http://127.0.0.1:4318/",
+      candidateRevision: "main"
+    }, expected);
     expect(issues).toHaveLength(2);
     expect(classifyConflictRetestFailure("passed", issues)).toBe("evidence-incomplete");
     expect(classifyConflictRetestFailure("browser environment unavailable", [])).toBe("environment-blocked");
+    expect(classifyConflictRetestFailure(
+      "MIDSCENE_ENVIRONMENT_BLOCKED: connect produced no result",
+      ["受管候选 URL 没有真实访问记录"]
+    )).toBe("environment-blocked");
     expect(classifyConflictRetestFailure("breadcrumb is missing", [])).toBe("product-failed");
     expect(classifyConflictRetestFailure("browser shows missing checkout button", [])).toBe("product-failed");
     expect(classifyConflictRetestFailure("browser failed to launch", ["url 未证明"])).toBe("environment-blocked");
@@ -83,20 +93,46 @@ describe("merge conflict leader protocol", () => {
     };
     expect(validateConflictRetestEvidence({
       verdict: "pass",
-      summary: `Pass。CANDIDATE_IDENTITY url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`
+      summary: `Pass。CANDIDATE_IDENTITY url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`,
+      e2eEvidence: [{ method: "browser", observed: "Candidate page loaded and the interaction passed." }]
     }, expected)).toEqual([]);
     expect(validateConflictRetestEvidence({
       verdict: "pass",
-      summary: `url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`
+      summary: `url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`,
+      e2eEvidence: [{ method: "browser", observed: "Candidate page loaded and the interaction passed." }]
     }, expected)).toEqual([]);
     expect(validateConflictRetestEvidence({
       verdict: "pass",
-      summary: `url=${expected.url}；url=http://127.0.0.1:4318/；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`
+      summary: `url=${expected.url}；url=http://127.0.0.1:4318/；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`,
+      e2eEvidence: [{ method: "browser", observed: "Candidate page loaded." }]
     }, expected)).toHaveLength(3);
     expect(validateConflictRetestEvidence({
       verdict: "pass",
-      summary: `url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=sha256:${"0".repeat(64)}。`
+      summary: `url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=sha256:${"0".repeat(64)}。`,
+      e2eEvidence: [{ method: "browser", observed: "Candidate page loaded." }]
     }, expected)).toHaveLength(3);
+  });
+
+  it("requires non-empty structured browser evidence in addition to candidate identity", () => {
+    const expected = {
+      url: "http://127.0.0.1:49166/?candidate-token=proof123",
+      sourceCommit: "cb557b3fa52cafc949dc2523a8f253868696bfd7",
+      candidateRevision: "sha256:996def400b586948f3ba6771a580d192de4e40d9cae3d4db384a51747954ceca"
+    };
+    const summary = `url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`;
+
+    expect(validateConflictRetestEvidence({ verdict: "pass", summary }, expected))
+      .toContain("e2eEvidence 未包含 observed 非空的 browser 验收证据");
+    expect(validateConflictRetestEvidence({
+      verdict: "pass",
+      summary,
+      e2eEvidence: [{ method: "http-behavior", observed: "GET returned 200." }]
+    }, expected)).toContain("e2eEvidence 未包含 observed 非空的 browser 验收证据");
+    expect(validateConflictRetestEvidence({
+      verdict: "pass",
+      summary,
+      e2eEvidence: [{ method: "browser", observed: "   " }]
+    }, expected)).toContain("e2eEvidence 未包含 observed 非空的 browser 验收证据");
   });
 
   it("binds pre-test and post-test workspace state to the persisted source commit", () => {
