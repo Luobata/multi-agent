@@ -165,6 +165,7 @@ import {
   LEADER_REVALIDATION_PASS,
   buildConflictExecutionRequest,
   buildConflictPlanningRequest,
+  buildConflictRetestRequest,
   buildLeaderRevalidationRequest,
   classifyConflictRetestFailure,
   hasExplicitDeliveryPass,
@@ -9304,17 +9305,13 @@ export class WorkbenchService {
           projectId,
           taskId,
           worktreePath,
-          [
-            "【冲突修复后原需求回归】",
-            `候选 Run：${id}`,
-            `唯一受管候选 URL：${candidatePreview.url}`,
-            `已 rebase 目标 commit：${resolution.targetCommit}`,
-            `冲突修复后候选 commit：${sourceCommit}`,
-            `候选 revision：${snapshot.revision}`,
-            "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。请在原候选 worktree 上执行独立测试，界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码或 Git 历史。",
-            `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${candidatePreview.url}；sourceCommit=${sourceCommit}；candidateRevision=${snapshot.revision}。`,
-            "服务端还会独立校验候选真实 GET、工作区 commit 与 revision；不得只复述身份而改用其他页面测试。测试、环境或证据有任一缺口必须返回 Block；只有可复现且证据充分才返回 Pass。"
-          ].join("\n"),
+          buildConflictRetestRequest({
+            runId: id,
+            url: candidatePreview.url,
+            targetCommit: resolution.targetCommit,
+            sourceCommit,
+            candidateRevision: snapshot.revision
+          }),
           "system:merge-conflict-retest"
         );
       } catch (error) {
@@ -9339,7 +9336,7 @@ export class WorkbenchService {
       if (testResult.status !== "passed" || evidenceIssues.length > 0) {
         throw conflictRevalidationFailure(
           `冲突修复后的独立测试未通过：${testResult.message}${evidenceIssues.length ? `；${evidenceIssues.join("；")}` : ""}`,
-          classifyConflictRetestFailure(testResult.message, evidenceIssues)
+          classifyConflictRetestFailure(testResult.message, evidenceIssues, testResult.output)
         );
       }
       if (!current.delivery) throw new Error("独立测试完成时交付记录丢失");

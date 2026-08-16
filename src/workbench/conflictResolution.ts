@@ -56,6 +56,28 @@ function hasBrowserE2eEvidence(value: JsonValue | undefined): boolean {
   ));
 }
 
+const REACHABILITY_PATTERN = /可达|可见|已连接|在线|rendered|reachable|connected/i;
+
+/**
+ * Detects a verdict that claims MIDSCENE_ENVIRONMENT_BLOCKED while its own browser
+ * evidence proves the candidate was reachable. Such a contradiction means the block
+ * is an interaction/product failure, not an environment failure.
+ */
+export function environmentBlockedClaimContradicted(output: JsonValue | undefined): boolean {
+  if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+  const summaries = stringsForKey(output, "summary");
+  if (!summaries.some((summary) => /\bMIDSCENE_ENVIRONMENT_BLOCKED\b/i.test(summary))) return false;
+  const evidence = output.e2eEvidence;
+  return Array.isArray(evidence) && evidence.some((entry) => (
+    entry !== null
+    && typeof entry === "object"
+    && !Array.isArray(entry)
+    && entry.method === "browser"
+    && typeof entry.observed === "string"
+    && REACHABILITY_PATTERN.test(entry.observed)
+  ));
+}
+
 export function validateConflictRetestEvidence(output: JsonValue | undefined, expected: ConflictRetestEvidence): string[] {
   // Project test roles use strict, versioned output schemas. Some schemas expose
   // identity fields directly; the standard tester schema intentionally allows
@@ -64,6 +86,9 @@ export function validateConflictRetestEvidence(output: JsonValue | undefined, ex
   const issues: string[] = [];
   if (!hasBrowserE2eEvidence(output)) {
     issues.push("e2eEvidence 未包含 observed 非空的 browser 验收证据");
+  }
+  if (environmentBlockedClaimContradicted(output)) {
+    issues.push("环境阻塞声明与浏览器可达证据矛盾");
   }
   if (!hasCandidateIdentityAttestation(output, expected)) {
     for (const key of ["url", "sourceCommit", "candidateRevision"] as const) {
@@ -91,8 +116,14 @@ export function validateCandidateWorkspaceState(
   return issues;
 }
 
-export function classifyConflictRetestFailure(message: string, evidenceIssues: string[]): "environment-blocked" | "evidence-incomplete" | "product-failed" {
-  if (/\bMIDSCENE_ENVIRONMENT_BLOCKED\b/i.test(message)) return "environment-blocked";
+export function classifyConflictRetestFailure(
+  message: string,
+  evidenceIssues: string[],
+  output?: JsonValue | undefined
+): "environment-blocked" | "evidence-incomplete" | "product-failed" {
+  if (/\bMIDSCENE_ENVIRONMENT_BLOCKED\b/i.test(message) && !environmentBlockedClaimContradicted(output)) {
+    return "environment-blocked";
+  }
   if (/econnrefused|eaddrinuse|enotfound|eacces|eperm|permission denied|sandbox|provider [^\n]{0,30}unavailable|socket|preview (?:server )?(?:unavailable|failed)|browser [^\n]{0,40}(?:unavailable|failed to (?:start|launch|connect))|health.?check|timeout|timed out|端口|环境(?:不可用|异常|失败)|预览(?:服务)?(?:不可用|失败|提前退出|超时)|无法.*预览|启动(?:失败|超时)|连接(?:失败|超时)/i.test(message)) {
     return "environment-blocked";
   }
@@ -186,5 +217,30 @@ export function buildLeaderRevalidationRequest(input: {
     `独立测试结论：${input.testMessage}`,
     "运行核心已经验证 worktree 干净、目标 commit 是候选祖先、merge-tree 无冲突，独立 test-engineer 也已回跑原需求相关测试。现在请作为原需求领队核对冲突取舍是否仍满足原需求、是否错误覆盖目标分支新行为，以及测试证据是否足以放行。此阶段只审阅，不再修改代码、Git 历史或依赖。",
     `只有确认可以自动合入时，最终单独输出 ${LEADER_REVALIDATION_PASS}；否则输出 LEADER_REVALIDATION: BLOCK 并说明缺失证据或风险。`
+  ].join("\n");
+}
+
+export function buildConflictRetestRequest(input: {
+  runId: string;
+  url: string;
+  targetCommit: string;
+  sourceCommit: string;
+  candidateRevision: string;
+}): string {
+  return [
+    "【冲突修复后原需求回归】",
+    `候选 Run：${input.runId}`,
+    `唯一受管候选 URL：${input.url}`,
+    `已 rebase 目标 commit：${input.targetCommit}`,
+    `冲突修复后候选 commit：${input.sourceCommit}`,
+    `候选 revision：${input.candidateRevision}`,
+    "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。请在原候选 worktree 上执行独立测试，界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码或 Git 历史。",
+    `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${input.url}；sourceCommit=${input.sourceCommit}；candidateRevision=${input.candidateRevision}。`,
+    "服务端还会独立校验候选真实 GET、工作区 commit 与 revision；不得只复述身份而改用其他页面测试。测试、环境或证据有任一缺口必须返回 Block；只有可复现且证据充分才返回 Pass。",
+    "接地要求（verdict 必须与自身证据一致，不得自相矛盾）：",
+    "- 关键交互后必须用 Midscene assert 验证期望状态，并把 assert 结果写入 e2eEvidence 的 observed。",
+    "- verdict 必须以最终截图与 Midscene 报告的最终状态为准；assert 通过即交互证据充分，不得以\"证据缺口\"Block。",
+    "- MIDSCENE_ENVIRONMENT_BLOCKED 仅用于候选 URL 无法连接或页面无法渲染（连接拒绝、空白页、核心离线）；页面可达但交互失败属于产品问题，不得标记为 environment-blocked。",
+    "- summary 的事实陈述必须与 e2eEvidence 一致，不得引用与结论矛盾的截图或报告作为证据。"
   ].join("\n");
 }

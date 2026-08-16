@@ -5,7 +5,9 @@ import {
   LEADER_REVALIDATION_PASS,
   buildConflictExecutionRequest,
   buildConflictPlanningRequest,
+  buildConflictRetestRequest,
   buildLeaderRevalidationRequest,
+  environmentBlockedClaimContradicted,
   hasExplicitDeliveryPass,
   classifyConflictRetestFailure,
   validateCandidateWorkspaceState,
@@ -144,5 +146,102 @@ describe("merge conflict leader protocol", () => {
       sourceCommit: "source-1",
       revision: "sha256:one"
     })[0]).toContain("测试期间变化");
+  });
+});
+
+describe("conflict retest grounding", () => {
+  const retestInput = {
+    runId: "run-conflict-1",
+    url: "http://127.0.0.1:49231/?candidate-token=proof123",
+    targetCommit: "abc123",
+    sourceCommit: "cb557b3fa52cafc949dc2523a8f253868696bfd7",
+    candidateRevision: "sha256:996def400b586948f3ba6771a580d192de4e40d9cae3d4db384a51747954ceca"
+  };
+
+  it("detects a contradiction when MIDSCENE_ENVIRONMENT_BLOCKED is claimed but browser evidence proves reachability", () => {
+    const output = {
+      verdict: "block",
+      summary: "恢复会话仍停在详情页 MIDSCENE_ENVIRONMENT_BLOCKED",
+      e2eEvidence: [{ method: "browser", observed: "页面可达，已回到项目列表页" }]
+    };
+    expect(environmentBlockedClaimContradicted(output)).toBe(true);
+  });
+
+  it("does not detect a contradiction when browser observed lacks reachability language", () => {
+    const output = {
+      verdict: "block",
+      summary: "MIDSCENE_ENVIRONMENT_BLOCKED: connect produced no result",
+      e2eEvidence: [{ method: "browser", observed: "页面停留在详情页" }]
+    };
+    expect(environmentBlockedClaimContradicted(output)).toBe(false);
+  });
+
+  it("does not detect a contradiction when summary lacks MIDSCENE_ENVIRONMENT_BLOCKED", () => {
+    const output = {
+      verdict: "block",
+      summary: "交互失败，面包屑未点击",
+      e2eEvidence: [{ method: "browser", observed: "页面可达" }]
+    };
+    expect(environmentBlockedClaimContradicted(output)).toBe(false);
+    expect(environmentBlockedClaimContradicted(undefined)).toBe(false);
+  });
+
+  it("appends a contradiction issue in validateConflictRetestEvidence", () => {
+    const expected = {
+      url: retestInput.url,
+      sourceCommit: retestInput.sourceCommit,
+      candidateRevision: retestInput.candidateRevision
+    };
+    const output = {
+      verdict: "block",
+      summary: `MIDSCENE_ENVIRONMENT_BLOCKED。CANDIDATE_IDENTITY url=${expected.url}；sourceCommit=${expected.sourceCommit}；candidateRevision=${expected.candidateRevision}。`,
+      e2eEvidence: [{ method: "browser", observed: "页面可达，最终截图显示项目列表页" }]
+    };
+    const issues = validateConflictRetestEvidence(output, expected);
+    expect(issues).toContain("环境阻塞声明与浏览器可达证据矛盾");
+  });
+
+  it("skips environment-blocked classification when the claim is contradicted", () => {
+    const output = {
+      verdict: "block",
+      summary: "恢复会话仍停在详情页，未执行目标面包屑点击 MIDSCENE_ENVIRONMENT_BLOCKED",
+      e2eEvidence: [{ method: "browser", observed: "页面可达，已回到项目列表页" }]
+    };
+    // With evidence issues → evidence-incomplete, not environment-blocked.
+    expect(classifyConflictRetestFailure("恢复会话仍停在详情页 MIDSCENE_ENVIRONMENT_BLOCKED", ["证据缺口"], output))
+      .toBe("evidence-incomplete");
+    // Without evidence issues → product-failed, not environment-blocked.
+    expect(classifyConflictRetestFailure("恢复会话仍停在详情页 MIDSCENE_ENVIRONMENT_BLOCKED", [], output))
+      .toBe("product-failed");
+  });
+
+  it("preserves environment-blocked classification when the claim is not contradicted", () => {
+    // No output at all (2-arg call) → environment-blocked.
+    expect(classifyConflictRetestFailure("MIDSCENE_ENVIRONMENT_BLOCKED: connect produced no result", []))
+      .toBe("environment-blocked");
+    // Output present but browser evidence lacks reachability language → environment-blocked.
+    const nonContradicted = {
+      verdict: "block",
+      summary: "MIDSCENE_ENVIRONMENT_BLOCKED",
+      e2eEvidence: [{ method: "browser", observed: "页面停留在详情页" }]
+    };
+    expect(classifyConflictRetestFailure("MIDSCENE_ENVIRONMENT_BLOCKED", [], nonContradicted))
+      .toBe("environment-blocked");
+  });
+
+  it("builds a retest request with grounding requirements and preserves original constraints", () => {
+    const prompt = buildConflictRetestRequest(retestInput);
+    // Four new grounding requirements (key phrases).
+    expect(prompt).toContain("assert");
+    expect(prompt).toContain("最终状态为准");
+    expect(prompt).toContain("MIDSCENE_ENVIRONMENT_BLOCKED 仅用于");
+    expect(prompt).toContain("一致");
+    // Original constraints preserved.
+    expect(prompt).toContain("唯一受管候选 URL");
+    expect(prompt).toContain("CANDIDATE_IDENTITY");
+    expect(prompt).toContain("不得安装依赖");
+    expect(prompt).toContain(retestInput.url);
+    expect(prompt).toContain(retestInput.sourceCommit);
+    expect(prompt).toContain(retestInput.candidateRevision);
   });
 });
