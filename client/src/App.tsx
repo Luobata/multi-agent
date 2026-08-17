@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import { DaemonGate, Icon, Modal } from "./components";
+import { Breadcrumb, DaemonGate, Icon, Modal, type BreadcrumbItem } from "./components";
 import { dashboardService } from "./dashboard/service";
 import { ErrorBlock, SkeletonBlock } from "./dashboard/view";
 import type { ActivityEvent, ActivitySnapshot, Bootstrap, HumanDecisionRequest } from "./types";
@@ -180,6 +180,9 @@ export function AppNotice({ notice, onClose, onRetry }: {
 export function App() {
   const [route, setRoute] = useState<PageRoute>(pageFromHash);
   const page = route.page;
+  const routeKey = [page, route.spaceId, route.requirementId, route.runId, route.recordId, route.section].map((part) => part ?? "").join("|");
+  const previousRouteKey = useRef(routeKey);
+  const mainContentRef = useRef<HTMLDivElement>(null);
   const [data, setData] = useState<Bootstrap>(emptyBootstrap);
   const [daemon, setDaemon] = useState<"checking" | "online" | "offline">("checking");
   const [activityStream, setActivityStream] = useState<"connecting" | "live" | "reconnecting" | "offline">("connecting");
@@ -283,6 +286,18 @@ export function App() {
     window.addEventListener("hashchange", update);
     return () => window.removeEventListener("hashchange", update);
   }, []);
+  useEffect(() => {
+    if (previousRouteKey.current === routeKey) return;
+    previousRouteKey.current = routeKey;
+    const mainContent = mainContentRef.current;
+    if (!mainContent) return;
+    try {
+      mainContent.focus({ preventScroll: true });
+    } catch {
+      // Older browsers only support the parameterless focus() overload.
+      mainContent.focus();
+    }
+  }, [routeKey]);
   useEffect(() => {
     const hash = window.location.hash || "#dashboard";
     const key = `${SCROLL_MEMORY_PREFIX}${hash}`;
@@ -432,6 +447,16 @@ export function App() {
   const activeNav: Page = page === "project" ? "projects" : page === "requirement" ? "board" : page;
   const [moreOpen, setMoreOpen] = useState(false);
   const commandItems = [...nav, ...utilityNav];
+  const topLabel = page === "employees" ? "员工档案" : page === "projects" ? "项目" : page === "skills" ? "Skills" : page === "workflows" ? "协作编排" : page === "runs" ? "运行卷宗" : page === "publications" ? "调用包" : nav.find((item) => item.id === page)?.label ?? page;
+  const recordLabel = route.recordId && (page === "employees" ? data.employees.find((item) => item.id === route.recordId)?.identity.displayName : page === "skills" ? data.skills.find((item) => item.id === route.recordId)?.displayName : page === "publications" ? data.publications.find((item) => item.id === route.recordId)?.name : route.recordId);
+  const projectLabel = route.spaceId && data.projects.find((item) => item.id === route.spaceId)?.name;
+  const breadcrumbItems: BreadcrumbItem[] = page === "project"
+    ? [{ label: "项目", href: "#projects" }, { label: projectLabel ?? route.spaceId!, current: true }]
+    : page === "board" ? [{ label: "项目", href: "#projects" }, { label: projectLabel ?? route.spaceId ?? "项目不可用", ...(route.spaceId ? { href: `#projects/${encodeURIComponent(route.spaceId)}` } : { unavailableReason: "缺少项目 ID" }) }, { label: "需求看板", current: true }]
+    : page === "requirement" ? [{ label: "项目", href: "#projects" }, { label: "项目不可用", unavailableReason: "需求数据尚未提供所属项目" }, { label: "需求看板", unavailableReason: "无法确定所属项目的需求看板" }, { label: route.requirementId!, current: true }]
+    : page === "runs" && route.runId ? [{ label: topLabel, href: "#runs" }, { label: route.runId, current: true }]
+    : route.recordId && ["employees", "skills", "workflows", "publications"].includes(page) ? [{ label: topLabel, href: `#${page}` }, { label: recordLabel ?? route.recordId, current: true }]
+    : [{ label: topLabel, current: true }];
 
   return <div className={`app-shell app-shell--${page}`}>
     <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
@@ -445,16 +470,8 @@ export function App() {
       <div><span className="daemon-dot" aria-hidden="true" /><strong>{daemon === "online" ? "本地运行核心已连接" : daemon === "offline" ? "本地运行核心未连接" : "正在核对本地运行核心"}</strong><code>127.0.0.1 · LOOPBACK</code></div>
       <span>{daemon === "offline" ? "READ ONLY · 写入与运行暂不可用" : syncing ? "SYNCING · 正在同步最新档案" : "LOCAL GARDEN · EVIDENCE ON"}</span>
     </header>
-    <nav className="side-nav" aria-label="主要导航">
-      <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>双叶幼儿园</strong><small>CRAYON KINDERGARTEN DOSSIER</small></div></div>
-      <div className="nav-items">{nav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={pendingDecisionCount > 0 && item.id === "dashboard" ? `${item.label} · ${pendingDecisionCount} 项待你决定` : item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span>{pendingDecisionCount > 0 && item.id === "dashboard" && <span className="nav-attention-badge" aria-label={`${pendingDecisionCount} 项待你决定`}>{pendingDecisionCount}</span>}</button>)}</div>
-      <div className="nav-items nav-utility">{utilityNav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
-      <button type="button" className="mobile-more" aria-expanded={moreOpen} onClick={() => setMoreOpen(true)}><Icon name="command" /><span>更多</span></button>
-      <button type="button" className="command-hint" title="命令入口" onClick={() => setCommandOpen(true)}><Icon name="command" /><span>命令面板</span><kbd>⌘K</kbd></button>
-      <button type="button" className="theme-toggle" onClick={() => setTheme(theme === "crayon" ? "pixel" : "crayon")} title={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"} aria-label={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"}><span className="theme-toggle-dot" aria-hidden="true" /><span>{theme === "crayon" ? "蜡笔小新" : "治愈像素"}</span><small>{theme === "crayon" ? "CRAYON" : "PIXEL"}</small></button>
-      <div className="nav-foot"><span>KG</span><div><strong>Kindergarten Workbench</strong><small>班级在册 · A2A 1.0</small></div></div>
-    </nav>
-    <DaemonGate status={daemon}><div id="main-content" className="app-content" tabIndex={-1}>
+    <DaemonGate status={daemon}><div ref={mainContentRef} id="main-content" className="app-content" tabIndex={-1}>
+      <Breadcrumb items={breadcrumbItems} />
       <Suspense fallback={<main className="dash-page" aria-live="polite"><SkeletonBlock rows={5} label="正在打开档案页面" /></main>}>
       {page === "office" && <OfficePage data={data} streamStatus={activityStream} onOpenRun={(runId) => {
         studioOrigin.current = { scrollY: window.scrollY, cardRunId: runId };
@@ -509,6 +526,15 @@ export function App() {
       {page === "settings" && <SettingsPage />}
       </Suspense>
     </div></DaemonGate>
+    <nav className="side-nav" aria-label="主要导航">
+      <div className="brand-mark"><span className="brand-sprite" aria-hidden="true"><i /></span><div><strong>双叶幼儿园</strong><small>CRAYON KINDERGARTEN DOSSIER</small></div></div>
+      <button type="button" className="theme-toggle" data-testid="theme-toggle" data-theme-target={theme === "crayon" ? "pixel" : "crayon"} onClick={() => setTheme(theme === "crayon" ? "pixel" : "crayon")} title={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"} aria-label={theme === "crayon" ? "切换到治愈像素主题" : "切换到蜡笔小新主题"}><span className="theme-toggle-dot" aria-hidden="true" /><span>{theme === "crayon" ? "蜡笔小新" : "治愈像素"}</span><small>{theme === "crayon" ? "CRAYON" : "PIXEL"}</small></button>
+      <div className="nav-items">{nav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={pendingDecisionCount > 0 && item.id === "dashboard" ? `${item.label} · ${pendingDecisionCount} 项待你决定` : item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span>{pendingDecisionCount > 0 && item.id === "dashboard" && <span className="nav-attention-badge" aria-label={`${pendingDecisionCount} 项待你决定`}>{pendingDecisionCount}</span>}</button>)}</div>
+      <div className="nav-items nav-utility">{utilityNav.map((item) => <button type="button" className={activeNav === item.id ? "active" : ""} aria-current={activeNav === item.id ? "page" : undefined} title={item.label} key={item.id} onClick={() => navigate(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</div>
+      <button type="button" className="mobile-more" aria-expanded={moreOpen} onClick={() => setMoreOpen(true)}><Icon name="command" /><span>更多</span></button>
+      <button type="button" className="command-hint" title="命令入口" onClick={() => setCommandOpen(true)}><Icon name="command" /><span>命令面板</span><kbd>⌘K</kbd></button>
+      <div className="nav-foot"><span>KG</span><div><strong>Kindergarten Workbench</strong><small>班级在册 · A2A 1.0</small></div></div>
+    </nav>
     {notice && <AppNotice
       notice={notice}
       onClose={() => setNotice(undefined)}

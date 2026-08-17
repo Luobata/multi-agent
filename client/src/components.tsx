@@ -17,6 +17,23 @@ export type StampStatus = "active" | "archived" | "running" | "passed" | "comple
 export type DaemonStatus = "checking" | "online" | "offline";
 export const DEFAULT_EMPLOYEE_ACCENT = "var(--stamp-red)";
 
+export interface BreadcrumbItem { label: string; href?: string; current?: boolean; unavailableReason?: string; }
+
+/** Read-only navigation: never inherits daemon write availability. */
+export function Breadcrumb({ items }: { items: BreadcrumbItem[] }) {
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLAnchorElement>, href: string) => {
+    if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") return;
+    event.preventDefault();
+    window.location.hash = href.startsWith("#") ? href.slice(1) : href;
+  };
+  return <nav className="app-breadcrumb" aria-label="面包屑" data-testid="breadcrumb"><ol>{items.map((item, index) => {
+    const current = item.current ?? index === items.length - 1;
+    return <li key={`${item.label}-${index}`}>{!current && item.href
+      ? <a href={item.href} onKeyDown={(event) => onKeyDown(event, item.href!)} data-testid={`breadcrumb-link-${index}`}>{item.label}</a>
+      : <span aria-current={current ? "page" : undefined} aria-label={item.unavailableReason ? `${item.label}，不可跳转：${item.unavailableReason}` : undefined}>{item.label}</span>}</li>;
+  })}</ol></nav>;
+}
+
 export function defaultEmployeeAccentInput(): string {
   return getComputedStyle(document.documentElement).getPropertyValue("--employee-accent-data").trim();
 }

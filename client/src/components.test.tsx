@@ -4,14 +4,91 @@ import { resolve } from "node:path";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { COMPLETED_STATE_LINGER_MS, TERMINAL_ATTENTION_LINGER_MS, RuntimeStatusChip, SelectControl, SwitchControl, employeeRuntimeHealth, employeeRuntimeStatus } from "./components";
+import { Breadcrumb, COMPLETED_STATE_LINGER_MS, TERMINAL_ATTENTION_LINGER_MS, RuntimeStatusChip, SelectControl, SwitchControl, employeeRuntimeHealth, employeeRuntimeStatus } from "./components";
 import type { WorkInstanceRecord } from "./types";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const options = [
   { value: "compatible", label: "兼容更新（推荐）", description: "安全变更自动同步" },
   { value: "locked", label: "锁定版本", description: "保留当前固定版本" },
   { value: "latest", label: "始终最新", description: "采用员工最新版本" }
 ];
+
+describe("Breadcrumb", () => {
+  it("renders links, unavailable segments, and the current page with distinct semantics", () => {
+    const host = document.createElement("div");
+    const root = createRoot(host);
+    act(() => root.render(<Breadcrumb items={[{ label: "项目", href: "#projects" }, { label: "未知上级", unavailableReason: "不可用" }, { label: "REQ-101", current: true }]} />));
+    expect(host.querySelector("nav")?.getAttribute("aria-label")).toBe("面包屑");
+    expect(host.querySelector("nav")?.getAttribute("data-testid")).toBe("breadcrumb");
+    expect(host.querySelectorAll("a")).toHaveLength(1);
+    expect(host.querySelector("a")?.getAttribute("href")).toBe("#projects");
+    expect(host.querySelector("a")?.getAttribute("data-testid")).toBe("breadcrumb-link-0");
+    const unavailable = Array.from(host.querySelectorAll("li > span")).find((item) => item.textContent?.includes("未知上级"));
+    expect(unavailable?.getAttribute("aria-label")).toBe("未知上级，不可跳转：不可用");
+    expect(unavailable?.hasAttribute("title")).toBe(false);
+    expect(host.querySelector("[aria-current='page']")?.textContent).toBe("REQ-101");
+    act(() => root.unmount());
+  });
+
+  it.each(["Enter", " "])("activates a focused link once with %j without scrolling", (key) => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    act(() => root.render(<Breadcrumb items={[{ label: "项目", href: "#projects" }, { label: "当前" }]} />));
+    const link = host.querySelector("a")!;
+    const click = vi.spyOn(link, "click");
+    window.location.hash = "#projects/project-1";
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    const scrollY = window.scrollY;
+    const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+    act(() => link.dispatchEvent(event));
+    expect(event.defaultPrevented).toBe(true);
+    expect(window.location.hash).toBe("#projects");
+    expect(click).not.toHaveBeenCalled();
+    expect(window.scrollY).toBe(scrollY);
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  it("keeps long labels inside its own scroll container in both themes", () => {
+    const css = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+    expect(css).toMatch(/\.app-breadcrumb \{[^}]*max-width:\s*100%[^}]*overflow-x:\s*auto/s);
+    expect(css).toMatch(/\.app-content \{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.app-breadcrumb ol \{[^}]*display:\s*flex[^}]*max-width:\s*100%/s);
+    expect(css).toMatch(/\.app-breadcrumb li \{[^}]*min-width:\s*0[^}]*white-space:\s*nowrap/s);
+    expect(css).toMatch(/\[data-theme="pixel"\] \.app-breadcrumb/);
+
+    for (const theme of ["crayon", "pixel"]) {
+      document.documentElement.dataset.theme = theme;
+      const host = document.createElement("div");
+      const root = createRoot(host);
+      act(() => root.render(<Breadcrumb items={[
+        { label: `项目-${"很长的中文项目名称".repeat(12)}`, href: "#projects" },
+        { label: `requirement-${"long-id-".repeat(20)}`, current: true }
+      ]} />));
+      expect(host.querySelector(".app-breadcrumb")?.classList.contains("daemon-write-surface")).toBe(false);
+      expect(host.querySelectorAll("a, [aria-current='page']")).toHaveLength(2);
+      act(() => root.unmount());
+    }
+  });
+
+  it("provides non-color interaction feedback without depending on pointer media detection", () => {
+    const css = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+    expect(css).toMatch(/\.app-breadcrumb a:hover \{[^}]*transform:\s*translateY\(-1px\)[^}]*border-bottom-color:\s*currentColor[^}]*text-decoration:\s*underline[^}]*text-decoration-thickness:\s*2px/s);
+    expect(css).toMatch(/\.app-breadcrumb a:focus-visible \{[^}]*outline:\s*2px solid var\(--focus\)[^}]*transform:\s*translateY\(-1px\)[^}]*border-bottom-color:\s*currentColor[^}]*text-decoration:\s*underline[^}]*text-decoration-thickness:\s*2px[^}]*transition:\s*none/s);
+    expect(css).toMatch(/\[data-theme="pixel"\] \.app-breadcrumb a:focus-visible \{[^}]*transform:\s*translateY\(-2px\)/s);
+    expect(css).toMatch(/\.app-breadcrumb a:active \{[^}]*transform:\s*translate\(2px, 2px\)/s);
+    expect(css).not.toMatch(/@media \(hover:\s*hover\)[^{]*\{\s*\.app-breadcrumb a:hover/);
+  });
+
+  it("keeps publication evidence shrinkable within the crayon page grid", () => {
+    const css = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+    expect(css).toMatch(/\.page-grid--publications,[\s\S]*?\.publication-dossier \.evidence-block pre \{\s*min-width:\s*0;\s*max-width:\s*100%;\s*\}/);
+  });
+});
 
 function productionTsxFiles(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {

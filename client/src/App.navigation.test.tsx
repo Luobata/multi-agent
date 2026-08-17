@@ -115,6 +115,9 @@ describe("App navigation freshness", () => {
       bootstrapRequests.push(request);
       return request.promise;
     }
+    if (url.startsWith("/api/runs") || url === "/api/human-decision-requests") {
+      return Promise.resolve({ ok: true, json: async () => ({ data: [] }) });
+    }
     // Secondary reads (e.g. employee version history) resolve with an inert envelope.
     return Promise.resolve({ ok: true, json: async () => ({ data: { versions: [] } }) });
   });
@@ -137,6 +140,12 @@ describe("App navigation freshness", () => {
     if (!button) throw new Error(`nav button not found: ${label}`);
     return button;
   };
+  const breadcrumb = () => container.querySelector<HTMLElement>(".app-breadcrumb")!;
+  const breadcrumbState = () => ({
+    links: Array.from(breadcrumb().querySelectorAll<HTMLAnchorElement>("a")).map((link) => [link.textContent, link.getAttribute("href")]),
+    current: breadcrumb().querySelector("[aria-current='page']")?.textContent,
+    plain: Array.from(breadcrumb().querySelectorAll("span:not([aria-current])")).map((item) => item.textContent)
+  });
 
   beforeEach(() => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -473,12 +482,133 @@ describe("App navigation freshness", () => {
     await flush();
 
     const toggle = container.querySelector<HTMLButtonElement>(".side-nav .theme-toggle");
+    const sidebar = container.querySelector<HTMLElement>(".side-nav")!;
+    const brand = sidebar.querySelector<HTMLElement>(":scope > .brand-mark")!;
+    const primaryNav = sidebar.querySelector<HTMLElement>(":scope > .nav-items")!;
+    expect(sidebar.querySelectorAll(":scope > .theme-toggle")).toHaveLength(1);
+    expect(brand.nextElementSibling).toBe(toggle);
+    expect(toggle?.nextElementSibling).toBe(primaryNav);
     expect(toggle?.getAttribute("aria-label")).toBe("切换到治愈像素主题");
+    expect(toggle?.dataset.testid).toBe("theme-toggle");
+    expect(toggle?.dataset.themeTarget).toBe("pixel");
     click(toggle!);
     await flush();
 
     expect(document.documentElement.getAttribute("data-theme")).toBe("pixel");
     expect(localStorage.getItem("workbench-theme")).toBe("pixel");
+    expect(toggle?.dataset.themeTarget).toBe("crayon");
+  });
+
+  it.each([
+    ["#employees", "员工档案"],
+    ["#projects", "项目"],
+    ["#skills", "Skills"],
+    ["#workflows", "协作编排"],
+    ["#runs", "运行卷宗"],
+    ["#publications", "调用包"]
+  ])("renders %s as a current non-link root breadcrumb", async (hash, label) => {
+    window.location.hash = hash;
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+    expect(breadcrumbState()).toEqual({ links: [], current: label, plain: [] });
+  });
+
+  it.each([
+    ["#employees?item=employee-1", "员工档案", "#employees", "employee-1"],
+    ["#skills?item=skill-1", "Skills", "#skills", "skill-1"],
+    ["#workflows?item=workflow-1", "协作编排", "#workflows", "workflow-1"],
+    ["#runs/run-1", "运行卷宗", "#runs", "run-1"],
+    ["#publications?item=publication-1", "调用包", "#publications", "publication-1"]
+  ])("maps detail route %s to its parent destination", async (hash, parent, href, current) => {
+    window.location.hash = hash;
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+    expect(breadcrumbState()).toEqual({ links: [[parent, href]], current, plain: [] });
+  });
+
+  it.each([
+    ["#projects/project-1", [["项目", "#projects"]], "project-1", []],
+    ["#projects/project-1/board", [["项目", "#projects"], ["project-1", "#projects/project-1"]], "需求看板", []],
+    ["#requirements/REQ-101", [["项目", "#projects"]], "REQ-101", ["项目不可用", "需求看板"]]
+  ])("maps nested route %s without creating uncertain dead links", async (hash, links, current, plain) => {
+    window.location.hash = hash;
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+    expect(breadcrumbState()).toEqual({ links, current, plain });
+  });
+
+  it.each(["checking", "offline"])("keeps breadcrumb read navigation enabled while daemon is %s", async (status) => {
+    window.location.hash = "#employees?item=employee-1";
+    act(() => root.render(<App />));
+    if (status === "offline") {
+      respondError(0, "offline");
+      await flush();
+    }
+    const link = breadcrumb().querySelector<HTMLAnchorElement>("a")!;
+    expect(link.tabIndex).toBe(0);
+    expect(link.getAttribute("aria-disabled")).toBeNull();
+    expect(link.closest("[disabled], .daemon-write-surface")).toBeNull();
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    const clickEvent = new MouseEvent("click", { bubbles: true, cancelable: true });
+    link.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    expect(link.dispatchEvent(clickEvent)).toBe(false);
+    expect(link.getAttribute("href")).toBe("#employees");
+  });
+
+  it("places the detail breadcrumb before sidebar and main-content controls in the tab order", async () => {
+    window.location.hash = "#projects/project-1";
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    const focusable = Array.from(container.querySelectorAll<HTMLElement>("a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"));
+    const breadcrumbLink = breadcrumb().querySelector<HTMLAnchorElement>("a")!;
+    const sidebarControl = container.querySelector<HTMLButtonElement>(".side-nav button")!;
+    const mainControl = container.querySelector<HTMLElement>("#main-content button, #main-content input, #main-content select, #main-content textarea")!;
+    expect(focusable.slice(0, 2)).toEqual([container.querySelector(".skip-link"), breadcrumbLink]);
+    expect(focusable.indexOf(breadcrumbLink)).toBeLessThan(focusable.indexOf(sidebarControl));
+    expect(focusable.indexOf(breadcrumbLink)).toBeLessThan(focusable.indexOf(mainControl));
+  });
+
+  it("does not move focus on the initial render", async () => {
+    window.location.hash = "#projects";
+    const beforeApp = document.createElement("button");
+    document.body.prepend(beforeApp);
+    beforeApp.focus();
+
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    expect(document.activeElement).toBe(beforeApp);
+  });
+
+  it("focuses main content after a route change and exposes the parent breadcrumb as the next tab stop", async () => {
+    window.location.hash = "#projects";
+    act(() => root.render(<App />));
+    respond(0, bootstrapWith({}));
+    await flush();
+
+    act(() => {
+      window.location.hash = "#projects/project-1";
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await flush();
+
+    const mainContent = container.querySelector<HTMLElement>("#main-content")!;
+    const parentBreadcrumb = breadcrumb().querySelector<HTMLAnchorElement>("a[href='#projects']")!;
+    const tabbableInMain = Array.from(mainContent.querySelectorAll<HTMLElement>("a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"));
+    expect(document.activeElement).toBe(mainContent);
+    expect(tabbableInMain[0]).toBe(parentBreadcrumb);
+
+    // jsdom does not perform native Tab traversal; focusing the proven first
+    // tabbable descendant is the deterministic equivalent of one Tab here.
+    parentBreadcrumb.focus();
+    expect(document.activeElement).toBe(parentBreadcrumb);
   });
 
   it("writes the canonical #runs/<id> hash when the operator selects a run from the list", async () => {
