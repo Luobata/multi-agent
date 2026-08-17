@@ -9583,6 +9583,29 @@ export class WorkbenchService {
       await handle.renew();
       await handle.assertActive();
       const validation = await createMergeValidationWorktree(run, runDir);
+      let snapshot: Awaited<ReturnType<typeof candidateWorkspaceSnapshot>>;
+      try {
+        snapshot = await candidateWorkspaceSnapshot(validation.worktreePath);
+      } catch (error) {
+        throw conflictRevalidationFailure(
+          `无法读取集成 worktree 身份：${error instanceof Error ? error.message : String(error)}`,
+          "environment-blocked"
+        );
+      }
+      let candidatePreview: Awaited<ReturnType<typeof startCandidatePreview>> | undefined;
+      try {
+        candidatePreview = await startCandidatePreview({
+          runDir,
+          worktreePath: validation.worktreePath,
+          dependencyRoot: validation.repositoryRoot,
+          identity: { runId: id, sourceCommit: validation.sourceCommit, targetCommit: validation.targetCommit, candidateRevision: snapshot.revision }
+        });
+      } catch (error) {
+        throw conflictRevalidationFailure(
+          error instanceof Error ? error.message : String(error),
+          "environment-blocked"
+        );
+      }
       try {
         const result = await this.invokeProjectTestRoleAtPath(
           projectId,
@@ -9591,23 +9614,32 @@ export class WorkbenchService {
           [
             "【待合入队列目标漂移重测】",
             `候选 Run：${id}`,
+            `唯一受管候选 URL：${candidatePreview.url}`,
             `目标分支：${validation.targetBranch}`,
             `目标 commit：${validation.targetCommit}`,
             `候选 commit：${validation.sourceCommit}`,
+            `候选 revision：${snapshot.revision}`,
             "当前目录是系统创建的临时集成 worktree，已合入候选但尚未写入真实目标分支。",
-            "请执行与本需求相关的独立回归测试并给出结构化 verdict。不得安装依赖，不得修改代码、Git 历史或任何真实分支。",
+            `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${candidatePreview.url}；sourceCommit=${validation.sourceCommit}；candidateRevision=${snapshot.revision}。`,
+            "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码、Git 历史或任何真实分支。",
             "测试失败、环境异常或无法证明通过时必须返回 block，不能把工具失败当作通过。"
           ].join("\n"),
           "system:merge-queue-retest"
         );
-        if (result.status !== "passed") {
+        const evidenceIssues = validateConflictRetestEvidence(result.output, {
+          url: candidatePreview.url,
+          sourceCommit: validation.sourceCommit,
+          candidateRevision: snapshot.revision
+        });
+        if (!candidatePreview.wasAccessed()) evidenceIssues.push("受管候选 URL 没有真实访问记录");
+        if (result.status !== "passed" || evidenceIssues.length > 0) {
           await handle.advance({
             type: "validation.failed",
             actor: "runtime",
             payload: {
               runId: result.runId,
               targetCommit: validation.targetCommit,
-              message: `目标分支变化后的独立重测未通过：${result.message}；候选已保留，请重新验收。`
+              message: `目标分支变化后的独立重测未通过：${result.message}${evidenceIssues.length ? `；${evidenceIssues.join("；")}` : ""}；候选已保留，请重新验收。`
             }
           });
           return;
@@ -9623,6 +9655,7 @@ export class WorkbenchService {
           }
         });
       } finally {
+        await candidatePreview?.stop();
         await removeMergeValidationWorktree(validation);
       }
     } else if (!conflictRevalidated) {
