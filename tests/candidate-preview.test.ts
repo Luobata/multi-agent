@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { afterEach, describe, expect, it } from "vitest";
 import { candidateWorkspaceSnapshot } from "../src/runtime/candidateRevision.js";
 import { isSuccessfulCandidateAccess, resolveViteBin, startCandidatePreview } from "../src/runtime/candidatePreview.js";
@@ -13,7 +14,15 @@ describe("candidate preview", () => {
     const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "candidate-worktree-no-deps-"));
     try {
       await fs.writeFile(path.join(worktree, "package.json"), "{\"type\":\"module\"}\n", "utf8");
-      expect(resolveViteBin(worktree, path.join(process.cwd(), "package.json"))).toBe(path.join(process.cwd(), "node_modules", "vite", "bin", "vite.js"));
+      // Resolve the expected bin the same way the implementation does, so the assertion
+      // holds whether the suite runs from the primary checkout or a nested worktree.
+      const fallbackPackageJson = path.join(process.cwd(), "package.json");
+      const expectedBin = path.join(
+        path.dirname(createRequire(fallbackPackageJson).resolve("vite/package.json")),
+        "bin",
+        "vite.js"
+      );
+      expect(resolveViteBin(worktree, fallbackPackageJson)).toBe(expectedBin);
     } finally {
       await fs.rm(worktree, { recursive: true, force: true });
     }
