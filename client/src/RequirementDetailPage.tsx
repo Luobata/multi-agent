@@ -8,6 +8,7 @@ import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { DagTaskNode, Requirement, RequirementDetail, RequirementLane } from "./dashboard/types";
 import { REQUIREMENT_EXCEPTION_LABELS, VISIBLE_REQUIREMENT_LANES, requirementLaneLabel } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
+import { LiveAgentWorkbench } from "./LiveAgentWorkbench";
 import { RunsPage } from "./RunsPage";
 import {
   buildRequirementAdvancementInput,
@@ -333,6 +334,7 @@ export function RequirementDetailPage({
       {detail.advancement.runId && <button type="button" className="button secondary" onClick={() => go(`requirements/${encodeURIComponent(detail.id)}?section=run`)}>查看阻塞现场与完整证据 →</button>}
     </section>}
     {state.status === "ready" && detail && section === "acceptance" && runBindingMismatch && <section className="requirement-blocker-callout" role="status"><strong>验收 Run 与最新推进 Run 不同</strong><p>本区固定展示验收快照 Run <code>{acceptanceRunId}</code>；最新推进 Run 为 <code>{detail.advancement?.runId}</code>。</p></section>}
+    {state.status === "ready" && detail && section === "run" && <LiveAgentWorkbench invocationId={activeInvocation?.id ?? detail.advancement?.invocationId} runId={focusedRunId} />}
     {state.status === "ready" && detail && (section === "run" || section === "acceptance") && focusedRunId && <RunsPage mode="embedded" view={section === "acceptance" ? "acceptance" : "all"} focusedRunId={focusedRunId} notify={notify} dashboard={service} onDashboardSync={syncDashboardProjection} onOpenRequirement={(requirementId, targetSection = "overview") => go(requirementId === detail.id && targetSection === "run"
       // 已在本需求卷宗内：终态 Run 的「核对交付与验收」直达验收幕，而不是绕回当前 run 幕。
       ? `requirements/${encodeURIComponent(requirementId)}?section=acceptance`
