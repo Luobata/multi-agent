@@ -9622,6 +9622,7 @@ export class WorkbenchService {
             "当前目录是系统创建的临时集成 worktree，已合入候选但尚未写入真实目标分支。",
             `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${candidatePreview.url}；sourceCommit=${validation.sourceCommit}；candidateRevision=${snapshot.revision}。`,
             "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码、Git 历史或任何真实分支。",
+            "在临时集成 worktree 中运行 `npm run check`（typecheck + test + build）并把结果写入 e2eEvidence；不要把浏览器验收和整库检查拆成不同分片。如果 `npm run check` 因环境问题（非产品问题）失败，在 summary 中明确区分环境失败与产品失败。",
             "测试失败、环境异常或无法证明通过时必须返回 block，不能把工具失败当作通过。"
           ].join("\n"),
           "system:merge-queue-retest"
