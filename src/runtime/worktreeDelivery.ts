@@ -888,7 +888,7 @@ function eventPolicyAllows(current: RunDeliveryRecordV2 | undefined, event: Deli
     case "conflict.started":
       return event.payload.retry
         ? status === "conflict" && conflictStatus === "failed"
-        : ["queued-for-merge", "merging"].includes(status ?? "");
+        : ["queued-for-merge", "merging", "returned-to-acceptance"].includes(status ?? "");
     case "conflict.stage-completed":
       if (["planned", "executed", "rebased"].includes(event.payload.stage)) {
         return status === "conflict" && conflictStatus === "resolving";
@@ -2474,6 +2474,68 @@ function discardConfirmationToken(runId: string): string {
   return `DISCARD ${runId}`;
 }
 
+/**
+ * Auto-sync a delivery whose sourceCommit is already an ancestor of the target branch.
+ * Emits the standard event sequence (validation.started → validation.passed →
+ * merge.intent-prepared → merge.ref-updated → merge.completed) so the delivery
+ * reaches "merged" through the existing state machine without a real merge.
+ */
+async function autoSyncMergedDelivery(
+  runDir: string,
+  runId: string,
+  delivery: RunDeliveryRecordV2,
+  targetBranch: string,
+  repositoryRoot: string
+): Promise<RunDeliveryRecordV2> {
+  const sourceCommit = delivery.sourceCommit;
+  if (!sourceCommit) throw new Error("auto-sync requires sourceCommit");
+  const targetCommit = await git(repositoryRoot, ["rev-parse", targetBranch]);
+  const intentId = randomUUID();
+  const targetRef = `refs/heads/${targetBranch}`;
+  const actor = "runtime-git-sync";
+  const message = "sourceCommit 已存在于目标分支，自动同步为 merged。";
+
+  let current = await advanceDeliveryEvent(runDir, runId, delivery.revision, {
+    type: "validation.started",
+    actor,
+    payload: { targetCommit, message }
+  });
+  current = await advanceDeliveryEvent(runDir, runId, current.revision, {
+    type: "validation.passed",
+    actor,
+    payload: { required: true, targetCommit, message }
+  });
+  current = await advanceDeliveryEvent(runDir, runId, current.revision, {
+    type: "merge.intent-prepared",
+    actor,
+    payload: {
+      intentId,
+      targetRef,
+      expectedTargetCommit: targetCommit,
+      sourceCommit,
+      preparedMergeCommit: sourceCommit,
+      message
+    }
+  });
+  current = await advanceDeliveryEvent(runDir, runId, current.revision, {
+    type: "merge.ref-updated",
+    actor,
+    payload: { intentId, message }
+  });
+  current = await advanceDeliveryEvent(runDir, runId, current.revision, {
+    type: "merge.completed",
+    actor,
+    payload: {
+      intentId,
+      targetBranch,
+      targetCommitBeforeMerge: delivery.baseCommit ?? "",
+      mergeCommit: sourceCommit,
+      message
+    }
+  });
+  return current;
+}
+
 export async function previewRunMerge(
   run: WorkflowRunRecord,
   runDir: string
@@ -2482,7 +2544,7 @@ export async function previewRunMerge(
   const reasons: string[] = [];
   const acceptanceReasons: string[] = [];
   const deliveryRead = await RunDeliveryStore.forRunDirectory(runDir, run.id).readDelivery(run.id);
-  const delivery = deliveryRead.kind === "valid" ? deliveryRead.record : undefined;
+  let delivery = deliveryRead.kind === "valid" ? deliveryRead.record : undefined;
   let recoveryRequired: RunMergePreview["recoveryRequired"];
   if (deliveryRead.kind === "corrupt") {
     recoveryRequired = {
@@ -2557,6 +2619,23 @@ export async function previewRunMerge(
       const historicalSource = delivery?.status === "merged" ? delivery.sourceCommit : undefined;
       targetBranch = delivery?.status === "merged" ? delivery.targetBranch : await git(repositoryRoot, ["branch", "--show-current"]);
       if (!targetBranch) reasons.push("目标仓库当前不在命名分支上。");
+      // Git reality sync: if the sourceCommit is already an ancestor of the target branch
+      // (e.g., merged manually or by another process), auto-advance the delivery to merged.
+      if (delivery
+        && delivery.sourceCommit
+        && targetBranch
+        && ["queued-for-merge", "retesting"].includes(delivery.status)) {
+        try {
+          const ancestry = await runGit(repositoryRoot, [
+            "merge-base", "--is-ancestor", delivery.sourceCommit, targetBranch
+          ]);
+          if (ancestry.code === 0) {
+            delivery = await autoSyncMergedDelivery(runDir, run.id, delivery, targetBranch, repositoryRoot);
+          }
+        } catch {
+          // Best-effort git reality check; ignore errors and fall through to normal preview.
+        }
+      }
       if (delivery?.status !== "merged") {
         const targetStatus = await git(repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
         targetClean = targetStatus.length === 0;
@@ -2684,10 +2763,15 @@ async function ensureDeliverySource(
       && delivery.baseCommit === delivery.conflictResolution.targetCommit;
     const independentlyValidatedSource = delivery.mergeValidation?.status === "passed"
       && delivery.mergeValidation.targetCommit === before.commit;
+    // A returned-to-acceptance candidate with a prior human merge approval has already been
+    // through rebase/validation; baseCommit drift is expected and must not block re-delivery.
+    const returnedWithApproval = delivery.status === "returned-to-acceptance"
+      && delivery.humanDecision?.action === "merge";
     if (run.isolation?.baseCommit
       && delivery.baseCommit !== run.isolation.baseCommit
       && !acceptedRebase
-      && !independentlyValidatedSource) {
+      && !independentlyValidatedSource
+      && !returnedWithApproval) {
       throw new Error("交付记录的 worktree 基线与当前 Run 不匹配");
     }
     const [currentSourceBranch, currentSourceCommit] = await Promise.all([

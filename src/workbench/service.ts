@@ -9705,12 +9705,48 @@ export class WorkbenchService {
     const actor = requireText(input.actor, "conflict retry actor");
     const { run, runDir } = await this.getRunDeliveryContext(id);
     const preview = await previewRunMerge(run, runDir);
-    if (preview.status !== "conflict" || preview.delivery?.conflictResolution?.status !== "failed") {
-      throw new Error("只有 AI 冲突处理失败的待合入候选可以重新处理");
+    const isConflictRetry = preview.status === "conflict" && preview.delivery?.conflictResolution?.status === "failed";
+    const isReturnedRecovery = preview.status === "returned-to-acceptance"
+      && preview.delivery?.humanDecision?.action === "merge";
+    if (!isConflictRetry && !isReturnedRecovery) {
+      throw new Error("只有 AI 冲突处理失败或被退回的已批准候选可以重新处理");
     }
+    if (!preview.delivery) throw new Error("该候选缺少交付记录");
     if (preview.delivery.humanDecision?.action !== "merge") throw new Error("该候选缺少原始人工合入批准");
     const resolution = preview.delivery.conflictResolution;
-    if (!resolution) throw new Error("冲突重试缺少原阶段记录");
+    if (!resolution) {
+      if (!isReturnedRecovery) throw new Error("冲突重试缺少原阶段记录");
+      // Returned-to-acceptance with cleared conflictResolution: start fresh conflict resolution.
+      const targetCommit = preview.delivery.queuedTargetCommit
+        ?? preview.delivery.baseCommit
+        ?? "";
+      if (!targetCommit) throw new Error("退回候选缺少目标 commit，无法重新处理");
+      let queued = await advanceDeliveryEvent(runDir, id, preview.delivery.revision, {
+        type: "conflict.started",
+        actor,
+        payload: {
+          targetCommit,
+          message: `${actor} 已要求从退回状态重新处理冲突。`
+        }
+      });
+      if (!queued.dispatch) {
+        if (!preview.repositoryRoot || !preview.targetBranch || !queued.humanDecision?.at) {
+          throw new Error("冲突重试缺少持久队列身份或批准顺序");
+        }
+        queued = await advanceDeliveryEvent(runDir, id, queued.revision, {
+          type: "dispatch.ready",
+          actor,
+          payload: {
+            queueKey: deliveryQueueKey(preview.repositoryRoot, preview.targetBranch),
+            approvedAt: queued.humanDecision.at,
+            message: "退回候选已重新入队，等待 delivery dispatcher claim。"
+          }
+        });
+      }
+      this.wakeDeliveryDispatcher(id);
+      if (queued.status !== "retesting" && queued.status !== "conflict") throw new Error("冲突重试恢复到了非法阶段");
+      return { status: queued.status, delivery: queued };
+    }
     const rebased = preview.delivery.sourceCommit !== undefined
       && preview.delivery.baseCommit === resolution.targetCommit
       && preview.delivery.queuedTargetCommit === resolution.targetCommit;
