@@ -168,6 +168,7 @@ import {
   buildConflictRetestRequest,
   buildLeaderRevalidationRequest,
   classifyConflictRetestFailure,
+  determineTestCommands,
   hasExplicitDeliveryPass,
   selectConflictExecutionRole,
   validateCandidateWorkspaceState,
@@ -9310,7 +9311,8 @@ export class WorkbenchService {
             url: candidatePreview.url,
             targetCommit: resolution.targetCommit,
             sourceCommit,
-            candidateRevision: snapshot.revision
+            candidateRevision: snapshot.revision,
+            testCommands: determineTestCommands(snapshot.changedFiles)
           }),
           "system:merge-conflict-retest"
         );

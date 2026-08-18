@@ -7,6 +7,8 @@ import {
   buildConflictPlanningRequest,
   buildConflictRetestRequest,
   buildLeaderRevalidationRequest,
+  classifyTestResults,
+  determineTestCommands,
   environmentBlockedClaimContradicted,
   hasExplicitDeliveryPass,
   classifyConflictRetestFailure,
@@ -243,5 +245,58 @@ describe("conflict retest grounding", () => {
     expect(prompt).toContain(retestInput.url);
     expect(prompt).toContain(retestInput.sourceCommit);
     expect(prompt).toContain(retestInput.candidateRevision);
+  });
+});
+
+describe("deterministic test scope and classification", () => {
+  it("maps client source files to their test files", () => {
+    const commands = determineTestCommands(["client/src/App.tsx", "client/src/components.tsx"]);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toContain("client/src/App.test.tsx");
+    expect(commands[0]).toContain("client/src/components.test.tsx");
+  });
+
+  it("uses npm run check for server changes", () => {
+    const commands = determineTestCommands(["src/runtime/runner.ts"]);
+    expect(commands).toContain("npm run check");
+  });
+
+  it("uses smoke test when no testable changes", () => {
+    const commands = determineTestCommands([]);
+    expect(commands[0]).toBe("npm test -- --run tests/smoke.test.ts");
+  });
+
+  it("classifies all-pass results as passed", () => {
+    const result = classifyTestResults([
+      { command: "npm test", exitCode: 0, summary: "all passed" }
+    ]);
+    expect(result).toBe("passed");
+  });
+
+  it("classifies environment failures as environment-blocked", () => {
+    const result = classifyTestResults([
+      { command: "npm test", exitCode: 1, summary: "EADDRINUSE port 4318" },
+      { command: "npm run check", exitCode: 1, summary: "EPERM operation not permitted" }
+    ]);
+    expect(result).toBe("environment-blocked");
+  });
+
+  it("classifies assertion failures as product-failed", () => {
+    const result = classifyTestResults([
+      { command: "npm test", exitCode: 1, summary: "expected true to be false" }
+    ]);
+    expect(result).toBe("product-failed");
+  });
+
+  it("classifies mixed failures as product-failed", () => {
+    const result = classifyTestResults([
+      { command: "npm test", exitCode: 0, summary: "passed" },
+      { command: "npm run check", exitCode: 1, summary: "type error" }
+    ]);
+    expect(result).toBe("product-failed");
+  });
+
+  it("classifies empty results as product-failed", () => {
+    expect(classifyTestResults([])).toBe("product-failed");
   });
 });

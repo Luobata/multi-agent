@@ -226,7 +226,14 @@ export function buildConflictRetestRequest(input: {
   targetCommit: string;
   sourceCommit: string;
   candidateRevision: string;
+  testCommands?: string[];
 }): string {
+  const testScope = input.testCommands && input.testCommands.length > 0
+    ? [
+        "服务端指定的测试范围（只运行这些命令，不要自行增加或跳过）：",
+        ...input.testCommands.map((command) => `- ${command}`)
+      ].join("\n")
+    : "服务端未指定测试范围；运行与改动文件直接相关的定向测试，不要跑整库 npm run check。";
   return [
     "【冲突修复后原需求回归】",
     `候选 Run：${input.runId}`,
@@ -237,10 +244,61 @@ export function buildConflictRetestRequest(input: {
     "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。请在原候选 worktree 上执行独立测试，界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码或 Git 历史。",
     `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${input.url}；sourceCommit=${input.sourceCommit}；candidateRevision=${input.candidateRevision}。`,
     "服务端还会独立校验候选真实 GET、工作区 commit 与 revision；不得只复述身份而改用其他页面测试。测试、环境或证据有任一缺口必须返回 Block；只有可复现且证据充分才返回 Pass。",
+    testScope,
     "接地要求（verdict 必须与自身证据一致，不得自相矛盾）：",
     "- 关键交互后必须用 Midscene assert 验证期望状态，并把 assert 结果写入 e2eEvidence 的 observed。",
     "- verdict 必须以最终截图与 Midscene 报告的最终状态为准；assert 通过即交互证据充分，不得以\"证据缺口\"Block。",
     "- MIDSCENE_ENVIRONMENT_BLOCKED 仅用于候选 URL 无法连接或页面无法渲染（连接拒绝、空白页、核心离线）；页面可达但交互失败属于产品问题，不得标记为 environment-blocked。",
     "- summary 的事实陈述必须与 e2eEvidence 一致，不得引用与结论矛盾的截图或报告作为证据。"
   ].join("\n");
+}
+
+/**
+ * Determine which test commands to run for a given set of changed files.
+ * Server-side deterministic test scope — the agent runs exactly these and reports raw results.
+ */
+export function determineTestCommands(changedFiles: string[]): string[] {
+  const commands: string[] = [];
+  const clientFiles = changedFiles.filter((f) => f.startsWith("client/"));
+  const serverFiles = changedFiles.filter((f) => f.startsWith("src/"));
+
+  if (clientFiles.length > 0) {
+    const testFiles = clientFiles
+      .filter((f) => /\.(tsx?|css)$/.test(f))
+      .map((f) => {
+        const base = f.replace(/\.(tsx?|css)$/, "");
+        return `${base}.test.tsx`;
+      })
+      .filter((f) => !f.endsWith(".test.test.tsx"));
+    if (testFiles.length > 0) {
+      commands.push(`npm test -- --run ${testFiles.join(" ")}`);
+    }
+  }
+  if (serverFiles.length > 0) {
+    commands.push("npm run check");
+  }
+  if (commands.length === 0) {
+    commands.push("npm test -- --run tests/smoke.test.ts");
+  }
+  return commands;
+}
+
+export interface TestCommandResult {
+  command: string;
+  exitCode: number;
+  summary: string;
+}
+
+/**
+ * Classify test results deterministically on the server side.
+ * The agent reports raw results; the server decides pass/fail/environment-blocked.
+ */
+export function classifyTestResults(results: TestCommandResult[]): "passed" | "environment-blocked" | "product-failed" {
+  if (results.length === 0) return "product-failed";
+  const failed = results.filter((r) => r.exitCode !== 0);
+  if (failed.length === 0) return "passed";
+  const allEnv = failed.every((r) =>
+    /econnrefused|eaddrinuse|enotfound|eacces|eperm|permission denied|sandbox|unavailable|socket|timeout|timed out|端口|环境(?:不可用|异常|失败)|预览(?:服务)?(?:不可用|失败|提前退出|超时)|无法.*预览|启动(?:失败|超时)|连接(?:失败|超时)/i.test(r.summary)
+  );
+  return allEnv ? "environment-blocked" : "product-failed";
 }
