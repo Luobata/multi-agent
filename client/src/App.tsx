@@ -1,10 +1,11 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { Breadcrumb, DaemonGate, Icon, Modal, type BreadcrumbItem } from "./components";
 import { dashboardService } from "./dashboard/service";
 import { ErrorBlock, SkeletonBlock } from "./dashboard/view";
 import type { ActivityEvent, ActivitySnapshot, Bootstrap, HumanDecisionRequest } from "./types";
 import { applyTheme, DEFAULT_THEME, readTheme, type ThemeName } from "./theme";
+import { ActivityStreamContext, type ActivityStreamValue } from "./ActivityStream";
 
 const ArchivePage = lazy(() => import("./ArchivePage").then((module) => ({ default: module.ArchivePage })));
 const BoardPage = lazy(() => import("./BoardPage").then((module) => ({ default: module.BoardPage })));
@@ -458,7 +459,13 @@ export function App() {
     : route.recordId && ["employees", "skills", "workflows", "publications"].includes(page) ? [{ label: topLabel, href: `#${page}` }, { label: recordLabel ?? route.recordId, current: true }]
     : [{ label: topLabel, current: true }];
 
-  return <div className={`app-shell app-shell--${page}`}>
+  // 共享 SSE 快照通过 context 下发；memo 避免无关渲染（通知、弹窗）波及所有消费方。
+  const activityStreamValue = useMemo<ActivityStreamValue>(
+    () => ({ activity: data.activity, status: activityStream }),
+    [data.activity, activityStream]
+  );
+
+  return <ActivityStreamContext.Provider value={activityStreamValue}><div className={`app-shell app-shell--${page}`}>
     <svg width="0" height="0" aria-hidden="true" focusable="false" style={{ position: "absolute" }}>
       <filter id="crayon-edge" x="-5%" y="-5%" width="110%" height="110%">
         <feTurbulence type="fractalNoise" baseFrequency="0.012 0.015" numOctaves="2" seed="7" result="noise" />
@@ -554,5 +561,5 @@ export function App() {
     {moreOpen && <Modal title="更多功能" eyebrow="WORKBENCH · NAVIGATION" onClose={() => setMoreOpen(false)}>
       <div className="command-list mobile-more-list">{commandItems.slice(4).map((item) => <button type="button" key={item.id} onClick={() => { navigate(item.id); setMoreOpen(false); }}><Icon name={item.icon} /><strong>{item.label}</strong></button>)}</div>
     </Modal>}
-  </div>;
+  </div></ActivityStreamContext.Provider>;
 }

@@ -1,13 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
+import { useActivityStream } from "./ActivityStream";
 import { Stamp, formatTime, type StampStatus } from "./components";
-import type { ActivityEvent, InvocationProgress, InvocationStatus, WorkInstanceRecord, WorkInstanceStatus } from "./types";
+import type { InvocationProgress, InvocationStatus, WorkInstanceRecord, WorkInstanceStatus } from "./types";
 
 /**
  * 实时 Agent 工作台：需求详情 Run 分区的只读可视化增量。
- * 首次用 /api/invocations/:id/progress 快照填充，随后由 /api/activity/stream 的
- * invocation.changed / instance.changed 事件增量驱动；SSE 不可用时降级为 5s 轮询，
- * 页面不可见时暂停。没有任何输入或操作控件。
+ * 首次用 /api/invocations/:id/progress 快照填充，随后消费 App 持有的共享
+ * /api/activity/stream（ActivityStreamContext）做增量更新，本组件不自建 EventSource；
+ * 共享流 offline 时降级为 5s 轮询，页面不可见时暂停。没有任何输入或操作控件。
  */
 
 type FeedState = "connecting" | "live" | "polling" | "paused";
@@ -138,125 +139,87 @@ function mergeCards(progress: InvocationProgress | undefined, live: Map<string, 
 }
 
 export function LiveAgentWorkbench({ invocationId, runId }: { invocationId?: string; runId?: string }) {
+  const { activity, status: streamStatus } = useActivityStream();
   const [progress, setProgress] = useState<InvocationProgress | undefined>(undefined);
   const [liveInstances, setLiveInstances] = useState<Map<string, WorkInstanceRecord>>(new Map());
   const [feed, setFeed] = useState<FeedState>("connecting");
   const [loadError, setLoadError] = useState("");
+  const [paused, setPaused] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const timelineEndRef = useRef<HTMLLIElement | null>(null);
   const seenRoundsRef = useRef(0);
 
   const terminal = Boolean(progress && (progress.terminal || TERMINAL_INVOCATION_STATUSES.includes(progress.status)));
 
-  useEffect(() => {
-    if (!invocationId) return undefined;
-    let disposed = false;
-    let stream: EventSource | undefined;
-    let pollTimer: number | undefined;
-    let mode: "sse" | "polling" = "sse";
-
-    const loadSnapshot = () => {
-      api<InvocationProgress>(`/api/invocations/${encodeURIComponent(invocationId)}/progress`)
-        .then((snapshot) => {
-          if (disposed) return;
-          const valid = asProgress(snapshot);
-          if (valid) {
-            setProgress(valid);
-            setLoadError("");
-          }
-        })
-        .catch((error: unknown) => {
-          if (!disposed) setLoadError(error instanceof Error ? error.message : String(error));
-        });
-    };
-
-    const stopStreaming = () => {
-      stream?.close();
-      stream = undefined;
-      if (pollTimer !== undefined) {
-        window.clearInterval(pollTimer);
-        pollTimer = undefined;
-      }
-    };
-
-    const startPolling = () => {
-      if (disposed || pollTimer !== undefined) return;
-      mode = "polling";
-      stream?.close();
-      stream = undefined;
-      setFeed("polling");
-      pollTimer = window.setInterval(loadSnapshot, 5000);
-    };
-
-    const receiveActivity = (event: MessageEvent<string>) => {
-      if (disposed) return;
-      let update: ActivityEvent;
-      try {
-        update = JSON.parse(event.data) as ActivityEvent;
-      } catch {
-        return;
-      }
-      if (update.type === "instance.changed" && update.instance.invocationId === invocationId) {
-        const record = update.instance;
-        setLiveInstances((current) => {
-          const next = new Map(current);
-          next.set(record.nodeId, record);
-          return next;
-        });
-      } else if (update.type === "invocation.changed" && update.invocation.id === invocationId) {
-        const invocation = update.invocation;
-        setProgress((current) => current
-          ? { ...current, status: invocation.status, phase: invocation.phase, terminal: TERMINAL_INVOCATION_STATUSES.includes(invocation.status), updatedAt: invocation.updatedAt }
-          : current);
-      }
-    };
-
-    const connect = () => {
-      if (disposed || mode === "polling") return;
-      if (typeof EventSource === "undefined") {
-        startPolling();
-        return;
-      }
-      try {
-        stream = new EventSource("/api/activity/stream");
-      } catch {
-        startPolling();
-        return;
-      }
-      stream.addEventListener("activity", receiveActivity as EventListener);
-      stream.onopen = () => { if (!disposed) setFeed("live"); };
-      stream.onerror = () => { if (!disposed) startPolling(); };
-    };
-
-    const onVisibility = () => {
-      if (disposed) return;
-      if (document.hidden) {
-        stopStreaming();
-        setFeed("paused");
-      } else {
-        loadSnapshot();
-        if (mode === "polling") {
-          pollTimer = window.setInterval(loadSnapshot, 5000);
-          setFeed("polling");
-        } else {
-          setFeed("connecting");
-          connect();
+  const loadSnapshot = useCallback(() => {
+    if (!invocationId) return;
+    api<InvocationProgress>(`/api/invocations/${encodeURIComponent(invocationId)}/progress`)
+      .then((snapshot) => {
+        const valid = asProgress(snapshot);
+        if (valid) {
+          setProgress(valid);
+          setLoadError("");
         }
-      }
-    };
+      })
+      .catch((error: unknown) => {
+        setLoadError(error instanceof Error ? error.message : String(error));
+      });
+  }, [invocationId]);
 
+  // 首次进入与切换 invocation 时用 progress 快照填充；实时增量由下方 context 同步负责。
+  useEffect(() => {
+    if (!invocationId) return;
     setProgress(undefined);
     setLiveInstances(new Map());
     setLoadError("");
     loadSnapshot();
-    connect();
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      disposed = true;
-      stopStreaming();
-      document.removeEventListener("visibilitychange", onVisibility);
+  }, [invocationId, loadSnapshot]);
+
+  // 消费 App 持有的共享 SSE 快照：只挑属于当前 invocation 的 instance/invocation 合并。
+  useEffect(() => {
+    if (!invocationId || paused) return;
+    if (streamStatus === "offline") {
+      setFeed("polling");
+      return;
+    }
+    setFeed(streamStatus === "live" ? "live" : "connecting");
+    const relevant = activity.instances.filter((instance) => instance.invocationId === invocationId);
+    if (relevant.length > 0) {
+      setLiveInstances((current) => {
+        const next = new Map(current);
+        for (const record of relevant) next.set(record.nodeId, record);
+        return next;
+      });
+    }
+    const invocation = activity.invocations.find((entry) => entry.id === invocationId);
+    if (invocation) {
+      setProgress((current) => current
+        ? { ...current, status: invocation.status, phase: invocation.phase, terminal: TERMINAL_INVOCATION_STATUSES.includes(invocation.status), updatedAt: invocation.updatedAt }
+        : current);
+    }
+  }, [activity, streamStatus, invocationId, paused]);
+
+  // 共享流不可用时降级为 5s 轮询，行为与上一版一致。
+  useEffect(() => {
+    if (feed !== "polling" || !invocationId || paused) return undefined;
+    const timer = window.setInterval(loadSnapshot, 5000);
+    return () => window.clearInterval(timer);
+  }, [feed, invocationId, paused, loadSnapshot]);
+
+  // 页面不可见时暂停展示更新；回到前台时立即补一次快照。
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.hidden) {
+        setPaused(true);
+        setFeed("paused");
+      } else {
+        setPaused(false);
+        loadSnapshot();
+      }
     };
-  }, [invocationId]);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [loadSnapshot]);
 
   const cards = useMemo(() => mergeCards(progress, liveInstances), [progress, liveInstances]);
   const hasRunning = !terminal && cards.some((card) => card.status === "running");

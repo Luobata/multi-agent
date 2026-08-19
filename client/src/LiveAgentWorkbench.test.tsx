@@ -1,28 +1,18 @@
 /** @vitest-environment jsdom */
-import { act } from "react";
+import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ActivityStreamContext, type ActivityStreamStatus, type ActivityStreamValue } from "./ActivityStream";
 import { LiveAgentWorkbench } from "./LiveAgentWorkbench";
-import type { InvocationProgress, WorkInstanceRecord } from "./types";
+import type { ActivitySnapshot, InvocationProgress, WorkInstanceRecord } from "./types";
 
 class FakeEventSource {
   static urls: string[] = [];
-  static closedCount = 0;
-  static active: FakeEventSource[] = [];
-  onopen: ((event: Event) => void) | null = null;
-  onerror: ((event: Event) => void) | null = null;
-  private listeners = new Map<string, EventListener>();
   constructor(url: string) {
     FakeEventSource.urls.push(url);
-    FakeEventSource.active.push(this);
   }
-  addEventListener(type: string, listener: EventListener): void {
-    this.listeners.set(type, listener);
-  }
-  emit(type: string, payload: unknown): void {
-    this.listeners.get(type)?.({ data: JSON.stringify(payload) } as MessageEvent<string>);
-  }
-  close(): void { FakeEventSource.closedCount += 1; }
+  addEventListener(): void { /* no-op: the workbench must never open its own stream */ }
+  close(): void { /* no-op */ }
 }
 
 function progressSnapshot(overrides: Partial<InvocationProgress> = {}): InvocationProgress {
@@ -80,6 +70,10 @@ function instanceRecord(overrides: Partial<WorkInstanceRecord> = {}): WorkInstan
   } as WorkInstanceRecord;
 }
 
+function streamValue(activity: Partial<ActivitySnapshot> = {}, status: ActivityStreamStatus = "live"): ActivityStreamValue {
+  return { activity: { invocations: [], instances: [], ...activity }, status };
+}
+
 describe("LiveAgentWorkbench", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -96,11 +90,13 @@ describe("LiveAgentWorkbench", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, ms)); });
   };
 
+  const renderWithStream = (ui: ReactElement, stream: ActivityStreamValue = streamValue()) => {
+    act(() => root.render(<ActivityStreamContext.Provider value={stream}>{ui}</ActivityStreamContext.Provider>));
+  };
+
   beforeEach(() => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     FakeEventSource.urls = [];
-    FakeEventSource.closedCount = 0;
-    FakeEventSource.active = [];
     fetchMock.mockClear();
     vi.stubGlobal("fetch", fetchMock);
     vi.stubGlobal("EventSource", FakeEventSource);
@@ -116,7 +112,7 @@ describe("LiveAgentWorkbench", () => {
   });
 
   it("renders agent cards from the progress snapshot with role, employee, status and phase", async () => {
-    act(() => root.render(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />));
+    renderWithStream(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />);
     await flush();
 
     expect(fetchMock.mock.calls.some(([input]) => String(input) === "/api/invocations/inv-1/progress")).toBe(true);
@@ -130,7 +126,7 @@ describe("LiveAgentWorkbench", () => {
   });
 
   it("marks running cards with the running visual class and completed cards with the passed class", async () => {
-    act(() => root.render(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />));
+    renderWithStream(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />);
     await flush();
 
     const frontend = container.querySelector('[data-node-id="node-frontend"]');
@@ -142,7 +138,7 @@ describe("LiveAgentWorkbench", () => {
   });
 
   it("renders the leader timeline with rounds, summary and assignments", async () => {
-    act(() => root.render(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />));
+    renderWithStream(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />);
     await flush();
 
     const timeline = container.querySelector(".live-leader-timeline");
@@ -155,31 +151,31 @@ describe("LiveAgentWorkbench", () => {
     expect(container.querySelector(".live-leader-entry--latest")).toBeTruthy();
   });
 
-  it("updates a card when an instance.changed SSE event arrives for this invocation", async () => {
-    act(() => root.render(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />));
+  it("updates a card when the shared activity snapshot carries a newer instance for this invocation", async () => {
+    const workbench = <LiveAgentWorkbench invocationId="inv-1" runId="run-1" />;
+    renderWithStream(workbench);
     await flush();
-    expect(FakeEventSource.urls).toContain("/api/activity/stream");
-    const stream = FakeEventSource.active[FakeEventSource.active.length - 1]!;
 
-    act(() => stream.emit("activity", {
-      type: "instance.changed",
-      at: "2026-08-17T01:01:00.000Z",
-      instance: instanceRecord({ status: "completed", phase: "登录表单已完成", completedAt: "2026-08-17T01:01:00.000Z" })
+    renderWithStream(workbench, streamValue({
+      instances: [instanceRecord({ status: "completed", phase: "登录表单已完成", completedAt: "2026-08-17T01:01:00.000Z", updatedAt: "2026-08-17T01:01:00.000Z" })]
     }));
+    await flush();
 
     const frontend = container.querySelector('[data-node-id="node-frontend"]');
     expect(frontend?.className).toContain("live-agent-card--passed");
     expect(frontend?.textContent).toContain("登录表单已完成");
     expect(frontend?.textContent).toContain("session-member-1");
 
-    // 其他 invocation 的事件不影响本工作台。
-    act(() => stream.emit("activity", {
-      type: "instance.changed",
-      at: "2026-08-17T01:02:00.000Z",
-      instance: instanceRecord({ id: "wi-other", invocationId: "inv-other", nodeId: "node-other", status: "failed", phase: "无关实例" })
+    // 其他 invocation 的实例不影响本工作台。
+    renderWithStream(workbench, streamValue({
+      instances: [instanceRecord({ id: "wi-other", invocationId: "inv-other", nodeId: "node-other", status: "failed", phase: "无关实例" })]
     }));
+    await flush();
     expect(container.querySelector('[data-node-id="node-other"]')).toBeNull();
     expect(container.textContent).not.toContain("无关实例");
+
+    // 共享流由 App 持有：本组件从不自建 EventSource。
+    expect(FakeEventSource.urls).toHaveLength(0);
   });
 
   it("shows the guidance copy when no invocation is bound yet", async () => {
@@ -209,7 +205,7 @@ describe("LiveAgentWorkbench", () => {
       return Promise.resolve({ ok: true, status: 200, json: async () => ({ data: [] }) });
     });
 
-    act(() => root.render(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />));
+    renderWithStream(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />);
     await flush();
 
     expect(container.querySelector(".live-workbench--terminal")).toBeTruthy();
@@ -219,12 +215,11 @@ describe("LiveAgentWorkbench", () => {
     expect(failed?.querySelector(".live-agent-card-error")?.textContent).toContain("worktree setup failed");
   });
 
-  it("falls back to polling when the SSE stream errors", async () => {
-    act(() => root.render(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />));
+  it("falls back to polling when the shared stream reports offline", async () => {
+    renderWithStream(<LiveAgentWorkbench invocationId="inv-1" runId="run-1" />, streamValue({}, "offline"));
     await flush();
-    const stream = FakeEventSource.active[FakeEventSource.active.length - 1]!;
 
-    act(() => stream.onerror?.(new Event("error")));
     expect(container.querySelector(".live-workbench-feed--polling")?.textContent).toContain("轮询刷新");
+    expect(FakeEventSource.urls).toHaveLength(0);
   });
 });
