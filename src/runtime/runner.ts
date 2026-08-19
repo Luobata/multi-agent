@@ -53,6 +53,11 @@ export interface RunWorkflowOptions {
   initialArtifacts?: Record<string, JsonValue>;
   /** Execution isolation evidence recorded verbatim on the run record. */
   isolation?: WorkflowRunIsolation;
+  /**
+   * Opt-in hard gate for member handoff completeness (supervisor architecture; default off).
+   * A sessionKey delegation attempt that leaves no handoff file is treated as incomplete (blocked).
+   */
+  requireMemberHandoff?: boolean;
   prepareNode?: (node: ExecutionPlanNode) => Promise<{
     node: ExecutionPlanNode;
     artifacts?: Record<string, JsonValue>;
@@ -861,6 +866,7 @@ export async function runWorkflow(
       writeArtifact: (relativePath, value) => store.writeArtifact(relativePath, value),
       candidateSnapshot: () => candidateWorkspaceSnapshot(options.providerCwd ?? loaded.projectRoot),
       executionRoot: () => providerCwd,
+      requireMemberHandoff: options.requireMemberHandoff,
       executionPackageScripts: async () => {
         try {
           const value = JSON.parse(await fs.promises.readFile(

@@ -33,6 +33,7 @@ interface MemberCall {
   handoffPath: string;
   handoff: string;
   prompt: string;
+  memberSession: unknown;
 }
 
 function captureMemberCall(invocation: {
@@ -46,7 +47,8 @@ function captureMemberCall(invocation: {
     todoId: String(withValue.__todoId ?? ""),
     handoffPath: String(withValue.__memberSessionHandoffPath ?? ""),
     handoff: String(withValue.__memberSessionHandoff ?? ""),
-    prompt: invocation.prompt
+    prompt: invocation.prompt,
+    memberSession: withValue.__memberSession ?? null
   };
 }
 
@@ -549,5 +551,108 @@ describe("Supervisor member session handoff", () => {
     expect(handoff.endsWith("…[truncated]")).toBe(true);
     expect(handoff.length).toBeLessThanOrEqual(8000 + "\n…[truncated]".length);
     expect(handoff.startsWith("x".repeat(8000))).toBe(true);
+  });
+
+  it("records handoffMissing on the member session turn and emits an event when no handoff is written (default: run still passes)", async () => {
+    const memberCalls: MemberCall[] = [];
+    const providers: ProviderRegistry = new Map([["handoff-missing-flow", {
+      id: "handoff-missing-flow",
+      validate: () => [],
+      invoke: async (invocation) => {
+        const role = (invocation.templateContext.role as { id: string }).id;
+        if (role === "supervisor") {
+          const round = supervisorRound(invocation);
+          if (round === 1) return planTodosResponse("handoff-missing");
+          if (round === 2) return delegateResponse("todo-1");
+          if (round === 3) return delegateResponse("todo-2");
+          return finishResponse();
+        }
+        memberCalls.push(captureMemberCall(invocation));
+        // Deliberately never writes a handoff file.
+        return providerResponse({ message: "todo completed." });
+      }
+    }]]);
+    const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+    await service.putProvider("handoff-missing-provider", { adapter: "handoff-missing-flow", outputProtocol: "json" });
+    await createTeam(service, "handoff-missing-provider");
+    await createWorkflow(service);
+    const providerCwd = temporaryRoot();
+    fs.writeFileSync(path.join(providerCwd, "package.json"), JSON.stringify({ scripts: {} }));
+
+    const result = await service.runWorkbenchWorkflow(
+      "handoff-supervision",
+      { message: "Build the feature." },
+      { kind: "workbench" },
+      { providerCwd }
+    );
+
+    expect(result.run.status, JSON.stringify(result.run.output)).toBe("passed");
+    expect(memberCalls).toHaveLength(2);
+    // Layer 1: the delegation prompt makes the handoff a mandatory pre-finish action.
+    expect(memberCalls[0]!.prompt).toContain("MUST write your updated handoff");
+    expect(memberCalls[0]!.prompt).toContain("recorded as incomplete");
+    // Layer 2: missing handoffs are observable in the run event ledger (default: never block).
+    const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8");
+    expect(events).toContain("supervisor.member-session.handoff-missing");
+    // The second delegation sees the first turn flagged as handoffMissing.
+    const session = memberCalls[1]!.memberSession as { turns?: Array<{ handoffMissing?: boolean }> } | null;
+    expect(session?.turns).toHaveLength(1);
+    expect(session?.turns?.[0]?.handoffMissing).toBe(true);
+  });
+
+  it("treats an attempt without a handoff as blocked when the hard gate is enabled", async () => {
+    const previous = process.env.MULTI_AGENT_REQUIRE_MEMBER_HANDOFF;
+    process.env.MULTI_AGENT_REQUIRE_MEMBER_HANDOFF = "1";
+    try {
+      const providers: ProviderRegistry = new Map([["handoff-gate-enforced-flow", {
+        id: "handoff-gate-enforced-flow",
+        validate: () => [],
+        invoke: async (invocation) => {
+          const role = (invocation.templateContext.role as { id: string }).id;
+          if (role === "supervisor") {
+            const round = supervisorRound(invocation);
+            if (round === 1) return planTodosResponse("handoff-gate-enforced");
+            if (round === 2) return delegateResponse("todo-1");
+            return finishResponse();
+          }
+          // Deliberately never writes a handoff file.
+          return providerResponse({ message: "todo completed." });
+        }
+      }]]);
+      const service = await WorkbenchService.open({ dataRoot: temporaryRoot(), providers });
+      await service.putProvider("handoff-gate-enforced-provider", { adapter: "handoff-gate-enforced-flow", outputProtocol: "json" });
+      await createTeam(service, "handoff-gate-enforced-provider");
+      // Require every delegation to succeed: with the gate on, the handoff-less attempt stays blocked.
+      await service.createManagementPolicy({
+        id: "handoff-gate-enforced-policy",
+        allowedRoleIds: ["builder"],
+        instructions: "Delegate explicit work and deliver only after required Gates pass.",
+        limits: { maxRounds: 3, maxDelegations: 8, maxParallelDelegations: 2, maxDurationMs: 60_000 },
+        completion: { requireDelegation: true, requireAllDelegationsSuccessful: true }
+      });
+      await service.createWorkflow({
+        id: "handoff-gate-enforced-supervision",
+        architecture: "supervisor",
+        supervisor: { employeeId: "handoff-lead" },
+        managementPolicy: { id: "handoff-gate-enforced-policy" },
+        members: [{ roleId: "builder", employeeId: "handoff-builder" }]
+      });
+      const providerCwd = temporaryRoot();
+      fs.writeFileSync(path.join(providerCwd, "package.json"), JSON.stringify({ scripts: {} }));
+
+      const result = await service.runWorkbenchWorkflow(
+        "handoff-gate-enforced-supervision",
+        { message: "Build the feature." },
+        { kind: "workbench" },
+        { providerCwd }
+      );
+
+      expect(result.run.status, JSON.stringify(result.run.output)).not.toBe("passed");
+      const events = fs.readFileSync(path.join(result.runDir, "events.jsonl"), "utf8");
+      expect(events).toContain("supervisor.member-session.handoff-missing");
+    } finally {
+      if (previous === undefined) delete process.env.MULTI_AGENT_REQUIRE_MEMBER_HANDOFF;
+      else process.env.MULTI_AGENT_REQUIRE_MEMBER_HANDOFF = previous;
+    }
   });
 });

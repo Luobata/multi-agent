@@ -64,6 +64,12 @@ export interface ArchitectureExecutionContext {
   candidateSnapshot(): Promise<CandidateWorkspaceSnapshot>;
   /** Absolute execution root (resolved provider cwd) for runtime-owned working files such as member handoff notes. */
   executionRoot(): string;
+  /**
+   * Opt-in hard gate (default off): a sessionKey delegation attempt that leaves no member handoff
+   * file is treated as incomplete (blocked). When omitted, missing handoffs are only recorded
+   * (turn flag + event) and never block the Run.
+   */
+  requireMemberHandoff?: boolean;
   executionPackageScripts(): Promise<Record<string, string>>;
   persist(): Promise<void>;
   emit(type: string, nodeId?: string, detail?: JsonValue): Promise<void>;

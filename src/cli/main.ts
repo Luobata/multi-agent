@@ -16,6 +16,7 @@ import type {
   KnowledgeRevisionCreateInput
 } from "../knowledge/types.js";
 import { runWorkflow } from "../runtime/runner.js";
+import { inspectDeliveryChain, repairDeliveryChain } from "../runtime/worktreeDelivery.js";
 import { startDaemon } from "../daemon/server.js";
 import type { MemoryKind } from "../memory/types.js";
 import { WorkbenchService } from "../workbench/service.js";
@@ -155,15 +156,19 @@ program
   .option("-c, --config <path>", "manifest path", "multi-agent.yaml")
   .option("-i, --input <path>", "JSON input file")
   .option("--dry-run", "compile and print the plan without invoking providers")
+  .option("--require-member-handoff", "treat member delegation attempts without a handoff file as incomplete (blocked)")
   .option("--json", "print machine-readable output")
-  .action(async (workflow: string | undefined, options: { config: string; input?: string; dryRun?: boolean; json?: boolean }) => {
+  .action(async (workflow: string | undefined, options: { config: string; input?: string; dryRun?: boolean; requireMemberHandoff?: boolean; json?: boolean }) => {
     const loaded = loadManifest(options.config);
     const workflowId = resolveWorkflow(loaded, workflow);
     if (options.dryRun) {
       process.stdout.write(`${formatPlanText(compilePlan(loaded, workflowId))}\n`);
       return;
     }
-    const result = await runWorkflow(loaded, workflowId, { input: readInput(options.input) });
+    const result = await runWorkflow(loaded, workflowId, {
+      input: readInput(options.input),
+      ...(options.requireMemberHandoff ? { requireMemberHandoff: true } : {})
+    });
     if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     else process.stdout.write(`Run ${result.run.id}: ${result.run.status}\nArtifacts: ${result.runDir}\n`);
     if (result.run.status === "failed") process.exitCode = 1;
@@ -662,6 +667,24 @@ workbenchWorkflow
   .option("-i, --input <file>", "JSON input file")
   .action(async (id: string, options: { input?: string }) => {
     process.stdout.write(`${JSON.stringify(await (await workbenchService()).runWorkbenchWorkflow(id, readInput(options.input)), null, 2)}\n`);
+  });
+
+workbench
+  .command("hub-reconcile")
+  .description("Diff a Run's delivery revision chain (dry-run by default) and optionally repair it")
+  .argument("<run-id>", "Run id whose delivery chain should be reconciled")
+  .option("--apply", "apply repairable fixes through the CAS/event-chain mechanisms (default: dry-run diff report only)")
+  .option("--merge-commit <sha>", "optional expected merge commit to verify against a persisted merge intent")
+  .action(async (runId: string, options: { apply?: boolean; mergeCommit?: string }) => {
+    const dataRoot = program.opts<{ dataRoot?: string }>().dataRoot ?? WorkbenchService.defaultDataRoot();
+    const runDir = path.join(dataRoot, "artifacts", "runs", runId);
+    const report = options.apply
+      ? await repairDeliveryChain(runDir, runId, { expectedMergeCommit: options.mergeCommit })
+      : await inspectDeliveryChain(runDir, runId, { expectedMergeCommit: options.mergeCommit });
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (report.status === "corrupt" || (options.apply && report.status !== "aligned" && report.status !== "absent")) {
+      process.exitCode = 1;
+    }
   });
 
 workbench

@@ -3359,10 +3359,21 @@ export interface DeliverySideEffectRecoveryResult {
 export async function reconcileRunDeliverySideEffects(
   run: WorkflowRunRecord,
   runDir: string,
-  leaseHandle?: DeliveryLeaseHandle
+  leaseHandle?: DeliveryLeaseHandle,
+  options: { expectedMergeCommit?: string } = {}
 ): Promise<DeliverySideEffectRecoveryResult> {
   const delivery = await readRunDelivery(runDir, run.id);
   if (!delivery || TERMINAL_DELIVERY_STATUSES.has(delivery.status)) return { action: "none", ...(delivery ? { delivery } : {}) };
+  if (options.expectedMergeCommit) {
+    const preparedMergeCommit = delivery.sideEffects?.merge?.preparedMergeCommit;
+    if (preparedMergeCommit && preparedMergeCommit !== options.expectedMergeCommit) {
+      return {
+        action: "attention",
+        delivery,
+        reason: `expected merge commit ${options.expectedMergeCommit} does not match the persisted merge intent ${preparedMergeCommit}`
+      };
+    }
+  }
   const worktreePath = run.isolation?.mode === "worktree" ? run.isolation.worktreePath : undefined;
   const inferredRoot = worktreePath ? inferredRepositoryRoot(worktreePath, run.id) : undefined;
   let repositoryRoot: string | undefined;
@@ -3478,6 +3489,375 @@ export async function reconcileRunDeliverySideEffects(
     }
   }
   return { action: "merge-completed", delivery: completed };
+}
+
+export type DeliveryChainStatus = "absent" | "aligned" | "misaligned" | "corrupt";
+
+export interface DeliveryChainFinding {
+  code:
+    | "snapshot-filename-mismatch"
+    | "snapshot-envelope-invalid"
+    | "snapshot-record-invalid"
+    | "snapshot-record-revision-mismatch"
+    | "snapshot-event-malformed"
+    | "snapshot-last-event-mismatch"
+    | "snapshot-gap"
+    | "projection-missing"
+    | "projection-invalid"
+    | "projection-diverged"
+    | "projection-ahead"
+    | "snapshot-missing-for-v2"
+    | "merge-intent-commit-mismatch";
+  severity: "repairable" | "attention";
+  detail: string;
+  /** Human description of the planned repair (repairable findings only). */
+  repair?: string;
+}
+
+export interface DeliveryChainReport {
+  runId: string;
+  status: DeliveryChainStatus;
+  highestRevision: number;
+  projectionRevision?: number;
+  findings: DeliveryChainFinding[];
+}
+
+export interface DeliveryChainRepairResult extends DeliveryChainReport {
+  /** Repair steps applied, in order. Empty when nothing was repaired. */
+  applied: string[];
+  /** True when the post-repair inspection reports an aligned chain. */
+  repaired: boolean;
+}
+
+interface ParsedChainSnapshot {
+  fileName: string;
+  revision: number;
+  record?: RunDeliveryRecordV2;
+}
+
+/**
+ * Read-only diff of a Run's delivery revision chain: immutable snapshot files
+ * (delivery-revisions/<revision>.json), the delivery.json projection, and their alignment.
+ * "repairable" findings can be fixed by repairDeliveryChain without bypassing the CAS invariants;
+ * "attention" findings require human review and block any repair (all-or-nothing).
+ */
+export async function inspectDeliveryChain(
+  runDir: string,
+  runId: string,
+  options: { expectedMergeCommit?: string } = {}
+): Promise<DeliveryChainReport> {
+  assertRunId(runId);
+  const findings: DeliveryChainFinding[] = [];
+  const directory = path.join(runDir, DELIVERY_REVISIONS_DIRECTORY);
+  let entries: string[] = [];
+  try {
+    entries = (await fs.readdir(directory)).filter((entry) => SNAPSHOT_NAME.test(entry));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  entries.sort();
+
+  const snapshots: ParsedChainSnapshot[] = [];
+  let highestRevision = 0;
+  for (const fileName of entries) {
+    const filePath = path.join(directory, fileName);
+    const raw = await fs.readFile(filePath, "utf8");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      findings.push({
+        code: "snapshot-envelope-invalid",
+        severity: "attention",
+        detail: `${fileName}: snapshot JSON is invalid: ${error instanceof Error ? error.message : String(error)}`
+      });
+      continue;
+    }
+    if (!isRecord(parsed) || parsed.schemaVersion !== 2 || !Number.isSafeInteger(parsed.revision)) {
+      findings.push({ code: "snapshot-envelope-invalid", severity: "attention", detail: `${fileName}: snapshot envelope is invalid` });
+      continue;
+    }
+    const revision = parsed.revision as number;
+    if (revision > highestRevision) highestRevision = revision;
+    const snapshot: ParsedChainSnapshot = { fileName, revision };
+    if (fileName !== revisionFileName(revision)) {
+      const target = revisionFileName(revision);
+      const collision = entries.includes(target);
+      findings.push({
+        code: "snapshot-filename-mismatch",
+        severity: collision ? "attention" : "repairable",
+        detail: `snapshot file ${fileName} contains revision ${revision}; expected filename ${target}`,
+        ...(collision ? {} : { repair: `rename ${fileName} to ${target}` })
+      });
+    }
+    const event = isRecord(parsed.event)
+      && typeof parsed.event.id === "string"
+      && typeof parsed.event.type === "string"
+      && typeof parsed.event.actor === "string"
+      && typeof parsed.event.at === "string"
+      && Number.isSafeInteger(parsed.event.fromRevision)
+      && Number.isSafeInteger(parsed.event.toRevision)
+      ? {
+          id: parsed.event.id as string,
+          type: parsed.event.type as string,
+          actor: parsed.event.actor as string,
+          at: parsed.event.at as string,
+          fromRevision: parsed.event.fromRevision as number,
+          toRevision: parsed.event.toRevision as number
+        }
+      : undefined;
+    if (!event) {
+      findings.push({ code: "snapshot-event-malformed", severity: "attention", detail: `${fileName}: snapshot event is missing or malformed` });
+    }
+    const validated = isRecord(parsed.record) ? validateDeliveryRecord(parsed.record, runId) : undefined;
+    if (!validated || !validated.valid) {
+      findings.push({
+        code: "snapshot-record-invalid",
+        severity: "attention",
+        detail: `${fileName}: ${validated ? validated.reason : "snapshot record is missing or not an object"}`
+      });
+    } else if (validated.legacy || validated.record.revision !== revision) {
+      findings.push({
+        code: "snapshot-record-revision-mismatch",
+        severity: "attention",
+        detail: `${fileName}: record revision ${validated.record.revision} does not match snapshot revision ${revision}`
+      });
+    } else {
+      snapshot.record = validated.record;
+      if (event && (
+        event.id !== validated.record.lastEvent.id
+        || event.type !== validated.record.lastEvent.type
+        || event.actor !== validated.record.lastEvent.actor
+        || event.at !== validated.record.lastEvent.at
+        || event.fromRevision !== revision - 1
+        || event.toRevision !== revision
+      )) {
+        findings.push({
+          code: "snapshot-last-event-mismatch",
+          severity: "repairable",
+          detail: `${fileName}: record.lastEvent does not match the snapshot event`,
+          repair: `rewrite record.lastEvent from the snapshot event in ${fileName}`
+        });
+      }
+    }
+    snapshots.push(snapshot);
+  }
+
+  // Revision continuity: snapshots must form a gap-free 1..N sequence.
+  const revisions = snapshots.map((snapshot) => snapshot.revision).sort((left, right) => left - right);
+  for (let index = 0; index < revisions.length; index += 1) {
+    if (revisions[index] !== index + 1) {
+      findings.push({
+        code: "snapshot-gap",
+        severity: "attention",
+        detail: `snapshot revisions are not contiguous: expected ${index + 1}, found ${revisions[index]}`
+      });
+      break;
+    }
+  }
+
+  // Projection (delivery.json) vs the highest correctly-named valid snapshot.
+  let projectionRevision: number | undefined;
+  const projectionBytes = await readBufferIfPresent(deliveryPath(runDir));
+  if (projectionBytes === undefined) {
+    if (snapshots.length > 0) {
+      findings.push({
+        code: "projection-missing",
+        severity: "repairable",
+        detail: "delivery.json is missing but immutable revision snapshots exist",
+        repair: "rewrite delivery.json from the highest valid snapshot"
+      });
+    }
+  } else {
+    let parsedProjection: unknown;
+    try {
+      parsedProjection = JSON.parse(projectionBytes.toString("utf8"));
+    } catch (error) {
+      findings.push({
+        code: "projection-invalid",
+        severity: "repairable",
+        detail: `delivery.json is invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        repair: "rewrite delivery.json from the highest valid snapshot"
+      });
+    }
+    if (parsedProjection !== undefined) {
+      const validated = validateDeliveryRecord(parsedProjection, runId);
+      if (!validated.valid) {
+        findings.push({
+          code: "projection-invalid",
+          severity: "repairable",
+          detail: `delivery.json: ${validated.reason}`,
+          repair: "rewrite delivery.json from the highest valid snapshot"
+        });
+      } else if (validated.legacy) {
+        projectionRevision = 0;
+        if (snapshots.length > 0) {
+          findings.push({
+            code: "projection-diverged",
+            severity: "repairable",
+            detail: "delivery.json is a legacy v1 projection but immutable revision snapshots exist",
+            repair: "rewrite delivery.json from the highest valid snapshot"
+          });
+        }
+      } else {
+        projectionRevision = validated.record.revision;
+        if (validated.record.revision > highestRevision) {
+          findings.push({
+            code: "projection-ahead",
+            severity: "attention",
+            detail: `delivery.json revision ${validated.record.revision} is ahead of the highest snapshot revision ${highestRevision}`
+          });
+        } else {
+          const highest = snapshots
+            .filter((snapshot) => snapshot.fileName === revisionFileName(snapshot.revision) && snapshot.record)
+            .sort((left, right) => right.revision - left.revision)[0];
+          if (!highest?.record) {
+            findings.push({
+              code: "snapshot-missing-for-v2",
+              severity: "attention",
+              detail: "delivery.json is v2 but no valid immutable revision snapshot is readable"
+            });
+          } else if (!isDeepStrictEqual(validated.record, highest.record)) {
+            findings.push({
+              code: "projection-diverged",
+              severity: "repairable",
+              detail: `delivery.json does not match the highest immutable snapshot (revision ${highest.revision})`,
+              repair: "rewrite delivery.json from the highest valid snapshot"
+            });
+          }
+        }
+      }
+    }
+  }
+
+  if (options.expectedMergeCommit) {
+    const highest = snapshots
+      .filter((snapshot) => snapshot.fileName === revisionFileName(snapshot.revision) && snapshot.record)
+      .sort((left, right) => right.revision - left.revision)[0];
+    const preparedMergeCommit = highest?.record?.sideEffects?.merge?.preparedMergeCommit;
+    if (preparedMergeCommit && preparedMergeCommit !== options.expectedMergeCommit) {
+      findings.push({
+        code: "merge-intent-commit-mismatch",
+        severity: "attention",
+        detail: `persisted merge intent preparedMergeCommit ${preparedMergeCommit} does not match expected ${options.expectedMergeCommit}`
+      });
+    }
+  }
+
+  const status: DeliveryChainStatus = snapshots.length === 0 && projectionBytes === undefined
+    ? "absent"
+    : findings.length === 0
+      ? "aligned"
+      : findings.some((finding) => finding.severity === "attention")
+        ? "corrupt"
+        : "misaligned";
+  return {
+    runId,
+    status,
+    highestRevision,
+    ...(projectionRevision === undefined ? {} : { projectionRevision }),
+    findings
+  };
+}
+
+/**
+ * Applies the repairable findings from inspectDeliveryChain through the existing CAS/event-chain
+ * mechanisms, stepwise and auditable. All-or-nothing: any "attention" finding blocks every repair.
+ * Repair order: snapshot filename renames → record.lastEvent rewrites (from each snapshot's own
+ * event block; the event evidence itself is never touched) → delivery.json projection repair via
+ * the existing repairProjectionFromSnapshot primitive.
+ */
+export async function repairDeliveryChain(
+  runDir: string,
+  runId: string,
+  options: { expectedMergeCommit?: string } = {}
+): Promise<DeliveryChainRepairResult> {
+  const before = await inspectDeliveryChain(runDir, runId, options);
+  if (before.status !== "misaligned") {
+    return { ...before, applied: [], repaired: false };
+  }
+  return withDeliveryMutex(runDir, async () => {
+    const applied: string[] = [];
+    const directory = path.join(runDir, DELIVERY_REVISIONS_DIRECTORY);
+
+    // Step 1: rename snapshot files whose filename does not match their revision.
+    const entries = (await fs.readdir(directory)).filter((entry) => SNAPSHOT_NAME.test(entry)).sort();
+    for (const fileName of entries) {
+      const filePath = path.join(directory, fileName);
+      let revision: unknown;
+      try {
+        ({ revision } = JSON.parse(await fs.readFile(filePath, "utf8")) as { revision?: unknown });
+      } catch {
+        continue; // attention finding already refused the repair
+      }
+      if (!Number.isSafeInteger(revision)) continue;
+      const target = revisionFileName(revision as number);
+      if (fileName === target) continue;
+      if (entries.includes(target)) {
+        // Collision: all-or-nothing refusal. Re-inspect to surface the attention state.
+        const after = await inspectDeliveryChain(runDir, runId, options);
+        return { ...after, applied, repaired: false };
+      }
+      await fs.rename(filePath, path.join(directory, target));
+      await fsyncDirectory(directory);
+      applied.push(`renamed snapshot ${fileName} to ${target}`);
+    }
+
+    // Step 2: rewrite record.lastEvent from each snapshot's own event block.
+    const renamed = (await fs.readdir(directory)).filter((entry) => SNAPSHOT_NAME.test(entry)).sort();
+    for (const fileName of renamed) {
+      const filePath = path.join(directory, fileName);
+      const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as {
+        revision?: unknown;
+        record?: unknown;
+        event?: unknown;
+      };
+      if (!Number.isSafeInteger(parsed.revision) || !isRecord(parsed.record) || !isRecord(parsed.event)) continue;
+      const revision = parsed.revision as number;
+      const event = parsed.event;
+      if (typeof event.id !== "string"
+        || typeof event.type !== "string"
+        || typeof event.actor !== "string"
+        || typeof event.at !== "string"
+        || !Number.isSafeInteger(event.fromRevision)
+        || !Number.isSafeInteger(event.toRevision)) {
+        continue; // attention finding already refused the repair
+      }
+      const lastEvent = {
+        id: event.id,
+        type: event.type,
+        actor: event.actor,
+        at: event.at,
+        fromRevision: revision - 1,
+        toRevision: revision
+      };
+      const current = (parsed.record as { lastEvent?: unknown }).lastEvent;
+      if (isRecord(current)
+        && current.id === lastEvent.id
+        && current.type === lastEvent.type
+        && current.actor === lastEvent.actor
+        && current.at === lastEvent.at
+        && current.fromRevision === lastEvent.fromRevision
+        && current.toRevision === lastEvent.toRevision) {
+        continue;
+      }
+      const fixed = { ...parsed, record: { ...parsed.record, lastEvent } };
+      const temporary = path.join(directory, `.${fileName}.${randomUUID()}.tmp`);
+      await writeSyncedFile(temporary, `${JSON.stringify(fixed, null, 2)}\n`);
+      await fs.rename(temporary, filePath);
+      await fsyncDirectory(directory);
+      applied.push(`rewrote record.lastEvent from the snapshot event in ${fileName}`);
+    }
+
+    // Step 3: repair the projection from the highest valid snapshot (existing CAS-safe primitive).
+    const store = RunDeliveryStore.forRunDirectory(runDir, runId);
+    if (await store.repairProjectionFromSnapshot(runId)) {
+      applied.push("rewrote delivery.json from the highest valid snapshot");
+    }
+
+    const after = await inspectDeliveryChain(runDir, runId, options);
+    return { ...after, applied, repaired: after.status === "aligned" };
+  });
 }
 
 function humanActor(value: string | undefined): string {

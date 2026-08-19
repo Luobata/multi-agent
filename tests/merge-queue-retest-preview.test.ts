@@ -137,6 +137,22 @@ async function waitForDeliveryTerminal(service: WorkbenchService, runId: string,
   throw new Error(`delivery did not reach terminal state: ${JSON.stringify(last?.delivery ?? null)}`);
 }
 
+// The validation worktree is removed in the service's finally block, which runs after the
+// validation.passed event settles the delivery. Poll for the cleanup instead of racing it:
+// a missing or empty directory is the intended invariant, and a cleanup that never finishes
+// still fails the test with the leftover listing as evidence.
+async function waitForValidationWorktreeCleanup(repo: string, timeoutMs = 10_000): Promise<void> {
+  const validationDir = path.join(repo, ".multi-agent", "merge-validation");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!fs.existsSync(validationDir)) return;
+    if (fs.readdirSync(validationDir).length === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const leftover = fs.existsSync(validationDir) ? fs.readdirSync(validationDir) : [];
+  throw new Error(`merge validation worktree was not cleaned up: ${JSON.stringify(leftover)}`);
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -367,10 +383,7 @@ describe("merge-queue-retest candidate preview", () => {
     expect(archived.testRunId).toBe(evidence!.testRunId);
     expect(archived.output.summary).toContain("CANDIDATE_IDENTITY");
     // The validation worktree is gone (or emptied), but its evidence survived in the archive.
-    const validationDir = path.join(repo, ".multi-agent", "merge-validation");
-    if (fs.existsSync(validationDir)) {
-      expect(fs.readdirSync(validationDir)).toHaveLength(0);
-    }
+    await waitForValidationWorktreeCleanup(repo);
   }, 60_000);
 
   it("stops the candidate preview in the finally block after retest completes", async () => {
@@ -397,11 +410,7 @@ describe("merge-queue-retest candidate preview", () => {
     expect(settled.delivery?.mergeValidation?.status).toBe("passed");
     expect(capturedPrompts.length).toBeGreaterThan(0);
     // The validation worktree must be removed (which happens after preview.stop() in finally).
-    const validationDir = path.join(repo, ".multi-agent", "merge-validation");
-    if (fs.existsSync(validationDir)) {
-      const remaining = fs.readdirSync(validationDir);
-      expect(remaining).toHaveLength(0);
-    }
+    await waitForValidationWorktreeCleanup(repo);
   }, 30_000);
 
   it("fails validation when the retest output lacks CANDIDATE_IDENTITY", async () => {

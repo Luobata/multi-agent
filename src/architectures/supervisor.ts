@@ -201,6 +201,8 @@ interface MemberSessionTurn {
   error: string | null;
   /** Best-effort handoff notes the member left for its next delegation; null when none were written. */
   handoff: string | null;
+  /** True when the attempt completed without a handoff file (missing or empty). Recorded for observability; never blocks the Run by itself. */
+  handoffMissing?: boolean;
 }
 
 interface MemberSessionState {
@@ -1314,6 +1316,42 @@ async function readMemberHandoff(context: ArchitectureExecutionContext, sessionK
   }
 }
 
+interface MemberHandoffInspection {
+  content: string | null;
+  /** True when no handoff was left: the file is absent, empty, or unreadable. */
+  missing: boolean;
+  /** Raw byte size of the handoff file (0 when absent). */
+  bytes: number;
+}
+
+/** Best-effort handoff inspection: existence, byte count, and truncated content. Never fails the Run. */
+async function inspectMemberHandoff(context: ArchitectureExecutionContext, sessionKey: string): Promise<MemberHandoffInspection> {
+  try {
+    const stats = await fs.promises.stat(memberHandoffPath(context, sessionKey));
+    if (!stats.isFile() || stats.size === 0) return { content: null, missing: true, bytes: 0 };
+    const content = await readMemberHandoff(context, sessionKey);
+    return { content, missing: content === null, bytes: stats.size };
+  } catch {
+    return { content: null, missing: true, bytes: 0 };
+  }
+}
+
+/**
+ * Opt-in hard gate (default off): a sessionKey delegation attempt that leaves no handoff file is
+ * treated as incomplete (blocked) and rides the existing worker-failure machinery. Enabled via the
+ * run execution config (ArchitectureExecutionContext.requireMemberHandoff) or the
+ * MULTI_AGENT_REQUIRE_MEMBER_HANDOFF environment switch for daemon-launched Runs.
+ */
+function memberHandoffGateEnforced(context: ArchitectureExecutionContext): boolean {
+  if (context.requireMemberHandoff === true) return true;
+  const env = process.env.MULTI_AGENT_REQUIRE_MEMBER_HANDOFF?.trim().toLowerCase();
+  return env === "1" || env === "true";
+}
+
+function handoffMissingError(sessionKey: string): string {
+  return `member handoff required by execution config was not written for session ${sessionKey}`;
+}
+
 const REGRESSION_LEVEL_ORDER: Record<RegressionRiskLevel, number> = { low: 0, medium: 1, high: 2 };
 const REGRESSION_SCOPE_ORDER: Record<RegressionScope, number> = { none: 0, targeted: 1, package: 2, full: 3 };
 
@@ -1781,7 +1819,6 @@ async function executeGateActivation(
     }
     await context.scheduleNode(node);
     const result = await context.executeNode(node, { dependencyFailure: "observe", deadlineAt });
-    results.push({ node, result });
     const serialized = JSON.stringify(result.output ?? result.error ?? null);
     if (serialized.includes("MIDSCENE_ENVIRONMENT_BLOCKED")) {
       const circuit = recordEnvironmentFailure(governance.circuits[circuitKey], {
@@ -1797,16 +1834,33 @@ async function executeGateActivation(
         break;
       }
     }
+    let effectiveResult = result;
     if (gateMemberSession) {
-      const handoff = await readMemberHandoff(context, gateMemberSession.key);
+      const handoff = await inspectMemberHandoff(context, gateMemberSession.key);
+      if (handoff.missing) {
+        await context.emit("supervisor.member-session.handoff-missing", node.id, {
+          memberSessionId: gateMemberSession.id,
+          sessionKey: gateMemberSession.key,
+          todoId: executionGroups[index]!.id,
+          bytes: handoff.bytes
+        });
+        if (memberHandoffGateEnforced(context)) {
+          effectiveResult = {
+            ...result,
+            status: "blocked" as const,
+            error: handoffMissingError(gateMemberSession.key)
+          };
+        }
+      }
       gateMemberSession.turns.push({
         todoId: executionGroups[index]!.id,
         nodeId: node.id,
         task: String(node.with.__delegatedTask ?? ""),
-        status: result.status,
-        output: result.output ?? null,
-        error: result.error ?? null,
-        handoff
+        status: effectiveResult.status,
+        output: effectiveResult.output ?? null,
+        error: effectiveResult.error ?? null,
+        handoff: handoff.content,
+        ...(handoff.missing ? { handoffMissing: true } : {})
       });
       if (index === nodes.length - 1) {
         gateMemberSession.status = "closed";
@@ -1814,10 +1868,11 @@ async function executeGateActivation(
           memberSessionId: gateMemberSession.id,
           sessionKey: gateMemberSession.key,
           turns: gateMemberSession.turns.length,
-          finalStatus: result.status
+          finalStatus: effectiveResult.status
         });
       }
     }
+    results.push({ node, result: effectiveResult });
   }
   let activationPassed = !circuitOpened && results.length + reusedShardCount === nodes.length;
   const errors: string[] = [];
@@ -3139,15 +3194,32 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       if (!sessionId) continue;
       const session = [...memberSessions.values()].find((candidate) => candidate.id === sessionId);
       if (!session) continue;
-      const handoff = await readMemberHandoff(context, session.key);
+      const handoff = await inspectMemberHandoff(context, session.key);
+      const todoId = typeof record.worker.metadata?.todoId === "string" ? record.worker.metadata.todoId : record.worker.id;
+      if (handoff.missing) {
+        await context.emit("supervisor.member-session.handoff-missing", record.worker.id, {
+          memberSessionId: session.id,
+          sessionKey: session.key,
+          todoId,
+          bytes: handoff.bytes
+        });
+        if (memberHandoffGateEnforced(context)) {
+          record.result = {
+            ...record.result,
+            status: "blocked" as const,
+            error: handoffMissingError(session.key)
+          };
+        }
+      }
       session.turns.push({
-        todoId: typeof record.worker.metadata?.todoId === "string" ? record.worker.metadata.todoId : record.worker.id,
+        todoId,
         nodeId: record.worker.id,
         task: record.assignment.task ?? "",
         status: record.result.status,
         output: record.result.output ?? null,
         error: record.result.error ?? null,
-        handoff
+        handoff: handoff.content,
+        ...(handoff.missing ? { handoffMissing: true } : {})
       });
       if (record.worker.metadata?.memberSessionRetained !== true) {
         session.status = "closed";
