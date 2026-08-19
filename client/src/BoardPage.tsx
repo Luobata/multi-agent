@@ -1,158 +1,27 @@
 /** 需求看板：九列数据契约、七列可见视图 + 三种正交异常态。列迁移走详情页。 */
-import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, cancelInvocation, getSession, monitorInvocation, startInvocation, type InvocationStartReceipt } from "./api";
 import { ConversationComposer, ConversationMessageEvidence, type ComposerDraft } from "./ConversationComposer";
-import { EmptyState, Field, Modal, RuntimeStatusChip, SelectControl, Stamp, formatTime, useDaemonAvailable } from "./components";
+import { EmptyState, Field, Modal, SelectControl, formatTime, useDaemonAvailable } from "./components";
 import { requirementAdvancementConfig, requirementOwnerLabel } from "./dashboard/advancement";
 import { dashboardService, type DashboardService } from "./dashboard/service";
 import type { ManagedProject, Requirement, RequirementException, RequirementPriority, SpaceNode } from "./dashboard/types";
 import { acceptanceSnapshotFromPreview, isRunAcceptanceReady } from "./dashboard/acceptance";
-import { REQUIREMENT_EXCEPTION_LABELS, REQUIREMENT_PRIORITY_LABELS, VISIBLE_REQUIREMENT_LANES, visibleRequirementLane } from "./dashboard/types";
+import { REQUIREMENT_PRIORITY_LABELS, VISIBLE_REQUIREMENT_LANES, visibleRequirementLane } from "./dashboard/types";
 import { ErrorBlock, OfflineNotice, PageHeader, SkeletonBlock, useServiceData } from "./dashboard/view";
-import type { HumanDecisionRequest, InvocationRecord, JsonValue, Project, ProjectBinding, RunMergePreview, Session } from "./types";
+import type { HumanDecisionRequest, InvocationRecord, Project, ProjectBinding, RunMergePreview, Session } from "./types";
+import { deliveryProgressChip, exceptionChip } from "./board/cards";
+import { ConversationMessageContent, formatAgentElapsedMs, type AgentPendingTurn } from "./board/conversation";
+import { requirementStewardOutput, type AgentRequirementDraft } from "./board/steward";
 import "./board-ai.css";
+
+export { requirementStewardOutput } from "./board/steward";
+export { ConversationMessageContent, normalizeConversationLineBreaks } from "./board/conversation";
 
 const REQUIREMENT_STEWARD_ROLE_ID = "requirement-steward";
 const EMPTY_PROJECTS: Project[] = [];
 const EMPTY_INVOCATIONS: InvocationRecord[] = [];
 const EMPTY_HUMAN_DECISION_REQUESTS: HumanDecisionRequest[] = [];
-
-interface AgentRequirementDraft {
-  title: string;
-  summary: string;
-  priority: RequirementPriority;
-  rawRequirement: string;
-  acceptanceCriteria: string[];
-}
-
-interface RequirementStewardOutput {
-  message: string;
-  nextAction: "clarify" | "draft";
-  draft?: AgentRequirementDraft | null;
-}
-
-function objectValue(value: JsonValue | undefined): Record<string, JsonValue> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, JsonValue>
-    : undefined;
-}
-
-export function requirementStewardOutput(value: JsonValue | undefined): RequirementStewardOutput | undefined {
-  const output = objectValue(value);
-  if (!output || typeof output.message !== "string" || (output.nextAction !== "clarify" && output.nextAction !== "draft")) return undefined;
-  const candidate = objectValue(output.draft);
-  const draft = candidate
-    && typeof candidate.title === "string"
-    && typeof candidate.summary === "string"
-    && ["low", "medium", "high"].includes(String(candidate.priority))
-    && typeof candidate.rawRequirement === "string"
-    && Array.isArray(candidate.acceptanceCriteria)
-    && candidate.acceptanceCriteria.every((item) => typeof item === "string")
-    ? {
-        title: candidate.title,
-        summary: candidate.summary,
-        priority: candidate.priority as RequirementPriority,
-        rawRequirement: candidate.rawRequirement,
-        acceptanceCriteria: candidate.acceptanceCriteria as string[]
-      }
-    : null;
-  return { message: output.message, nextAction: output.nextAction, draft };
-}
-
-/**
- * Provider JSON occasionally contains a second, literal escaping layer. Decode only
- * line-break escapes here; React renders every resulting fragment as an escaped text
- * node, so message content can never introduce executable HTML.
- */
-export function normalizeConversationLineBreaks(content: string): string {
-  return content.replace(/\\r\\n|\\n|\\r/g, "\n");
-}
-
-function inlineMarkdown(text: string): ReactNode[] {
-  return text.split(/(\*\*[^*\n]+\*\*)/g).filter(Boolean).map((part, index) =>
-    part.startsWith("**") && part.endsWith("**")
-      ? <strong key={index}>{part.slice(2, -2)}</strong>
-      : <Fragment key={index}>{part}</Fragment>
-  );
-}
-
-export function ConversationMessageContent({ content }: { content: string }) {
-  const lines = normalizeConversationLineBreaks(content).split("\n");
-  const blocks: ReactNode[] = [];
-  for (let index = 0; index < lines.length;) {
-    const line = lines[index]!;
-    const unordered = /^\s*[-*+]\s+(.+)$/.exec(line);
-    const ordered = /^\s*\d+[.)]\s+(.+)$/.exec(line);
-    if (unordered || ordered) {
-      const orderedList = Boolean(ordered);
-      const items: ReactNode[] = [];
-      while (index < lines.length) {
-        const match = orderedList
-          ? /^\s*\d+[.)]\s+(.+)$/.exec(lines[index]!)
-          : /^\s*[-*+]\s+(.+)$/.exec(lines[index]!);
-        if (!match) break;
-        items.push(<li key={index}>{inlineMarkdown(match[1]!)}</li>);
-        index += 1;
-      }
-      blocks.push(orderedList ? <ol key={`list-${index}`}>{items}</ol> : <ul key={`list-${index}`}>{items}</ul>);
-      continue;
-    }
-    if (!line.trim()) {
-      blocks.push(<div className="board-ai-message-spacer" aria-hidden="true" key={`blank-${index}`} />);
-    } else {
-      blocks.push(<p key={`paragraph-${index}`}>{inlineMarkdown(line)}</p>);
-    }
-    index += 1;
-  }
-  return <div className="board-ai-message-content">{blocks}</div>;
-}
-
-function exceptionChip(exception: Requirement["exception"]) {
-  if (exception === "blocked") return <Stamp status="blocked" label={REQUIREMENT_EXCEPTION_LABELS.blocked} />;
-  if (exception === "failed") return <Stamp status="failed" label={REQUIREMENT_EXCEPTION_LABELS.failed} />;
-  if (exception === "cancelled") return <RuntimeStatusChip status="cancelled" label={REQUIREMENT_EXCEPTION_LABELS.cancelled} />;
-  return null;
-}
-
-function deliveryProgressChip(requirement: Requirement) {
-  if (requirement.lane !== "merging" || !requirement.delivery) return null;
-  const labels: Record<NonNullable<Requirement["delivery"]>["status"], string> = {
-    "queued-for-merge": "等待串行合入",
-    retesting: "合入前重新验收",
-    merging: "正在写入目标分支",
-    merged: "合入完成",
-    conflict: "冲突处理中",
-    "returned-to-acceptance": "已退回验收"
-  };
-  const resolution = requirement.delivery.conflictResolution;
-  const detail = requirement.delivery.message?.includes("目标仓库存在未提交改动") ? "等待目标仓库洁净"
-    : resolution?.status === "resolving" ? "冲突处理中"
-    : resolution?.status === "retesting" ? "候选复测中"
-      : resolution?.status === "leader-review" ? "领队复验"
-        : resolution?.status === "failed" ? (resolution.failureClass === "environment-blocked" ? "候选环境阻塞" : resolution.failureClass === "evidence-incomplete" ? "证据不完整" : resolution.failureClass === "product-failed" ? "产品回归失败" : "冲突处理失败")
-          : labels[requirement.delivery.status];
-  return <span className="board-evidence-capture" role="status" title={resolution?.message ?? requirement.delivery.message}>{detail}</span>;
-}
-
-interface AgentPendingTurn {
-  receipt: InvocationStartReceipt;
-  message: string;
-  startedAt: number;
-  cursor: string;
-  phase: "waiting" | "cancelling" | "interrupted";
-  /** False once the monitor loop has died (interrupted); remount sets it back. */
-  monitorLive: boolean;
-  lastReason?: "changed" | "heartbeat";
-  lastUpdateAt?: string;
-  lastStatus?: string;
-  lastPhase?: string;
-  error?: string;
-}
-
-function formatAgentElapsedMs(ms: number): string {
-  const seconds = Math.max(0, Math.floor(ms / 1000));
-  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
-}
 
 export function BoardPage({ spaceId, go, notify, service = dashboardService, catalogRevision = "", sourceReady = true, sourceError, onRetrySource, projects: connectedProjects = EMPTY_PROJECTS, projectBindings, invocations = EMPTY_INVOCATIONS, humanDecisionRequests = EMPTY_HUMAN_DECISION_REQUESTS, onOpenRun }: {
   spaceId?: string;

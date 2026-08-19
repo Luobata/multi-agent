@@ -7,6 +7,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Breadcrumb, COMPLETED_STATE_LINGER_MS, TERMINAL_ATTENTION_LINGER_MS, RuntimeStatusChip, SelectControl, SwitchControl, employeeRuntimeHealth, employeeRuntimeStatus } from "./components";
 import type { WorkInstanceRecord } from "./types";
 
+/** styles.css 是聚合入口：按其中 @import 顺序拼接 styles/ 切片，还原与拆分前逐字节等价的全量样式文本。 */
+const readStylesCss = () => {
+  const entry = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+  const slices = [...entry.matchAll(/@import "\.\/styles\/([^"]+)";/g)];
+  if (slices.length === 0) return entry;
+  return slices.map((match) => readFileSync(resolve(process.cwd(), "client/src/styles", match[1]), "utf8")).join("");
+};
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const options = [
@@ -54,7 +62,7 @@ describe("Breadcrumb", () => {
   });
 
   it("keeps long labels inside its own scroll container in both themes", () => {
-    const css = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+    const css = readStylesCss();
     expect(css).toMatch(/\.app-breadcrumb \{[^}]*max-width:\s*100%[^}]*overflow-x:\s*auto/s);
     expect(css).toMatch(/\.app-content \{[^}]*min-width:\s*0/s);
     expect(css).toMatch(/\.app-breadcrumb ol \{[^}]*display:\s*flex[^}]*max-width:\s*100%/s);
@@ -76,7 +84,7 @@ describe("Breadcrumb", () => {
   });
 
   it("provides non-color interaction feedback without depending on pointer media detection", () => {
-    const css = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+    const css = readStylesCss();
     expect(css).toMatch(/\.app-breadcrumb a:hover \{[^}]*transform:\s*translateY\(-1px\)[^}]*border-bottom-color:\s*currentColor[^}]*text-decoration:\s*underline[^}]*text-decoration-thickness:\s*2px/s);
     expect(css).toMatch(/\.app-breadcrumb a:focus-visible \{[^}]*outline:\s*2px solid var\(--focus\)[^}]*transform:\s*translateY\(-1px\)[^}]*border-bottom-color:\s*currentColor[^}]*text-decoration:\s*underline[^}]*text-decoration-thickness:\s*2px[^}]*transition:\s*none/s);
     expect(css).toMatch(/\[data-theme="pixel"\] \.app-breadcrumb a:focus-visible \{[^}]*transform:\s*translateY\(-2px\)/s);
@@ -85,7 +93,7 @@ describe("Breadcrumb", () => {
   });
 
   it("keeps publication evidence shrinkable within the crayon page grid", () => {
-    const css = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+    const css = readStylesCss();
     expect(css).toMatch(/\.page-grid--publications,[\s\S]*?\.publication-dossier \.evidence-block pre \{\s*min-width:\s*0;\s*max-width:\s*100%;\s*\}/);
   });
 });
@@ -325,7 +333,7 @@ describe("RuntimeStatusChip", () => {
 
 describe("reduced-motion runtime signals", () => {
   it("stops looping runtime animations while keeping static shape, text and rail signals", () => {
-    const css = readFileSync(resolve(process.cwd(), "client/src/styles.css"), "utf8");
+    const css = readStylesCss();
     const reducedMotion = css.slice(css.indexOf("@media (prefers-reduced-motion: reduce)"));
 
     // Looping motion stops: running chip pulse and the seat character bob/wait.

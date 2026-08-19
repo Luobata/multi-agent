@@ -1,0 +1,79 @@
+/* ============ Crayon Shin-chan theme overrides ============ */
+/* §四.2 · 控制台组件补登晃动描边。SelectControl 弹层 createPortal 到 body / 最近 dialog（components.tsx），
+   已逃逸被 filter 的祖先，故 .dash-panel / .dash-dossier 等含 SelectControl 的容器施加 filter 安全。 */
+[data-theme="crayon"] .run-card,
+[data-theme="crayon"] .record-list,
+[data-theme="crayon"] .dossier-section,
+[data-theme="crayon"] .nav-items button,
+[data-theme="crayon"] .command-hint,
+[data-theme="crayon"] .theme-toggle,
+[data-theme="crayon"] .board-lane,
+[data-theme="crayon"] .board-card,
+[data-theme="crayon"] .dash-tabs button,
+[data-theme="crayon"] .dash-panel,
+[data-theme="crayon"] .dash-dossier,
+[data-theme="crayon"] .empty-state,
+[data-theme="crayon"] .archive-list,
+[data-theme="crayon"] .space-tree,
+[data-theme="crayon"] .projects-directory-intro,
+[data-theme="crayon"] .mcp-onboarding-banner,
+[data-theme="crayon"] .project-connect-error,
+[data-theme="crayon"] .project-connect-behavior,
+[data-theme="crayon"] .brand-mark > .brand-sprite {
+  filter: url(#crayon-edge);
+}
+
+[data-theme="crayon"] {
+  --shadow-paper: 4px 5px 1px var(--paper-shadow);
+  --shadow-paper-small: 2px 2px 1px var(--paper-shadow);
+  --shadow-lift: 3px 4px 1px var(--paper-shadow);
+  --shadow-modal: 6px 7px 2px var(--pixel-shadow);
+}
+
+[data-theme="crayon"] .brand-mark > .brand-sprite {
+  background: var(--season-summer-soft);
+  border-radius: 46% 54% 50% 50% / 55% 50% 50% 45%;
+}
+[data-theme="crayon"] .brand-sprite i {
+  width: 10px;
+  height: 14px;
+  background: none;
+  box-shadow: none;
+  border-radius: 0;
+}
+[data-theme="crayon"] .brand-sprite i::before,
+[data-theme="crayon"] .brand-sprite i::after {
+  content: "";
+  position: absolute;
+  width: 11px; height: 14px;
+  background: var(--seal-green);
+  border: 2px solid var(--line-strong);
+  border-radius: 0 90% 0 90%;
+}
+[data-theme="crayon"] .brand-sprite i::before { transform: translate(-8px, -2px) rotate(-18deg); }
+[data-theme="crayon"] .brand-sprite i::after  { transform: translate(2px, -2px) rotate(18deg); background: var(--season-spring); }
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="crayon"] .run-card,
+  [data-theme="crayon"] .record-list,
+  [data-theme="crayon"] .dossier-section,
+  [data-theme="crayon"] .nav-items button,
+  [data-theme="crayon"] .command-hint,
+  [data-theme="crayon"] .theme-toggle,
+  [data-theme="crayon"] .board-lane,
+  [data-theme="crayon"] .board-card,
+  [data-theme="crayon"] .dash-tabs button,
+  [data-theme="crayon"] .dash-panel,
+  [data-theme="crayon"] .dash-dossier,
+  [data-theme="crayon"] .empty-state,
+  [data-theme="crayon"] .archive-list,
+  [data-theme="crayon"] .space-tree,
+  [data-theme="crayon"] .projects-directory-intro,
+  [data-theme="crayon"] .mcp-onboarding-banner,
+  [data-theme="crayon"] .project-connect-error,
+  [data-theme="crayon"] .project-connect-behavior,
+  [data-theme="crayon"] .brand-mark > .brand-sprite {
+    filter: none;
+  }
+}
+

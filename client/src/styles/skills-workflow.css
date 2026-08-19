@@ -1,0 +1,151 @@
+/* Skills library: a shelf of reusable spellbooks, without changing Skill data. */
+.library-page {
+  background-color: var(--sky-pale);
+  background-image: radial-gradient(circle at 12px 12px, rgb(242 207 120 / 16%) 0 2px, transparent 3px);
+  background-size: 32px 32px;
+}
+.library-header {
+  padding: var(--space-5) var(--space-6);
+  border: 2px solid var(--line-strong);
+  border-radius: var(--radius-3);
+  background: var(--season-summer-soft);
+  box-shadow: var(--shadow-paper);
+}
+.library-header h1 { color: var(--ink); font-weight: 800; }
+.library-toolbar {
+  margin-top: var(--space-5);
+  border: 2px solid var(--line-strong);
+  border-bottom: 2px dashed var(--line-strong);
+  border-radius: var(--radius-3) var(--radius-3) 0 0;
+  background: var(--cloud);
+  box-shadow: 3px 3px 0 var(--pixel-shadow);
+}
+.skill-ledger {
+  overflow: hidden;
+  border: 2px solid var(--line-strong);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-3) var(--radius-3);
+  background: var(--cloud);
+  box-shadow: var(--shadow-paper);
+}
+.skill-ledger-row { border-bottom: 2px dashed var(--line); }
+.skill-ledger-row:nth-child(4n + 2) { background: rgb(222 242 216 / 34%); }
+.skill-ledger-row:nth-child(4n + 3) { background: rgb(255 240 189 / 30%); }
+.skill-ledger-row:nth-child(4n) { background: rgb(249 220 229 / 30%); }
+.skill-ledger-row:not(.skill-ledger-labels):hover {
+  background: var(--season-winter-soft);
+  box-shadow: inset 5px 0 0 var(--season-winter);
+}
+.skill-ledger-labels {
+  border-bottom: 2px dashed var(--line-strong);
+  background: var(--paper-sunken);
+  color: var(--ink-2);
+}
+.skill-ledger-identity:hover strong { color: var(--seal-blue); }
+.skill-book {
+  position: relative;
+  width: 36px;
+  height: 40px;
+  border: 2px solid var(--line-strong);
+  border-radius: var(--radius-2) var(--radius-1) var(--radius-1) var(--radius-2);
+  background: var(--season-summer-soft);
+  color: var(--ink);
+  box-shadow: inset 5px 0 0 var(--season-autumn), 2px 2px 0 var(--pixel-shadow);
+}
+.skill-book::after {
+  content: "";
+  position: absolute;
+  right: 5px;
+  bottom: 6px;
+  width: 4px;
+  height: 4px;
+  background: var(--season-rose);
+  box-shadow: -4px -4px 0 var(--season-rose), 4px -4px 0 var(--season-rose), 0 -8px 0 var(--season-rose);
+}
+.skill-source code, .paper-tag { border: 2px solid var(--line); border-radius: var(--radius-1); background: var(--paper); }
+.library-footnote {
+  border: 2px dashed var(--seal-amber);
+  border-left: 6px solid var(--season-summer);
+  border-radius: var(--radius-2);
+  background: var(--season-summer-soft);
+}
+.skill-inspector-head { border-bottom: 2px dashed var(--line-strong); }
+.skill-inspector-grid { border-bottom: 2px dashed var(--line); }
+.skill-inspector-grid > section + section { border-left: 2px dashed var(--line); }
+.skill-binding-summary > div { border-top: 2px dashed var(--line); }
+.employee-skill-ledger, .skill-manager-list article {
+  border: 2px solid var(--line);
+  border-radius: var(--radius-2);
+  background: var(--paper);
+}
+.employee-skill-ledger article { border-bottom: 2px dashed var(--line); }
+.skill-manager-toolbar { border-bottom: 2px dashed var(--line-strong); background: var(--season-summer-soft); }
+.skill-manager-list article { box-shadow: 2px 2px 0 var(--line); }
+.skill-manager-list article.selected { border-color: var(--seal-blue); background: var(--seal-blue-bg); box-shadow: 3px 3px 0 var(--pixel-shadow); }
+.skill-manager-config { border-top: 2px dashed var(--line); }
+input[role="switch"] { border: 2px solid var(--line-strong); border-radius: var(--radius-1); }
+input[role="switch"]::after { top: 3px; left: 3px; border: 0; border-radius: 1px; background: var(--cloud); box-shadow: 1px 1px 0 var(--line-strong); }
+
+/* Workflow map: grid paper becomes a gentle game-map editor. */
+.architecture-template-section, .workflow-builder { border-bottom: 2px dashed var(--line-strong); }
+.architecture-template-section > summary, .workflow-builder-toolbar { background: var(--season-winter-soft); }
+.architecture-cards button {
+  border: 2px solid var(--line);
+  border-radius: var(--radius-2);
+  background: var(--paper);
+  box-shadow: 2px 2px 0 var(--line);
+}
+.architecture-cards button:nth-child(4n + 1) { background: var(--season-spring-soft); }
+.architecture-cards button:nth-child(4n + 2) { background: var(--season-summer-soft); }
+.architecture-cards button:nth-child(4n + 3) { background: var(--season-rose-soft); }
+.architecture-cards button:nth-child(4n) { background: var(--season-winter-soft); }
+.architecture-cards button:hover {
+  border-color: var(--line-strong);
+  box-shadow: 4px 4px 0 var(--pixel-shadow);
+  transform: translate(-2px, -2px);
+}
+.architecture-cards button.selected {
+  border: 2px solid var(--seal-blue);
+  background: var(--seal-blue-bg);
+  box-shadow: inset 5px 0 0 var(--season-winter), 3px 3px 0 var(--pixel-shadow);
+}
+.template-mapping {
+  border: 2px solid var(--line-strong);
+  border-radius: var(--radius-2);
+  box-shadow: 3px 3px 0 var(--pixel-shadow);
+}
+.template-mapping > header, .template-slots label { border-color: var(--line); border-style: dashed; border-width: 0 0 2px; }
+.template-slots label:nth-child(odd) { border-right: 2px dashed var(--line); }
+.section-kicker { border-bottom: 2px dashed var(--line); }
+.canvas-column { border-right: 2px dashed var(--line-strong); background: var(--surface-canvas); }
+.workflow-canvas-scroll {
+  border: 2px solid var(--line-strong);
+  border-radius: var(--radius-2);
+  background: var(--paper);
+  box-shadow: inset 0 0 0 4px rgb(196 183 228 / 18%), 3px 3px 0 var(--pixel-shadow);
+}
+.workflow-canvas-stage {
+  background-image:
+    linear-gradient(var(--line) 2px, transparent 2px),
+    linear-gradient(90deg, var(--line) 2px, transparent 2px),
+    radial-gradient(circle, rgb(158 214 174 / 36%) 0 2px, transparent 3px);
+  background-size: 24px 24px, 24px 24px, 96px 96px;
+}
+.workflow-canvas-node {
+  height: 80px;
+  border: 2px solid var(--line-strong);
+  border-left: 6px solid var(--node-accent);
+  border-radius: var(--radius-2);
+  background: var(--cloud);
+  box-shadow: 3px 3px 0 var(--pixel-shadow);
+}
+.workflow-canvas-node:hover { border-color: var(--ink); box-shadow: 4px 4px 0 var(--pixel-shadow); }
+.workflow-canvas-node.selected { border-color: var(--seal-blue); box-shadow: 0 0 0 2px var(--season-summer), 4px 4px 0 var(--pixel-shadow); }
+.canvas-node-avatar { border: 2px solid var(--node-accent); border-radius: 50%; }
+.canvas-node-port { border: 2px solid var(--line-strong); border-radius: 1px; background: var(--season-summer-soft); }
+.node-inspector { background: var(--cloud); }
+.node-inspector > header { border-bottom: 2px dashed var(--line-strong); }
+.dependency-checks { border: 2px solid var(--line); border-radius: var(--radius-2); }
+.dependency-checks label { border-bottom: 2px dashed var(--line); }
+.run-node-list article { box-shadow: 2px 2px 0 var(--line); }
+
