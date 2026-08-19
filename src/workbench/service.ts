@@ -174,6 +174,7 @@ import {
   deriveCommittedChangedFiles,
   determineTestCommands,
   hasExplicitDeliveryPass,
+  missingTestCommands,
   parseTestResults,
   resolveRetestFailureClass,
   selectConflictExecutionRole,
@@ -9324,6 +9325,11 @@ export class WorkbenchService {
         "environment-blocked"
       );
     }
+    // The server owns the test scope: the same command list goes into the prompt
+    // and into the post-run coverage check below.
+    const testCommands = input.testScope === "full-check"
+      ? ["npm run check"]
+      : determineTestCommands(changedFiles);
     let result: EmployeeInvocationResult;
     try {
       result = await this.invokeProjectTestRoleAtPath(
@@ -9336,9 +9342,7 @@ export class WorkbenchService {
           targetCommit: input.targetCommit,
           sourceCommit: input.sourceCommit,
           candidateRevision: snapshot.revision,
-          testCommands: input.testScope === "full-check"
-            ? ["npm run check"]
-            : determineTestCommands(changedFiles),
+          testCommands,
           narrative: input.narrative
         }),
         input.caller
@@ -9368,13 +9372,20 @@ export class WorkbenchService {
         revision: snapshot.revision
       }));
     }
+    // 结构化结果必须覆盖服务端指定的全部命令（防止 agent 跳过测试）；
+    // 旧格式（无 TEST_RESULTS 行）走 legacy 门禁，不做覆盖检查。
+    const testResults = parseTestResults(result.output, result.message);
+    const skippedCommands = missingTestCommands(testCommands, testResults);
+    if (skippedCommands.length > 0) {
+      evidenceIssues.push(`TEST_RESULTS 未覆盖服务端指定的命令：${skippedCommands.join("、")}`);
+    }
     if (result.status !== "passed" || evidenceIssues.length > 0) {
       return {
         status: "failed",
         result,
         evidenceIssues,
         failureClass: resolveRetestFailureClass({
-          testResults: parseTestResults(result.output, result.message),
+          testResults,
           evidenceIssues,
           message: result.message,
           output: result.output

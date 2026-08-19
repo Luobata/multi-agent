@@ -406,6 +406,17 @@ export function parseTestResults(output: JsonValue | undefined, message: string)
 }
 
 /**
+ * Returns the server-specified commands the agent did not report results for.
+ * When the agent uses the legacy format (no TEST_RESULTS line) coverage cannot
+ * be checked and the legacy gate applies; only the structured path is enforced.
+ */
+export function missingTestCommands(expected: string[], reported: TestCommandResult[] | undefined): string[] {
+  if (!reported) return [];
+  const seen = new Set(reported.map((r) => r.command.trim()));
+  return expected.filter((command) => !seen.has(command.trim()));
+}
+
+/**
  * Failure classification for a failed retest outcome.
  * Gate invariant: structured results only refine failure semantics. They can never
  * force a pass — the verdict/evidence gate (evidenceIssues veto, agent Block) stands,

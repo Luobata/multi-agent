@@ -18,6 +18,7 @@ import {
   determineTestCommands,
   environmentBlockedClaimContradicted,
   hasExplicitDeliveryPass,
+  missingTestCommands,
   classifyConflictRetestFailure,
   parseTestResults,
   resolveRetestFailureClass,
@@ -457,6 +458,32 @@ describe("structured test results classification", () => {
       message: "breadcrumb is missing",
       output: malformed
     })).toBe("product-failed");
+  });
+
+  it("⑥ flags skipped server-specified commands as an evidence failure", () => {
+    const expected = ["npm run check", "npm test -- --run client/src/App.navigation.test.tsx"];
+    // Agent ran only the first command and reported a pass verdict.
+    const partial = outputWith(
+      'TEST_RESULTS: [{"command":"npm run check","exitCode":0,"summary":"all green"}]'
+    );
+    const testResults = parseTestResults(partial, "");
+    const skipped = missingTestCommands(expected, testResults);
+    expect(skipped).toEqual(["npm test -- --run client/src/App.navigation.test.tsx"]);
+    // The coverage issue vetoes the pass: the gate fails with evidence-incomplete.
+    expect(resolveRetestFailureClass({
+      testResults,
+      evidenceIssues: [`TEST_RESULTS 未覆盖服务端指定的命令：${skipped.join("、")}`],
+      message: "passed",
+      output: partial
+    })).toBe("evidence-incomplete");
+    // Full coverage → no issue.
+    const full = outputWith(
+      'TEST_RESULTS: [{"command":"npm run check","exitCode":0,"summary":"ok"},'
+      + '{"command":"npm test -- --run client/src/App.navigation.test.tsx","exitCode":0,"summary":"ok"}]'
+    );
+    expect(missingTestCommands(expected, parseTestResults(full, ""))).toEqual([]);
+    // Legacy format (no TEST_RESULTS) → coverage not enforced, legacy gate applies.
+    expect(missingTestCommands(expected, undefined)).toEqual([]);
   });
 });
 
