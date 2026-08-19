@@ -8,6 +8,8 @@ import type { MemoryKind } from "../memory/types.js";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
+import { createRequirementReader } from "../workbench/requirementService.js";
+import { readRunDelivery } from "../runtime/worktreeDelivery.js";
 import { DeliveryRecoveryConflict, DeliveryRevisionConflict, inspectDeliveryChain, repairDeliveryChain } from "../runtime/worktreeDelivery.js";
 import type {
   EmployeeInvocationInput,
@@ -610,6 +612,29 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   app.get("/api/project-accesses", (_request, response) => {
     send(response, service.listPassiveProjectAccesses());
   });
+  // Server-side requirement board projection (P1: read-only). Lanes and
+  // exceptions are derived at read time from intent + invocation + delivery
+  // facts; the write path (create/PATCH/reserve/acceptance/import) ships in
+  // later phases per reports/plan-backup-requirement-server-design.md.
+  const requirementReader = createRequirementReader({
+    dataRoot: service.store.dataRoot,
+    snapshot: () => service.snapshot(),
+    readDelivery: (runDir, runId) => readRunDelivery(runDir, runId)
+  });
+  app.get("/api/requirements", asyncRoute(async (request, response) => {
+    const projectId = typeof request.query.projectId === "string" && request.query.projectId
+      ? request.query.projectId
+      : undefined;
+    send(response, { requirements: await requirementReader.list(projectId) });
+  }));
+  app.get("/api/requirements/:id", asyncRoute(async (request, response) => {
+    const projected = await requirementReader.get(routeParam(request, "id"));
+    if (!projected) {
+      response.status(404).json({ error: { message: `requirement not found: ${routeParam(request, "id")}` } });
+      return;
+    }
+    send(response, { requirement: projected });
+  }));
   app.post("/api/projects/connect", asyncRoute(async (request, response) => {
     send(response, await service.connectProject(request.body), 201);
   }));
