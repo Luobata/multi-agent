@@ -76,6 +76,11 @@ export interface ArchitectureExecutionContext {
    * to one-line summaries, except human/Gate decisions which stay verbatim regardless of age.
    */
   supervisorHistoryKeepRounds?: number;
+  /**
+   * Reads the durable Invocation cancellation epoch. The supervisor dispatch critical section
+   * fences batches when the epoch changes between the leader decision and spawn (B3 cancel fencing).
+   */
+  getCancellationEpoch?: () => number | Promise<number>;
   executionPackageScripts(): Promise<Record<string, string>>;
   persist(): Promise<void>;
   emit(type: string, nodeId?: string, detail?: JsonValue): Promise<void>;

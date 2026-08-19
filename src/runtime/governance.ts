@@ -121,6 +121,22 @@ export class ExecutionBudget {
     };
   }
 
+  /**
+   * Reconcile durable dispatch reservations after a crash. Every reservation handle died with
+   * the process, so the restored snapshot's `reserved` map is untrusted: the dispatch ledger is
+   * the authority. `outstanding` replaces the tracked counter's reserved total (0 when the
+   * ledger has no live entries), and `committed` folds settled-commit ledger entries into used
+   * exactly once (the reconciliation itself). Other counters' leaked reservations are cleared.
+   */
+  reconcileDispatchLedger(
+    counter: ExecutionBudgetCounter,
+    input: { committed: number; outstanding: number }
+  ): void {
+    for (const key of Object.keys(this.reserved)) delete this.reserved[key as ExecutionBudgetCounter];
+    if (input.outstanding > 0) this.reserved[counter] = input.outstanding;
+    if (input.committed > 0) this.used[counter] = (this.used[counter] ?? 0) + input.committed;
+  }
+
   private elapsedMs(): number {
     return Math.max(0, this.clock() - this.startedAtMs);
   }

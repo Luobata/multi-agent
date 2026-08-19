@@ -3418,7 +3418,9 @@ export class WorkbenchService {
           isolation,
           signal,
           capabilityBroker: this.capabilityBroker,
-          budget: this.executionBudget ? new ExecutionBudget(this.executionBudget) : undefined,
+          budget: this.executionBudget
+            ? new ExecutionBudget(this.executionBudget, await this.recoverBudgetSnapshot(invocation.runId))
+            : undefined,
           openHumanDecision: (request) => this.openHumanDecisionRequest(invocation, workflow, request),
           getCancellationEpoch: () => this.snapshot().invocations[invocation.id]?.cancellation?.epoch ?? 0,
           acquireNodePermit: async (node, onWait) => {
@@ -9042,6 +9044,73 @@ export class WorkbenchService {
     return { scanned, ready, leased, waiting, incidents };
   }
 
+  /**
+   * Startup reconciliation for supervisor dispatch ledgers (B2), scanned alongside the C3
+   * delivery recovery. Dead Runs (no active Invocation) with outstanding ledger entries have
+   * them force-settled so a crashed process cannot strand reservations forever. Active Runs
+   * are owned by their live process — the per-Run checkpoint lease already excludes concurrent
+   * resume — and are only reported.
+   */
+  async recoverDispatchLedgers(): Promise<{
+    scanned: number;
+    reconciled: number;
+    incidents: Array<{ runId: string; reason: string }>;
+  }> {
+    const runsRoot = path.join(this.store.dataRoot, "artifacts", "runs");
+    let entries: Dirent[] = [];
+    try {
+      entries = await fs.readdir(runsRoot, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const incidents: Array<{ runId: string; reason: string }> = [];
+    const activeRunIds = new Set(
+      Object.values(this.snapshot().invocations)
+        .filter((invocation) => !isInvocationTerminal(invocation.status))
+        .map((invocation) => invocation.runId)
+    );
+    let scanned = 0;
+    let reconciled = 0;
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory() || !/^run-[A-Za-z0-9-]+$/.test(entry.name)) continue;
+      const runId = entry.name;
+      const statePath = path.join(runsRoot, runId, "supervisor-state.json");
+      let raw: string;
+      try {
+        raw = await fs.readFile(statePath, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        continue;
+      }
+      scanned += 1;
+      let state: { dispatchLedger?: Array<{ state?: string; settledReason?: string; settledAt?: string }> };
+      try {
+        state = JSON.parse(raw) as typeof state;
+      } catch {
+        incidents.push({ runId, reason: "supervisor-state.json is unreadable" });
+        continue;
+      }
+      if (!Array.isArray(state.dispatchLedger)) continue;
+      const outstanding = state.dispatchLedger.filter(
+        (item) => item && (item.state === "reserved" || item.state === "dispatched")
+      );
+      if (outstanding.length === 0) continue;
+      if (activeRunIds.has(runId)) {
+        incidents.push({ runId, reason: `active run has ${outstanding.length} outstanding dispatch ledger entries (live owner)` });
+        continue;
+      }
+      const settledAt = new Date().toISOString();
+      for (const item of outstanding) {
+        item.state = "settled-release";
+        item.settledReason = "startup-recovered";
+        item.settledAt = settledAt;
+      }
+      await new RunStore(path.join(runsRoot, runId)).writeArtifact("supervisor-state.json", state);
+      reconciled += outstanding.length;
+    }
+    return { scanned, reconciled, incidents };
+  }
+
   wakeDeliveryDispatcher(_runId?: string): void {
     if (this.deliveryWake) return;
     const wake = Promise.resolve()
@@ -10007,12 +10076,32 @@ export class WorkbenchService {
     };
   }
 
+  /**
+   * Best-effort read of the last durable budget snapshot for a resumed Run, so a crash restart
+   * does not count provider/delegation consumption from zero. The Runner still overrides this
+   * with the fresher checkpoint.json budget when a live checkpoint exists.
+   */
+  private async recoverBudgetSnapshot(runId: string): Promise<ExecutionBudgetSnapshot | undefined> {
+    if (!/^run-[A-Za-z0-9-]+$/.test(runId)) return undefined;
+    try {
+      const manifest = JSON.parse(await fs.readFile(
+        path.join(this.store.dataRoot, "artifacts", "runs", runId, "run-manifest.json"),
+        "utf8"
+      )) as { budget?: ExecutionBudgetSnapshot };
+      return manifest.budget;
+    } catch {
+      return undefined;
+    }
+  }
+
   previewRetention(policy: RetentionPolicy) { return retentionPreview(this.store.dataRoot, this.snapshot(), policy); }
 
   async applyRetention(policy: RetentionPolicy, confirmation: string) {
     const preview = await this.previewRetention(policy);
     if (confirmation !== preview.token) throw new Error(`confirmation token required: ${preview.token}`);
     const ids = new Set(preview.candidates.map(item => item.invocationId));
+    const sessionIds = new Set(preview.sessions.map(item => item.sessionId));
+    const instanceIds = new Set(preview.workInstances.map(item => item.instanceId));
     const runIds = preview.candidates.flatMap(item => item.runId ? [item.runId] : []);
     await this.store.mutate(state => {
       for (const id of ids) {
@@ -10020,12 +10109,22 @@ export class WorkbenchService {
         if (!current || ["queued", "running", "cancellation-requested", "awaiting-human", "awaiting-human-decision"].includes(current.status)) throw new Error(`retention candidate changed or is protected: ${id}`);
         delete state.invocations[id];
       }
+      for (const id of sessionIds) {
+        const current = state.sessions[id];
+        if (!current || current.status !== "closed") throw new Error(`retention candidate changed or is protected: ${id}`);
+        delete state.sessions[id];
+      }
+      for (const id of instanceIds) {
+        const current = state.workInstances[id];
+        if (!current || !isInstanceTerminal(current.status)) throw new Error(`retention candidate changed or is protected: ${id}`);
+        delete state.workInstances[id];
+      }
     });
     if (policy.preserveRunEvidence === false) for (const runId of runIds) {
       if (!/^run-[A-Za-z0-9-]+$/.test(runId)) throw new Error(`unsafe run id in retention preview: ${runId}`);
       await fs.rm(path.join(this.store.dataRoot, "artifacts", "runs", runId), { recursive: true, force: true });
     }
-    return { deleted: ids.size, preservedEvidence: policy.preserveRunEvidence !== false, estimatedBytes: preview.estimatedBytes };
+    return { deleted: ids.size + sessionIds.size + instanceIds.size, preservedEvidence: policy.preserveRunEvidence !== false, estimatedBytes: preview.estimatedBytes };
   }
 
   backup(target: string, allowedRoot?: string) { return writeBackup(this.store.dataRoot, this.snapshot(), target, allowedRoot); }

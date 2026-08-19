@@ -1,7 +1,7 @@
 import { Ajv, type ErrorObject } from "ajv";
 import fs from "node:fs";
 import path from "node:path";
-import { ManifestValidationError } from "../core/errors.js";
+import { ManifestValidationError, ProviderExecutionError } from "../core/errors.js";
 import type {
   ExecutionPlan,
   ExecutionPlanNode,
@@ -910,6 +910,8 @@ function supervisorResumeState(input: {
   delegationLedger: DelegationRecord[];
   gateSequence: number;
   impact?: SupervisorImpactAssessment;
+  dispatchLedger: DispatchLedgerEntry[];
+  dispatchSequence: number;
 }): JsonObject {
   return jsonObject({
     schemaVersion: 1,
@@ -938,7 +940,9 @@ function supervisorResumeState(input: {
     memberSessions: [...input.memberSessions.values()],
     delegationLedger: input.delegationLedger,
     gateSequence: input.gateSequence,
-    impact: input.impact ?? null
+    impact: input.impact ?? null,
+    dispatchLedger: input.dispatchLedger,
+    dispatchSequence: input.dispatchSequence
   });
 }
 
@@ -969,6 +973,8 @@ function restoreSupervisorResumeState(input: {
   delegationLedger: DelegationRecord[];
   gateSequence: number;
   impact?: SupervisorImpactAssessment;
+  dispatchLedger: DispatchLedgerEntry[];
+  dispatchSequence: number;
 } | undefined {
   const resume = input.resume;
   if (!resume) return undefined;
@@ -1118,6 +1124,13 @@ function restoreSupervisorResumeState(input: {
     && (typeof remainingDurationMs !== "number" || !Number.isFinite(remainingDurationMs) || remainingDurationMs < 0)) {
     throw new Error("durable Supervisor resume state has an invalid remaining duration");
   }
+  const dispatchLedger = parseDispatchLedger(resume.dispatchLedger as JsonValue | undefined);
+  const dispatchSequenceRaw = resume.dispatchSequence;
+  if (dispatchSequenceRaw !== undefined
+    && (!Number.isSafeInteger(dispatchSequenceRaw) || Number(dispatchSequenceRaw) < 0)) {
+    throw new Error("durable Supervisor resume state has an invalid dispatch sequence");
+  }
+  const dispatchSequence = Number(dispatchSequenceRaw ?? 0);
   return {
     round: Number(round),
     delegations: Number(delegations),
@@ -1130,8 +1143,106 @@ function restoreSupervisorResumeState(input: {
     memberSessions,
     delegationLedger,
     gateSequence: Number(gateSequence),
-    ...(impact ? { impact } : {})
+    ...(impact ? { impact } : {}),
+    dispatchLedger,
+    dispatchSequence
   };
+}
+
+// --- Dispatch ledger (durable dispatch / budget reservation reconciliation) ---
+//
+// The ledger is the authority for in-flight delegation reservations. The in-memory
+// ExecutionBudget handles are process-local: a crash loses every handle, so on resume the
+// budget's `reserved` map is rebuilt from ledger entries that were still outstanding, and
+// entries whose worker never produced durable artifacts are force-settled.
+
+export type DispatchLedgerState = "reserved" | "dispatched" | "settled-commit" | "settled-release";
+
+export interface DispatchLedgerEntry {
+  dispatchId: string;
+  nodeId: string;
+  activationKey: string;
+  epoch: number;
+  budgetReserved: Partial<Record<import("../runtime/governance.js").ExecutionBudgetCounter, number>>;
+  state: DispatchLedgerState;
+  workerId?: string;
+  settledAt?: string;
+  settledReason?: string;
+}
+
+export interface ReconciledDispatchLedger {
+  entries: DispatchLedgerEntry[];
+  /** Σ budgetReserved of entries force-settled as committed (worker artifacts existed). */
+  committed: Partial<Record<import("../runtime/governance.js").ExecutionBudgetCounter, number>>;
+  /** Σ budgetReserved of entries still outstanding after reconciliation. */
+  outstanding: Partial<Record<import("../runtime/governance.js").ExecutionBudgetCounter, number>>;
+  recovered: number;
+}
+
+const DISPATCH_LEDGER_TERMINAL: ReadonlySet<DispatchLedgerState> = new Set(["settled-commit", "settled-release"]);
+
+function addCounters(
+  target: Partial<Record<import("../runtime/governance.js").ExecutionBudgetCounter, number>>,
+  source: Partial<Record<import("../runtime/governance.js").ExecutionBudgetCounter, number>>
+): void {
+  for (const [key, amount] of Object.entries(source)) {
+    if (typeof amount !== "number" || amount <= 0) continue;
+    const counter = key as import("../runtime/governance.js").ExecutionBudgetCounter;
+    target[counter] = (target[counter] ?? 0) + amount;
+  }
+}
+
+/**
+ * Reconciles a restored ledger against durable worker artifacts after a crash. Entries in
+ * `dispatched` state whose node has durable attempt artifacts are treated as consumed
+ * (settled-commit, crash-recovered); everything else still outstanding never reached a worker
+ * (or the worker left no trace) and is released (settled-release, crash-recovered). Nodes are
+ * left for the ordinary replay/retry path: terminal results replay, interrupted nodes re-dispatch.
+ */
+export function reconcileDispatchLedger(
+  entries: DispatchLedgerEntry[],
+  hasWorkerArtifact: (nodeId: string) => boolean,
+  settledAt: string
+): ReconciledDispatchLedger {
+  const committed: ReconciledDispatchLedger["committed"] = {};
+  const outstanding: ReconciledDispatchLedger["outstanding"] = {};
+  let recovered = 0;
+  for (const entry of entries) {
+    if (DISPATCH_LEDGER_TERMINAL.has(entry.state)) continue;
+    recovered += 1;
+    if (entry.state === "dispatched" && hasWorkerArtifact(entry.nodeId)) {
+      entry.state = "settled-commit";
+      entry.settledReason = "crash-recovered";
+      entry.settledAt = settledAt;
+      addCounters(committed, entry.budgetReserved);
+    } else {
+      entry.state = "settled-release";
+      entry.settledReason = "crash-recovered";
+      entry.settledAt = settledAt;
+    }
+  }
+  for (const entry of entries) {
+    if (!DISPATCH_LEDGER_TERMINAL.has(entry.state)) addCounters(outstanding, entry.budgetReserved);
+  }
+  return { entries, committed, outstanding, recovered };
+}
+
+/** Parses and validates the dispatchLedger field of a durable supervisor-state.json. */
+function parseDispatchLedger(value: JsonValue | undefined): DispatchLedgerEntry[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error("durable Supervisor resume state has an invalid dispatch ledger");
+  const entries: DispatchLedgerEntry[] = [];
+  for (const raw of value) {
+    const entry = raw as Partial<DispatchLedgerEntry>;
+    if (!entry || typeof entry.dispatchId !== "string" || typeof entry.nodeId !== "string"
+      || typeof entry.activationKey !== "string" || !Number.isSafeInteger(entry.epoch) || (entry.epoch ?? 0) < 0
+      || !entry.budgetReserved || typeof entry.budgetReserved !== "object"
+      || !["reserved", "dispatched", "settled-commit", "settled-release"].includes(String(entry.state))) {
+      throw new Error("durable Supervisor resume state has an invalid dispatch ledger entry");
+    }
+    entries.push(structuredClone(entry) as DispatchLedgerEntry);
+  }
+  return entries;
 }
 
 function approvedCandidateUrl(input: JsonObject, decision?: { candidateUrl?: string; comment?: string }): string | undefined {
@@ -2241,6 +2352,8 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
   let delegationCount = 0;
   let planRevision = hasStaticDag ? 1 : 0;
   let latestNodeIds: string[] = [];
+  let dispatchLedger: DispatchLedgerEntry[] = [];
+  let dispatchSequence = 0;
   // Absolute wall-clock ceiling is optional. When the policy omits maxDurationMs the run has no
   // fixed deadline: it keeps going while nodes make progress and is bounded only by per-node idle
   // timeouts and the round/delegation limits. A value still acts as a hard safety ceiling.
@@ -2269,6 +2382,27 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     delegationLedger.push(...restored.delegationLedger);
     workerResults.push(...restored.delegationLedger.map(({ result }) => ({ status: result.status })));
     gateSequence.value = restored.gateSequence;
+    dispatchLedger = restored.dispatchLedger;
+    dispatchSequence = restored.dispatchSequence;
+    // Crash recovery: every in-memory reservation handle died with the previous process. Reconcile
+    // the restored ledger against durable worker artifacts, then rebuild the budget's reserved map
+    // from the ledger (the restored snapshot's reserved map is untrusted).
+    const reconciled = reconcileDispatchLedger(
+      dispatchLedger,
+      (nodeId) => (context.run.nodes[nodeId]?.attempts ?? 0) > 0,
+      new Date().toISOString()
+    );
+    if (reconciled.recovered > 0) {
+      context.budget?.reconcileDispatchLedger("delegations", {
+        committed: reconciled.committed.delegations ?? 0,
+        outstanding: reconciled.outstanding.delegations ?? 0
+      });
+      await context.emit("supervisor.dispatch.recovered", context.plan.nodes[0]!.id, {
+        recovered: reconciled.recovered,
+        committed: reconciled.committed,
+        outstanding: reconciled.outstanding
+      });
+    }
   }
   const durationExceeded = () => deadlineAt !== undefined && Date.now() >= deadlineAt;
   const currentResumeState = (): JsonObject => supervisorResumeState({
@@ -2284,7 +2418,9 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     memberSessions,
     delegationLedger,
     gateSequence: gateSequence.value,
-    impact: regressionImpact
+    impact: regressionImpact,
+    dispatchLedger,
+    dispatchSequence
   });
   const syncSupervisorState = (): void => updateSupervisorRunState(
     context,
@@ -2357,6 +2493,9 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     syncSupervisorState();
     await context.writeArtifact("supervisor-state.json", currentResumeState());
     await context.scheduleNode(node);
+    // The decision epoch for this round: any dispatch decided below must be abandoned if the
+    // durable cancellation epoch changes before the spawn critical section.
+    const roundEpoch = context.getCancellationEpoch ? await context.getCancellationEpoch() : 0;
     const supervisorResult = await context.executeNode(node, {
       dependencyFailure: "observe",
       deadlineAt,
@@ -3278,6 +3417,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
       ? context.budget?.reserve("delegations", scheduled.length)
       : undefined;
     let completed: DelegationRecord[] = [];
+    let dispatchEntries: DispatchLedgerEntry[] = [];
     try {
       if (dagTrackers) {
         for (const { assignment } of scheduled) {
@@ -3287,18 +3427,95 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
         syncSupervisorState();
         await context.persist();
       }
-      for (const item of scheduled) await context.scheduleNode(item.worker);
-      completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
-        assignment,
-        worker,
-        result: await context.executeNode(worker, {
-          deadlineAt,
-          retryValidation: true,
-          ...(worker.metadata?.observesDependencyFailure === true ? { dependencyFailure: "observe" } : {})
-        })
-      })));
-      delegationReservation?.commit();
+      if (scheduled.length > 0) {
+        // B2: ledger the reservation before any worker can spawn. The dispatched rows are made
+        // durable before spawn so crash recovery can tell a real dispatch from a lost reservation.
+        dispatchEntries = scheduled.map(({ assignment, worker }) => {
+          dispatchSequence += 1;
+          return {
+            dispatchId: `d-${dispatchSequence}`,
+            nodeId: worker.id,
+            activationKey: assignment.nodeId ?? worker.id,
+            epoch: 0,
+            budgetReserved: { delegations: 1 },
+            state: "reserved" as const,
+            workerId: worker.id
+          };
+        });
+        dispatchLedger.push(...dispatchEntries);
+        // B3: dispatch critical section — read the durable cancellation epoch, mark the rows
+        // dispatched, and persist BEFORE spawning. A cancel landing between the leader decision
+        // and this window fences the whole batch: zero workers spawned.
+        const dispatchEpoch = context.getCancellationEpoch ? await context.getCancellationEpoch() : 0;
+        if (dispatchEpoch !== roundEpoch) {
+          for (const entry of dispatchEntries) {
+            entry.state = "settled-release";
+            entry.settledReason = "cancel-fenced";
+            entry.settledAt = new Date().toISOString();
+          }
+          await context.writeArtifact("supervisor-state.json", currentResumeState());
+          await context.emit("supervisor.dispatch.fenced", node.id, {
+            phase: "dispatch",
+            dispatchIds: dispatchEntries.map((entry) => entry.dispatchId),
+            decisionEpoch: roundEpoch,
+            currentEpoch: dispatchEpoch
+          });
+          throw new ProviderExecutionError("workflow cancellation epoch changed", "", "", { kind: "aborted", retryable: false });
+        }
+        for (const entry of dispatchEntries) {
+          entry.epoch = dispatchEpoch;
+          entry.state = "dispatched";
+        }
+        await context.writeArtifact("supervisor-state.json", currentResumeState());
+        for (const item of scheduled) await context.scheduleNode(item.worker);
+        completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
+          assignment,
+          worker,
+          result: await context.executeNode(worker, {
+            deadlineAt,
+            retryValidation: true,
+            ...(worker.metadata?.observesDependencyFailure === true ? { dependencyFailure: "observe" } : {})
+          })
+        })));
+        // B3: completion fence — a cancel landing while the batch was in flight discards the
+        // completions: the cancel path owns terminal state, and no new dispatch may follow.
+        const completionEpoch = context.getCancellationEpoch ? await context.getCancellationEpoch() : 0;
+        if (completionEpoch !== dispatchEpoch) {
+          for (const entry of dispatchEntries) {
+            entry.state = "settled-release";
+            entry.settledReason = "cancel-fenced";
+            entry.settledAt = new Date().toISOString();
+          }
+          await context.writeArtifact("supervisor-state.json", currentResumeState());
+          await context.emit("supervisor.dispatch.fenced", node.id, {
+            phase: "completion",
+            dispatchIds: dispatchEntries.map((entry) => entry.dispatchId),
+            dispatchEpoch,
+            currentEpoch: completionEpoch
+          });
+          throw new ProviderExecutionError("workflow cancellation epoch changed", "", "", { kind: "aborted", retryable: false });
+        }
+        // B2: settle write-log-first — the settled-commit intent is durable before the in-memory
+        // budget commit, so crash recovery reconciles from the ledger instead of guessing.
+        for (const entry of dispatchEntries) {
+          entry.state = "settled-commit";
+          entry.settledAt = new Date().toISOString();
+        }
+        await context.writeArtifact("supervisor-state.json", currentResumeState());
+        delegationReservation?.commit();
+      }
     } catch (error) {
+      // Rows that never reached the durable dispatched state are released here; rows already
+      // dispatched stay in the ledger for crash recovery (or were settled by a fence above).
+      if (dispatchEntries.some((entry) => entry.state === "reserved")) {
+        for (const entry of dispatchEntries) {
+          if (entry.state === "reserved") {
+            entry.state = "settled-release";
+            entry.settledReason = "dispatch-failed";
+            entry.settledAt = new Date().toISOString();
+          }
+        }
+      }
       delegationReservation?.release();
       throw error;
     }

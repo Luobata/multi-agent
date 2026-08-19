@@ -135,10 +135,24 @@ export async function doctorReport(dataRoot: string, state: WorkbenchState): Pro
 }
 
 export interface RetentionPolicy { olderThanDays?: number; statuses?: string[]; maxBytes?: number; preserveRunEvidence?: boolean }
-export interface RetentionPreview { candidates: Array<{ invocationId: string; runId?: string; status: string; estimatedBytes: number }>; protected: number; deleteCount: number; estimatedBytes: number; irreversible: string[]; token: string }
+export interface RetentionPreview {
+  candidates: Array<{ invocationId: string; runId?: string; status: string; estimatedBytes: number }>;
+  sessions: Array<{ sessionId: string; status: string; messages: number; estimatedBytes: number }>;
+  workInstances: Array<{ instanceId: string; invocationId: string; status: string; estimatedBytes: number }>;
+  protected: number;
+  deleteCount: number;
+  estimatedBytes: number;
+  irreversible: string[];
+  token: string;
+}
 const ACTIVE = new Set(["queued", "running", "cancellation-requested", "awaiting-human", "awaiting-human-decision"]);
+const TERMINAL_WORK_INSTANCE_STATUSES = new Set(["completed", "blocked", "failed", "skipped", "cancelled"]);
+const DEFAULT_RETENTION_AGE_DAYS = 14;
+const recordBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8");
+
 export async function retentionPreview(dataRoot: string, state: WorkbenchState, policy: RetentionPolicy): Promise<RetentionPreview> {
-  const cutoff = Date.now() - (policy.olderThanDays ?? 30) * 86_400_000; let protectedCount = 0;
+  const cutoff = Date.now() - (policy.olderThanDays ?? DEFAULT_RETENTION_AGE_DAYS) * 86_400_000;
+  let protectedCount = 0;
   const candidates = [] as RetentionPreview["candidates"];
   for (const invocation of Object.values(state.invocations)) {
     if (ACTIVE.has(invocation.status)) { protectedCount++; continue; }
@@ -148,7 +162,34 @@ export async function retentionPreview(dataRoot: string, state: WorkbenchState, 
     candidates.push({ invocationId: invocation.id, runId: invocation.runId, status: invocation.status, estimatedBytes });
   }
   const selected = policy.maxBytes ? candidates.filter((_, i) => candidates.slice(0, i + 1).reduce((n, c) => n + c.estimatedBytes, 0) <= policy.maxBytes!) : candidates;
-  return { candidates: selected, protected: protectedCount, deleteCount: selected.length, estimatedBytes: selected.reduce((n, c) => n + c.estimatedBytes, 0), irreversible: ["invocation metadata", ...(policy.preserveRunEvidence === false ? ["run evidence files"] : [])], token: `DELETE-${digest(selected.map(c => c.invocationId)).slice(0, 12).toUpperCase()}` };
+  // Sessions and work instances are append-only activity domains: every terminal record past the
+  // cutoff is dead weight that the store rewrites on every mutation. Active records are protected.
+  const sessions = [] as RetentionPreview["sessions"];
+  for (const session of Object.values(state.sessions)) {
+    if (session.status !== "closed") { protectedCount++; continue; }
+    if (Date.parse(session.updatedAt) > cutoff) continue;
+    sessions.push({ sessionId: session.id, status: session.status, messages: session.messages.length, estimatedBytes: recordBytes(session) });
+  }
+  const workInstances = [] as RetentionPreview["workInstances"];
+  for (const instance of Object.values(state.workInstances)) {
+    if (!TERMINAL_WORK_INSTANCE_STATUSES.has(instance.status)) { protectedCount++; continue; }
+    if (Date.parse(instance.completedAt ?? instance.updatedAt) > cutoff) continue;
+    workInstances.push({ instanceId: instance.id, invocationId: instance.invocationId, status: instance.status, estimatedBytes: recordBytes(instance) });
+  }
+  const estimatedBytes = selected.reduce((n, c) => n + c.estimatedBytes, 0)
+    + sessions.reduce((n, c) => n + c.estimatedBytes, 0)
+    + workInstances.reduce((n, c) => n + c.estimatedBytes, 0);
+  const digestInput = [...selected.map(c => c.invocationId), ...sessions.map(c => c.sessionId), ...workInstances.map(c => c.instanceId)].sort();
+  return {
+    candidates: selected,
+    sessions,
+    workInstances,
+    protected: protectedCount,
+    deleteCount: selected.length + sessions.length + workInstances.length,
+    estimatedBytes,
+    irreversible: ["invocation metadata", "session history", "work instance history", ...(policy.preserveRunEvidence === false ? ["run evidence files"] : [])],
+    token: `DELETE-${digest(digestInput).slice(0, 12).toUpperCase()}`
+  };
 }
 
 export function receiptFor(run: Record<string, unknown> | null, invocation?: Record<string, unknown>): Record<string, unknown> {

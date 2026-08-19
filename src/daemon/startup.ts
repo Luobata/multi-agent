@@ -3,7 +3,7 @@ import type { WorkbenchService } from "../workbench/service.js";
 import { startDaemon, type StartDaemonOptions } from "./server.js";
 
 type RecoverableWorkbenchService = Pick<WorkbenchService, "recoverInterruptedActivity">
-  & Partial<Pick<WorkbenchService, "recoverDeliveryDispatches">>;
+  & Partial<Pick<WorkbenchService, "recoverDeliveryDispatches" | "recoverDispatchLedgers">>;
 type DaemonStarter = (service: WorkbenchService, options?: StartDaemonOptions) => Promise<Server>;
 
 /**
@@ -19,5 +19,6 @@ export async function startRecoveredDaemon(
   const recoverable = service as RecoverableWorkbenchService;
   await recoverable.recoverInterruptedActivity();
   await recoverable.recoverDeliveryDispatches?.();
+  await recoverable.recoverDispatchLedgers?.();
   return starter(service, options);
 }

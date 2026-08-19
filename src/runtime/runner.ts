@@ -873,6 +873,7 @@ export async function runWorkflow(
       executionRoot: () => providerCwd,
       requireMemberHandoff: options.requireMemberHandoff,
       supervisorHistoryKeepRounds: options.supervisorHistoryKeepRounds,
+      getCancellationEpoch: options.getCancellationEpoch,
       executionPackageScripts: async () => {
         try {
           const value = JSON.parse(await fs.promises.readFile(
