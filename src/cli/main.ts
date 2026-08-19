@@ -20,6 +20,7 @@ import { inspectDeliveryChain, repairDeliveryChain } from "../runtime/worktreeDe
 import { startDaemon } from "../daemon/server.js";
 import type { MemoryKind } from "../memory/types.js";
 import { WorkbenchService } from "../workbench/service.js";
+import { verifyStore } from "../workbench/store.js";
 import type {
   EmployeeCreateInput,
   EntrancePolicyCreateInput,
@@ -219,6 +220,16 @@ workbench.command("doctor")
     const report = await (await workbenchService()).doctor();
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     if (report.overall === "blocked") process.exitCode = 2;
+  });
+
+workbench.command("store-verify")
+  .description("Read-only health check of the Workbench state store (v2 shard replay + manifest reconciliation)")
+  .action(async () => {
+    const dataRoot = program.opts<{ dataRoot?: string }>().dataRoot
+      ?? WorkbenchService.defaultDataRoot();
+    const report = await verifyStore(dataRoot);
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (!report.ok) process.exitCode = 2;
   });
 
 const workbenchRun = workbench.command("run").description("Inspect durable Run records");

@@ -287,6 +287,7 @@ import {
   type ManagementPolicyUpdateInput,
   type SkillCreateInput,
   type SkillUpdateInput,
+  type WorkbenchConfigState,
   type WorkbenchSkillDefinition,
   type WorkbenchState,
   type WorkbenchWorkflowDefinition,
@@ -380,7 +381,7 @@ function validateVerdict(verdict: EmployeeDefinition["verdict"], label: string):
 }
 
 function resolveSkillVersion(
-  state: WorkbenchState,
+  state: WorkbenchConfigState,
   id: string,
   version?: number
 ): WorkbenchSkillDefinition {
@@ -393,7 +394,7 @@ function resolveSkillVersion(
 }
 
 function pinSkillVersions(
-  state: WorkbenchState,
+  state: WorkbenchConfigState,
   bindings: RoleSkillBinding[],
   requested: Record<string, number> = {}
 ): Record<string, number> {
@@ -405,7 +406,7 @@ function pinSkillVersions(
 }
 
 function validateSkillBindings(
-  state: WorkbenchState,
+  state: WorkbenchConfigState,
   bindings: RoleSkillBinding[],
   versions: Record<string, number>
 ): void {
@@ -474,7 +475,7 @@ function uniqueIds(values: string[], label: string): string[] {
   return normalized;
 }
 
-function validateKnowledgeProfileIds(state: WorkbenchState, values: string[], label: string): string[] {
+function validateKnowledgeProfileIds(state: WorkbenchConfigState, values: string[], label: string): string[] {
   const ids = uniqueIds(values, label);
   for (const id of ids) {
     const profile = state.knowledgeProfiles[id]?.current;
@@ -512,7 +513,7 @@ function legacyMetadataProjectId(identity: RoleIdentityDefinition): string | und
 }
 
 function normalizeEmployeeScope(
-  state: WorkbenchState,
+  state: WorkbenchConfigState,
   scope: EmployeeScopeInput | undefined,
   identity: RoleIdentityDefinition,
   label: string
@@ -633,7 +634,7 @@ export function isSystemEmployee(e: { systemRole?: string }): boolean {
 }
 
 function buildEmployeeDefinition(
-  state: WorkbenchState,
+  state: WorkbenchConfigState,
   input: EmployeeCreateInput,
   timestamp: string,
   template?: EmployeeTemplateSource
@@ -700,7 +701,7 @@ function buildEmployeeDefinition(
 }
 
 function buildUpdatedEmployeeDefinition(
-  state: WorkbenchState,
+  state: WorkbenchConfigState,
   id: string,
   input: EmployeeUpdateInput,
   updatedAt: string,
@@ -789,7 +790,7 @@ function buildUpdatedEmployeeDefinition(
 }
 
 function normalizeEmployeeTemplateDefaults(
-  state: WorkbenchState,
+  state: WorkbenchConfigState,
   id: string,
   displayName: string,
   defaults: EmployeeTemplateDefaults,
@@ -2729,7 +2730,7 @@ export class WorkbenchService {
       await Promise.race([tracked.promise, new Promise<void>((resolve) => setTimeout(resolve, graceMs))]);
     }
     const acknowledgedAt = now();
-    const cancelled = await this.store.mutate((state) => {
+    const cancelled = await this.store.mutateActivity((state) => {
       const target = state.invocations[id];
       if (!target) throw new Error(`invocation not found: ${id}`);
       if (isInvocationTerminal(target.status)) return target;
@@ -2884,7 +2885,7 @@ export class WorkbenchService {
       : `supervisor-round:${invocation.runId}:${completedLeaderEntry!.round}:${completedLeaderEntry!.action}`;
     const content = formatInvocationProgressReport(progress, true);
     const timestamp = now();
-    await this.store.mutate((state) => {
+    await this.store.mutateActivity((state) => {
       const session = state.sessions[invocation.sessionId!];
       if (!session?.supervisor || session.supervisor.invocationId !== invocationId) return;
       if (session.messages.some((message) => message.dedupeKey === dedupeKey)) return;
@@ -3059,7 +3060,7 @@ export class WorkbenchService {
       updatedAt: timestamp,
       transitions: [{ at: timestamp, status: "queued", phase: "queued" }]
     };
-    await this.store.mutate((next) => {
+    await this.store.mutateActivity((next) => {
       next.invocations[invocation.id] = invocation;
       if (leaderSession) next.sessions[leaderSession.id] = leaderSession;
       for (const instance of instances) next.workInstances[instance.id] = instance;
@@ -3174,7 +3175,7 @@ export class WorkbenchService {
     message?: string
   ): Promise<InvocationRecord> {
     const timestamp = now();
-    const invocation = await this.store.mutate((state) => {
+    const invocation = await this.store.mutateActivity((state) => {
       const target = state.invocations[id];
       if (!target) throw new Error(`invocation not found: ${id}`);
       if (isInvocationTerminal(target.status)) return target;
@@ -3226,7 +3227,7 @@ export class WorkbenchService {
     failure?: WorkInstanceRecord["failure"]
   ): Promise<WorkInstanceRecord | undefined> {
     const timestamp = now();
-    const instance = await this.store.mutate((state) => {
+    const instance = await this.store.mutateActivity((state) => {
       const invocation = state.invocations[invocationId];
       const target = invocation?.instanceIds
         .map((id) => state.workInstances[id])
@@ -3712,7 +3713,7 @@ export class WorkbenchService {
         throw new Error(`workbench provider env ${unsafe[0]} must use a $ENV:VARIABLE_NAME reference; plaintext values are not persisted`);
       }
     }
-    await this.store.mutate((state) => {
+    await this.store.mutateConfig((state) => {
       state.providers[id] = definition;
     });
   }
@@ -3726,7 +3727,7 @@ export class WorkbenchService {
   async createSkill(input: SkillCreateInput): Promise<WorkbenchSkillDefinition> {
     const id = requireId(input.id, "skill id");
     if (input.configSchema) validateSchema(input.configSchema, `skill ${id} configSchema`);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.skills[id]) throw new Error(`skill already exists: ${id}`);
       const timestamp = now();
       const skill: WorkbenchSkillDefinition = {
@@ -3752,7 +3753,7 @@ export class WorkbenchService {
 
   async updateSkill(id: string, input: SkillUpdateInput): Promise<WorkbenchSkillDefinition> {
     if (input.configSchema) validateSchema(input.configSchema, `skill ${id} configSchema`);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const current = state.skills[id];
       if (!current) throw new Error(`skill not found: ${id}`);
       if (current.owner === "system") throw new Error(`system skill ${id} cannot be updated`);
@@ -3776,7 +3777,7 @@ export class WorkbenchService {
   }
 
   async archiveSkill(id: string): Promise<WorkbenchSkillDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const current = state.skills[id];
       if (!current) throw new Error(`skill not found: ${id}`);
       if (current.owner === "system") throw new Error(`system skill ${id} cannot be archived`);
@@ -3794,7 +3795,7 @@ export class WorkbenchService {
   }
 
   async restoreSkill(id: string): Promise<WorkbenchSkillDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const current = state.skills[id];
       if (!current) throw new Error(`skill not found: ${id}`);
       if (current.owner === "system") throw new Error(`system skill ${id} cannot be restored`);
@@ -3832,7 +3833,7 @@ export class WorkbenchService {
 
   async createEmployeeTemplate(input: EmployeeTemplateCreateInput): Promise<EmployeeTemplateDefinition> {
     const id = requireId(input.id, "employee template id");
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.employeeTemplates[id]) throw new Error(`employee template already exists: ${id}`);
       const timestamp = now();
       const displayName = requireText(input.displayName ?? id, "employee template displayName");
@@ -3852,7 +3853,7 @@ export class WorkbenchService {
   }
 
   async updateEmployeeTemplate(id: string, input: EmployeeTemplateUpdateInput): Promise<EmployeeTemplateDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.employeeTemplates[id];
       if (!record) throw new Error(`employee template not found: ${id}`);
       const current = record.current;
@@ -3879,7 +3880,7 @@ export class WorkbenchService {
   }
 
   async archiveEmployeeTemplate(id: string): Promise<EmployeeTemplateDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.employeeTemplates[id];
       if (!record) throw new Error(`employee template not found: ${id}`);
       if (record.current.status === "archived") return record.current;
@@ -3896,7 +3897,7 @@ export class WorkbenchService {
   }
 
   async restoreEmployeeTemplate(id: string): Promise<EmployeeTemplateDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.employeeTemplates[id];
       if (!record) throw new Error(`employee template not found: ${id}`);
       if (record.current.status === "active") return record.current;
@@ -4305,7 +4306,7 @@ export class WorkbenchService {
       createdAt: timestamp,
       updatedAt: timestamp
     };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       state.workflowChangeRequests[request.id] = request;
       return request;
     });
@@ -4386,7 +4387,7 @@ export class WorkbenchService {
     // apply through updateWorkflow → re-validates and produces a new workflow version.
     await this.updateWorkflow(request.workflowId, { architecture: "supervisor", flow });
 
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const stored = state.workflowChangeRequests[id];
       if (!stored) throw new Error(`工作流变更请求不存在：${id}`);
       const timestamp = now();
@@ -4398,7 +4399,7 @@ export class WorkbenchService {
   }
 
   async rejectWorkflowChangeRequest(id: string, actor = "local-owner", comment?: string): Promise<WorkflowChangeRequest> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const request = state.workflowChangeRequests[id];
       if (!request) throw new Error(`工作流变更请求不存在：${id}`);
       if (request.status !== "awaiting-approval") {
@@ -4724,7 +4725,7 @@ export class WorkbenchService {
       createdAt: timestamp,
       updatedAt: timestamp
     };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       state.knowledgeChangeRequests[request.id] = request;
       return request;
     });
@@ -4796,7 +4797,7 @@ export class WorkbenchService {
     try {
       plan = await this.planKnowledgeChange(current.operation);
     } catch (error) {
-      await this.store.mutate((state) => {
+      await this.store.mutateConfig((state) => {
         const request = state.knowledgeChangeRequests[id];
         if (!request) return;
         request.status = "needs-reapproval";
@@ -4806,7 +4807,7 @@ export class WorkbenchService {
       throw error;
     }
     if (plan.planHash !== current.planHash) {
-      await this.store.mutate((state) => {
+      await this.store.mutateConfig((state) => {
         const request = state.knowledgeChangeRequests[id];
         if (!request) return;
         request.status = "needs-reapproval";
@@ -4816,7 +4817,7 @@ export class WorkbenchService {
       throw new Error(`knowledge change ${id} changed after review and needs reapproval`);
     }
     const approvedAt = now();
-    await this.store.mutate((state) => {
+    await this.store.mutateConfig((state) => {
       const request = state.knowledgeChangeRequests[id];
       if (!request || request.status !== "awaiting-approval") throw new Error(`knowledge change ${id} is no longer awaiting approval`);
       request.status = "applying";
@@ -4831,7 +4832,7 @@ export class WorkbenchService {
     });
     try {
       const result = await this.applyKnowledgeChangeOperation(plan.operation);
-      return this.store.mutate((state) => {
+      return this.store.mutateConfig((state) => {
         const request = state.knowledgeChangeRequests[id];
         if (!request) throw new Error(`knowledge change request not found: ${id}`);
         request.status = "applied";
@@ -4842,7 +4843,7 @@ export class WorkbenchService {
         return request;
       });
     } catch (error) {
-      await this.store.mutate((state) => {
+      await this.store.mutateConfig((state) => {
         const request = state.knowledgeChangeRequests[id];
         if (!request) return;
         request.status = "failed";
@@ -4854,7 +4855,7 @@ export class WorkbenchService {
   }
 
   async rejectKnowledgeChangeRequest(id: string, actor = "local-owner", comment?: string): Promise<KnowledgeChangeRequest> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const request = state.knowledgeChangeRequests[id];
       if (!request) throw new Error(`knowledge change request not found: ${id}`);
       if (request.status !== "awaiting-approval") throw new Error(`knowledge change ${id} is ${request.status}`);
@@ -4877,7 +4878,7 @@ export class WorkbenchService {
     actor = "local-owner",
     comment?: string
   ): Promise<KnowledgeChangeRequest> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const request = state.knowledgeChangeRequests[id];
       if (!request) throw new Error(`knowledge change request not found: ${id}`);
       if (request.status !== "awaiting-approval" && request.status !== "needs-reapproval") {
@@ -5202,7 +5203,7 @@ export class WorkbenchService {
   }
 
   async cancelConfigurationProposal(id: string, actor = "local-owner", comment?: string): Promise<ConfigurationProposal> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const proposal = state.configurationProposals[id];
       if (!proposal) throw new Error(`configuration proposal not found: ${id}`);
       if (proposal.status !== "awaiting-review" && proposal.status !== "ready-to-apply" && proposal.status !== "needs-reapproval") {
@@ -5305,7 +5306,7 @@ export class WorkbenchService {
       knowledgeBase.latestRevision = 1;
       if (input.publish) knowledgeBase.publishedRevision = 1;
     }
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.knowledgeBases[knowledgeBase.id]) throw new Error(`knowledge base already exists: ${knowledgeBase.id}`);
       state.knowledgeBases[knowledgeBase.id] = { current: knowledgeBase, versions: [knowledgeBase] };
       return knowledgeBase;
@@ -5331,7 +5332,7 @@ export class WorkbenchService {
       const orphan = revision.documents.find((document) => !allowed.has(document.collectionId));
       if (orphan) throw new Error(`collection ${orphan.collectionId} is still used by knowledge document ${orphan.id}`);
     }
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.knowledgeBases[id];
       if (!record) throw new Error(`knowledge base not found: ${id}`);
       record.current = updated;
@@ -5353,7 +5354,7 @@ export class WorkbenchService {
       createdAt: timestamp
     };
     await this.knowledge.contentStore.writeRevision(revision);
-    await this.store.mutate((state) => {
+    await this.store.mutateConfig((state) => {
       const record = state.knowledgeBases[id];
       if (!record || record.current.version !== knowledgeBase.version) throw new Error(`knowledge base ${id} changed while creating revision`);
       const updated: KnowledgeBaseDefinition = {
@@ -5375,7 +5376,7 @@ export class WorkbenchService {
     if (current.syncStatus === "syncing") throw new Error(`knowledge base ${id} is already syncing`);
     if (current.sources.length === 0) throw new Error(`knowledge base ${id} has no configured sources`);
     const startedAt = now();
-    const knowledgeBase = await this.store.mutate((state) => {
+    const knowledgeBase = await this.store.mutateConfig((state) => {
       const record = state.knowledgeBases[id];
       if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed before syncing`);
       const syncing: KnowledgeBaseDefinition = {
@@ -5412,7 +5413,7 @@ export class WorkbenchService {
         createdAt: timestamp
       };
       await this.knowledge.contentStore.writeRevision(revision);
-      await this.store.mutate((state) => {
+      await this.store.mutateConfig((state) => {
         const record = state.knowledgeBases[id];
         if (!record || record.current.version !== knowledgeBase.version) throw new Error(`knowledge base ${id} changed while syncing`);
         const updated: KnowledgeBaseDefinition = {
@@ -5430,7 +5431,7 @@ export class WorkbenchService {
       });
       return revision;
     } catch (error) {
-      await this.store.mutate((state) => {
+      await this.store.mutateConfig((state) => {
         const record = state.knowledgeBases[id];
         if (!record) return;
         if (record.current.version !== knowledgeBase.version || record.current.syncStatus !== "syncing") return;
@@ -5466,7 +5467,7 @@ export class WorkbenchService {
       qualityStatus: "healthy",
       updatedAt: now()
     };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.knowledgeBases[id];
       if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed while publishing`);
       record.current = updated;
@@ -5479,7 +5480,7 @@ export class WorkbenchService {
     const current = this.getKnowledgeBase(id);
     if (current.status === "archived") return current;
     const archived: KnowledgeBaseDefinition = { ...current, status: "archived", version: current.version + 1, updatedAt: now() };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.knowledgeBases[id];
       if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed while archiving`);
       record.current = archived;
@@ -5492,7 +5493,7 @@ export class WorkbenchService {
     const current = this.getKnowledgeBase(id);
     if (current.status === "active") return current;
     const restored: KnowledgeBaseDefinition = { ...current, status: "active", version: current.version + 1, updatedAt: now() };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.knowledgeBases[id];
       if (!record || record.current.version !== current.version) throw new Error(`knowledge base ${id} changed while restoring`);
       record.current = restored;
@@ -5544,7 +5545,7 @@ export class WorkbenchService {
 
   async createKnowledgeProfile(input: KnowledgeProfileCreateInput): Promise<KnowledgeProfileDefinition> {
     const profile = this.normalizeKnowledgeProfile(input);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.knowledgeProfiles[profile.id]) throw new Error(`knowledge profile already exists: ${profile.id}`);
       state.knowledgeProfiles[profile.id] = { current: profile, versions: [profile] };
       return profile;
@@ -5559,7 +5560,7 @@ export class WorkbenchService {
       description: input.description ?? current.description,
       rules: input.rules ?? current.rules
     }, current);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.knowledgeProfiles[id];
       if (!record) throw new Error(`knowledge profile not found: ${id}`);
       record.current = updated;
@@ -5572,7 +5573,7 @@ export class WorkbenchService {
     const current = this.getKnowledgeProfile(id);
     if (current.status === "archived") return current;
     const archived: KnowledgeProfileDefinition = { ...current, status: "archived", version: current.version + 1, updatedAt: now() };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.knowledgeProfiles[id];
       if (!record || record.current.version !== current.version) throw new Error(`knowledge profile ${id} changed while archiving`);
       record.current = archived;
@@ -5585,7 +5586,7 @@ export class WorkbenchService {
     const current = this.getKnowledgeProfile(id);
     if (current.status === "active") return current;
     const restored: KnowledgeProfileDefinition = { ...current, status: "active", version: current.version + 1, updatedAt: now() };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.knowledgeProfiles[id];
       if (!record || record.current.version !== current.version) throw new Error(`knowledge profile ${id} changed while restoring`);
       record.current = restored;
@@ -5832,7 +5833,7 @@ export class WorkbenchService {
 
   async createProject(input: ProjectCreateInput): Promise<ProjectDefinition> {
     const project = this.normalizeProject(input);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.projects[project.id]) throw new Error(`project already exists: ${project.id}`);
       state.projects[project.id] = { current: project, versions: [project] };
       return project;
@@ -5854,7 +5855,7 @@ export class WorkbenchService {
       status: value.status
     });
     if (jsonEqual(comparable(current), comparable(project))) return current;
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.projects[id];
       if (!record) throw new Error(`project not found: ${id}`);
       record.current = project;
@@ -5875,7 +5876,7 @@ export class WorkbenchService {
     const current = this.getProject(id);
     if (current.status === "archived") return current;
     const archived: ProjectDefinition = { ...current, status: "archived", version: current.version + 1, updatedAt: now() };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.projects[id];
       if (!record) throw new Error(`project not found: ${id}`);
       record.current = archived;
@@ -5993,7 +5994,7 @@ export class WorkbenchService {
       createdAt: current?.createdAt ?? timestamp,
       updatedAt: timestamp
     };
-    return this.store.mutate((next) => {
+    return this.store.mutateConfig((next) => {
       const record = next.projectBindings[projectId];
       if (record) {
         record.current = binding;
@@ -6065,7 +6066,7 @@ export class WorkbenchService {
       roles: refreshed,
       updatedAt: timestamp
     };
-    await this.store.mutate((next) => {
+    await this.store.mutateConfig((next) => {
       const record = next.projectBindings[projectId];
       if (!record) throw new Error(`project binding not found: ${projectId}`);
       record.current = nextBinding;
@@ -6095,7 +6096,7 @@ export class WorkbenchService {
 
   async createEmployee(input: EmployeeCreateInput): Promise<EmployeeDefinition> {
     const id = requireId(input.id, "employee id");
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.employees[id]) throw new Error(`employee already exists: ${id}`);
       const timestamp = now();
       const employee = buildEmployeeDefinition(state, input, timestamp);
@@ -6110,7 +6111,7 @@ export class WorkbenchService {
   ): Promise<EmployeeDefinition> {
     requireId(templateId, "employee template id");
     const id = requireId(input.id, "employee id");
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.employees[id]) throw new Error(`employee already exists: ${id}`);
       const record = state.employeeTemplates[templateId];
       if (!record) throw new Error(`employee template not found: ${templateId}`);
@@ -6151,7 +6152,7 @@ export class WorkbenchService {
     if (isSystemEmployee(current) && !options?.allowSystemEmployeeMutation) {
       throw new Error(`员工 ${id} 是系统员工，默认受保护；如确需修改请显式确认（allowSystemEmployeeMutation）`);
     }
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);
       const updatedAt = now();
@@ -6168,7 +6169,7 @@ export class WorkbenchService {
     const project = this.getProject(employee.scope.projectId, requestedProjectVersion);
     if (project.status !== "active") throw new Error(`project ${project.id} is archived`);
     if (employee.scope.projectVersion === project.version) return employee;
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);
       const updated = buildUpdatedEmployeeDefinition(state, id, {
@@ -6220,7 +6221,7 @@ export class WorkbenchService {
     if (isSystemEmployee(current) && !options?.allowSystemEmployeeMutation) {
       throw new Error(`员工 ${id} 是系统员工，默认受保护；如确需归档请显式确认（allowSystemEmployeeMutation）`);
     }
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.employees[id];
       if (!record) throw new Error(`employee not found: ${id}`);
       if (record.current.status === "archived") return record.current;
@@ -6435,7 +6436,7 @@ export class WorkbenchService {
         updatedAt: timestamp
       };
       const newSession = session;
-      await this.store.mutate((state) => {
+      await this.store.mutateActivity((state) => {
         state.sessions[newSession.id] = newSession;
       });
     }
@@ -6486,7 +6487,7 @@ export class WorkbenchService {
       const node = result.run.nodes.respond;
       const responseMessage = invocationMessage(node?.output);
       const timestamp = now();
-      const updatedSession = await this.store.mutate((state) => {
+      const updatedSession = await this.store.mutateActivity((state) => {
         const target = state.sessions[sessionId];
         if (!target) throw new Error(`session not found: ${sessionId}`);
         target.messages.push(
@@ -7279,7 +7280,7 @@ export class WorkbenchService {
 
   async createEntrancePolicy(input: EntrancePolicyCreateInput): Promise<EntrancePolicyDefinition> {
     const policy = this.normalizeEntrancePolicy(input);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.entrancePolicies[policy.id]) throw new Error(`entrance policy already exists: ${policy.id}`);
       state.entrancePolicies[policy.id] = { current: policy, versions: [policy] };
       return policy;
@@ -7289,7 +7290,7 @@ export class WorkbenchService {
   async updateEntrancePolicy(id: string, input: EntrancePolicyUpdateInput): Promise<EntrancePolicyDefinition> {
     const current = this.getEntrancePolicy(id);
     const policy = this.normalizeEntrancePolicy({ id, ...input }, current);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.entrancePolicies[id];
       if (!record) throw new Error(`entrance policy not found: ${id}`);
       record.current = policy;
@@ -7299,7 +7300,7 @@ export class WorkbenchService {
   }
 
   async archiveEntrancePolicy(id: string): Promise<EntrancePolicyDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.entrancePolicies[id];
       if (!record) throw new Error(`entrance policy not found: ${id}`);
       if (record.current.status === "archived") return record.current;
@@ -7316,7 +7317,7 @@ export class WorkbenchService {
   }
 
   async restoreEntrancePolicy(id: string): Promise<EntrancePolicyDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.entrancePolicies[id];
       if (!record) throw new Error(`entrance policy not found: ${id}`);
       if (record.current.status === "active") return record.current;
@@ -7539,7 +7540,7 @@ export class WorkbenchService {
 
   async createManagementPolicy(input: ManagementPolicyCreateInput): Promise<ManagementPolicyDefinition> {
     const policy = this.normalizeManagementPolicy(input);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.managementPolicies[policy.id]) throw new Error(`management policy already exists: ${policy.id}`);
       state.managementPolicies[policy.id] = { current: policy, versions: [policy] };
       return policy;
@@ -7559,7 +7560,7 @@ export class WorkbenchService {
       completion: input.completion ?? current.completion,
       execution: input.execution ?? current.execution
     }, current);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.managementPolicies[id];
       if (!record) throw new Error(`management policy not found: ${id}`);
       record.current = policy;
@@ -7576,7 +7577,7 @@ export class WorkbenchService {
     if (references.length > 0) {
       throw new Error(`management policy ${id} is used by active workflows: ${references.map((workflow) => workflow.id).join(", ")}`);
     }
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.managementPolicies[id];
       if (!record) throw new Error(`management policy not found: ${id}`);
       if (record.current.status === "archived") return record.current;
@@ -7588,7 +7589,7 @@ export class WorkbenchService {
   }
 
   async restoreManagementPolicy(id: string): Promise<ManagementPolicyDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.managementPolicies[id];
       if (!record) throw new Error(`management policy not found: ${id}`);
       if (record.current.status === "active") return record.current;
@@ -7804,7 +7805,7 @@ export class WorkbenchService {
   async createWorkflow(input: WorkflowCreateInput): Promise<WorkbenchWorkflowDefinition> {
     const workflow = this.normalizeWorkflow(input);
     await this.validateWorkflow(workflow);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.workflows[workflow.id]) throw new Error(`workflow already exists: ${workflow.id}`);
       state.workflows[workflow.id] = { current: workflow, versions: [workflow] };
       return workflow;
@@ -7848,7 +7849,7 @@ export class WorkbenchService {
           presentation: input.presentation ?? current.presentation
         }, current, options);
     await this.validateWorkflow(workflow);
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.workflows[id];
       if (!record) throw new Error(`workflow not found: ${id}`);
       record.current = workflow;
@@ -7954,7 +7955,7 @@ export class WorkbenchService {
         leader: { workflowId: workflow.id }
       }, policy)
     }));
-    await this.store.mutate((state) => {
+    await this.store.mutateConfig((state) => {
       for (const replacement of replacements) {
         const record = state.entrancePolicies[replacement.previous.id];
         if (!record) throw new Error(`entrance policy not found: ${replacement.previous.id}`);
@@ -8353,7 +8354,7 @@ export class WorkbenchService {
   }
 
   async archiveWorkflow(id: string): Promise<WorkbenchWorkflowDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const record = state.workflows[id];
       if (!record) throw new Error(`workflow not found: ${id}`);
       if (record.current.status === "archived") return record.current;
@@ -8410,7 +8411,7 @@ export class WorkbenchService {
         }
       }
     }
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (state.publications[input.id]) throw new Error(`publication already exists: ${input.id}`);
       const timestamp = now();
       const publication: PublicationDefinition = {
@@ -8449,7 +8450,7 @@ export class WorkbenchService {
       releaseChannel: input.releaseChannel ?? current.releaseChannel,
       updatedAt: now()
     };
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       if (!state.publications[id]) throw new Error(`publication not found: ${id}`);
       state.publications[id] = updated;
       return updated;
@@ -8457,7 +8458,7 @@ export class WorkbenchService {
   }
 
   async archivePublication(id: string): Promise<PublicationDefinition> {
-    return this.store.mutate((state) => {
+    return this.store.mutateConfig((state) => {
       const current = state.publications[id];
       if (!current) throw new Error(`publication not found: ${id}`);
       if (current.status === "archived") return current;
@@ -10114,7 +10115,7 @@ export class WorkbenchService {
     const sessionIds = new Set(preview.sessions.map(item => item.sessionId));
     const instanceIds = new Set(preview.workInstances.map(item => item.instanceId));
     const runIds = preview.candidates.flatMap(item => item.runId ? [item.runId] : []);
-    await this.store.mutate(state => {
+    await this.store.mutateActivity(state => {
       for (const id of ids) {
         const current = state.invocations[id];
         if (!current || ["queued", "running", "cancellation-requested", "awaiting-human", "awaiting-human-decision"].includes(current.status)) throw new Error(`retention candidate changed or is protected: ${id}`);

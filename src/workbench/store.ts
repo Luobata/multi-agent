@@ -1,14 +1,29 @@
-import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync, truncateSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { configurationReviewHash, configurationReviewProgress } from "../configuration/proposal.js";
 import type { ProviderDefinition } from "../core/types.js";
 import type { KnowledgeProfileGrant } from "../knowledge/types.js";
 import { isSystemManagedProviderId, systemProviderRuntimeProfiles } from "../runtime/systemProviders.js";
-import type { EmployeeDefinition, WorkbenchSkillDefinition, WorkbenchState } from "./types.js";
+import type { EmployeeDefinition, EmployeeSession, EmployeeSessionMessage, WorkbenchSkillDefinition, WorkbenchState } from "./types.js";
+import {
+  ACTIVITY_ENTITIES,
+  ACTIVITY_SHARD_DIRS,
+  type ActivityAppend,
+  type ActivityEntity,
+  type ActivityLogEvent,
+  type ActivityManifests,
+  type ActivityShardManifest,
+  type ActivityState,
+  type StoreOpenReport,
+  type StoreVerifyReport,
+  type WorkbenchConfigState,
+  type WorkbenchStateV2
+} from "./storeTypes.js";
 import { defaultSupervisorFlow } from "./supervisorFlow.js";
 import { normalizePassiveProjectAccesses } from "./passiveProjectAccess.js";
 
@@ -593,10 +608,30 @@ function normalizeState(state: WorkbenchState): WorkbenchState {
   return state;
 }
 
+async function fsyncPath(filePath: string): Promise<void> {
+  const handle = await fs.open(filePath, "r+");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function fsyncDirectory(dirPath: string): Promise<void> {
+  const handle = await fs.open(dirPath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   await fs.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await fsyncPath(temporaryPath);
   await fs.rename(temporaryPath, filePath);
+  await fsyncDirectory(path.dirname(filePath));
 }
 
 async function acquireFileLock(lockPath: string): Promise<() => Promise<void>> {
@@ -627,70 +662,724 @@ async function acquireFileLock(lockPath: string): Promise<() => Promise<void>> {
   throw new Error(`timed out waiting for Workbench state lock: ${lockPath}`);
 }
 
+// ---------------------------------------------------------------------------
+// Store v2: config document + append-only activity shards (design A3)
+// ---------------------------------------------------------------------------
+
+/** Loose envelope for parsing state.json before its schema version is known. */
+type PersistedEnvelope = { schemaVersion: number } & Record<string, unknown>;
+
+const CONFIG_DOMAINS = [
+  "providers",
+  "skills",
+  "skillHistory",
+  "knowledgeBases",
+  "knowledgeProfiles",
+  "knowledgeChangeRequests",
+  "workflowChangeRequests",
+  "configurationProposals",
+  "employees",
+  "employeeTemplates",
+  "managementPolicies",
+  "entrancePolicies",
+  "workflows",
+  "publications",
+  "projects",
+  "projectBindings",
+  "passiveProjectAccesses",
+  "humanDecisionRequests"
+] as const;
+
+function pickConfig(state: WorkbenchState): WorkbenchConfigState {
+  const config = {} as WorkbenchConfigState;
+  for (const domain of CONFIG_DOMAINS) {
+    (config as Record<string, unknown>)[domain] = state[domain];
+  }
+  return config;
+}
+
+function activityOf(state: WorkbenchState): ActivityState {
+  return {
+    sessions: state.sessions,
+    workInstances: state.workInstances,
+    invocations: state.invocations
+  };
+}
+
+function assembleState(config: WorkbenchConfigState, activity: ActivityState): WorkbenchState {
+  return {
+    schemaVersion: 1,
+    ...config,
+    sessions: activity.sessions,
+    workInstances: activity.workInstances,
+    invocations: activity.invocations
+  } as WorkbenchState;
+}
+
+function sha256Digest(content: string | Buffer): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(content).digest("hex")}`;
+}
+
+function shardDir(root: string, entity: ActivityEntity): string {
+  return path.join(root, "activity", ACTIVITY_SHARD_DIRS[entity]);
+}
+
+function shardBasePath(root: string, entity: ActivityEntity): string {
+  return path.join(shardDir(root, entity), "base.json");
+}
+
+function shardLogPath(root: string, entity: ActivityEntity): string {
+  return path.join(shardDir(root, entity), "log.jsonl");
+}
+
+function hasActivityData(state: WorkbenchState): boolean {
+  return Object.keys(state.sessions).length > 0
+    || Object.keys(state.invocations).length > 0
+    || Object.keys(state.workInstances).length > 0;
+}
+
+function isActivityLogEvent(value: unknown): value is ActivityLogEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Record<string, unknown>;
+  if (event.v !== 1 || typeof event.seq !== "number" || typeof event.op !== "string") return false;
+  if (event.op === "record.upsert") return typeof event.id === "string" && "record" in event;
+  if (event.op === "record.delete") return typeof event.id === "string";
+  if (event.op === "messages.append") {
+    return event.entity === "sessions" && typeof event.id === "string"
+      && event.message !== null && typeof event.message === "object";
+  }
+  return false;
+}
+
+interface ParsedLog {
+  events: ActivityLogEvent[];
+  /** Byte offset just past the last complete (parsed) line. */
+  lastValidEnd: number;
+  /** True when the final line could not be parsed (torn append). */
+  tailTorn: boolean;
+}
+
+/** Parses log content line by line; a torn tail is reported, not fatal. */
+function parseLogContent(raw: string): ParsedLog {
+  const events: ActivityLogEvent[] = [];
+  let lineStart = 0;
+  const lineEnds: number[] = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] === "\n") {
+      lineEnds.push(index + 1);
+      lineStart = index + 1;
+    }
+  }
+  const hasTrailingFragment = lineStart < raw.length;
+  const boundaries = [...lineEnds];
+  if (hasTrailingFragment) boundaries.push(raw.length);
+  let lastValidEnd = 0;
+  let tailTorn = false;
+  for (let index = 0; index < boundaries.length; index += 1) {
+    const end = boundaries[index]!;
+    const start = index === 0 ? 0 : boundaries[index - 1]!;
+    const text = raw.slice(start, end).replace(/\n$/, "");
+    if (text.trim().length === 0) {
+      lastValidEnd = end;
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      if (index === boundaries.length - 1) {
+        tailTorn = true;
+        break;
+      }
+      throw new Error(`corrupt activity log at byte ${start}`);
+    }
+    if (!isActivityLogEvent(parsed)) {
+      if (index === boundaries.length - 1) {
+        tailTorn = true;
+        break;
+      }
+      throw new Error(`invalid activity event at byte ${start}`);
+    }
+    events.push(parsed);
+    lastValidEnd = end;
+  }
+  return { events, lastValidEnd, tailTorn };
+}
+
+interface ReplayedShard {
+  records: Record<string, unknown>;
+  lastSeq: number;
+  /** Number of parsed (non-blank) log lines. */
+  logEntries: number;
+  truncatedTailBytes: number;
+  skippedEvents: number;
+}
+
+function replayEvents(
+  records: Record<string, unknown>,
+  baseSeq: number,
+  events: ActivityLogEvent[]
+): { lastSeq: number; logEntries: number; skippedEvents: number } {
+  let lastSeq = baseSeq;
+  let skippedEvents = 0;
+  let logEntries = 0;
+  for (const event of events) {
+    logEntries += 1;
+    if (event.seq <= lastSeq) {
+      skippedEvents += 1;
+      continue;
+    }
+    if (event.op === "record.upsert") {
+      records[event.id] = event.record;
+    } else if (event.op === "record.delete") {
+      delete records[event.id];
+    } else {
+      const session = records[event.id] as EmployeeSession | undefined;
+      if (!session) {
+        skippedEvents += 1;
+        continue;
+      }
+      const dedupeKey = event.dedupeKey ?? event.message.dedupeKey;
+      if (dedupeKey && session.messages.some((message) => message.dedupeKey === dedupeKey)) {
+        skippedEvents += 1;
+        continue;
+      }
+      if (event.dedupeKey && !event.message.dedupeKey) event.message.dedupeKey = event.dedupeKey;
+      session.messages.push(event.message);
+    }
+    lastSeq = event.seq;
+  }
+  return { lastSeq, logEntries, skippedEvents };
+}
+
+async function replayShard(
+  root: string,
+  entity: ActivityEntity,
+  manifest: ActivityShardManifest,
+  options: { truncateTail?: boolean } = {}
+): Promise<ReplayedShard> {
+  const baseBytes = await fs.readFile(shardBasePath(root, entity));
+  if (sha256Digest(baseBytes) !== manifest.baseSha256) {
+    throw new Error(`activity shard ${entity} base.json sha256 mismatch`);
+  }
+  const records = JSON.parse(baseBytes.toString("utf8")) as Record<string, unknown>;
+  let raw = "";
+  try {
+    raw = await fs.readFile(shardLogPath(root, entity), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return { records, lastSeq: manifest.baseSeq, logEntries: 0, truncatedTailBytes: 0, skippedEvents: 0 };
+  }
+  const parsed = parseLogContent(raw);
+  if (parsed.tailTorn && parsed.lastValidEnd < raw.length && options.truncateTail !== false) {
+    await fs.truncate(shardLogPath(root, entity), parsed.lastValidEnd);
+  }
+  const replayed = replayEvents(records, manifest.baseSeq, parsed.events);
+  return {
+    records,
+    lastSeq: replayed.lastSeq,
+    logEntries: replayed.logEntries,
+    truncatedTailBytes: parsed.tailTorn ? raw.length - parsed.lastValidEnd : 0,
+    skippedEvents: replayed.skippedEvents
+  };
+}
+
+function replayShardSync(root: string, entity: ActivityEntity, manifest: ActivityShardManifest): ReplayedShard {
+  const baseBytes = readFileSync(shardBasePath(root, entity));
+  if (sha256Digest(baseBytes) !== manifest.baseSha256) {
+    throw new Error(`activity shard ${entity} base.json sha256 mismatch`);
+  }
+  const records = JSON.parse(baseBytes.toString("utf8")) as Record<string, unknown>;
+  let raw = "";
+  try {
+    raw = readFileSync(shardLogPath(root, entity), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return { records, lastSeq: manifest.baseSeq, logEntries: 0, truncatedTailBytes: 0, skippedEvents: 0 };
+  }
+  const parsed = parseLogContent(raw);
+  if (parsed.tailTorn && parsed.lastValidEnd < raw.length) {
+    truncateSync(shardLogPath(root, entity), parsed.lastValidEnd);
+  }
+  const replayed = replayEvents(records, manifest.baseSeq, parsed.events);
+  return {
+    records,
+    lastSeq: replayed.lastSeq,
+    logEntries: replayed.logEntries,
+    truncatedTailBytes: parsed.tailTorn ? raw.length - parsed.lastValidEnd : 0,
+    skippedEvents: replayed.skippedEvents
+  };
+}
+
+/** Diffs two activity states into append events; sessions message-only appends use messages.append. */
+function diffActivity(
+  before: ActivityState,
+  after: ActivityState,
+  lastSeq: Record<ActivityEntity, number>,
+  at: string
+): { events: ActivityLogEvent[]; nextSeq: Record<ActivityEntity, number> } {
+  const events: ActivityLogEvent[] = [];
+  const nextSeq: Record<ActivityEntity, number> = { ...lastSeq };
+  for (const entity of ACTIVITY_ENTITIES) {
+    const beforeRecords = before[entity] as unknown as Record<string, Record<string, unknown>>;
+    const afterRecords = after[entity] as unknown as Record<string, Record<string, unknown>>;
+    for (const id of Object.keys(afterRecords)) {
+      const beforeRecord = beforeRecords[id];
+      const afterRecord = afterRecords[id]!;
+      if (beforeRecord && JSON.stringify(beforeRecord) === JSON.stringify(afterRecord)) continue;
+      if (entity === "sessions" && beforeRecord && onlyMessagesAppended(beforeRecord, afterRecord)) {
+        const oldMessages = (beforeRecord.messages as EmployeeSessionMessage[] | undefined) ?? [];
+        const newMessages = (afterRecord.messages as EmployeeSessionMessage[] | undefined) ?? [];
+        for (const message of newMessages.slice(oldMessages.length)) {
+          nextSeq[entity] += 1;
+          events.push({
+            v: 1, seq: nextSeq[entity], op: "messages.append", entity: "sessions",
+            id, message, dedupeKey: message.dedupeKey, at
+          });
+        }
+      } else {
+        nextSeq[entity] += 1;
+        events.push({ v: 1, seq: nextSeq[entity], op: "record.upsert", entity, id, record: afterRecord, at });
+      }
+    }
+    for (const id of Object.keys(beforeRecords)) {
+      if (!afterRecords[id]) {
+        nextSeq[entity] += 1;
+        events.push({ v: 1, seq: nextSeq[entity], op: "record.delete", entity, id, at });
+      }
+    }
+  }
+  return { events, nextSeq };
+}
+
+function onlyMessagesAppended(before: Record<string, unknown>, after: Record<string, unknown>): boolean {
+  const beforeMessages = (before.messages as EmployeeSessionMessage[] | undefined) ?? [];
+  const afterMessages = (after.messages as EmployeeSessionMessage[] | undefined) ?? [];
+  if (afterMessages.length < beforeMessages.length) return false;
+  for (let index = 0; index < beforeMessages.length; index += 1) {
+    if (JSON.stringify(beforeMessages[index]) !== JSON.stringify(afterMessages[index])) return false;
+  }
+  const beforeRest: Record<string, unknown> = { ...before };
+  const afterRest: Record<string, unknown> = { ...after };
+  delete beforeRest.messages;
+  delete afterRest.messages;
+  return JSON.stringify(beforeRest) === JSON.stringify(afterRest);
+}
+
+function applyAppendToState(state: WorkbenchState, append: ActivityAppend): void {
+  if (append.op === "record.upsert") {
+    (state[append.entity] as Record<string, unknown>)[append.id] = append.record;
+  } else if (append.op === "record.delete") {
+    delete (state[append.entity] as Record<string, unknown>)[append.id];
+  } else {
+    const session = state.sessions[append.id];
+    if (!session) return;
+    const dedupeKey = append.dedupeKey ?? append.message.dedupeKey;
+    if (dedupeKey && session.messages.some((message) => message.dedupeKey === dedupeKey)) return;
+    if (append.dedupeKey && !append.message.dedupeKey) append.message.dedupeKey = append.dedupeKey;
+    session.messages.push(append.message);
+  }
+}
+
+/**
+ * One-shot v1 → v2 migration under the caller's lock. Writes shards, the v2
+ * state document, and a `.v1.bak` backup, then reconciles the reassembled v2
+ * state against the v1 parse per domain; any mismatch restores v1 and throws.
+ */
+async function migrateV1ToV2(
+  root: string,
+  v1Raw: string,
+  v1: WorkbenchState
+): Promise<{ config: WorkbenchConfigState; activity: ActivityState; manifests: ActivityManifests; report: NonNullable<StoreOpenReport["migration"]> }> {
+  const started = Date.now();
+  const backupPath = path.join(root, "state.json.v1.bak");
+  await fs.writeFile(backupPath, v1Raw, "utf8");
+  await fsyncPath(backupPath);
+
+  const manifests = {} as ActivityManifests;
+  const activity = {} as Record<ActivityEntity, Record<string, unknown>>;
+  for (const entity of ACTIVITY_ENTITIES) {
+    const dir = shardDir(root, entity);
+    await fs.mkdir(dir, { recursive: true });
+    const records = v1[entity] as unknown as Record<string, unknown>;
+    const baseBytes = Buffer.from(`${JSON.stringify(records, null, 2)}\n`, "utf8");
+    await fs.writeFile(shardBasePath(root, entity), baseBytes);
+    await fsyncPath(shardBasePath(root, entity));
+    await fs.writeFile(shardLogPath(root, entity), "", "utf8");
+    await fsyncPath(shardLogPath(root, entity));
+    manifests[entity] = { version: 1, baseSeq: 0, logEntries: 0, baseSha256: sha256Digest(baseBytes) };
+    activity[entity] = structuredClone(records);
+  }
+  const config = pickConfig(v1);
+  const v2: WorkbenchStateV2 = { schemaVersion: 2, config, activity: manifests };
+  await writeJsonAtomic(path.join(root, "state.json"), v2);
+
+  // Reconciliation: reassemble from disk and compare every domain with the v1 parse.
+  const reassembled = await assembleFromDisk(root, v2);
+  const domainSha256: Record<string, `sha256:${string}`> = {};
+  for (const domain of [...CONFIG_DOMAINS, "sessions", "workInstances", "invocations"] as const) {
+    const before = JSON.stringify(v1[domain]);
+    const after = JSON.stringify(reassembled[domain]);
+    if (before !== after) {
+      await fs.writeFile(path.join(root, "state.json"), v1Raw, "utf8");
+      await fs.rm(path.join(root, "activity"), { recursive: true, force: true });
+      throw new Error(`v1→v2 migration reconciliation failed for domain ${String(domain)}`);
+    }
+    domainSha256[String(domain)] = sha256Digest(after);
+  }
+  return {
+    config,
+    activity: activity as unknown as ActivityState,
+    manifests,
+    report: {
+      v1Sha256: sha256Digest(v1Raw),
+      v2Sha256: sha256Digest(JSON.stringify(reassembled)),
+      domainSha256,
+      activityCounts: {
+        sessions: Object.keys(v1.sessions).length,
+        workInstances: Object.keys(v1.workInstances).length,
+        invocations: Object.keys(v1.invocations).length
+      },
+      durationMs: Date.now() - started
+    }
+  };
+}
+
+async function assembleFromDisk(root: string, v2: WorkbenchStateV2): Promise<WorkbenchState> {
+  const activity = {} as Record<ActivityEntity, Record<string, unknown>>;
+  for (const entity of ACTIVITY_ENTITIES) {
+    const replayed = await replayShard(root, entity, v2.activity[entity], { truncateTail: false });
+    activity[entity] = replayed.records;
+  }
+  return assembleState(v2.config, activity as unknown as ActivityState);
+}
+
 export class WorkbenchStore {
   private state: WorkbenchState;
   private mutationQueue: Promise<void> = Promise.resolve();
   private snapshotMtimeMs = -1;
+  private mode: "v1" | "v2";
+  private config: WorkbenchConfigState | undefined;
+  private activityState: ActivityState | undefined;
+  private manifests: ActivityManifests | undefined;
+  private lastSeq: Record<ActivityEntity, number> | undefined;
+  private shardKeys: Partial<Record<ActivityEntity, string>> = {};
+  private cacheKey = "";
+  readonly openReport: StoreOpenReport;
 
   private constructor(
     public readonly dataRoot: string,
-    state: WorkbenchState
+    state: WorkbenchState,
+    mode: "v1" | "v2",
+    openReport: StoreOpenReport
   ) {
     this.state = state;
+    this.mode = mode;
+    this.openReport = openReport;
   }
 
   static async open(dataRoot: string): Promise<WorkbenchStore> {
     const resolvedRoot = path.resolve(dataRoot);
     await fs.mkdir(resolvedRoot, { recursive: true });
     const statePath = path.join(resolvedRoot, "state.json");
-    let state: WorkbenchState;
+    const report: StoreOpenReport = { migrated: false, truncatedTail: [], manifestDrift: [], skippedEvents: 0 };
+    let raw: string;
     try {
-      const persisted = JSON.parse(await fs.readFile(statePath, "utf8")) as WorkbenchState;
-      const passiveBefore = JSON.stringify(persisted.passiveProjectAccesses ?? {});
-      state = normalizeState(persisted);
-      if (state.schemaVersion !== 1) throw new Error(`unsupported workbench schema version ${String(state.schemaVersion)}`);
-      if (passiveBefore !== JSON.stringify(state.passiveProjectAccesses)) {
-        const release = await acquireFileLock(path.join(resolvedRoot, "state.lock"));
-        try {
-          const latestPersisted = JSON.parse(await fs.readFile(statePath, "utf8")) as WorkbenchState;
-          const latestPassiveBefore = JSON.stringify(latestPersisted.passiveProjectAccesses ?? {});
-          const latest = normalizeState(structuredClone(latestPersisted));
-          if (latestPassiveBefore !== JSON.stringify(latest.passiveProjectAccesses)) {
-            latestPersisted.passiveProjectAccesses = latest.passiveProjectAccesses;
-            await writeJsonAtomic(statePath, latestPersisted);
-          }
-          state = latest;
-        } finally {
-          await release();
-        }
-      }
+      raw = await fs.readFile(statePath, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      state = initialState();
+      const state = initialState();
       await writeJsonAtomic(statePath, state);
+      return new WorkbenchStore(resolvedRoot, state, "v1", report);
     }
-    return new WorkbenchStore(resolvedRoot, state);
+    const persisted = JSON.parse(raw) as PersistedEnvelope;
+    if (persisted.schemaVersion === 2) {
+      return await WorkbenchStore.openV2(resolvedRoot, persisted as unknown as WorkbenchStateV2, report);
+    }
+    if (persisted.schemaVersion !== 1) {
+      throw new Error(`unsupported workbench schema version ${String(persisted.schemaVersion)}`);
+    }
+    const persistedV1 = persisted as unknown as WorkbenchState;
+    if (!hasActivityData(persistedV1)) {
+      return WorkbenchStore.openV1Legacy(resolvedRoot, statePath, persistedV1, report);
+    }
+    // v1 with activity data: migrate under the global lock (double-checked).
+    const release = await acquireFileLock(path.join(resolvedRoot, "state.lock"));
+    try {
+      const latestRaw = await fs.readFile(statePath, "utf8");
+      const latest = JSON.parse(latestRaw) as PersistedEnvelope;
+      if (latest.schemaVersion === 2) {
+        return await WorkbenchStore.openV2(resolvedRoot, latest as unknown as WorkbenchStateV2, report);
+      }
+      if (latest.schemaVersion !== 1) {
+        throw new Error(`unsupported workbench schema version ${String(latest.schemaVersion)}`);
+      }
+      const normalized = normalizeState(structuredClone(latest as unknown as WorkbenchState)) as WorkbenchState;
+      const migration = await migrateV1ToV2(resolvedRoot, latestRaw, normalized);
+      report.migrated = true;
+      report.migration = migration.report;
+      const store = new WorkbenchStore(resolvedRoot, normalized, "v2", report);
+      store.config = migration.config;
+      store.activityState = migration.activity;
+      store.manifests = migration.manifests;
+      store.lastSeq = { sessions: 0, workInstances: 0, invocations: 0 };
+      store.cacheKey = store.currentCacheKey();
+      return store;
+    } finally {
+      await release();
+    }
+  }
+
+  /** v1 without activity data: the legacy normalize + passive-write-back path, unchanged. */
+  private static async openV1Legacy(
+    resolvedRoot: string,
+    statePath: string,
+    persisted: WorkbenchState,
+    report: StoreOpenReport
+  ): Promise<WorkbenchStore> {
+    const passiveBefore = JSON.stringify(persisted.passiveProjectAccesses ?? {});
+    let state = normalizeState(persisted);
+    if (state.schemaVersion !== 1) throw new Error(`unsupported workbench schema version ${String(state.schemaVersion)}`);
+    if (passiveBefore !== JSON.stringify(state.passiveProjectAccesses)) {
+      const release = await acquireFileLock(path.join(resolvedRoot, "state.lock"));
+      try {
+        const latestRaw = await fs.readFile(statePath, "utf8");
+        const latestEnvelope = JSON.parse(latestRaw) as PersistedEnvelope;
+        if (latestEnvelope.schemaVersion === 2) {
+          // Another process migrated under us; v2 migration already normalized passive accesses.
+          const v2 = latestEnvelope as unknown as WorkbenchStateV2;
+          const activity = {} as Record<ActivityEntity, Record<string, unknown>>;
+          for (const entity of ACTIVITY_ENTITIES) {
+            activity[entity] = (await replayShard(resolvedRoot, entity, v2.activity[entity])).records;
+          }
+          state = normalizeState(assembleState(v2.config, activity as unknown as ActivityState));
+          return new WorkbenchStore(resolvedRoot, state, "v2", report);
+        }
+        const latestPersisted = latestEnvelope as unknown as WorkbenchState;
+        const latestPassiveBefore = JSON.stringify(latestPersisted.passiveProjectAccesses ?? {});
+        const latest = normalizeState(structuredClone(latestPersisted));
+        if (latestPassiveBefore !== JSON.stringify(latest.passiveProjectAccesses)) {
+          latestPersisted.passiveProjectAccesses = latest.passiveProjectAccesses;
+          await writeJsonAtomic(statePath, latestPersisted);
+        }
+        state = latest;
+      } finally {
+        await release();
+      }
+    }
+    return new WorkbenchStore(resolvedRoot, state, "v1", report);
+  }
+
+  private static async openV2(
+    resolvedRoot: string,
+    v2: WorkbenchStateV2,
+    report: StoreOpenReport
+  ): Promise<WorkbenchStore> {
+    const activity = {} as Record<ActivityEntity, Record<string, unknown>>;
+    const lastSeq: Record<ActivityEntity, number> = { sessions: 0, workInstances: 0, invocations: 0 };
+    for (const entity of ACTIVITY_ENTITIES) {
+      const manifest = v2.activity[entity];
+      const replayed = await replayShard(resolvedRoot, entity, manifest);
+      activity[entity] = replayed.records;
+      lastSeq[entity] = replayed.lastSeq;
+      if (replayed.truncatedTailBytes > 0) {
+        report.truncatedTail.push({ entity, bytesDropped: replayed.truncatedTailBytes });
+      }
+      if (manifest.logEntries !== replayed.logEntries) {
+        report.manifestDrift.push({ entity, expected: manifest.logEntries, actual: replayed.logEntries });
+      }
+      report.skippedEvents += replayed.skippedEvents;
+    }
+    const state = normalizeState(assembleState(v2.config, activity as unknown as ActivityState));
+    const store = new WorkbenchStore(resolvedRoot, state, "v2", report);
+    store.config = v2.config;
+    store.activityState = activity as unknown as ActivityState;
+    store.manifests = v2.activity;
+    store.lastSeq = lastSeq;
+    store.cacheKey = store.currentCacheKey();
+    return store;
   }
 
   snapshot(): WorkbenchState {
-    const statePath = path.join(this.dataRoot, "state.json");
-    const mtimeMs = statSync(statePath).mtimeMs;
-    if (mtimeMs === this.snapshotMtimeMs) return structuredClone(this.state);
-    const latest = normalizeState(JSON.parse(readFileSync(statePath, "utf8")) as WorkbenchState);
-    if (latest.schemaVersion !== 1) throw new Error(`unsupported workbench schema version ${String(latest.schemaVersion)}`);
-    this.state = latest;
-    this.snapshotMtimeMs = mtimeMs;
+    if (this.mode === "v1") {
+      const statePath = path.join(this.dataRoot, "state.json");
+      const mtimeMs = statSync(statePath).mtimeMs;
+      if (mtimeMs === this.snapshotMtimeMs) return structuredClone(this.state);
+      const raw = readFileSync(statePath, "utf8");
+      if (this.adoptV2(raw)) return structuredClone(this.state);
+      const latest = normalizeState(JSON.parse(raw) as WorkbenchState);
+      if (latest.schemaVersion !== 1) throw new Error(`unsupported workbench schema version ${String(latest.schemaVersion)}`);
+      this.state = latest;
+      this.snapshotMtimeMs = mtimeMs;
+      return structuredClone(this.state);
+    }
+    const key = this.currentCacheKey();
+    if (key === this.cacheKey) return structuredClone(this.state);
+    this.reloadV2Sync();
+    this.cacheKey = key;
     return structuredClone(this.state);
   }
 
+  /**
+   * Adopts a v2 layout migrated by another process while this instance was open
+   * in v1 mode (daemon/CLI interleave). Returns false when the content is still v1.
+   */
+  private adoptV2(raw: string): boolean {
+    const parsed = JSON.parse(raw) as PersistedEnvelope;
+    if (parsed.schemaVersion !== 2) return false;
+    const v2 = parsed as unknown as WorkbenchStateV2;
+    const activity = {} as Record<ActivityEntity, Record<string, unknown>>;
+    const lastSeq: Record<ActivityEntity, number> = { sessions: 0, workInstances: 0, invocations: 0 };
+    for (const entity of ACTIVITY_ENTITIES) {
+      const replayed = replayShardSync(this.dataRoot, entity, v2.activity[entity]);
+      activity[entity] = replayed.records;
+      lastSeq[entity] = replayed.lastSeq;
+    }
+    this.config = v2.config;
+    this.manifests = v2.activity;
+    this.activityState = activity as unknown as ActivityState;
+    this.lastSeq = lastSeq;
+    this.shardKeys = {};
+    this.state = normalizeState(assembleState(v2.config, this.activityState));
+    this.mode = "v2";
+    this.cacheKey = this.currentCacheKey();
+    return true;
+  }
+
   async mutate<T>(mutation: (state: WorkbenchState) => T | Promise<T>): Promise<T> {
+    if (this.mode === "v1") return this.mutateV1(mutation);
+    return this.writeLocked(() => this.writeV2Mutation(mutation));
+  }
+
+  /** Applies a full-state mutation in v2 mode (diff → activity-first persist). Caller must hold the lock. */
+  private async writeV2Mutation<T>(mutation: (state: WorkbenchState) => T | Promise<T>): Promise<T> {
+    this.reloadV2Sync();
+    const before = this.state;
+    const next = structuredClone(before);
+    const result = await mutation(next);
+    const configChanged = (CONFIG_DOMAINS as readonly string[]).some(
+      (domain) => JSON.stringify(before[domain as keyof WorkbenchState]) !== JSON.stringify(next[domain as keyof WorkbenchState])
+    );
+    const { events, nextSeq } = diffActivity(
+      activityOf(before),
+      activityOf(next),
+      this.lastSeq!,
+      new Date().toISOString()
+    );
+    if (configChanged || events.length > 0) {
+      await this.persistV2(next, events);
+      this.lastSeq = nextSeq;
+    }
+    return result;
+  }
+
+  /** Config-only write: the 18 configuration domains, untouched activity shards. */
+  async mutateConfig<T>(mutation: (config: WorkbenchConfigState) => T | Promise<T>): Promise<T> {
+    if (this.mode === "v1") {
+      return this.mutate((state) => {
+        const slice = pickConfig(state);
+        const result = mutation(slice);
+        for (const domain of CONFIG_DOMAINS) {
+          (state as unknown as Record<string, unknown>)[domain] = slice[domain];
+        }
+        return result;
+      });
+    }
+    return this.writeLocked(async () => {
+      this.reloadV2Sync();
+      const nextConfig = structuredClone(this.config!);
+      const result = await mutation(nextConfig);
+      const v2: WorkbenchStateV2 = { schemaVersion: 2, config: nextConfig, activity: this.manifests! };
+      await writeJsonAtomic(path.join(this.dataRoot, "state.json"), v2);
+      this.config = nextConfig;
+      this.state = normalizeState(assembleState(nextConfig, this.activityState!));
+      this.cacheKey = this.currentCacheKey();
+      return result;
+    });
+  }
+
+  /** Activity-only write: record-level diff becomes upsert/delete events. */
+  async mutateActivity<T>(mutation: (activity: ActivityState) => T | Promise<T>): Promise<T> {
+    if (this.mode === "v1") {
+      return this.mutate((state) => {
+        const slice = activityOf(state);
+        const result = mutation(slice);
+        state.sessions = slice.sessions;
+        state.workInstances = slice.workInstances;
+        state.invocations = slice.invocations;
+        return result;
+      });
+    }
+    return this.writeLocked(async () => {
+      this.reloadV2Sync();
+      const before = this.activityState!;
+      const next = structuredClone(before) as ActivityState;
+      const result = await mutation(next);
+      const { events, nextSeq } = diffActivity(before, next, this.lastSeq!, new Date().toISOString());
+      if (events.length > 0) {
+        await this.persistV2(assembleState(this.config!, next), events);
+        this.lastSeq = nextSeq;
+      }
+      return result;
+    });
+  }
+
+  /** Hot-path single-event append (session messages, status transitions). */
+  async appendActivity(append: ActivityAppend): Promise<void> {
+    if (this.mode === "v1") {
+      await this.mutate((state) => {
+        applyAppendToState(state, append);
+      });
+      return;
+    }
+    await this.writeLocked(async () => {
+      this.reloadV2Sync();
+      const entity = append.entity;
+      const seq = this.lastSeq![entity] + 1;
+      const at = new Date().toISOString();
+      const event: ActivityLogEvent = append.op === "messages.append"
+        ? { v: 1, seq, op: "messages.append", entity: append.entity, id: append.id, message: append.message, dedupeKey: append.dedupeKey, at }
+        : append.op === "record.upsert"
+          ? { v: 1, seq, op: "record.upsert", entity, id: append.id, record: append.record, at }
+          : { v: 1, seq, op: "record.delete", entity, id: append.id, at };
+      await this.persistV2(this.state, [event]);
+      this.lastSeq![entity] = seq;
+    });
+  }
+
+  private async writeLocked<T>(body: () => Promise<T>): Promise<T> {
     let result: T | undefined;
     let failure: unknown;
     this.mutationQueue = this.mutationQueue.then(async () => {
       let release: (() => Promise<void>) | undefined;
       try {
         release = await acquireFileLock(path.join(this.dataRoot, "state.lock"));
-        const latest = normalizeState(JSON.parse(await fs.readFile(path.join(this.dataRoot, "state.json"), "utf8")) as WorkbenchState);
+        result = await body();
+      } catch (error) {
+        failure = error;
+      } finally {
+        await release?.();
+      }
+    });
+    await this.mutationQueue;
+    if (failure) throw failure;
+    return result as T;
+  }
+
+  private async mutateV1<T>(mutation: (state: WorkbenchState) => T | Promise<T>): Promise<T> {
+    let result: T | undefined;
+    let failure: unknown;
+    this.mutationQueue = this.mutationQueue.then(async () => {
+      let release: (() => Promise<void>) | undefined;
+      try {
+        release = await acquireFileLock(path.join(this.dataRoot, "state.lock"));
+        const raw = await fs.readFile(path.join(this.dataRoot, "state.json"), "utf8");
+        if (this.adoptV2(raw)) {
+          // Another process migrated while this instance was open in v1 mode.
+          result = await this.writeV2Mutation(mutation);
+          return;
+        }
+        const latest = normalizeState(JSON.parse(raw) as WorkbenchState);
         if (latest.schemaVersion !== 1) throw new Error(`unsupported workbench schema version ${String(latest.schemaVersion)}`);
         const next = structuredClone(latest);
         result = await mutation(next);
@@ -707,4 +1396,173 @@ export class WorkbenchStore {
     if (failure) throw failure;
     return result as T;
   }
+
+  /** Appends events to shard logs (activity first), then persists config + manifests. */
+  private async persistV2(nextState: WorkbenchState, events: ActivityLogEvent[]): Promise<void> {
+    const byEntity = new Map<ActivityEntity, ActivityLogEvent[]>();
+    for (const event of events) {
+      const list = byEntity.get(event.entity) ?? [];
+      list.push(event);
+      byEntity.set(event.entity, list);
+    }
+    for (const [entity, shardEvents] of byEntity) {
+      const handle = await fs.open(shardLogPath(this.dataRoot, entity), "a");
+      try {
+        for (const event of shardEvents) {
+          await handle.writeFile(`${JSON.stringify(event)}\n`, "utf8");
+        }
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      this.manifests![entity].logEntries += shardEvents.length;
+      for (const event of shardEvents) {
+        applyEventToRecords(this.activityState![entity], event);
+      }
+    }
+    const nextConfig = pickConfig(nextState);
+    const v2: WorkbenchStateV2 = { schemaVersion: 2, config: nextConfig, activity: this.manifests! };
+    await writeJsonAtomic(path.join(this.dataRoot, "state.json"), v2);
+    this.config = nextConfig;
+    this.state = normalizeState(assembleState(nextConfig, this.activityState!));
+    this.cacheKey = this.currentCacheKey();
+  }
+
+  /** Re-reads the config document and replays shards changed on disk (cross-process). */
+  private reloadV2Sync(): void {
+    const v2 = JSON.parse(readFileSync(path.join(this.dataRoot, "state.json"), "utf8")) as WorkbenchStateV2;
+    if (v2.schemaVersion !== 2) throw new Error(`unsupported workbench schema version ${String(v2.schemaVersion)}`);
+    this.config = v2.config;
+    this.manifests = v2.activity;
+    for (const entity of ACTIVITY_ENTITIES) {
+      let baseMtime = 0;
+      let logSize = -1;
+      let logMtime = 0;
+      try {
+        baseMtime = statSync(shardBasePath(this.dataRoot, entity)).mtimeMs;
+        const logStat = statSync(shardLogPath(this.dataRoot, entity));
+        logSize = logStat.size;
+        logMtime = logStat.mtimeMs;
+      } catch {
+        // shard files missing → key stays distinct from any cached value
+      }
+      const key = `${baseMtime}:${logSize}:${logMtime}`;
+      if (key === this.shardKeys[entity]) continue;
+      const replayed = replayShardSync(this.dataRoot, entity, v2.activity[entity]);
+      (this.activityState! as Record<ActivityEntity, Record<string, unknown>>)[entity] = replayed.records;
+      this.lastSeq![entity] = replayed.lastSeq;
+      this.shardKeys[entity] = key;
+    }
+    this.state = normalizeState(assembleState(this.config, this.activityState!));
+  }
+
+  private currentCacheKey(): string {
+    const parts: string[] = [];
+    try {
+      parts.push(`state:${statSync(path.join(this.dataRoot, "state.json")).mtimeMs}`);
+    } catch {
+      parts.push("state:missing");
+    }
+    for (const entity of ACTIVITY_ENTITIES) {
+      try {
+        parts.push(`${entity}-base:${statSync(shardBasePath(this.dataRoot, entity)).mtimeMs}`);
+      } catch {
+        parts.push(`${entity}-base:missing`);
+      }
+      try {
+        const stat = statSync(shardLogPath(this.dataRoot, entity));
+        parts.push(`${entity}-log:${stat.size}:${stat.mtimeMs}`);
+      } catch {
+        parts.push(`${entity}-log:missing`);
+      }
+    }
+    return parts.join("|");
+  }
+}
+
+function applyEventToRecords(records: Record<string, unknown>, event: ActivityLogEvent): void {
+  if (event.op === "record.upsert") {
+    records[event.id] = event.record;
+  } else if (event.op === "record.delete") {
+    delete records[event.id];
+  } else {
+    const session = records[event.id] as EmployeeSession | undefined;
+    if (!session) return;
+    const dedupeKey = event.dedupeKey ?? event.message.dedupeKey;
+    if (dedupeKey && session.messages.some((message) => message.dedupeKey === dedupeKey)) return;
+    if (event.dedupeKey && !event.message.dedupeKey) event.message.dedupeKey = event.dedupeKey;
+    session.messages.push(event.message);
+  }
+}
+
+/**
+ * Read-only health check for `workbench store-verify`: replays every shard,
+ * reconciles manifests, and (when a `.v1.bak` exists) reports drift against it.
+ */
+export async function verifyStore(dataRoot: string): Promise<StoreVerifyReport> {
+  const root = path.resolve(dataRoot);
+  const report: StoreVerifyReport = { ok: true, dataRoot: root, schemaVersion: 1, notes: [] };
+  const statePath = path.join(root, "state.json");
+  const parsed = JSON.parse(await fs.readFile(statePath, "utf8")) as PersistedEnvelope;
+  if (parsed.schemaVersion === 1) {
+    report.notes.push("v1 state.json; no shards to verify");
+    return report;
+  }
+  if (parsed.schemaVersion !== 2) {
+    throw new Error(`unsupported workbench schema version ${String(parsed.schemaVersion)}`);
+  }
+  const v2 = parsed as unknown as WorkbenchStateV2;
+  report.schemaVersion = 2;
+  report.shards = [];
+  for (const entity of ACTIVITY_ENTITIES) {
+    const manifest = v2.activity[entity];
+    const baseBytes = await fs.readFile(shardBasePath(root, entity));
+    const baseSha256Matches = sha256Digest(baseBytes) === manifest.baseSha256;
+    if (!baseSha256Matches) report.ok = false;
+    let recordCount = 0;
+    if (baseSha256Matches) {
+      const replayed = await replayShard(root, entity, manifest, { truncateTail: false });
+      recordCount = Object.keys(replayed.records).length;
+    } else {
+      recordCount = Object.keys(JSON.parse(baseBytes.toString("utf8")) as Record<string, unknown>).length;
+    }
+    let logRaw = "";
+    try {
+      logRaw = await fs.readFile(shardLogPath(root, entity), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const actualLines = logRaw === "" ? 0 : logRaw.split("\n").filter((line) => line.trim().length > 0).length;
+    const torn = parseLogContent(logRaw).tailTorn;
+    if (torn) report.ok = false;
+    if (manifest.logEntries !== actualLines) report.ok = false;
+    report.shards.push({
+      entity,
+      baseSha256Matches,
+      logEntriesExpected: manifest.logEntries,
+      logEntriesActual: actualLines,
+      recordCount,
+      truncatedTail: torn
+    });
+  }
+  const backupPath = path.join(root, "state.json.v1.bak");
+  try {
+    const backupRaw = await fs.readFile(backupPath, "utf8");
+    const backup = JSON.parse(backupRaw) as WorkbenchState;
+    if (report.shards?.every((shard) => shard.baseSha256Matches)) {
+      const assembled = await assembleFromDisk(root, v2);
+      const backupDrift: Record<ActivityEntity, { backup: number; current: number }> = {} as Record<ActivityEntity, { backup: number; current: number }>;
+      for (const entity of ACTIVITY_ENTITIES) {
+        backupDrift[entity] = {
+          backup: Object.keys(backup[entity]).length,
+          current: Object.keys(assembled[entity]).length
+        };
+      }
+      report.backupDrift = backupDrift;
+    }
+    report.notes.push(`state.json.v1.bak present (sha256 ${sha256Digest(backupRaw)})`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return report;
 }

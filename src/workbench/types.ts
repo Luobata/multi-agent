@@ -1332,3 +1332,19 @@ export const DEFAULT_EMPLOYEE_OUTPUT_SCHEMA: JsonObject = {
     message: { type: "string" }
   }
 };
+
+// Store v2 persistence types live in storeTypes.ts to keep this file from
+// growing further; re-exported here for existing import sites.
+export type {
+  ActivityAppend,
+  ActivityEntity,
+  ActivityLogEvent,
+  ActivityManifests,
+  ActivityShardManifest,
+  ActivityState,
+  StoreOpenReport,
+  StoreVerifyReport,
+  WorkbenchConfigState,
+  WorkbenchStateV2
+} from "./storeTypes.js";
+export { ACTIVITY_ENTITIES, ACTIVITY_SHARD_DIRS } from "./storeTypes.js";

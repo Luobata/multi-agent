@@ -123,9 +123,15 @@ describe("Local Agent Workbench", () => {
       })
     ]);
     const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      schemaVersion?: number;
       passiveProjectAccesses?: Record<string, { projectKeys?: string[]; requestCount?: number }>;
+      config?: { passiveProjectAccesses?: Record<string, { projectKeys?: string[]; requestCount?: number }> };
     };
-    expect(Object.values(persisted.passiveProjectAccesses ?? {})).toEqual([
+    // v2 keeps config domains under `config`; the persisted assertion is shape-agnostic.
+    const persistedAccesses = persisted.schemaVersion === 2
+      ? persisted.config?.passiveProjectAccesses ?? {}
+      : persisted.passiveProjectAccesses ?? {};
+    expect(Object.values(persistedAccesses)).toEqual([
       expect.objectContaining({ projectKeys: ["vibe-docing"], requestCount: 2 })
     ]);
 
