@@ -3009,9 +3009,48 @@ export async function removeMergeValidationWorktree(input: MergeValidationWorktr
 }
 
 const ACCEPTANCE_EVIDENCE_MEDIA_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov"]);
+const ACCEPTANCE_EVIDENCE_IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+const REFERENCED_IMAGE_PATTERN = /\/[\w./-]+\.(?:png|jpg|jpeg|webp|gif)/g;
 const ACCEPTANCE_EVIDENCE_MAX_FILES = 50;
 const ACCEPTANCE_EVIDENCE_MAX_TOTAL_BYTES = 25 * 1024 * 1024;
 const ACCEPTANCE_EVIDENCE_MAX_DEPTH = 6;
+
+/**
+ * Collects absolute image paths referenced anywhere in the retest output
+ * (e2eEvidence observations, summary prose, …). Agents frequently leave screenshots
+ * in temp locations (/var/folders, /tmp) that vanish with the worktree; the archive
+ * pins anything that still exists on disk. Paths may be a dedicated field value or
+ * embedded in prose; relative mentions are ignored so they cannot fake an issue.
+ */
+function collectReferencedImagePaths(value: JsonValue | undefined): string[] {
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const add = (candidate: string, requireAbsolute: boolean): void => {
+    if (requireAbsolute && !path.isAbsolute(candidate)) return;
+    if (!ACCEPTANCE_EVIDENCE_IMAGE_EXTENSIONS.has(path.extname(candidate).toLowerCase())) return;
+    const resolved = path.resolve(candidate);
+    if (!seen.has(resolved)) {
+      seen.add(resolved);
+      found.push(resolved);
+    }
+  };
+  const visit = (node: unknown): void => {
+    if (typeof node === "string") {
+      add(node, true);
+      for (const match of node.matchAll(REFERENCED_IMAGE_PATTERN)) add(match[0], false);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (node && typeof node === "object") {
+      for (const entry of Object.values(node as Record<string, unknown>)) visit(entry);
+    }
+  };
+  visit(value);
+  return found;
+}
 
 export interface AcceptanceEvidenceArchiveInput {
   kind: "conflict-retest" | "merge-queue-retest";
@@ -3041,6 +3080,7 @@ export async function archiveAcceptanceEvidence(input: AcceptanceEvidenceArchive
   const items: AcceptanceEvidenceItem[] = [];
   const issues: string[] = [];
   let totalBytes = 0;
+  const archivedSources = new Set<string>();
 
   const writeItem = async (type: AcceptanceEvidenceItemType, relativePath: string, buffer: Buffer): Promise<void> => {
     const destination = path.join(archiveRoot, relativePath);
@@ -3117,12 +3157,41 @@ export async function archiveAcceptanceEvidence(input: AcceptanceEvidenceArchive
           ? "screenshot"
           : "midscene-report";
         await writeItem(type, `midscene/${relative}`, buffer);
+        archivedSources.add(path.resolve(absolute));
       } catch (error) {
         issues.push(`midscene/${relative}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   };
   await copyMidscene(midsceneRoot, 0);
+
+  // e2eEvidence 引用的临时截图（/var/folders、/tmp 等）：存在且未归档则补归档，
+  // 缺失或不可读只记 issues，不阻塞归档。
+  const screenshotNames = new Map<string, number>();
+  for (const absolute of collectReferencedImagePaths(input.output)) {
+    if (items.length >= ACCEPTANCE_EVIDENCE_MAX_FILES || totalBytes >= ACCEPTANCE_EVIDENCE_MAX_TOTAL_BYTES) {
+      issues.push("screenshots: 归档文件数或总体积达到上限，其余证据未复制");
+      break;
+    }
+    if (archivedSources.has(absolute)) continue;
+    const base = path.basename(absolute);
+    try {
+      const stat = await fs.stat(absolute);
+      if (!stat.isFile()) continue;
+      if (stat.size > ACCEPTANCE_EVIDENCE_MAX_TOTAL_BYTES) {
+        issues.push(`screenshots/${base}: 文件超过归档体积上限`);
+        continue;
+      }
+      const buffer = await fs.readFile(absolute);
+      const seen = screenshotNames.get(base) ?? 0;
+      screenshotNames.set(base, seen + 1);
+      const relativeName = seen === 0 ? base : `${path.parse(base).name}-${seen}${path.parse(base).ext}`;
+      await writeItem("screenshot", `screenshots/${relativeName}`, buffer);
+      archivedSources.add(absolute);
+    } catch (error) {
+      issues.push(`screenshots/${base}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   return {
     kind: input.kind,

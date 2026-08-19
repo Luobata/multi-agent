@@ -1,4 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   CONFLICT_EXECUTION_PASS,
   CONFLICT_PLAN_READY,
@@ -10,15 +14,30 @@ import {
   buildLeaderRevalidationRequest,
   buildMergeQueueRetestNarrative,
   classifyTestResults,
+  deriveCommittedChangedFiles,
   determineTestCommands,
   environmentBlockedClaimContradicted,
   hasExplicitDeliveryPass,
   classifyConflictRetestFailure,
+  parseTestResults,
+  resolveRetestFailureClass,
   validateCandidateWorkspaceState,
   validateConflictRetestEvidence,
   selectConflictExecutionRole,
   CONFLICT_RETEST_NARRATIVE
 } from "../src/workbench/conflictResolution.js";
+
+const roots: string[] = [];
+
+function temporaryRoot(prefix: string): string {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  roots.push(root);
+  return root;
+}
+
+afterEach(() => {
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
 
 describe("merge conflict leader protocol", () => {
   it("has the read-only original leader plan and a write-capable project role execute in the original worktree", () => {
@@ -349,6 +368,9 @@ describe("unified acceptance retest prompt", () => {
     expect(prompt).toContain("- npm run check");
     expect(prompt).toContain("接地要求");
     expect(prompt).toContain("MIDSCENE_ENVIRONMENT_BLOCKED 仅用于");
+    // 结构化 testResults 汇报指令随 testScope 一起出现。
+    expect(prompt).toContain("TEST_RESULTS:");
+    expect(prompt).toContain("exitCode");
   });
 
   it("keeps the conflict narrative free of the merge-queue full-check gate instructions", () => {
@@ -363,5 +385,101 @@ describe("unified acceptance retest prompt", () => {
       narrative: buildMergeQueueRetestNarrative("main")
     });
     expect(prompt).toContain("服务端未指定测试范围；运行与改动文件直接相关的定向测试，不要跑整库 npm run check。");
+    // 无范围时不附带 TEST_RESULTS 汇报指令。
+    expect(prompt).not.toContain("TEST_RESULTS");
+  });
+});
+
+describe("structured test results classification", () => {
+  const outputWith = (summary: string) => ({
+    verdict: "block",
+    summary,
+    e2eEvidence: [{ method: "browser", steps: "navigate", observed: "页面可达" }]
+  });
+
+  it("parses TEST_RESULTS lines from summary and from message", () => {
+    const fromSummary = parseTestResults(
+      outputWith('TEST_RESULTS: [{"command":"npm run check","exitCode":0,"summary":"all green"}]'),
+      ""
+    );
+    expect(fromSummary).toEqual([{ command: "npm run check", exitCode: 0, summary: "all green" }]);
+    const fromMessage = parseTestResults(undefined, 'TEST_RESULTS: [{"command":"npm test","exitCode":1,"summary":"EPERM"}]');
+    expect(fromMessage).toEqual([{ command: "npm test", exitCode: 1, summary: "EPERM" }]);
+  });
+
+  it("① all-pass testResults against a blocked verdict is product-failed, never environment-blocked", () => {
+    const output = outputWith('交互失败。TEST_RESULTS: [{"command":"npm run check","exitCode":0,"summary":"all green"}]');
+    const testResults = parseTestResults(output, "");
+    expect(testResults).toBeDefined();
+    // 无证据缺口：agent Block 不被测试全过覆盖 → product-failed（不放行、不误标环境）。
+    expect(resolveRetestFailureClass({ testResults, evidenceIssues: [], message: "block", output })).toBe("product-failed");
+    // 证据缺口一票否决 → evidence-incomplete。
+    expect(resolveRetestFailureClass({
+      testResults,
+      evidenceIssues: ["受管候选 URL 没有真实访问记录"],
+      message: "block",
+      output
+    })).toBe("evidence-incomplete");
+  });
+
+  it("② EPERM/timeout summaries classify as environment-blocked", () => {
+    const output = outputWith(
+      'TEST_RESULTS: [{"command":"npm run check","exitCode":1,"summary":"EPERM operation not permitted"},'
+      + '{"command":"npm test","exitCode":1,"summary":"timed out after 30s"}]'
+    );
+    const testResults = parseTestResults(output, "");
+    expect(resolveRetestFailureClass({ testResults, evidenceIssues: [], message: "failed", output }))
+      .toBe("environment-blocked");
+  });
+
+  it("③ assertion failures classify as product-failed", () => {
+    const output = outputWith('TEST_RESULTS: [{"command":"npm test","exitCode":1,"summary":"expected true to be false"}]');
+    const testResults = parseTestResults(output, "");
+    expect(resolveRetestFailureClass({ testResults, evidenceIssues: [], message: "failed", output }))
+      .toBe("product-failed");
+  });
+
+  it("④ absent or malformed testResults fall back to the legacy classifier", () => {
+    const envOutput = { verdict: "block", summary: "MIDSCENE_ENVIRONMENT_BLOCKED: connect refused" };
+    expect(parseTestResults(envOutput, "MIDSCENE_ENVIRONMENT_BLOCKED: connect refused")).toBeUndefined();
+    expect(resolveRetestFailureClass({
+      testResults: undefined,
+      evidenceIssues: [],
+      message: "MIDSCENE_ENVIRONMENT_BLOCKED: connect refused",
+      output: envOutput
+    })).toBe("environment-blocked");
+    // 畸形（exitCode 越界）→ 整体回退到 message 正则路径。
+    const malformed = outputWith('TEST_RESULTS: [{"command":"npm test","exitCode":999,"summary":"bad"}]');
+    expect(parseTestResults(malformed, "")).toBeUndefined();
+    expect(resolveRetestFailureClass({
+      testResults: parseTestResults(malformed, ""),
+      evidenceIssues: [],
+      message: "breadcrumb is missing",
+      output: malformed
+    })).toBe("product-failed");
+  });
+});
+
+describe("committed-range scope derivation", () => {
+  it("⑤ derives changed files from baseCommit..sourceCommit in a clean worktree", async () => {
+    const root = temporaryRoot("cr-derive-");
+    execFileSync("git", ["init", "-b", "main"], { cwd: root });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
+    fs.writeFileSync(path.join(root, "README.md"), "seed\n");
+    execFileSync("git", ["add", "-A"], { cwd: root });
+    execFileSync("git", ["commit", "-m", "seed"], { cwd: root });
+    const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+    fs.mkdirSync(path.join(root, "client"), { recursive: true });
+    fs.writeFileSync(path.join(root, "client", "App.tsx"), "export const a = 1;\n");
+    fs.writeFileSync(path.join(root, "server.ts"), "export const b = 2;\n");
+    execFileSync("git", ["add", "-A"], { cwd: root });
+    execFileSync("git", ["commit", "-m", "candidate"], { cwd: root });
+    const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+
+    const derived = await deriveCommittedChangedFiles(root, baseCommit, sourceCommit);
+    expect(derived).toEqual(["client/App.tsx", "server.ts"]);
+    // 不可解析的 range → undefined（调用方回退 smoke）。
+    expect(await deriveCommittedChangedFiles(root, "deadbeef", sourceCommit)).toBeUndefined();
   });
 });

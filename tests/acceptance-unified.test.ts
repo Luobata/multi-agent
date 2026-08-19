@@ -145,6 +145,50 @@ describe("acceptance evidence archive", () => {
     expect(ref.items).toHaveLength(1);
     expect(ref.archiveError).toContain("midscene_run");
   });
+
+  it("archives screenshots referenced from e2eEvidence temp paths", async () => {
+    const root = temporaryRoot("acceptance-shots-");
+    const runDir = path.join(root, "runs", "run-acceptance-shots");
+    const worktreePath = path.join(root, "worktree");
+    fs.mkdirSync(worktreePath, { recursive: true });
+    const shotDir = fs.mkdtempSync(path.join(os.tmpdir(), "acceptance-shot-"));
+    roots.push(shotDir);
+    const shotPath = path.join(shotDir, "final.png");
+    const shotBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+    fs.writeFileSync(shotPath, shotBytes);
+    const missingPath = path.join(shotDir, "missing.png");
+
+    const ref = await archiveAcceptanceEvidence({
+      kind: "conflict-retest",
+      runDir,
+      testRunId: "inv-acceptance-shots",
+      url: "http://127.0.0.1:59999/",
+      sourceCommit: COMMIT_A,
+      targetCommit: COMMIT_B,
+      candidateRevision: REVISION,
+      invocationStatus: "passed",
+      message: "ok",
+      output: {
+        verdict: "pass",
+        e2eEvidence: [
+          { method: "browser", steps: "screenshot", observed: `最终截图见 ${shotPath}` },
+          { method: "browser", steps: "screenshot", observed: `缺失截图 ${missingPath}` }
+        ]
+      },
+      worktreePath
+    });
+
+    const screenshotItems = ref.items.filter((item) => item.relativePath.endsWith("screenshots/final.png"));
+    expect(screenshotItems).toHaveLength(1);
+    expect(screenshotItems[0]?.type).toBe("screenshot");
+    expect(screenshotItems[0]?.sizeBytes).toBe(shotBytes.length);
+    expect(screenshotItems[0]?.sha256).toBe(sha256(shotBytes));
+    const archivedShot = path.join(runDir, screenshotItems[0]!.relativePath.split("/").join(path.sep));
+    expect(fs.existsSync(archivedShot)).toBe(true);
+    // 缺失路径记 issues 不阻塞，结构化 output 仍归档。
+    expect(ref.archiveError).toContain("missing.png");
+    expect(ref.items.find((item) => item.type === "retest-output")).toBeDefined();
+  });
 });
 
 describe("delivery record evidence references", () => {

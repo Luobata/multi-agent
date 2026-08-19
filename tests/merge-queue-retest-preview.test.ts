@@ -347,6 +347,8 @@ describe("merge-queue-retest candidate preview", () => {
     // testScope 恒为 ["npm run check"]：范围段只有这一条命令。
     const normalizedPrompt = retestPrompt.replace(/\\n/g, "\n");
     expect(normalizedPrompt).toMatch(/服务端指定的测试范围（只运行这些命令，不要自行增加或跳过）：\n- npm run check\n/);
+    // 结构化 testResults 汇报指令随 testScope 出现。
+    expect(retestPrompt).toContain("TEST_RESULTS:");
 
     // P1-B: acceptance evidence is archived under the run dir and referenced from the delivery record.
     const evidence = settled.delivery?.mergeValidation?.evidence;

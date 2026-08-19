@@ -126,3 +126,49 @@
 1. merge-queue 入口现在强制整库 `npm run check`——client-only 候选也会跑完整门禁（这是 `3b46951` 的本意，本轮恢复）。
 2. merge-queue 测试 provider 是桩实现，不真正执行 `npm run check`；生产中由测试角色在集成 worktree 内执行，prompt 的 testScope 段与三条指令共同约束。
 3. worktree 清理竞态断言（merge-queue-retest-preview :401）在全量并行下偶发 flake，隔离必过；如需根治建议 Hub 单独立项（不在本合同范围）。
+
+---
+
+## 7. 验收确定性补完（合同 `seed-gsb-core-bug-acceptance-determinism`，2026-08-19）
+
+前置：fix1 已由 Hub 落库（`e961cfd`）。本轮在同一代码域补完三项。
+
+### A. classifyTestResults 运行时接线（补完 P0-2）
+
+- **承载约定（不改 outputSchema）**：retest prompt 在 testScope 段后要求 agent 在 summary 末尾另起一行汇报 `TEST_RESULTS: [{"command","exitCode","summary"}]`（与 CANDIDATE_IDENTITY 同一载体，任何 schema 都可满足）。
+- `parseTestResults(output, message)`（conflictResolution.ts）：从 summary 串与 message 中逐行匹配 marker，JSON.parse 后严格校验（command 非空串、exitCode 为 0-255 整数、summary 为串）；**任一 entry 畸形整体判无效 → fallback**，绝不部分采纳。
+- `resolveRetestFailureClass({testResults, evidenceIssues, message, output})`：testResults 有效时——evidenceIssues 非空 → `evidence-incomplete`（一票否决）；否则 `classifyTestResults` 为 environment-blocked → `environment-blocked`，其余（含全过）→ `product-failed`。无 testResults → `classifyConflictRetestFailure`（与 HEAD 逐字一致）。
+- `runManagedAcceptanceRetest`（service.ts）失败出口改用 `resolveRetestFailureClass`；调用点的 `??` 兜底保留。
+- **门禁不变量遵守**：分类只影响失败语义。全过 testResults 不能覆盖 agent Block（outcome 仍 failed，failureClass=product-failed），不能抵消证据缺口（evidence-incomplete），不放行、不标环境。browser 交互证据校验路径未动。
+
+### B. conflict 路径 testScope 空范围改进
+
+- `deriveCommittedChangedFiles(worktreePath, baseCommit, sourceCommit)`（conflictResolution.ts）：`git -C <worktree> diff --name-only -z <base>..<source>`，排序返回；任何失败 → undefined。
+- `runManagedAcceptanceRetest`：changed-files 范围且 `snapshot.changedFiles` 为空且传入 `scopeBaseCommit` 时，用推导结果替代空数组；推导失败/缺失 → `determineTestCommands([])` smoke 回退（c44f98c 行为）。
+- conflict 调用点传 `scopeBaseCommit: current.delivery?.baseCommit`——rebased 阶段 reducer 把 `baseCommit` 置为 rebase target（worktreeDelivery.ts:1270），故 `baseCommit..sourceCommit` 恰为候选自身改动（与 delivery diff 的既有 anchor 区间一致，worktreeDelivery.ts:447）。
+- **边界**：仅 conflict changed-files 范围生效；merge-queue 的 full-check 与集成 worktree（merge --no-commit 态）不触碰，stop condition 中的 detached/中间态场景不适用。
+
+### C. 证据归档覆盖临时截图
+
+- `archiveAcceptanceEvidence`（worktreeDelivery.ts）在 midscene 拷贝后，递归扫描 output 全部字符串：整串为绝对图片路径、或散文内嵌 `/[\w./-]+\.(png|jpg|jpeg|webp|gif)` 匹配（双通道；相对路径提及忽略，不产生假 issue）。
+- 命中且存在、未归档（按 resolved path 去重，midscene 已拷的自动跳过）→ 拷入 `delivery-evidence/<testRunId>/screenshots/<basename>`（同名加序号），登记 `screenshot` item（sha256/size 结构不变，50 文件/25 MB 上限共用）；缺失/不可读 → `archiveError` 记 issue，不阻塞。
+
+### 测试证据（本轮亲自执行）
+
+- 聚焦测试：`npx vitest run tests/conflict-resolution.test.ts tests/acceptance-unified.test.ts tests/merge-queue-retest-preview.test.ts` → **3 files / 42 tests PASS**（conflict-resolution 31、acceptance-unified 7、merge-queue-retest-preview 4）。合同要求的 6 类断言全覆盖：
+  ① 全过 testResults + agent Block → product-failed（非 environment-blocked），证据缺口 → evidence-incomplete；
+  ② EPERM/超时 → environment-blocked；
+  ③ 断言失败 → product-failed；
+  ④ 无/畸形 testResults → 与 HEAD 一致（MIDSCENE_ENVIRONMENT_BLOCKED → environment-blocked；breadcrumb → product-failed）；
+  ⑤ 干净 worktree 从 baseCommit..sourceCommit 推导（含不可解析 range → undefined 回退）；
+  ⑥ e2eEvidence 引用 /tmp 截图归档（sha256 校验 + 缺失记 issue 不阻塞）。
+- `npm run typecheck:server` → **exit 0**。
+- `npm run check` → **exit 0，109 files / 947 tests PASS，build ✓**（首轮即绿，无 flake）。
+- `git diff --check` clean；diff 限于 allow-list 的 6 个文件（+357/-5）。
+
+### Caveats（本轮）
+
+1. testResults 的 command 清单不与服务端指定命令交叉校验（agent 自报；分类只影响失败语义，不放宽门禁）。
+2. `TEST_RESULTS` marker 逐行匹配、首个有效者胜；同一行多条 marker 只取首条。
+3. 散文内嵌路径提取用保守字符集（`\w`/`.`/`/`/`-`），含空格或 Unicode 的路径不会被提取——agent 应把截图路径放在独立字段或行内。
+4. B 项依赖 delivery.baseCommit 在 rebased 阶段被置为 rebase target（reducer 既有行为）；若未来该语义变化，推导自动回退 smoke，不会静默跑错范围。

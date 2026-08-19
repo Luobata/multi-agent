@@ -171,8 +171,11 @@ import {
   buildLeaderRevalidationRequest,
   buildMergeQueueRetestNarrative,
   classifyConflictRetestFailure,
+  deriveCommittedChangedFiles,
   determineTestCommands,
   hasExplicitDeliveryPass,
+  parseTestResults,
+  resolveRetestFailureClass,
   selectConflictExecutionRole,
   validateCandidateWorkspaceState,
   validateConflictRetestEvidence,
@@ -9204,6 +9207,12 @@ export class WorkbenchService {
     evidenceKind: "conflict-retest" | "merge-queue-retest";
     workspaceBinding: "candidate" | "integration";
     testScope: "changed-files" | "full-check";
+    /**
+     * Post-rebase base commit for the committed-range scope derivation. Only the
+     * conflict path supplies it (delivery.baseCommit = rebase target); the
+     * integration worktree uses full-check and never needs it.
+     */
+    scopeBaseCommit?: string;
   }): Promise<ManagedAcceptanceRetestOutcome> {
     let snapshot: Awaited<ReturnType<typeof candidateWorkspaceSnapshot>>;
     try {
@@ -9219,6 +9228,13 @@ export class WorkbenchService {
       if (workspaceIssues.length > 0) {
         throw conflictRevalidationFailure(workspaceIssues.join("；"), "evidence-incomplete");
       }
+    }
+    // Clean worktree (the normal post-rebase state): derive the candidate's own
+    // changes from the committed range instead of falling back to the smoke scope.
+    let changedFiles = snapshot.changedFiles;
+    if (input.testScope === "changed-files" && changedFiles.length === 0 && input.scopeBaseCommit) {
+      const derived = await deriveCommittedChangedFiles(input.worktreePath, input.scopeBaseCommit, input.sourceCommit);
+      if (derived) changedFiles = derived;
     }
     let candidatePreview: Awaited<ReturnType<typeof startCandidatePreview>> | undefined;
     try {
@@ -9253,7 +9269,7 @@ export class WorkbenchService {
           candidateRevision: snapshot.revision,
           testCommands: input.testScope === "full-check"
             ? ["npm run check"]
-            : determineTestCommands(snapshot.changedFiles),
+            : determineTestCommands(changedFiles),
           narrative: input.narrative
         }),
         input.caller
@@ -9288,7 +9304,12 @@ export class WorkbenchService {
         status: "failed",
         result,
         evidenceIssues,
-        failureClass: classifyConflictRetestFailure(result.message, evidenceIssues, result.output),
+        failureClass: resolveRetestFailureClass({
+          testResults: parseTestResults(result.output, result.message),
+          evidenceIssues,
+          message: result.message,
+          output: result.output
+        }),
         candidateRevision: snapshot.revision,
         previewUrl: candidatePreview.url,
         evidenceRef: undefined
@@ -9447,7 +9468,8 @@ export class WorkbenchService {
           caller: "system:merge-conflict-retest",
           evidenceKind: "conflict-retest",
           workspaceBinding: "candidate",
-          testScope: "changed-files"
+          testScope: "changed-files",
+          scopeBaseCommit: current.delivery?.baseCommit
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

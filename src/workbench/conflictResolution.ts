@@ -1,4 +1,8 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { JsonValue } from "../core/types.js";
+
+const execFileAsync = promisify(execFile);
 
 export const CONFLICT_PLAN_READY = "CONFLICT_PLAN: READY";
 export const CONFLICT_EXECUTION_PASS = "CONFLICT_EXECUTION: PASS";
@@ -269,7 +273,10 @@ export function buildAcceptanceRetestRequest(input: {
   const testScope = input.testCommands && input.testCommands.length > 0
     ? [
         "服务端指定的测试范围（只运行这些命令，不要自行增加或跳过）：",
-        ...input.testCommands.map((command) => `- ${command}`)
+        ...input.testCommands.map((command) => `- ${command}`),
+        "对上述每条命令，在 summary 末尾另起一行汇报机器可读结果：TEST_RESULTS: "
+          + '[{"command":"<命令>","exitCode":<进程退出码>,"summary":"<一句话结果>"}]'
+          + "（每条命令一项，exitCode 为真实退出码；服务端据此分类，缺失或格式错误时回退原有判定）"
       ].join("\n")
     : "服务端未指定测试范围；运行与改动文件直接相关的定向测试，不要跑整库 npm run check。";
   return [
@@ -351,4 +358,94 @@ export function classifyTestResults(results: TestCommandResult[]): "passed" | "e
     /econnrefused|eaddrinuse|enotfound|eacces|eperm|permission denied|sandbox|unavailable|socket|timeout|timed out|端口|环境(?:不可用|异常|失败)|预览(?:服务)?(?:不可用|失败|提前退出|超时)|无法.*预览|启动(?:失败|超时)|连接(?:失败|超时)/i.test(r.summary)
   );
   return allEnv ? "environment-blocked" : "product-failed";
+}
+
+/**
+ * Extracts structured per-command test results reported by the agent.
+ * Convention: a `TEST_RESULTS: <json-array>` line in summary — the same carrier as
+ * the CANDIDATE_IDENTITY attestation, so no outputSchema change is required.
+ * Returns undefined when absent or malformed; callers fall back to the legacy path.
+ */
+export function parseTestResults(output: JsonValue | undefined, message: string): TestCommandResult[] | undefined {
+  const candidates = [...stringsForKey(output, "summary"), message];
+  for (const candidate of candidates) {
+    for (const line of candidate.split("\n")) {
+      const match = /TEST_RESULTS:\s*(\[.*\])/.exec(line);
+      if (!match?.[1]) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(match[1]);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(parsed) || parsed.length === 0) continue;
+      const results: TestCommandResult[] = [];
+      let valid = true;
+      for (const entry of parsed) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          valid = false;
+          break;
+        }
+        const record = entry as Record<string, unknown>;
+        if (typeof record.command !== "string"
+          || record.command.trim().length === 0
+          || typeof record.exitCode !== "number"
+          || !Number.isInteger(record.exitCode)
+          || record.exitCode < 0
+          || record.exitCode > 255
+          || typeof record.summary !== "string") {
+          valid = false;
+          break;
+        }
+        results.push({ command: record.command, exitCode: record.exitCode, summary: record.summary });
+      }
+      if (valid) return results;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Failure classification for a failed retest outcome.
+ * Gate invariant: structured results only refine failure semantics. They can never
+ * force a pass — the verdict/evidence gate (evidenceIssues veto, agent Block) stands,
+ * and an all-pass report against an agent Block is classified product-failed.
+ */
+export function resolveRetestFailureClass(input: {
+  testResults: TestCommandResult[] | undefined;
+  evidenceIssues: string[];
+  message: string;
+  output?: JsonValue | undefined;
+}): "environment-blocked" | "evidence-incomplete" | "product-failed" {
+  if (input.testResults) {
+    if (input.evidenceIssues.length > 0) return "evidence-incomplete";
+    return classifyTestResults(input.testResults) === "environment-blocked"
+      ? "environment-blocked"
+      : "product-failed";
+  }
+  return classifyConflictRetestFailure(input.message, input.evidenceIssues, input.output);
+}
+
+/**
+ * Derives the candidate's changed files from the committed range when the worktree
+ * itself is clean. In the post-rebase conflict retest, delivery.baseCommit is the
+ * rebase target (set at the rebased stage), so baseCommit..sourceCommit is exactly
+ * the candidate's own changes. Returns undefined when the range cannot be resolved;
+ * callers fall back to the smoke scope.
+ */
+export async function deriveCommittedChangedFiles(
+  worktreePath: string,
+  baseCommit: string,
+  sourceCommit: string
+): Promise<string[] | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", worktreePath, "diff", "--name-only", "-z", `${baseCommit}..${sourceCommit}`],
+      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }
+    );
+    return stdout.split("\0").filter(Boolean).sort();
+  } catch {
+    return undefined;
+  }
 }
