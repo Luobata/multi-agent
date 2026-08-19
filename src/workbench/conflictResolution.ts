@@ -220,13 +220,51 @@ export function buildLeaderRevalidationRequest(input: {
   ].join("\n");
 }
 
-export function buildConflictRetestRequest(input: {
+/**
+ * Narrative differences between the two acceptance retest entries. The orchestration
+ * (workspace snapshot, managed preview, invocation, evidence validation, failure
+ * classification) is shared; only the wording and context differ.
+ */
+export interface AcceptanceRetestNarrative {
+  heading: string;
+  targetCommitLabel: string;
+  sourceCommitLabel: string;
+  worktreeInstruction: string;
+  contextLines: string[];
+}
+
+export const CONFLICT_RETEST_NARRATIVE: AcceptanceRetestNarrative = {
+  heading: "【冲突修复后原需求回归】",
+  targetCommitLabel: "已 rebase 目标 commit",
+  sourceCommitLabel: "冲突修复后候选 commit",
+  worktreeInstruction: "请在原候选 worktree 上执行独立测试",
+  contextLines: []
+};
+
+export function buildMergeQueueRetestNarrative(targetBranch: string): AcceptanceRetestNarrative {
+  return {
+    heading: "【待合入队列目标漂移重测】",
+    targetCommitLabel: "目标 commit",
+    sourceCommitLabel: "候选 commit",
+    worktreeInstruction: "请在当前临时集成 worktree 上执行独立测试",
+    contextLines: [
+      `目标分支：${targetBranch}`,
+      "当前目录是系统创建的临时集成 worktree，已合入候选但尚未写入真实目标分支。",
+      // 3b46951 门禁语义：队列漂移重测必须跑整库 check（跨文件类型破坏、集成级失败只有整库能捕获），
+      // 且不得与浏览器验收分片；环境失败与产品失败必须在 summary 中区分。
+      "在临时集成 worktree 中运行 `npm run check`（typecheck + test + build）并把结果写入 e2eEvidence；不要把浏览器验收和整库检查拆成不同分片。如果 `npm run check` 因环境问题（非产品问题）失败，在 summary 中明确区分环境失败与产品失败。"
+    ]
+  };
+}
+
+export function buildAcceptanceRetestRequest(input: {
   runId: string;
   url: string;
   targetCommit: string;
   sourceCommit: string;
   candidateRevision: string;
   testCommands?: string[];
+  narrative: AcceptanceRetestNarrative;
 }): string {
   const testScope = input.testCommands && input.testCommands.length > 0
     ? [
@@ -235,13 +273,14 @@ export function buildConflictRetestRequest(input: {
       ].join("\n")
     : "服务端未指定测试范围；运行与改动文件直接相关的定向测试，不要跑整库 npm run check。";
   return [
-    "【冲突修复后原需求回归】",
+    input.narrative.heading,
     `候选 Run：${input.runId}`,
     `唯一受管候选 URL：${input.url}`,
-    `已 rebase 目标 commit：${input.targetCommit}`,
-    `冲突修复后候选 commit：${input.sourceCommit}`,
+    `${input.narrative.targetCommitLabel}：${input.targetCommit}`,
+    `${input.narrative.sourceCommitLabel}：${input.sourceCommit}`,
     `候选 revision：${input.candidateRevision}`,
-    "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。请在原候选 worktree 上执行独立测试，界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码或 Git 历史。",
+    ...input.narrative.contextLines,
+    `只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。${input.narrative.worktreeInstruction}，界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码或 Git 历史。`,
     `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${input.url}；sourceCommit=${input.sourceCommit}；candidateRevision=${input.candidateRevision}。`,
     "服务端还会独立校验候选真实 GET、工作区 commit 与 revision；不得只复述身份而改用其他页面测试。测试、环境或证据有任一缺口必须返回 Block；只有可复现且证据充分才返回 Pass。",
     testScope,
@@ -251,6 +290,17 @@ export function buildConflictRetestRequest(input: {
     "- MIDSCENE_ENVIRONMENT_BLOCKED 仅用于候选 URL 无法连接或页面无法渲染（连接拒绝、空白页、核心离线）；页面可达但交互失败属于产品问题，不得标记为 environment-blocked。",
     "- summary 的事实陈述必须与 e2eEvidence 一致，不得引用与结论矛盾的截图或报告作为证据。"
   ].join("\n");
+}
+
+export function buildConflictRetestRequest(input: {
+  runId: string;
+  url: string;
+  targetCommit: string;
+  sourceCommit: string;
+  candidateRevision: string;
+  testCommands?: string[];
+}): string {
+  return buildAcceptanceRetestRequest({ ...input, narrative: CONFLICT_RETEST_NARRATIVE });
 }
 
 /**

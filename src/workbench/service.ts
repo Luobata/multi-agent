@@ -144,6 +144,7 @@ import {
   removeMergeValidationWorktree,
   resolveRunEvidenceAsset,
   deliveryQueueKey,
+  archiveAcceptanceEvidence,
   DeliveryBranchLeaseRevisionConflict,
   DeliveryBranchLeaseStore,
   DeliveryLeaseHandle,
@@ -151,6 +152,7 @@ import {
   DeliveryTransitionError,
   RunDeliveryStore,
   TargetChangedAfterValidationError,
+  type AcceptanceEvidenceRef,
   type RunDeliveryActionResult,
   type DeliveryMissingReason,
   type RunDeliveryRecordV2,
@@ -163,16 +165,19 @@ import {
   CONFLICT_EXECUTION_PASS,
   CONFLICT_PLAN_READY,
   LEADER_REVALIDATION_PASS,
+  buildAcceptanceRetestRequest,
   buildConflictExecutionRequest,
   buildConflictPlanningRequest,
-  buildConflictRetestRequest,
   buildLeaderRevalidationRequest,
+  buildMergeQueueRetestNarrative,
   classifyConflictRetestFailure,
   determineTestCommands,
   hasExplicitDeliveryPass,
   selectConflictExecutionRole,
   validateCandidateWorkspaceState,
-  validateConflictRetestEvidence
+  validateConflictRetestEvidence,
+  CONFLICT_RETEST_NARRATIVE,
+  type AcceptanceRetestNarrative
 } from "./conflictResolution.js";
 import {
   materializeWorkflow,
@@ -318,6 +323,16 @@ function now(): string {
 }
 
 type ConflictFailureClass = "environment-blocked" | "evidence-incomplete" | "product-failed";
+
+interface ManagedAcceptanceRetestOutcome {
+  status: "passed" | "failed";
+  result: EmployeeInvocationResult;
+  evidenceIssues: string[];
+  failureClass: ConflictFailureClass | undefined;
+  candidateRevision: string;
+  previewUrl: string;
+  evidenceRef: AcceptanceEvidenceRef | undefined;
+}
 
 function conflictRevalidationFailure(message: string, failureClass: ConflictFailureClass): Error & { failureClass: ConflictFailureClass } {
   const error = new Error(message) as Error & { failureClass: ConflictFailureClass };
@@ -9159,6 +9174,150 @@ export class WorkbenchService {
     }
   }
 
+  /**
+   * Single orchestration for both acceptance retest entries (merge-conflict-retest
+   * and merge-queue-retest). Shared contract: workspace snapshot → managed candidate
+   * preview → test-role invocation → evidence validation → deterministic failure
+   * classification → evidence archival. Injected differences:
+   * - narrative: prompt wording and drift/context lines;
+   * - workspaceBinding: the candidate worktree is identity-checked before and after
+   *   the test, while the throwaway integration worktree is not (its HEAD is the
+   *   target commit and its content never reaches the real merge);
+   * - testScope: "changed-files" runs the P0-2 deterministic scope derived from the
+   *   candidate worktree (conflict path), while "full-check" always runs the whole
+   *   `npm run check` gate in the integration worktree (merge-queue path — 3b46951
+   *   semantics: cross-file type breakage and integration failures need the full gate);
+   * - failure translation stays at the call site (conflict path → conflict.failed;
+   *   queue path → validation.failed, invocation throws propagate to dispatch failure).
+   */
+  private async runManagedAcceptanceRetest(input: {
+    runId: string;
+    projectId: string;
+    taskId: string | undefined;
+    runDir: string;
+    worktreePath: string;
+    dependencyRoot?: string;
+    sourceCommit: string;
+    targetCommit: string;
+    narrative: AcceptanceRetestNarrative;
+    caller: string;
+    evidenceKind: "conflict-retest" | "merge-queue-retest";
+    workspaceBinding: "candidate" | "integration";
+    testScope: "changed-files" | "full-check";
+  }): Promise<ManagedAcceptanceRetestOutcome> {
+    let snapshot: Awaited<ReturnType<typeof candidateWorkspaceSnapshot>>;
+    try {
+      snapshot = await candidateWorkspaceSnapshot(input.worktreePath);
+    } catch (error) {
+      throw conflictRevalidationFailure(
+        `无法读取候选 worktree 身份：${error instanceof Error ? error.message : String(error)}`,
+        "environment-blocked"
+      );
+    }
+    if (input.workspaceBinding === "candidate") {
+      const workspaceIssues = validateCandidateWorkspaceState(snapshot, { sourceCommit: input.sourceCommit });
+      if (workspaceIssues.length > 0) {
+        throw conflictRevalidationFailure(workspaceIssues.join("；"), "evidence-incomplete");
+      }
+    }
+    let candidatePreview: Awaited<ReturnType<typeof startCandidatePreview>> | undefined;
+    try {
+      candidatePreview = await startCandidatePreview({
+        runDir: input.runDir,
+        worktreePath: input.worktreePath,
+        dependencyRoot: input.dependencyRoot,
+        identity: {
+          runId: input.runId,
+          sourceCommit: input.sourceCommit,
+          targetCommit: input.targetCommit,
+          candidateRevision: snapshot.revision
+        }
+      });
+    } catch (error) {
+      throw conflictRevalidationFailure(
+        error instanceof Error ? error.message : String(error),
+        "environment-blocked"
+      );
+    }
+    let result: EmployeeInvocationResult;
+    try {
+      result = await this.invokeProjectTestRoleAtPath(
+        input.projectId,
+        input.taskId,
+        input.worktreePath,
+        buildAcceptanceRetestRequest({
+          runId: input.runId,
+          url: candidatePreview.url,
+          targetCommit: input.targetCommit,
+          sourceCommit: input.sourceCommit,
+          candidateRevision: snapshot.revision,
+          testCommands: input.testScope === "full-check"
+            ? ["npm run check"]
+            : determineTestCommands(snapshot.changedFiles),
+          narrative: input.narrative
+        }),
+        input.caller
+      );
+    } finally {
+      await candidatePreview?.stop();
+    }
+    const expectedEvidence = {
+      url: candidatePreview.url,
+      sourceCommit: input.sourceCommit,
+      candidateRevision: snapshot.revision
+    };
+    const evidenceIssues = validateConflictRetestEvidence(result.output, expectedEvidence);
+    if (!candidatePreview.wasAccessed()) evidenceIssues.push("受管候选 URL 没有真实访问记录");
+    if (input.workspaceBinding === "candidate") {
+      let finalSnapshot: Awaited<ReturnType<typeof candidateWorkspaceSnapshot>>;
+      try {
+        finalSnapshot = await candidateWorkspaceSnapshot(input.worktreePath);
+      } catch (error) {
+        throw conflictRevalidationFailure(
+          `测试后无法复核候选 worktree 身份：${error instanceof Error ? error.message : String(error)}`,
+          "environment-blocked"
+        );
+      }
+      evidenceIssues.push(...validateCandidateWorkspaceState(finalSnapshot, {
+        sourceCommit: input.sourceCommit,
+        revision: snapshot.revision
+      }));
+    }
+    if (result.status !== "passed" || evidenceIssues.length > 0) {
+      return {
+        status: "failed",
+        result,
+        evidenceIssues,
+        failureClass: classifyConflictRetestFailure(result.message, evidenceIssues, result.output),
+        candidateRevision: snapshot.revision,
+        previewUrl: candidatePreview.url,
+        evidenceRef: undefined
+      };
+    }
+    const evidenceRef = await archiveAcceptanceEvidence({
+      kind: input.evidenceKind,
+      runDir: input.runDir,
+      testRunId: result.runId,
+      url: candidatePreview.url,
+      sourceCommit: input.sourceCommit,
+      targetCommit: input.targetCommit,
+      candidateRevision: snapshot.revision,
+      invocationStatus: result.status,
+      message: result.message,
+      output: result.output,
+      worktreePath: input.worktreePath
+    });
+    return {
+      status: "passed",
+      result,
+      evidenceIssues,
+      failureClass: undefined,
+      candidateRevision: snapshot.revision,
+      previewUrl: candidatePreview.url,
+      evidenceRef
+    };
+  }
+
   private async completeConflictRevalidation(
     id: string,
     run: WorkflowRunRecord,
@@ -9273,72 +9432,42 @@ export class WorkbenchService {
     if (resolution.status === "retesting") {
       const sourceCommit = current.delivery?.sourceCommit;
       if (!sourceCommit) throw new Error("冲突复测缺少 rebased 候选 commit");
-      let snapshot: Awaited<ReturnType<typeof candidateWorkspaceSnapshot>>;
+      let outcome: ManagedAcceptanceRetestOutcome;
       try {
-        snapshot = await candidateWorkspaceSnapshot(worktreePath);
-      } catch (error) {
-        throw conflictRevalidationFailure(
-          `无法读取候选 worktree 身份：${error instanceof Error ? error.message : String(error)}`,
-          "environment-blocked"
-        );
-      }
-      const workspaceIssues = validateCandidateWorkspaceState(snapshot, { sourceCommit });
-      if (workspaceIssues.length > 0) {
-        throw conflictRevalidationFailure(workspaceIssues.join("；"), "evidence-incomplete");
-      }
-      let candidatePreview: Awaited<ReturnType<typeof startCandidatePreview>> | undefined;
-      let testResult: EmployeeInvocationResult;
-      try {
-        candidatePreview = await startCandidatePreview({
+        outcome = await this.runManagedAcceptanceRetest({
+          runId: id,
+          projectId,
+          taskId,
           runDir,
           worktreePath,
           dependencyRoot: current.repositoryRoot,
-          identity: { runId: id, sourceCommit, targetCommit: resolution.targetCommit, candidateRevision: snapshot.revision }
+          sourceCommit,
+          targetCommit: resolution.targetCommit,
+          narrative: CONFLICT_RETEST_NARRATIVE,
+          caller: "system:merge-conflict-retest",
+          evidenceKind: "conflict-retest",
+          workspaceBinding: "candidate",
+          testScope: "changed-files"
         });
       } catch (error) {
-        throw conflictRevalidationFailure(
-          error instanceof Error ? error.message : String(error),
-          "environment-blocked"
-        );
-      }
-      try {
-        testResult = await this.invokeProjectTestRoleAtPath(
-          projectId,
-          taskId,
-          worktreePath,
-          buildConflictRetestRequest({
-            runId: id,
-            url: candidatePreview.url,
-            targetCommit: resolution.targetCommit,
-            sourceCommit,
-            candidateRevision: snapshot.revision,
-            testCommands: determineTestCommands(snapshot.changedFiles)
-          }),
-          "system:merge-conflict-retest"
-        );
-      } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        throw conflictRevalidationFailure(message, classifyConflictRetestFailure(message, []));
-      } finally {
-        await candidatePreview?.stop();
-      }
-      const expectedEvidence = { url: candidatePreview.url, sourceCommit, candidateRevision: snapshot.revision };
-      const evidenceIssues = validateConflictRetestEvidence(testResult.output, expectedEvidence);
-      if (!candidatePreview.wasAccessed()) evidenceIssues.push("受管候选 URL 没有真实访问记录");
-      let finalSnapshot: Awaited<ReturnType<typeof candidateWorkspaceSnapshot>>;
-      try {
-        finalSnapshot = await candidateWorkspaceSnapshot(worktreePath);
-      } catch (error) {
         throw conflictRevalidationFailure(
-          `测试后无法复核候选 worktree 身份：${error instanceof Error ? error.message : String(error)}`,
-          "environment-blocked"
+          message,
+          (error as Error & { failureClass?: ConflictFailureClass }).failureClass
+            ?? classifyConflictRetestFailure(message, [])
         );
       }
-      evidenceIssues.push(...validateCandidateWorkspaceState(finalSnapshot, { sourceCommit, revision: snapshot.revision }));
-      if (testResult.status !== "passed" || evidenceIssues.length > 0) {
+      if (outcome.status === "failed") {
+        const evidenceSuffix = outcome.evidenceIssues.length > 0
+          ? `；${outcome.evidenceIssues.join("；")}`
+          : "";
         throw conflictRevalidationFailure(
-          `冲突修复后的独立测试未通过：${testResult.message}${evidenceIssues.length ? `；${evidenceIssues.join("；")}` : ""}`,
-          classifyConflictRetestFailure(testResult.message, evidenceIssues, testResult.output)
+          `冲突修复后的独立测试未通过：${outcome.result.message}${evidenceSuffix}`,
+          outcome.failureClass ?? classifyConflictRetestFailure(
+            outcome.result.message,
+            outcome.evidenceIssues,
+            outcome.result.output
+          )
         );
       }
       if (!current.delivery) throw new Error("独立测试完成时交付记录丢失");
@@ -9347,12 +9476,13 @@ export class WorkbenchService {
         actor: "runtime",
         payload: {
           stage: "tested",
-          testRunId: testResult.runId,
+          testRunId: outcome.result.runId,
           testedSourceCommit: sourceCommit,
-          testedCandidateRevision: snapshot.revision,
-          testedUrl: candidatePreview.url,
-          detailMessage: testResult.message,
-          message: "冲突修复后的独立测试已通过，正在等待原需求领队最终复验。"
+          testedCandidateRevision: outcome.candidateRevision,
+          testedUrl: outcome.previewUrl,
+          detailMessage: outcome.result.message,
+          message: "冲突修复后的独立测试已通过，正在等待原需求领队最终复验。",
+          ...(outcome.evidenceRef ? { evidence: outcome.evidenceRef } : {})
         }
       });
       workerRevision = tested.revision;
@@ -9585,64 +9715,33 @@ export class WorkbenchService {
       await handle.renew();
       await handle.assertActive();
       const validation = await createMergeValidationWorktree(run, runDir);
-      let snapshot: Awaited<ReturnType<typeof candidateWorkspaceSnapshot>>;
       try {
-        snapshot = await candidateWorkspaceSnapshot(validation.worktreePath);
-      } catch (error) {
-        throw conflictRevalidationFailure(
-          `无法读取集成 worktree 身份：${error instanceof Error ? error.message : String(error)}`,
-          "environment-blocked"
-        );
-      }
-      let candidatePreview: Awaited<ReturnType<typeof startCandidatePreview>> | undefined;
-      try {
-        candidatePreview = await startCandidatePreview({
+        const outcome = await this.runManagedAcceptanceRetest({
+          runId: id,
+          projectId,
+          taskId: invocation?.source.taskId,
           runDir,
           worktreePath: validation.worktreePath,
           dependencyRoot: validation.repositoryRoot,
-          identity: { runId: id, sourceCommit: validation.sourceCommit, targetCommit: validation.targetCommit, candidateRevision: snapshot.revision }
-        });
-      } catch (error) {
-        throw conflictRevalidationFailure(
-          error instanceof Error ? error.message : String(error),
-          "environment-blocked"
-        );
-      }
-      try {
-        const result = await this.invokeProjectTestRoleAtPath(
-          projectId,
-          invocation?.source.taskId,
-          validation.worktreePath,
-          [
-            "【待合入队列目标漂移重测】",
-            `候选 Run：${id}`,
-            `唯一受管候选 URL：${candidatePreview.url}`,
-            `目标分支：${validation.targetBranch}`,
-            `目标 commit：${validation.targetCommit}`,
-            `候选 commit：${validation.sourceCommit}`,
-            `候选 revision：${snapshot.revision}`,
-            "当前目录是系统创建的临时集成 worktree，已合入候选但尚未写入真实目标分支。",
-            `测试角色的固定输出 Schema 不允许增加字段；请在 summary 中原样包含一条候选身份声明：CANDIDATE_IDENTITY url=${candidatePreview.url}；sourceCommit=${validation.sourceCommit}；candidateRevision=${snapshot.revision}。`,
-            "只能用上述唯一 URL 形成候选结论；严禁使用 4318/main 或其他已运行页面替代候选。界面路径必须用 Midscene 留下真实可见证据。不得安装依赖，不得修改代码、Git 历史或任何真实分支。",
-            "在临时集成 worktree 中运行 `npm run check`（typecheck + test + build）并把结果写入 e2eEvidence；不要把浏览器验收和整库检查拆成不同分片。如果 `npm run check` 因环境问题（非产品问题）失败，在 summary 中明确区分环境失败与产品失败。",
-            "测试失败、环境异常或无法证明通过时必须返回 block，不能把工具失败当作通过。"
-          ].join("\n"),
-          "system:merge-queue-retest"
-        );
-        const evidenceIssues = validateConflictRetestEvidence(result.output, {
-          url: candidatePreview.url,
           sourceCommit: validation.sourceCommit,
-          candidateRevision: snapshot.revision
+          targetCommit: validation.targetCommit,
+          narrative: buildMergeQueueRetestNarrative(validation.targetBranch),
+          caller: "system:merge-queue-retest",
+          evidenceKind: "merge-queue-retest",
+          workspaceBinding: "integration",
+          testScope: "full-check"
         });
-        if (!candidatePreview.wasAccessed()) evidenceIssues.push("受管候选 URL 没有真实访问记录");
-        if (result.status !== "passed" || evidenceIssues.length > 0) {
+        if (outcome.status === "failed") {
+          const evidenceSuffix = outcome.evidenceIssues.length > 0
+            ? `；${outcome.evidenceIssues.join("；")}`
+            : "";
           await handle.advance({
             type: "validation.failed",
             actor: "runtime",
             payload: {
-              runId: result.runId,
+              runId: outcome.result.runId,
               targetCommit: validation.targetCommit,
-              message: `目标分支变化后的独立重测未通过：${result.message}${evidenceIssues.length ? `；${evidenceIssues.join("；")}` : ""}；候选已保留，请重新验收。`
+              message: `目标分支变化后的独立重测未通过：${outcome.result.message}${evidenceSuffix}；候选已保留，请重新验收。`
             }
           });
           return;
@@ -9652,13 +9751,13 @@ export class WorkbenchService {
           actor: "runtime",
           payload: {
             required: true,
-            runId: result.runId,
+            runId: outcome.result.runId,
             targetCommit: validation.targetCommit,
-            message: "目标漂移回归已通过，正在写入真实目标分支。"
+            message: "目标漂移回归已通过，正在写入真实目标分支。",
+            ...(outcome.evidenceRef ? { evidence: outcome.evidenceRef } : {})
           }
         });
       } finally {
-        await candidatePreview?.stop();
         await removeMergeValidationWorktree(validation);
       }
     } else if (!conflictRevalidated) {

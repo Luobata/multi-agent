@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import type { Dirent } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -29,6 +30,35 @@ export type DeliveryStatus =
 export type EvidenceRerunStatus = "queued" | "running" | "passed" | "failed";
 export type ConflictResolutionStatus = "resolving" | "retesting" | "leader-review" | "passed" | "failed";
 export type ConflictRetestFailure = "environment-blocked" | "evidence-incomplete" | "product-failed";
+
+export type AcceptanceEvidenceItemType = "retest-output" | "midscene-report" | "screenshot" | "metadata";
+
+export interface AcceptanceEvidenceItem {
+  type: AcceptanceEvidenceItemType;
+  /** Relative to the Run artifact directory (runDir), using POSIX separators. */
+  relativePath: string;
+  sha256: `sha256:${string}`;
+  sizeBytes: number;
+}
+
+/**
+ * Stable, traceable reference to the acceptance evidence of one retest attempt.
+ * The files live under `<runDir>/delivery-evidence/<testRunId>/`, which survives
+ * candidate worktree removal (merge-queue validation worktrees are deleted after
+ * the retest, so without this archive their Midscene reports would be lost).
+ */
+export interface AcceptanceEvidenceRef {
+  kind: "conflict-retest" | "merge-queue-retest";
+  archivedAt: string;
+  testRunId: string;
+  url: string;
+  sourceCommit: string;
+  targetCommit: string;
+  candidateRevision: string;
+  items: AcceptanceEvidenceItem[];
+  /** Set when archiving completed partially; the retest outcome is never blocked on archival. */
+  archiveError?: string;
+}
 
 export interface RunEvidenceAsset {
   id: string;
@@ -80,6 +110,7 @@ export interface RunDeliveryRecord {
     failureClass?: ConflictRetestFailure;
     leaderReviewRunId?: string;
     message?: string;
+    evidence?: AcceptanceEvidenceRef;
   };
   mergeValidation?: {
     required: boolean;
@@ -88,6 +119,7 @@ export interface RunDeliveryRecord {
     targetCommit?: string;
     message?: string;
     updatedAt: string;
+    evidence?: AcceptanceEvidenceRef;
   };
   evidenceRerun?: {
     status: EvidenceRerunStatus;
@@ -264,6 +296,7 @@ export type DeliveryEvent =
           testedCandidateRevision: string;
           testedUrl: string;
           detailMessage?: string;
+          evidence?: AcceptanceEvidenceRef;
         }
       | { stage: "leader-approved"; leaderReviewRunId: string; detailMessage?: string }
     )>
@@ -280,6 +313,7 @@ export type DeliveryEvent =
       required: boolean;
       targetCommit: string;
       runId?: string;
+      evidence?: AcceptanceEvidenceRef;
     }>
   | DeliveryEventBase<"validation.failed", DeliveryStagePayload & {
       targetCommit?: string;
@@ -625,6 +659,49 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const ACCEPTANCE_EVIDENCE_SHA_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const ACCEPTANCE_EVIDENCE_ITEM_TYPES = new Set<AcceptanceEvidenceItemType>([
+  "retest-output",
+  "midscene-report",
+  "screenshot",
+  "metadata"
+]);
+
+function validateAcceptanceEvidenceRef(value: unknown, label: string): string | undefined {
+  if (!isRecord(value)) return `${label} is not an object`;
+  if (value.kind !== "conflict-retest" && value.kind !== "merge-queue-retest") {
+    return `${label}.kind is invalid`;
+  }
+  for (const key of ["archivedAt", "testRunId", "url", "sourceCommit", "targetCommit", "candidateRevision"] as const) {
+    if (typeof value[key] !== "string" || !(value[key] as string).trim()) {
+      return `${label}.${key} is invalid`;
+    }
+  }
+  if (!Array.isArray(value.items)) return `${label}.items is not an array`;
+  for (const [index, item] of value.items.entries()) {
+    if (!isRecord(item)) return `${label}.items[${index}] is not an object`;
+    if (typeof item.type !== "string" || !ACCEPTANCE_EVIDENCE_ITEM_TYPES.has(item.type as AcceptanceEvidenceItemType)) {
+      return `${label}.items[${index}].type is invalid`;
+    }
+    if (typeof item.relativePath !== "string"
+      || !item.relativePath.trim()
+      || path.isAbsolute(item.relativePath)
+      || item.relativePath.split(/[\\/]/).includes("..")) {
+      return `${label}.items[${index}].relativePath is invalid`;
+    }
+    if (typeof item.sha256 !== "string" || !ACCEPTANCE_EVIDENCE_SHA_PATTERN.test(item.sha256)) {
+      return `${label}.items[${index}].sha256 is invalid`;
+    }
+    if (!Number.isSafeInteger(item.sizeBytes) || (item.sizeBytes as number) < 0) {
+      return `${label}.items[${index}].sizeBytes is invalid`;
+    }
+  }
+  if (value.archiveError !== undefined && typeof value.archiveError !== "string") {
+    return `${label}.archiveError is invalid`;
+  }
+  return undefined;
+}
+
 function legacyAsV2(record: RunDeliveryRecord, digest: `sha256:${string}`): RunDeliveryRecordV2 {
   return {
     ...record,
@@ -698,6 +775,14 @@ function validateDeliveryRecord(
         || typeof value.dispatch.lease.expiresAt !== "string")) {
       return { valid: false, reason: "delivery leased dispatch is invalid" };
     }
+  }
+  if (isRecord(value.conflictResolution) && value.conflictResolution.evidence !== undefined) {
+    const issue = validateAcceptanceEvidenceRef(value.conflictResolution.evidence, "conflictResolution.evidence");
+    if (issue) return { valid: false, reason: `delivery ${issue}` };
+  }
+  if (isRecord(value.mergeValidation) && value.mergeValidation.evidence !== undefined) {
+    const issue = validateAcceptanceEvidenceRef(value.mergeValidation.evidence, "mergeValidation.evidence");
+    if (issue) return { valid: false, reason: `delivery ${issue}` };
   }
   return { valid: true, record: value as unknown as RunDeliveryRecordV2, legacy: false };
 }
@@ -1210,7 +1295,8 @@ function reduceDelivery(
               testedUrl: event.payload.testedUrl,
               failureClass: undefined,
               updatedAt: event.at,
-              message: event.payload.detailMessage ?? message
+              message: event.payload.detailMessage ?? message,
+              ...(event.payload.evidence ? { evidence: event.payload.evidence } : {})
             },
             mergeValidation: {
               required: true,
@@ -1300,7 +1386,8 @@ function reduceDelivery(
           ...(event.payload.runId ? { runId: event.payload.runId } : {}),
           targetCommit: event.payload.targetCommit,
           message,
-          updatedAt: event.at
+          updatedAt: event.at,
+          ...(event.payload.evidence ? { evidence: event.payload.evidence } : {})
         }
       };
       break;
@@ -2919,6 +3006,135 @@ export async function createMergeValidationWorktree(
 
 export async function removeMergeValidationWorktree(input: MergeValidationWorktree): Promise<void> {
   await removeRunWorktree(input.repositoryRoot, input.worktreePath);
+}
+
+const ACCEPTANCE_EVIDENCE_MEDIA_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov"]);
+const ACCEPTANCE_EVIDENCE_MAX_FILES = 50;
+const ACCEPTANCE_EVIDENCE_MAX_TOTAL_BYTES = 25 * 1024 * 1024;
+const ACCEPTANCE_EVIDENCE_MAX_DEPTH = 6;
+
+export interface AcceptanceEvidenceArchiveInput {
+  kind: "conflict-retest" | "merge-queue-retest";
+  runDir: string;
+  testRunId: string;
+  url: string;
+  sourceCommit: string;
+  targetCommit: string;
+  candidateRevision: string;
+  invocationStatus: string;
+  message: string;
+  output: JsonValue | undefined;
+  worktreePath: string;
+}
+
+/**
+ * Archive one retest's acceptance evidence under `<runDir>/delivery-evidence/<testRunId>/`
+ * and return a reference for the delivery record. The archive outlives candidate
+ * worktrees (merge-queue validation worktrees are removed right after the retest),
+ * so Midscene reports and the structured tester output stay traceable from the record.
+ * Best-effort: archival failures are reported via `archiveError` and never block the
+ * retest outcome or the delivery transition.
+ */
+export async function archiveAcceptanceEvidence(input: AcceptanceEvidenceArchiveInput): Promise<AcceptanceEvidenceRef> {
+  const archivedAt = new Date().toISOString();
+  const archiveRoot = path.join(input.runDir, "delivery-evidence", input.testRunId);
+  const items: AcceptanceEvidenceItem[] = [];
+  const issues: string[] = [];
+  let totalBytes = 0;
+
+  const writeItem = async (type: AcceptanceEvidenceItemType, relativePath: string, buffer: Buffer): Promise<void> => {
+    const destination = path.join(archiveRoot, relativePath);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.writeFile(destination, buffer);
+    items.push({
+      type,
+      relativePath: path.relative(input.runDir, destination).split(path.sep).join("/"),
+      sha256: sha256(buffer),
+      sizeBytes: buffer.length
+    });
+    totalBytes += buffer.length;
+  };
+
+  try {
+    await fs.mkdir(archiveRoot, { recursive: true });
+    const outputPayload = {
+      kind: input.kind,
+      archivedAt,
+      testRunId: input.testRunId,
+      url: input.url,
+      sourceCommit: input.sourceCommit,
+      targetCommit: input.targetCommit,
+      candidateRevision: input.candidateRevision,
+      invocationStatus: input.invocationStatus,
+      message: input.message,
+      output: input.output ?? null
+    };
+    await writeItem(
+      "retest-output",
+      "retest-output.json",
+      Buffer.from(`${JSON.stringify(outputPayload, null, 2)}\n`, "utf8")
+    );
+  } catch (error) {
+    issues.push(`retest-output.json: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const midsceneRoot = path.join(input.worktreePath, "midscene_run");
+  const copyMidscene = async (directory: string, depth: number): Promise<void> => {
+    if (depth > ACCEPTANCE_EVIDENCE_MAX_DEPTH
+      || items.length >= ACCEPTANCE_EVIDENCE_MAX_FILES
+      || totalBytes >= ACCEPTANCE_EVIDENCE_MAX_TOTAL_BYTES) {
+      return;
+    }
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      issues.push(`midscene_run: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    for (const entry of entries) {
+      if (items.length >= ACCEPTANCE_EVIDENCE_MAX_FILES || totalBytes >= ACCEPTANCE_EVIDENCE_MAX_TOTAL_BYTES) {
+        issues.push("midscene_run: 归档文件数或总体积达到上限，其余证据未复制");
+        return;
+      }
+      if (entry.isSymbolicLink()) continue;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await copyMidscene(absolute, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relative = path.relative(midsceneRoot, absolute).split(path.sep).join("/");
+      try {
+        const stat = await fs.stat(absolute);
+        if (stat.size > ACCEPTANCE_EVIDENCE_MAX_TOTAL_BYTES) {
+          issues.push(`midscene/${relative}: 文件超过归档体积上限`);
+          continue;
+        }
+        const buffer = await fs.readFile(absolute);
+        const type: AcceptanceEvidenceItemType = ACCEPTANCE_EVIDENCE_MEDIA_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+          ? "screenshot"
+          : "midscene-report";
+        await writeItem(type, `midscene/${relative}`, buffer);
+      } catch (error) {
+        issues.push(`midscene/${relative}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  };
+  await copyMidscene(midsceneRoot, 0);
+
+  return {
+    kind: input.kind,
+    archivedAt,
+    testRunId: input.testRunId,
+    url: input.url,
+    sourceCommit: input.sourceCommit,
+    targetCommit: input.targetCommit,
+    candidateRevision: input.candidateRevision,
+    items,
+    ...(issues.length > 0 ? { archiveError: issues.join("；").slice(0, 4_000) } : {})
+  };
 }
 
 export async function mergeAcceptedRun(

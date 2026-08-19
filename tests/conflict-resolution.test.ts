@@ -3,10 +3,12 @@ import {
   CONFLICT_EXECUTION_PASS,
   CONFLICT_PLAN_READY,
   LEADER_REVALIDATION_PASS,
+  buildAcceptanceRetestRequest,
   buildConflictExecutionRequest,
   buildConflictPlanningRequest,
   buildConflictRetestRequest,
   buildLeaderRevalidationRequest,
+  buildMergeQueueRetestNarrative,
   classifyTestResults,
   determineTestCommands,
   environmentBlockedClaimContradicted,
@@ -14,7 +16,8 @@ import {
   classifyConflictRetestFailure,
   validateCandidateWorkspaceState,
   validateConflictRetestEvidence,
-  selectConflictExecutionRole
+  selectConflictExecutionRole,
+  CONFLICT_RETEST_NARRATIVE
 } from "../src/workbench/conflictResolution.js";
 
 describe("merge conflict leader protocol", () => {
@@ -298,5 +301,67 @@ describe("deterministic test scope and classification", () => {
 
   it("classifies empty results as product-failed", () => {
     expect(classifyTestResults([])).toBe("product-failed");
+  });
+});
+
+describe("unified acceptance retest prompt", () => {
+  const retestInput = {
+    runId: "run-conflict-1",
+    url: "http://127.0.0.1:49231/?candidate-token=proof123",
+    targetCommit: "abc123",
+    sourceCommit: "cb557b3fa52cafc949dc2523a8f253868696bfd7",
+    candidateRevision: "sha256:996def400b586948f3ba6771a580d192de4e40d9cae3d4db384a51747954ceca"
+  };
+
+  it("keeps buildConflictRetestRequest identical to the unified builder with the conflict narrative", () => {
+    const viaWrapper = buildConflictRetestRequest({ ...retestInput, testCommands: ["npm test -- --run client/src/App.test.tsx"] });
+    const viaUnified = buildAcceptanceRetestRequest({
+      ...retestInput,
+      testCommands: ["npm test -- --run client/src/App.test.tsx"],
+      narrative: CONFLICT_RETEST_NARRATIVE
+    });
+    expect(viaWrapper).toBe(viaUnified);
+    expect(viaWrapper).toContain("【冲突修复后原需求回归】");
+    expect(viaWrapper).toContain("已 rebase 目标 commit：abc123");
+    expect(viaWrapper).toContain("冲突修复后候选 commit：cb557b3fa52cafc949dc2523a8f253868696bfd7");
+  });
+
+  it("builds the merge-queue narrative with drift context, full-check gate and grounding", () => {
+    const prompt = buildAcceptanceRetestRequest({
+      ...retestInput,
+      testCommands: ["npm run check"],
+      narrative: buildMergeQueueRetestNarrative("main")
+    });
+    expect(prompt).toContain("【待合入队列目标漂移重测】");
+    expect(prompt).toContain("目标分支：main");
+    expect(prompt).toContain("当前目录是系统创建的临时集成 worktree，已合入候选但尚未写入真实目标分支。");
+    expect(prompt).toContain("目标 commit：abc123");
+    expect(prompt).toContain("候选 commit：cb557b3fa52cafc949dc2523a8f253868696bfd7");
+    expect(prompt).toContain("请在当前临时集成 worktree 上执行独立测试");
+    // 3b46951 三条指令：整库 check 写入 e2eEvidence、不拆分片、区分环境/产品失败。
+    expect(prompt).toContain("在临时集成 worktree 中运行 `npm run check`（typecheck + test + build）并把结果写入 e2eEvidence");
+    expect(prompt).toContain("不要把浏览器验收和整库检查拆成不同分片");
+    expect(prompt).toContain("在 summary 中明确区分环境失败与产品失败");
+    // Shared contract: managed URL, identity attestation, server-side scope, grounding.
+    expect(prompt).toContain("唯一受管候选 URL：http://127.0.0.1:49231/?candidate-token=proof123");
+    expect(prompt).toContain("CANDIDATE_IDENTITY");
+    expect(prompt).toContain("服务端指定的测试范围（只运行这些命令，不要自行增加或跳过）：");
+    expect(prompt).toContain("- npm run check");
+    expect(prompt).toContain("接地要求");
+    expect(prompt).toContain("MIDSCENE_ENVIRONMENT_BLOCKED 仅用于");
+  });
+
+  it("keeps the conflict narrative free of the merge-queue full-check gate instructions", () => {
+    const prompt = buildConflictRetestRequest({ ...retestInput, testCommands: ["npm test -- --run client/src/App.test.tsx"] });
+    expect(prompt).not.toContain("整库检查");
+    expect(prompt).not.toContain("typecheck + test + build");
+  });
+
+  it("falls back to the shared no-scope wording when no commands are given for either narrative", () => {
+    const prompt = buildAcceptanceRetestRequest({
+      ...retestInput,
+      narrative: buildMergeQueueRetestNarrative("main")
+    });
+    expect(prompt).toContain("服务端未指定测试范围；运行与改动文件直接相关的定向测试，不要跑整库 npm run check。");
   });
 });

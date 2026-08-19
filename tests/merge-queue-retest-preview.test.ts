@@ -337,6 +337,38 @@ describe("merge-queue-retest candidate preview", () => {
     expect(retestPrompt).toContain("唯一受管候选 URL：http://127.0.0.1:");
     expect(retestPrompt).toContain("CANDIDATE_IDENTITY");
     expect(retestPrompt).toContain("候选 revision：sha256:");
+    // Unified prompt: full-check gate (3b46951 semantics) and grounding language.
+    expect(retestPrompt).toContain("【待合入队列目标漂移重测】");
+    expect(retestPrompt).toContain("接地要求");
+    // 三条指令：整库 check 写入 e2eEvidence、不拆分片、区分环境/产品失败。
+    expect(retestPrompt).toContain("在临时集成 worktree 中运行 `npm run check`（typecheck + test + build）并把结果写入 e2eEvidence");
+    expect(retestPrompt).toContain("不要把浏览器验收和整库检查拆成不同分片");
+    expect(retestPrompt).toContain("在 summary 中明确区分环境失败与产品失败");
+    // testScope 恒为 ["npm run check"]：范围段只有这一条命令。
+    const normalizedPrompt = retestPrompt.replace(/\\n/g, "\n");
+    expect(normalizedPrompt).toMatch(/服务端指定的测试范围（只运行这些命令，不要自行增加或跳过）：\n- npm run check\n/);
+
+    // P1-B: acceptance evidence is archived under the run dir and referenced from the delivery record.
+    const evidence = settled.delivery?.mergeValidation?.evidence;
+    expect(evidence).toBeDefined();
+    expect(evidence!.kind).toBe("merge-queue-retest");
+    expect(evidence!.testRunId).toBeTruthy();
+    expect(evidence!.items.length).toBeGreaterThan(0);
+    const outputItem = evidence!.items.find((item) => item.type === "retest-output");
+    expect(outputItem).toBeDefined();
+    const outputPath = path.join(runDir, outputItem!.relativePath);
+    expect(fs.existsSync(outputPath)).toBe(true);
+    const archived = JSON.parse(fs.readFileSync(outputPath, "utf8")) as {
+      testRunId: string;
+      output: { summary: string };
+    };
+    expect(archived.testRunId).toBe(evidence!.testRunId);
+    expect(archived.output.summary).toContain("CANDIDATE_IDENTITY");
+    // The validation worktree is gone (or emptied), but its evidence survived in the archive.
+    const validationDir = path.join(repo, ".multi-agent", "merge-validation");
+    if (fs.existsSync(validationDir)) {
+      expect(fs.readdirSync(validationDir)).toHaveLength(0);
+    }
   }, 60_000);
 
   it("stops the candidate preview in the finally block after retest completes", async () => {
