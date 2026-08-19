@@ -157,17 +157,25 @@ program
   .option("-i, --input <path>", "JSON input file")
   .option("--dry-run", "compile and print the plan without invoking providers")
   .option("--require-member-handoff", "treat member delegation attempts without a handoff file as incomplete (blocked)")
+  .option("--supervisor-history-keep-rounds <n>", "number of recent supervisor rounds kept verbatim in the injected history (older rounds are compacted; default 6)")
   .option("--json", "print machine-readable output")
-  .action(async (workflow: string | undefined, options: { config: string; input?: string; dryRun?: boolean; requireMemberHandoff?: boolean; json?: boolean }) => {
+  .action(async (workflow: string | undefined, options: { config: string; input?: string; dryRun?: boolean; requireMemberHandoff?: boolean; supervisorHistoryKeepRounds?: string; json?: boolean }) => {
     const loaded = loadManifest(options.config);
     const workflowId = resolveWorkflow(loaded, workflow);
     if (options.dryRun) {
       process.stdout.write(`${formatPlanText(compilePlan(loaded, workflowId))}\n`);
       return;
     }
+    const keepRounds = options.supervisorHistoryKeepRounds === undefined
+      ? undefined
+      : Number.parseInt(options.supervisorHistoryKeepRounds, 10);
+    if (keepRounds !== undefined && (!Number.isSafeInteger(keepRounds) || keepRounds < 0)) {
+      throw new Error("--supervisor-history-keep-rounds must be a non-negative integer");
+    }
     const result = await runWorkflow(loaded, workflowId, {
       input: readInput(options.input),
-      ...(options.requireMemberHandoff ? { requireMemberHandoff: true } : {})
+      ...(options.requireMemberHandoff ? { requireMemberHandoff: true } : {}),
+      ...(keepRounds !== undefined ? { supervisorHistoryKeepRounds: keepRounds } : {})
     });
     if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     else process.stdout.write(`Run ${result.run.id}: ${result.run.status}\nArtifacts: ${result.runDir}\n`);

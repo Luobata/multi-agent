@@ -8,7 +8,7 @@ import type { MemoryKind } from "../memory/types.js";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
-import { DeliveryRecoveryConflict, DeliveryRevisionConflict } from "../runtime/worktreeDelivery.js";
+import { DeliveryRecoveryConflict, DeliveryRevisionConflict, inspectDeliveryChain, repairDeliveryChain } from "../runtime/worktreeDelivery.js";
 import type {
   EmployeeInvocationInput,
   EntrancePolicyDispatchInput,
@@ -1054,6 +1054,23 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
   }));
   app.get("/api/runs/:id/receipt", asyncRoute(async (request, response) => {
     send(response, await service.getRunReceipt(routeParam(request, "id")));
+  }));
+  app.get("/api/runs/:id/delivery-chain", asyncRoute(async (request, response) => {
+    const runId = routeParam(request, "id");
+    const runDir = path.join(service.store.dataRoot, "artifacts", "runs", runId);
+    const rawMergeCommit = request.query.mergeCommit;
+    const mergeCommit = typeof rawMergeCommit === "string" && rawMergeCommit.trim() ? rawMergeCommit.trim() : undefined;
+    send(response, await inspectDeliveryChain(runDir, runId, { expectedMergeCommit: mergeCommit }));
+  }));
+  app.post("/api/runs/:id/delivery-chain/repair", asyncRoute(async (request, response) => {
+    const body = jsonObject(request.body ?? {}, "delivery chain repair input");
+    if (body.apply !== true) throw new Error("delivery chain repair requires explicit apply confirmation");
+    if (body.mergeCommit !== undefined && typeof body.mergeCommit !== "string") {
+      throw new Error("delivery chain repair mergeCommit must be a string");
+    }
+    const runId = routeParam(request, "id");
+    const runDir = path.join(service.store.dataRoot, "artifacts", "runs", runId);
+    send(response, await repairDeliveryChain(runDir, runId, { expectedMergeCommit: body.mergeCommit }));
   }));
 
   app.get("/api/doctor", asyncRoute(async (_request, response) => send(response, await service.doctor())));

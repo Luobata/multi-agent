@@ -58,6 +58,11 @@ export interface RunWorkflowOptions {
    * A sessionKey delegation attempt that leaves no handoff file is treated as incomplete (blocked).
    */
   requireMemberHandoff?: boolean;
+  /**
+   * Number of recent supervisor rounds kept verbatim in the injected history (default 6).
+   * Older rounds are deterministically compacted; human/Gate decisions always stay verbatim.
+   */
+  supervisorHistoryKeepRounds?: number;
   prepareNode?: (node: ExecutionPlanNode) => Promise<{
     node: ExecutionPlanNode;
     artifacts?: Record<string, JsonValue>;
@@ -867,6 +872,7 @@ export async function runWorkflow(
       candidateSnapshot: () => candidateWorkspaceSnapshot(options.providerCwd ?? loaded.projectRoot),
       executionRoot: () => providerCwd,
       requireMemberHandoff: options.requireMemberHandoff,
+      supervisorHistoryKeepRounds: options.supervisorHistoryKeepRounds,
       executionPackageScripts: async () => {
         try {
           const value = JSON.parse(await fs.promises.readFile(

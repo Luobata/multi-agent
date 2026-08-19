@@ -747,6 +747,112 @@ function supervisorWith(
   };
 }
 
+/**
+ * Deterministic server-side compaction for the supervisor history injected into each prompt.
+ * The last `keepRounds` rounds stay verbatim; older entries collapse to one deterministic line
+ * each (action → target → status). Entries carrying human decisions, Gate decisions, or Gate
+ * snapshots stay verbatim regardless of age: supervisor replanning depends on their exact text.
+ * Persisted history is never mutated — compaction only transforms the injected view.
+ */
+const DEFAULT_SUPERVISOR_HISTORY_KEEP_ROUNDS = 6;
+const HISTORY_SUMMARY_TEXT_LIMIT = 160;
+
+function supervisorHistoryKeepRounds(context: ArchitectureExecutionContext): number {
+  const configured = context.supervisorHistoryKeepRounds;
+  return typeof configured === "number" && Number.isSafeInteger(configured) && configured >= 0
+    ? configured
+    : DEFAULT_SUPERVISOR_HISTORY_KEEP_ROUNDS;
+}
+
+function asJsonObject(value: JsonValue | undefined): JsonObject | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonObject) : undefined;
+}
+
+function historySummaryText(value: unknown, limit = HISTORY_SUMMARY_TEXT_LIMIT): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "";
+  const collapsed = text.replace(/\s+/g, " ");
+  return collapsed.length > limit ? `${collapsed.slice(0, limit)}…` : collapsed;
+}
+
+/** Deterministic one-line summary for an aged-out history entry: action → target → status. */
+function summarizeHistoryEntry(entry: JsonObject): string {
+  const round = typeof entry.round === "number" ? entry.round : 0;
+  const decision = asJsonObject(entry.decision as JsonValue | undefined) ?? {};
+  const action = typeof decision.action === "string" ? decision.action : "unknown";
+  const parts = [`[r${round}] ${action}`];
+  if (action === "delegate" && Array.isArray(decision.assignments)) {
+    const roles = decision.assignments
+      .map((assignment) => asJsonObject(assignment as JsonValue)?.roleId)
+      .filter((roleId): roleId is string => typeof roleId === "string")
+      .join(",");
+    parts.push(`roles=[${roles}]`);
+  } else if (action === "satisfy-gate" && typeof decision.gateId === "string") {
+    parts.push(`gate=${decision.gateId}`);
+  } else if (action === "request-human-decision") {
+    parts.push(`risk=${typeof decision.riskCategory === "string" ? decision.riskCategory : "?"}`);
+  } else if (action === "plan-todos" && Array.isArray(decision.todos)) {
+    parts.push(`todos=${decision.todos.length}`);
+  } else if (action === "finish" && typeof decision.summary === "string") {
+    parts.push(`summary=${historySummaryText(decision.summary)}`);
+  }
+  if (typeof entry.decisionRejected === "string") {
+    parts.push(`rejected=${historySummaryText(entry.decisionRejected)}`);
+  }
+  if (entry.humanDecision !== undefined) {
+    const human = asJsonObject(entry.humanDecision as JsonValue);
+    parts.push(`human=${human && typeof human.decision === "string" ? human.decision : "?"}`);
+  }
+  if (Array.isArray(entry.delegations)) {
+    const statuses = entry.delegations
+      .map((delegation) => asJsonObject(delegation as JsonValue)?.status)
+      .filter((status): status is string => typeof status === "string")
+      .join(",");
+    parts.push(`statuses=[${statuses}]`);
+  }
+  if (entry.todoPlanAccepted === true) parts.push("accepted");
+  if (entry.finishIntercepted === true) parts.push("finish-intercepted");
+  return parts.join(" → ");
+}
+
+/** Entries whose exact text is decision-critical and must never be compressed. */
+function historyEntryVerbatim(entry: JsonObject): boolean {
+  if (entry.humanDecision !== undefined) return true;
+  if (entry.gates !== undefined) return true;
+  return asJsonObject(entry.decision as JsonValue | undefined)?.action === "satisfy-gate";
+}
+
+export interface CompactedSupervisorHistory {
+  entries: JsonValue[];
+  keepRounds: number;
+  compactedRounds: number;
+  compactedEntries: number;
+  charsSaved: number;
+}
+
+export function compactSupervisorHistory(history: JsonValue[], currentRound: number, keepRounds: number): CompactedSupervisorHistory {
+  const verbatimRound = currentRound - keepRounds;
+  const beforeChars = JSON.stringify(history).length;
+  const compactedRounds = new Set<number>();
+  let compactedEntries = 0;
+  const entries = history.map((entry) => {
+    const record = asJsonObject(entry);
+    if (!record) return entry;
+    const round = typeof record.round === "number" ? record.round : 0;
+    if (round > verbatimRound || historyEntryVerbatim(record)) return entry;
+    compactedEntries += 1;
+    compactedRounds.add(round);
+    return summarizeHistoryEntry(record);
+  });
+  return {
+    entries,
+    keepRounds,
+    compactedRounds: compactedRounds.size,
+    compactedEntries,
+    charsSaved: beforeChars - JSON.stringify(entries).length
+  };
+}
+
 function updateSupervisorRunState(
   context: ArchitectureExecutionContext,
   value: SupervisorWorkflowConfig,
@@ -2235,7 +2341,16 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     const node = round === 1
       ? context.plan.nodes[0]!
       : supervisorNode(value, round, latestNodeIds, history, gateSnapshot(trackers), dagTrackers);
-    if (round === 1) node.with = supervisorWith(value, round, history, gateSnapshot(trackers), dagTrackers);
+    const compactedHistory = compactSupervisorHistory(history, round, supervisorHistoryKeepRounds(context));
+    if (compactedHistory.compactedEntries > 0) {
+      await context.emit("supervisor.history-compacted", node.id, {
+        keepRounds: compactedHistory.keepRounds,
+        compactedRounds: compactedHistory.compactedRounds,
+        compactedEntries: compactedHistory.compactedEntries,
+        charsSaved: compactedHistory.charsSaved
+      });
+    }
+    node.with = supervisorWith(value, round, compactedHistory.entries, gateSnapshot(trackers), dagTrackers);
     const supervisorRole = context.loaded.manifest.roles[node.role];
     if (!supervisorRole) throw new Error(`supervisor runtime role not found: ${node.role}`);
     node.provider = supervisorRole.provider;

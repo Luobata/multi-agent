@@ -70,6 +70,12 @@ export interface ArchitectureExecutionContext {
    * (turn flag + event) and never block the Run.
    */
   requireMemberHandoff?: boolean;
+  /**
+   * Number of recent supervisor rounds injected verbatim into the supervisor prompt's history
+   * section (supervisor architecture; default 6). Older rounds are deterministically compacted
+   * to one-line summaries, except human/Gate decisions which stay verbatim regardless of age.
+   */
+  supervisorHistoryKeepRounds?: number;
   executionPackageScripts(): Promise<Record<string, string>>;
   persist(): Promise<void>;
   emit(type: string, nodeId?: string, detail?: JsonValue): Promise<void>;
