@@ -1,4 +1,5 @@
 import { Ajv, type ErrorObject } from "ajv";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ManifestValidationError, ProviderExecutionError } from "../core/errors.js";
@@ -44,6 +45,7 @@ import {
   type GateShardEvidence,
   type RuntimeImpactManifest
 } from "../runtime/gateGovernance.js";
+import { nodeMutationResources, WORKSPACE_MUTATION_RESOURCE_PREFIX } from "../workbench/runtimeResources.js";
 
 type SupervisorWorkKind = "discussion" | "code" | "test" | "audit" | "integration" | "other";
 
@@ -68,6 +70,12 @@ interface SupervisorPolicyConfig {
   execution?: {
     isolation?: "worktree" | "none";
   };
+  /**
+   * B4 deterministic human-risk barrier. Absent = narrow shadow default (the verdict is computed
+   * and observed but never blocks). `enforce` is the test seam for this contract; the B5 canary
+   * policy field replaces it.
+   */
+  humanBarrier?: HumanBarrierPolicy;
 }
 
 interface SupervisorGateConfig {
@@ -78,6 +86,8 @@ interface SupervisorGateConfig {
   instructions: string;
   fallback: "supervisor" | "block";
   validatorId?: string;
+  /** B4: a gate strategy declaring high risk forces a human barrier on its dispatch. */
+  riskCategory?: string;
 }
 
 type SupervisorFlowStageConfig =
@@ -326,9 +336,325 @@ function technicalCircuitReason(
 
 type GateRunStatus = "pending" | "passed" | "blocked" | "skipped";
 
+/**
+ * B1: stable Gate activation identity. The key is derived exclusively from persistent facts
+ * (node ids, execution ids, candidate revision, evidence epoch) so it survives durable resume
+ * byte-for-byte, yet changes whenever the evidence generation changes (upstream re-execution),
+ * which prevents stale `passed` evidence from being reused for a newer candidate. Identity
+ * derivation must never consume Date.now(), round numbers, or randomness.
+ */
+interface GateActivationIdentity {
+  identityVersion: 2;
+  gateId: string;
+  sourceNodeIds: string[];
+  candidateRevision: string;
+  evidenceEpoch: string;
+}
+
 interface GateActivation {
   key: string;
   sourceNodeIds: string[];
+  /** Absent for activations restored from pre-B1 durable state; kept read-only compatible. */
+  identity?: GateActivationIdentity;
+}
+
+/**
+ * Inputs for a new Gate activation. `evidence` carries the per-source passing execution; the
+ * candidate revision is stamped by executeGateActivation once resolved. `identity` is supplied
+ * only when replaying a stored activation whose identity was already derived.
+ */
+interface GateActivationSeed {
+  sourceNodeIds: string[];
+  identity?: GateActivationIdentity;
+  evidence?: Array<{ sourceNodeId: string; passedExecutionNodeId: string }>;
+}
+
+/** One source's contribution to the evidence epoch: which passing execution proved it, and against which candidate revision. */
+export interface GateActivationEvidence {
+  sourceNodeId: string;
+  passedExecutionNodeId: string;
+  candidateRevision: string;
+}
+
+/** Canonical JSON with sorted object keys so the digest is stable across processes. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+/**
+ * Derives the evidence epoch: `epoch:<sha256>` over the sorted per-source evidence. A source
+ * re-execution (new passedExecutionNodeId) or a candidate change flips the epoch, which flips
+ * the activation key, so a Gate that passed on the old generation must re-run.
+ */
+export function deriveGateEvidenceEpoch(evidence: GateActivationEvidence[]): string {
+  const sorted = [...evidence].sort((a, b) => a.sourceNodeId.localeCompare(b.sourceNodeId));
+  return `epoch:${sha256Hex(canonicalJson(sorted))}`;
+}
+
+export function deriveGateActivationIdentity(input: {
+  gateId: string;
+  sourceNodeIds: string[];
+  candidateRevision: string;
+  evidence: GateActivationEvidence[];
+}): GateActivationIdentity {
+  return {
+    identityVersion: 2,
+    gateId: input.gateId,
+    sourceNodeIds: [...input.sourceNodeIds].sort(),
+    candidateRevision: input.candidateRevision,
+    evidenceEpoch: deriveGateEvidenceEpoch(input.evidence)
+  };
+}
+
+/** key = sha256(canonical-json(identity)); persisted in supervisor-state.json gates[].activations[]. */
+export function deriveGateActivationKey(identity: GateActivationIdentity): string {
+  return sha256Hex(canonicalJson(identity));
+}
+
+// --- B4: deterministic human-risk barrier ---
+
+export type HumanBarrierReason =
+  | "policy-deny"
+  | "mutation-resource"
+  | "integration-work"
+  | "protected-target"
+  | "gate-high-risk";
+
+/**
+ * Deterministic barrier policy. The default (absent) policy is narrow and conservative: any
+ * mutating node (code/integration with workspace-mutation resources) barriers, so the shadow
+ * period observes the false-positive rate before the list is widened by an explicit, audited
+ * policy change. Overrides have the highest priority: deny forces a barrier, allow exempts.
+ */
+export interface HumanBarrierPolicy {
+  /** Test seam for enforcement; the B5 canary policy field replaces this. */
+  enforce?: boolean;
+  /** Substrings matched against `target:<changeSet>`, `workKind:<kind>`, and `resource:<resource>` signals. */
+  deny?: string[];
+  /** Substrings matched the same way; a match exempts from the barrier unless a deny pattern also matches. */
+  allow?: string[];
+  /** changeSet targets that always barrier (protected branches/targets). */
+  protectedTargets?: string[];
+  /** Mutation-resource substrings classified as cross-repo/publish-class. Absent/empty = any mutation resource. */
+  crossRepoResourcePatterns?: string[];
+  /** Gate riskCategories that force a barrier. Default: ["high"]. */
+  gateRiskCategories?: string[];
+}
+
+export interface HumanBarrierVerdict {
+  required: boolean;
+  reasons: HumanBarrierReason[];
+  /** sha256 of the canonical policy — bound to human approvals; a mismatch at apply time means the
+   * policy changed and the approval is stale. */
+  policyHash: string;
+}
+
+export function deriveHumanBarrierPolicyHash(policy: HumanBarrierPolicy | undefined): string {
+  return sha256Hex(canonicalJson(policy ?? {}));
+}
+
+/**
+ * Pure deterministic barrier verdict. The LLM's riskCategory is deliberately NOT an input: it is
+ * advisory only and can raise (via the existing request-human-decision action) but never lower the
+ * deterministic verdict. Every input is a persistent fact, so the verdict is reproducible.
+ */
+export function requiresHumanBarrier(input: {
+  mutationResources: string[];
+  workKind: string | undefined;
+  changeSet: string | undefined;
+  gateRiskCategories: Array<{ gateId: string; riskCategory?: string }>;
+  policy: HumanBarrierPolicy | undefined;
+}): HumanBarrierVerdict {
+  const policy = input.policy ?? {};
+  const policyHash = deriveHumanBarrierPolicyHash(input.policy);
+  const signals = [
+    ...(input.changeSet ? [`target:${input.changeSet}`] : []),
+    ...(input.workKind ? [`workKind:${input.workKind}`] : []),
+    ...input.mutationResources.map((resource) => `resource:${resource}`)
+  ];
+  const matches = (patterns: string[]): boolean => patterns.some((pattern) => signals.some((signal) => signal.includes(pattern)));
+  const denyMatch = Array.isArray(policy.deny) && policy.deny.length > 0 ? matches(policy.deny) : false;
+  const allowMatch = !denyMatch && Array.isArray(policy.allow) && policy.allow.length > 0 ? matches(policy.allow) : false;
+
+  const reasons: HumanBarrierReason[] = [];
+  if (denyMatch) {
+    reasons.push("policy-deny");
+  } else if (!allowMatch) {
+    const crossRepoPatterns = Array.isArray(policy.crossRepoResourcePatterns) ? policy.crossRepoResourcePatterns : [];
+    const resourceBarriers = input.mutationResources.filter((resource) => (
+      crossRepoPatterns.length === 0 || crossRepoPatterns.some((pattern) => resource.includes(pattern))
+    ));
+    if (resourceBarriers.length > 0) reasons.push("mutation-resource");
+    if (input.workKind === "integration") reasons.push("integration-work");
+    if (input.changeSet && Array.isArray(policy.protectedTargets) && policy.protectedTargets.includes(input.changeSet)) {
+      reasons.push("protected-target");
+    }
+    const gateCategories = new Set(Array.isArray(policy.gateRiskCategories) && policy.gateRiskCategories.length > 0
+      ? policy.gateRiskCategories
+      : ["high"]);
+    if (input.gateRiskCategories.some((gate) => typeof gate.riskCategory === "string" && gateCategories.has(gate.riskCategory))) {
+      reasons.push("gate-high-risk");
+    }
+  }
+  return { required: reasons.length > 0, reasons, policyHash };
+}
+
+// --- B5 step 1: shadow dispatch plan (compiled-dispatch observation, never dispatches) ---
+
+/** Sync candidate revision for shadow projections: the declared input revision, else the isolation
+ * base commit. The async workspace-candidate fallback used by executeGateActivation is intentionally
+ * not replicated — the shadow activation prediction is advisory, and the authoritative key remains
+ * the one persisted by the Gate activation path. */
+function shadowCandidateRevision(context: ArchitectureExecutionContext): string {
+  const declared = typeof context.input.candidateRevision === "string" ? context.input.candidateRevision.trim() : "";
+  return declared || context.run.isolation?.baseCommit || "";
+}
+
+export interface ShadowDispatchEntry {
+  nodeId: string;
+  ready: boolean;
+  /** ready && !barrier.required — what the compiled dispatcher would actually spawn. */
+  wouldDispatch: boolean;
+  barrier: {
+    required: boolean;
+    reasons: HumanBarrierReason[];
+    policyHash: string;
+  };
+  /** Predicted gate activation for ready nodes that feed a required matching Gate. */
+  activation?: {
+    gateId: string;
+    key: string;
+    evidenceEpoch: string;
+  };
+}
+
+export interface ShadowDispatchPlan {
+  /** Always false in this contract; the canary flip is a later, explicit Hub decision. */
+  compiledDispatchEnabled: false;
+  entries: ShadowDispatchEntry[];
+}
+
+export type SchedulerDivergenceReason =
+  | "llm-dispatched-not-ready"
+  | "llm-dispatched-cancelled"
+  | "llm-dispatched-barrier-required";
+
+export interface SchedulerDivergence {
+  nodeId: string;
+  reason: SchedulerDivergenceReason;
+  detail: JsonValue;
+}
+
+/**
+ * Pure projection of what the compiled dispatcher WOULD do with the current DAG state. Runs every
+ * round in shadow mode; the result is compared against the LLM's actual dispatch decision. Never
+ * dispatches anything — `compiledDispatchEnabled` stays false.
+ */
+export function buildShadowDispatchPlan(input: {
+  dagTrackers: Map<string, SupervisorDagNodeTracker> | undefined;
+  gateTrackers: Map<string, GateTracker>;
+  policy: SupervisorPolicyConfig;
+  candidateRevision: string;
+  executionRoot: string;
+}): ShadowDispatchPlan {
+  const entries: ShadowDispatchEntry[] = [];
+  if (!input.dagTrackers) return { compiledDispatchEnabled: false, entries };
+  const gateRisk = [...input.gateTrackers.values()].map((tracker) => ({
+    gateId: tracker.gate.id,
+    riskCategory: tracker.gate.riskCategory
+  }));
+  for (const tracker of input.dagTrackers.values()) {
+    const node = tracker.node;
+    const ready = supervisorDagTrackerReady(tracker, input.dagTrackers);
+    // Mirror nodeMutationResources for a DAG node config (workKind code/integration ⇒ mutating).
+    const mutationResources = (node.workKind === "code" || node.workKind === "integration")
+      ? [`${WORKSPACE_MUTATION_RESOURCE_PREFIX}${path.resolve(input.executionRoot)}`]
+      : [];
+    const barrier = requiresHumanBarrier({
+      mutationResources,
+      workKind: node.workKind,
+      changeSet: node.changeSet,
+      gateRiskCategories: gateRisk,
+      policy: input.policy.humanBarrier
+    });
+    let activation: ShadowDispatchEntry["activation"];
+    if (ready && (node.workKind === "code" || node.workKind === "integration")) {
+      const assignment: SupervisorAssignment = {
+        roleId: node.roleId,
+        workKind: node.workKind,
+        ...(node.changeSet ? { changeSet: node.changeSet } : {})
+      };
+      const matchingGate = [...input.gateTrackers.values()].find((tracker) => (
+        tracker.gate.required && gateMatchesAssignment(tracker.gate, assignment)
+      ));
+      if (matchingGate) {
+        const identity = deriveGateActivationIdentity({
+          gateId: matchingGate.gate.id,
+          sourceNodeIds: [node.nodeId],
+          candidateRevision: input.candidateRevision,
+          evidence: [{ sourceNodeId: node.nodeId, passedExecutionNodeId: node.nodeId, candidateRevision: input.candidateRevision }]
+        });
+        activation = {
+          gateId: matchingGate.gate.id,
+          key: deriveGateActivationKey(identity),
+          evidenceEpoch: identity.evidenceEpoch
+        };
+      }
+    }
+    entries.push({
+      nodeId: node.nodeId,
+      ready,
+      wouldDispatch: ready && !barrier.required,
+      barrier: { required: barrier.required, reasons: barrier.reasons, policyHash: barrier.policyHash },
+      ...(activation ? { activation } : {})
+    });
+  }
+  return { compiledDispatchEnabled: false, entries };
+}
+
+/**
+ * Compares the LLM's actual dispatch decision against the shadow plan. Flags only LLM actions
+ * that VIOLATE the shadow (dispatching a node the compiled dispatcher would hold); LLM inactions
+ * (holding a ready node) are not divergences — the LLM legitimately batches across rounds.
+ */
+export function compareShadowDispatch(input: {
+  plan: ShadowDispatchPlan;
+  llmDispatchedNodeIds: string[];
+  cancelledNodeIds?: string[];
+}): SchedulerDivergence[] {
+  const byNode = new Map(input.plan.entries.map((entry) => [entry.nodeId, entry]));
+  const cancelled = new Set(input.cancelledNodeIds ?? []);
+  const divergences: SchedulerDivergence[] = [];
+  for (const nodeId of input.llmDispatchedNodeIds) {
+    // A cancelled node has no shadow entry (it was removed from the active DAG), so this check
+    // must precede the entry lookup.
+    if (cancelled.has(nodeId)) {
+      divergences.push({ nodeId, reason: "llm-dispatched-cancelled", detail: { cancelled: true } });
+      continue;
+    }
+    const entry = byNode.get(nodeId);
+    if (!entry) continue;
+    if (!entry.ready) {
+      divergences.push({ nodeId, reason: "llm-dispatched-not-ready", detail: { ready: false } });
+      continue;
+    }
+    if (entry.barrier.required) {
+      divergences.push({
+        nodeId,
+        reason: "llm-dispatched-barrier-required",
+        detail: { reasons: entry.barrier.reasons, policyHash: entry.barrier.policyHash }
+      });
+    }
+  }
+  return divergences;
 }
 
 interface GateExecutionRecord {
@@ -867,6 +1193,15 @@ function updateSupervisorRunState(
   const previousSequence = typeof context.run.architectureState?.sequence === "number"
     ? context.run.architectureState.sequence
     : 0;
+  // B5-shadow: the compiled dispatcher's plan is projected every round alongside the iterative
+  // state. It is observation only — compiledDispatchEnabled stays false.
+  const shadowPlan = buildShadowDispatchPlan({
+    dagTrackers,
+    gateTrackers: trackers,
+    policy: value.policy,
+    candidateRevision: shadowCandidateRevision(context),
+    executionRoot: context.executionRoot()
+  });
   context.run.architectureState = {
     schemaVersion: 1,
     kind: "supervisor",
@@ -882,7 +1217,8 @@ function updateSupervisorRunState(
         ? [...dagTrackers.values()]
             .filter((tracker) => supervisorDagTrackerReady(tracker, dagTrackers))
             .map((tracker) => tracker.node.nodeId)
-        : []
+        : [],
+      shadowDispatchPlan: shadowPlan as unknown as JsonValue
     },
     limits: { ...value.policy.limits },
     dag: supervisorDagSnapshot(dagTrackers),
@@ -1087,7 +1423,38 @@ function restoreSupervisorResumeState(input: {
       if (!activation || typeof activation.key !== "string" || !sourceNodeIds) {
         throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} has an invalid activation`);
       }
-      tracker.activations.set(activation.key, { key: activation.key, sourceNodeIds });
+      const restored: GateActivation = { key: activation.key, sourceNodeIds };
+      const rawIdentity = activation.identity;
+      if (rawIdentity !== undefined && rawIdentity !== null) {
+        // B1: re-derive the key from the persisted identity and assert byte-stability. A drift
+        // here means the derivation changed or the state was tampered with; either is fatal.
+        const identity = recordValue(rawIdentity);
+        const identitySourceNodeIds = identity ? stringArray(identity.sourceNodeIds) : undefined;
+        if (!identity
+          || identity.identityVersion !== 2
+          || typeof identity.gateId !== "string"
+          || !identitySourceNodeIds
+          || typeof identity.candidateRevision !== "string"
+          || typeof identity.evidenceEpoch !== "string"
+          || !identity.evidenceEpoch.startsWith("epoch:")) {
+          throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} has an invalid activation identity`);
+        }
+        const parsed: GateActivationIdentity = {
+          identityVersion: 2,
+          gateId: identity.gateId,
+          sourceNodeIds: identitySourceNodeIds,
+          candidateRevision: identity.candidateRevision,
+          evidenceEpoch: identity.evidenceEpoch
+        };
+        if (parsed.gateId !== tracker.gate.id) {
+          throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} has an activation identity for a different gate`);
+        }
+        if (deriveGateActivationKey(parsed) !== activation.key) {
+          throw new Error(`durable Supervisor resume Gate ${tracker.gate.id} activation key drifted from its identity`);
+        }
+        restored.identity = parsed;
+      }
+      tracker.activations.set(activation.key, restored);
     }
     const passed = stringArray(entry.passed);
     if (!passed || passed.some((key) => !tracker.activations.has(key))) {
@@ -1682,6 +2049,15 @@ function codeChangeSetRecords(records: DelegationRecord[]): DelegationRecord[] {
   return [...byChangeSet.values()];
 }
 
+/**
+ * Iterative-mode evidence: each delegation source IS the passing execution node (its worker id),
+ * so passedExecutionNodeId equals the source node id. The DAG/compiled path will supply the
+ * tracker's passedExecutionNodeId instead when it lands.
+ */
+function activationEvidence(sourceNodeIds: string[]): Array<{ sourceNodeId: string; passedExecutionNodeId: string }> {
+  return sourceNodeIds.map((sourceNodeId) => ({ sourceNodeId, passedExecutionNodeId: sourceNodeId }));
+}
+
 function trackerStatus(tracker: GateTracker): void {
   if (tracker.noExecutor) {
     tracker.status = "blocked";
@@ -1730,15 +2106,38 @@ async function executeGateActivation(
   context: ArchitectureExecutionContext,
   value: SupervisorWorkflowConfig,
   tracker: GateTracker,
-  activation: GateActivation,
+  seed: GateActivationSeed,
   round: number,
   parentNodeId: string,
   deadlineAt: number | undefined,
   sequence: number,
   upstreamEvidenceNodeIds: string[] = []
 ): Promise<string[]> {
-  tracker.activations.set(activation.key, activation);
-  if (tracker.passed.has(activation.key)) return [];
+  const declaredRegressionImpact = sourceRegressionImpact(context, seed.sourceNodeIds);
+  const candidateUrl = approvedCandidateUrl(context.input);
+  const declaredCandidateRevision = typeof context.input.candidateRevision === "string" ? context.input.candidateRevision.trim() : "";
+  let workspaceCandidate: Awaited<ReturnType<ArchitectureExecutionContext["candidateSnapshot"]>> | undefined;
+  let candidateSnapshotError: string | undefined;
+  try {
+    workspaceCandidate = await context.candidateSnapshot();
+  } catch (error) {
+    candidateSnapshotError = error instanceof Error ? error.message : String(error);
+  }
+  // B1: the activation key is derived from persistent facts only (node ids, execution ids,
+  // candidate revision, evidence epoch) — never round, wall clock, or the legacy key string.
+  // A re-executed source therefore produces a new key and cannot reuse stale passed evidence
+  // for a newer candidate; the same facts re-derive the same key byte-for-byte on resume.
+  const candidateRevision = declaredCandidateRevision || workspaceCandidate?.revision || context.run.isolation?.baseCommit || "";
+  const identity = seed.identity ?? deriveGateActivationIdentity({
+    gateId: tracker.gate.id,
+    sourceNodeIds: seed.sourceNodeIds,
+    candidateRevision,
+    evidence: (seed.evidence ?? []).map((entry) => ({ ...entry, candidateRevision }))
+  });
+  const key = deriveGateActivationKey(identity);
+  const activation: GateActivation = { key, sourceNodeIds: [...seed.sourceNodeIds].sort(), identity };
+  tracker.activations.set(key, activation);
+  if (tracker.passed.has(key)) return [];
   const sourceRuntimeRoles = new Set(
     activation.sourceNodeIds.flatMap((sourceNodeId) => {
       const source = context.plan.nodes.find((candidate) => candidate.id === sourceNodeId);
@@ -1781,17 +2180,6 @@ async function executeGateActivation(
   }
   const role = context.loaded.manifest.roles[executor.role];
   if (!role) throw new Error(`gate executor runtime role not found: ${executor.role}`);
-  const declaredRegressionImpact = sourceRegressionImpact(context, activation.sourceNodeIds);
-  const candidateUrl = approvedCandidateUrl(context.input);
-  const declaredCandidateRevision = typeof context.input.candidateRevision === "string" ? context.input.candidateRevision.trim() : "";
-  let workspaceCandidate: Awaited<ReturnType<ArchitectureExecutionContext["candidateSnapshot"]>> | undefined;
-  let candidateSnapshotError: string | undefined;
-  try {
-    workspaceCandidate = await context.candidateSnapshot();
-  } catch (error) {
-    candidateSnapshotError = error instanceof Error ? error.message : String(error);
-  }
-  const candidateRevision = declaredCandidateRevision || workspaceCandidate?.revision || context.run.isolation?.baseCommit || activation.key;
   const candidateIdentity = gateCandidateIdentity({
     candidateRevision,
     sourceNodeIds: activation.sourceNodeIds,
@@ -2178,12 +2566,12 @@ async function runAfterDelegationGates(
     if (tracker.gate.requiredCapability === "code.integration") {
       const changeSets = codeChangeSetRecords(allDelegations);
       if (changeSets.length < 2) continue;
-      const key = `change-sets:${changeSets.map((record) => record.assignment.changeSet!).sort().join(",")}`;
+      const sourceNodeIds = changeSets.map((record) => record.worker.id);
       const executedNodeIds = await executeGateActivation(
         context,
         value,
         tracker,
-        { key, sourceNodeIds: changeSets.map((record) => record.worker.id) },
+        { sourceNodeIds, evidence: activationEvidence(sourceNodeIds) },
         round,
         parentNodeId,
         deadlineAt,
@@ -2198,7 +2586,7 @@ async function runAfterDelegationGates(
         context,
         value,
         tracker,
-        { key: `delegation:${record.worker.id}`, sourceNodeIds: [record.worker.id] },
+        { sourceNodeIds: [record.worker.id], evidence: [{ sourceNodeId: record.worker.id, passedExecutionNodeId: record.worker.id }] },
         round,
         parentNodeId,
         deadlineAt,
@@ -2224,23 +2612,27 @@ async function runCompletionGates(
   const upstreamEvidenceNodeIds: string[] = [];
   for (const tracker of trackers.values()) {
     if (tracker.gate.mode === "after-each-delegation") {
-      for (const activation of tracker.activations.values()) {
+      for (const activation of [...tracker.activations.values()]) {
         if (tracker.passed.has(activation.key)) continue;
+        // Replay a stored v2 activation under its persisted identity (re-derives the same key);
+        // a pre-B1 activation without identity is re-executed under a fresh B1 identity.
+        if (!activation.identity) tracker.activations.delete(activation.key);
+        const seed: GateActivationSeed = activation.identity
+          ? { sourceNodeIds: activation.sourceNodeIds, identity: activation.identity }
+          : { sourceNodeIds: activation.sourceNodeIds, evidence: activationEvidence(activation.sourceNodeIds) };
         const executedNodeIds = await executeGateActivation(
-          context, value, tracker, activation, round, parentNodeId, deadlineAt, ++sequence.value
+          context, value, tracker, seed, round, parentNodeId, deadlineAt, ++sequence.value
         );
         nodeIds.push(...executedNodeIds);
       }
       continue;
     }
-    let activation: GateActivation | undefined;
+    let activation: GateActivationSeed | undefined;
     if (tracker.gate.requiredCapability === "code.integration") {
       const changeSets = codeChangeSetRecords(delegations);
       if (changeSets.length >= 2) {
-        activation = {
-          key: `completion-change-sets:${changeSets.map((record) => record.assignment.changeSet!).sort().join(",")}`,
-          sourceNodeIds: changeSets.map((record) => record.worker.id)
-        };
+        const sourceNodeIds = changeSets.map((record) => record.worker.id);
+        activation = { sourceNodeIds, evidence: activationEvidence(sourceNodeIds) };
       }
     } else {
       const matching = completionGateRecords(delegations, tracker.gate);
@@ -2250,12 +2642,8 @@ async function runCompletionGates(
       const strictQualityGate = value.policy.execution?.isolation === "worktree"
         && (tracker.gate.requiredCapability === "quality.test" || tracker.gate.requiredCapability === "quality.audit");
       if (matching.length > 0 || !capabilityHasWorkCondition || strictQualityGate) {
-        activation = {
-          key: matching.length > 0
-            ? `completion:${matching.map(({ key }) => key).join(",")}`
-            : strictQualityGate ? "completion:no-code-source" : "completion",
-          sourceNodeIds: matching.map(({ record }) => record.worker.id)
-        };
+        const sourceNodeIds = matching.map(({ record }) => record.worker.id);
+        activation = { sourceNodeIds, evidence: activationEvidence(sourceNodeIds) };
       }
     }
     if (!activation) continue;
@@ -2314,6 +2702,10 @@ function invalidateCompletionGatesForRemediation(
   for (const tracker of trackers.values()) {
     if (!tracker.gate.required || !gateMatchesAssignment(tracker.gate, assignment)) continue;
     tracker.passed.clear();
+    // B1: identity keys make evidence generations distinct, so the pre-B1 key collapse (which
+    // replaced the stale activation on re-execution) no longer hides old generations. Drop the
+    // stale activations explicitly — the Gate must rerun against the latest change-set evidence.
+    tracker.activations.clear();
     tracker.status = "pending";
     tracker.reason = "code remediation changed the reviewed candidate; rerun this Gate against the latest change-set evidence";
     invalidated.push(tracker.gate.id);
@@ -2983,6 +3375,38 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
     };
     const remediationRequiredGates = requiredGateIssues(trackers);
     const invalidatedGateIds = new Set<string>();
+    // B5-shadow: compare the LLM's raw dispatch decision against the compiled dispatcher's plan.
+    // This runs on the decision itself, not the post-validation scheduled set, so divergences the
+    // iterative validators reject (not-ready, outside-DAG) are still observed. Observation only —
+    // events are emitted and the iterative path is otherwise unaffected.
+    if (dagTrackers) {
+      const shadowPlan = buildShadowDispatchPlan({
+        dagTrackers,
+        gateTrackers: trackers,
+        policy: value.policy,
+        candidateRevision: shadowCandidateRevision(context),
+        executionRoot: context.executionRoot()
+      });
+      const llmDispatchedNodeIds: string[] = [];
+      const cancelledNodeIds: string[] = [];
+      for (const assignment of next.assignments) {
+        const dispatchedNodeId = assignment.nodeId ?? assignment.todoId;
+        if (typeof dispatchedNodeId !== "string" || !dispatchedNodeId.trim()) continue;
+        llmDispatchedNodeIds.push(dispatchedNodeId);
+        // A nodeId absent from the active DAG was removed by a plan revision or never existed.
+        if (!dagTrackers.has(dispatchedNodeId)) cancelledNodeIds.push(dispatchedNodeId);
+      }
+      const divergences = compareShadowDispatch({ plan: shadowPlan, llmDispatchedNodeIds, cancelledNodeIds });
+      for (const divergence of divergences) {
+        await context.emit("scheduler.divergence", node.id, {
+          nodeId: divergence.nodeId,
+          reason: divergence.reason,
+          detail: divergence.detail,
+          round,
+          compiledDispatchEnabled: false
+        });
+      }
+    }
     const scheduled: Array<{
       assignment: SupervisorAssignment;
       worker: ExecutionPlanNode;
@@ -3467,8 +3891,109 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           entry.state = "dispatched";
         }
         await context.writeArtifact("supervisor-state.json", currentResumeState());
-        for (const item of scheduled) await context.scheduleNode(item.worker);
-        completed = await Promise.all(scheduled.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
+        // B4: deterministic human-risk barrier. The verdict is always computed and observed
+        // (shadow); enforcement requires the policy seam so the iterative path never blocks on a
+        // human in shadow. The LLM's riskCategory is advisory only — it is not an input here, so
+        // it can raise (via the existing request-human-decision action) but never lower the verdict.
+        const barrierPolicy = value.policy.humanBarrier;
+        const barrierEnforce = barrierPolicy?.enforce === true;
+        const barrierGateRisk = [...trackers.values()].map((tracker) => ({
+          gateId: tracker.gate.id,
+          riskCategory: tracker.gate.riskCategory
+        }));
+        const barrierVerdictFor = (worker: ExecutionPlanNode): HumanBarrierVerdict => requiresHumanBarrier({
+          mutationResources: nodeMutationResources(worker, context.executionRoot()),
+          workKind: typeof worker.with.__workKind === "string" ? worker.with.__workKind : undefined,
+          changeSet: typeof worker.with.__changeSet === "string" && worker.with.__changeSet.trim()
+            ? worker.with.__changeSet
+            : undefined,
+          gateRiskCategories: barrierGateRisk,
+          policy: barrierPolicy
+        });
+        const barrierInputs = scheduled.map((item) => ({ ...item, verdict: barrierVerdictFor(item.worker) }));
+        for (const item of barrierInputs) {
+          if (!item.verdict.required) continue;
+          await context.emit("supervisor.dispatch.human-barrier", item.worker.id, {
+            shadow: !barrierEnforce,
+            nodeId: item.worker.id,
+            todoId: item.assignment.nodeId ?? null,
+            reasons: item.verdict.reasons,
+            policyHash: item.verdict.policyHash
+          });
+        }
+        let activeReservation = delegationReservation;
+        let spawnItems = scheduled;
+        if (barrierEnforce) {
+          spawnItems = [];
+          for (const item of barrierInputs) {
+            if (!item.verdict.required) {
+              spawnItems.push(item);
+              continue;
+            }
+            if (!context.requestHumanDecision) {
+              throw new ProviderExecutionError(
+                `deterministic human-risk barrier blocked ${item.worker.id} but no human-decision control plane is available`,
+                "",
+                "",
+                { kind: "aborted", retryable: false }
+              );
+            }
+            // Bind the approval to the policy hash; a changed policy at apply time invalidates it.
+            let boundHash = item.verdict.policyHash;
+            let outcome;
+            for (let barrierAttempt = 0; ; barrierAttempt += 1) {
+              outcome = await context.requestHumanDecision({
+                nodeId: item.worker.id,
+                round,
+                riskCategory: "irreversible-other",
+                summary: `Deterministic human-risk barrier blocked ${item.worker.id}: ${item.verdict.reasons.join(", ")}`,
+                proposedAction: {
+                  action: "delegate",
+                  summary: next.summary ?? "",
+                  assignments: [{ todoId: item.assignment.nodeId ?? "", roleId: item.assignment.roleId }]
+                }
+              });
+              if (outcome.decision === "rejected") break;
+              const fresh = barrierVerdictFor(item.worker);
+              if (!fresh.required || fresh.policyHash === boundHash) break;
+              // The policy changed while the human was deciding: the approval is stale, re-request.
+              boundHash = fresh.policyHash;
+              if (barrierAttempt >= 3) {
+                outcome = {
+                  requestId: outcome.requestId,
+                  decision: "rejected" as const,
+                  comment: "human-risk barrier policy kept changing; giving up"
+                };
+                break;
+              }
+            }
+            if (outcome.decision === "approved") {
+              spawnItems.push(item);
+            } else {
+              // Reject: settle the dispatch entry and fail the todo; the leader re-plans next round.
+              const entry = dispatchEntries.find((candidate) => candidate.nodeId === item.worker.id);
+              if (entry) {
+                entry.state = "settled-release";
+                entry.settledReason = "human-barrier-rejected";
+                entry.settledAt = new Date().toISOString();
+              }
+              if (dagTrackers && item.assignment.nodeId) {
+                const tracker = dagTrackers.get(item.assignment.nodeId);
+                if (tracker) tracker.status = "failed";
+              }
+            }
+          }
+          // Release the over-reserved budget for rejected items and re-reserve for the spawned set.
+          if (spawnItems.length < scheduled.length) {
+            activeReservation?.release();
+            activeReservation = spawnItems.length > 0
+              ? context.budget?.reserve("delegations", spawnItems.length)
+              : undefined;
+          }
+          await context.writeArtifact("supervisor-state.json", currentResumeState());
+        }
+        for (const item of spawnItems) await context.scheduleNode(item.worker);
+        completed = await Promise.all(spawnItems.map(async ({ assignment, worker }): Promise<DelegationRecord> => ({
           assignment,
           worker,
           result: await context.executeNode(worker, {
@@ -3502,7 +4027,7 @@ async function executeSupervisor(context: ArchitectureExecutionContext): Promise
           entry.settledAt = new Date().toISOString();
         }
         await context.writeArtifact("supervisor-state.json", currentResumeState());
-        delegationReservation?.commit();
+        activeReservation?.commit();
       }
     } catch (error) {
       // Rows that never reached the durable dispatched state are released here; rows already
