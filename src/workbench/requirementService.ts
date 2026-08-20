@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import type { InvocationRecord, InvocationStatus } from "./types.js";
 import type { DeliveryStatus } from "../runtime/worktreeDelivery.js";
 
@@ -96,7 +97,6 @@ export interface ProjectedRequirement {
   updatedAt: string;
 }
 
-const EMPTY_FILE: RequirementsFile = { schemaVersion: 1, requirements: {} };
 
 /** Client parity: client/src/dashboard/advancement.ts:119 advancementLane. */
 export function invocationLane(status: InvocationStatus): RequirementLane {
@@ -184,7 +184,9 @@ export async function loadRequirementsFile(dataRoot: string): Promise<Requiremen
     }
     return parsed;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return EMPTY_FILE;
+    // A fresh object every call — a shared EMPTY_FILE constant would leak records
+    // across data roots once the first caller mutates the returned file.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { schemaVersion: 1, requirements: {} };
     throw error;
   }
 }
@@ -244,4 +246,236 @@ export function createRequirementReader(deps: RequirementReaderDeps) {
       return projectRequirement(record, invocation, delivery);
     }
   };
+}
+
+// ---------------------------------------------------------------------------
+// P2 write path. requirements.json shares the state.lock + tmp→rename atomic
+// write conventions with state.json (design §2.1), so config writes and
+// requirement writes serialize on the same file lock. Import is all-or-nothing
+// per commit and idempotent on (legacyClientId, contentHash); the browser's
+// localStorage copy is never the source of truth after a successful commit.
+
+async function writeRequirementsAtomic(dataRoot: string, file: RequirementsFile): Promise<void> {
+  const filePath = path.join(dataRoot, "requirements.json");
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  await fs.writeFile(temporaryPath, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  await fs.rename(temporaryPath, filePath);
+}
+
+async function withRequirementsLock<T>(dataRoot: string, mutate: (file: RequirementsFile) => Promise<T> | T): Promise<T> {
+  const lockPath = path.join(dataRoot, "state.lock");
+  let release: (() => Promise<void>) | undefined;
+  for (let attempt = 0; attempt < 240 && !release; attempt += 1) {
+    try {
+      const handle = await fs.open(lockPath, "wx", 0o600);
+      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`, "utf8");
+      release = async () => {
+        await handle.close();
+        await fs.unlink(lockPath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const stat = await fs.stat(lockPath);
+        if (Date.now() - stat.mtimeMs > 30_000) {
+          await fs.unlink(lockPath);
+          continue;
+        }
+      } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10 + Math.min(attempt, 40)));
+    }
+  }
+  if (!release) throw new Error(`timed out waiting for requirements lock: ${lockPath}`);
+  try {
+    const file = await loadRequirementsFile(dataRoot);
+    const result = await mutate(file);
+    await writeRequirementsAtomic(dataRoot, file);
+    return result;
+  } finally {
+    await release();
+  }
+}
+
+export interface RequirementCreateInput {
+  projectId: string;
+  title: string;
+  summary: string;
+  priority: RequirementServerRecord["priority"];
+  owner: string;
+  rawRequirement: string;
+  acceptanceCriteria: string[];
+  intentLane?: RequirementIntentLane;
+}
+
+function nextRequirementCode(file: RequirementsFile): string {
+  let max = 0;
+  for (const record of Object.values(file.requirements)) {
+    const match = /^R-(\d+)$/.exec(record.code);
+    if (match?.[1]) max = Math.max(max, Number.parseInt(match[1], 10));
+  }
+  return `R-${String(max + 1).padStart(3, "0")}`;
+}
+
+export function createRequirementWriter(deps: { dataRoot: string; projectExists: (projectId: string) => boolean }) {
+  return {
+    async create(input: RequirementCreateInput): Promise<RequirementServerRecord> {
+      if (!deps.projectExists(input.projectId)) {
+        throw new Error(`unknown project: ${input.projectId}`);
+      }
+      return withRequirementsLock(deps.dataRoot, (file) => {
+        const now = new Date().toISOString();
+        const record: RequirementServerRecord = {
+          schemaVersion: 1,
+          id: `req-${randomUUID().slice(0, 8)}`,
+          projectId: input.projectId,
+          code: nextRequirementCode(file),
+          title: input.title,
+          summary: input.summary,
+          priority: input.priority,
+          owner: input.owner,
+          rawRequirement: input.rawRequirement,
+          acceptanceCriteria: input.acceptanceCriteria,
+          intentLane: input.intentLane ?? "inbox",
+          createdAt: now,
+          updatedAt: now,
+          revision: 1
+        };
+        file.requirements[record.id] = record;
+        return record;
+      });
+    },
+    /** Content/priority/intent updates with per-record revision CAS. */
+    async update(id: string, patch: Partial<Pick<RequirementServerRecord, "title" | "summary" | "priority" | "owner" | "rawRequirement" | "acceptanceCriteria" | "intentLane">>, ifMatchRevision?: number): Promise<RequirementServerRecord> {
+      return withRequirementsLock(deps.dataRoot, (file) => {
+        const record = file.requirements[id];
+        if (!record) throw new Error(`requirement not found: ${id}`);
+        if (ifMatchRevision !== undefined && record.revision !== ifMatchRevision) {
+          const conflict = new Error(`revision conflict: expected ${ifMatchRevision}, current ${record.revision}`);
+          (conflict as Error & { conflict?: boolean }).conflict = true;
+          throw conflict;
+        }
+        Object.assign(record, patch);
+        record.updatedAt = new Date().toISOString();
+        record.revision += 1;
+        return record;
+      });
+    },
+    async archive(id: string): Promise<RequirementServerRecord> {
+      return withRequirementsLock(deps.dataRoot, (file) => {
+        const record = file.requirements[id];
+        if (!record) throw new Error(`requirement not found: ${id}`);
+        record.archivedAt = new Date().toISOString();
+        record.updatedAt = record.archivedAt;
+        record.revision += 1;
+        return record;
+      });
+    },
+    async restore(id: string): Promise<RequirementServerRecord> {
+      return withRequirementsLock(deps.dataRoot, (file) => {
+        const record = file.requirements[id];
+        if (!record) throw new Error(`requirement not found: ${id}`);
+        record.archivedAt = null;
+        record.updatedAt = new Date().toISOString();
+        record.revision += 1;
+        return record;
+      });
+    },
+    /** One-shot migration import; dry-run reports the diff, commit is idempotent. */
+    async import(payload: RequirementImportEntry[], mode: "dry-run" | "commit"): Promise<RequirementImportReport> {
+      const report: RequirementImportReport = { mode, created: [], skipped: [], invalid: [] };
+      await withRequirementsLock(deps.dataRoot, async (file) => {
+        const byLegacy = new Map(Object.values(file.requirements)
+          .filter((record) => record.legacyClientId)
+          .map((record) => [record.legacyClientId as string, record]));
+        for (const entry of payload) {
+          if (!entry.legacyClientId || !entry.projectId || !entry.title) {
+            report.invalid.push({ legacyClientId: entry.legacyClientId, reason: "缺少 legacyClientId/projectId/title" });
+            continue;
+          }
+          if (!deps.projectExists(entry.projectId)) {
+            report.invalid.push({ legacyClientId: entry.legacyClientId, reason: `projectId 不存在: ${entry.projectId}` });
+            continue;
+          }
+          const legacyClientId = entry.legacyClientId;
+          const contentHash = requirementContentHash({
+            projectId: entry.projectId,
+            title: entry.title,
+            summary: entry.summary ?? "",
+            rawRequirement: entry.rawRequirement ?? "",
+            acceptanceCriteria: entry.acceptanceCriteria ?? []
+          });
+          const existing = byLegacy.get(legacyClientId);
+          if (existing && requirementContentHash(existing) === contentHash) {
+            report.skipped.push({ legacyClientId: entry.legacyClientId, reason: "内容 hash 相同（已导入）" });
+            continue;
+          }
+          if (existing) {
+            report.skipped.push({ legacyClientId: entry.legacyClientId, reason: "legacyClientId 已存在且内容不同——commit 不覆盖，需人工裁决" });
+            continue;
+          }
+          const now = new Date().toISOString();
+          const record: RequirementServerRecord = {
+            schemaVersion: 1,
+            id: `req-${randomUUID().slice(0, 8)}`,
+            legacyClientId: entry.legacyClientId,
+            projectId: entry.projectId,
+            code: entry.code ?? nextRequirementCode(file),
+            title: entry.title,
+            summary: entry.summary ?? "",
+            priority: entry.priority ?? "medium",
+            owner: entry.owner ?? "",
+            rawRequirement: entry.rawRequirement ?? "",
+            acceptanceCriteria: entry.acceptanceCriteria ?? [],
+            intentLane: entry.intentLane ?? "inbox",
+            archivedAt: entry.archivedAt ?? null,
+            createdAt: entry.createdAt ?? now,
+            updatedAt: entry.updatedAt ?? now,
+            revision: 1
+          };
+          byLegacy.set(legacyClientId, record);
+          report.created.push({ id: record.id, legacyClientId, code: record.code });
+          if (mode === "commit") file.requirements[record.id] = record;
+        }
+      });
+      return report;
+    }
+  };
+}
+
+export interface RequirementImportEntry {
+  legacyClientId: string;
+  projectId: string;
+  code?: string;
+  title: string;
+  summary?: string;
+  priority?: RequirementServerRecord["priority"];
+  owner?: string;
+  rawRequirement?: string;
+  acceptanceCriteria?: string[];
+  intentLane?: RequirementIntentLane;
+  archivedAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface RequirementImportReport {
+  mode: "dry-run" | "commit";
+  created: Array<{ id: string; legacyClientId: string; code: string }>;
+  skipped: Array<{ legacyClientId: string; reason: string }>;
+  invalid: Array<{ legacyClientId?: string; reason: string }>;
+}
+
+/** Stable hash over the human-intent content used for import idempotency. */
+export function requirementContentHash(value: Pick<RequirementServerRecord, "projectId" | "title" | "summary" | "rawRequirement" | "acceptanceCriteria">): string {
+  return createHash("sha256").update(JSON.stringify([
+    value.projectId,
+    value.title,
+    value.summary,
+    value.rawRequirement,
+    value.acceptanceCriteria
+  ])).digest("hex");
 }

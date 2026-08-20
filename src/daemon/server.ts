@@ -8,7 +8,7 @@ import type { MemoryKind } from "../memory/types.js";
 import { decodeUtf8HeaderValue } from "../core/httpHeaders.js";
 import { buildAgentCard, createA2ARequestHandler } from "../protocols/a2a.js";
 import { WorkbenchService } from "../workbench/service.js";
-import { createRequirementReader } from "../workbench/requirementService.js";
+import { createRequirementReader, createRequirementWriter, type RequirementImportEntry } from "../workbench/requirementService.js";
 import { readRunDelivery } from "../runtime/worktreeDelivery.js";
 import { DeliveryRecoveryConflict, DeliveryRevisionConflict, inspectDeliveryChain, repairDeliveryChain } from "../runtime/worktreeDelivery.js";
 import type {
@@ -634,6 +634,39 @@ export function createDaemonApp(service: WorkbenchService, options: DaemonAppOpt
       return;
     }
     send(response, { requirement: projected });
+  }));
+  // P2 write path: create / CAS update / archive / restore / one-shot import.
+  const requirementWriter = createRequirementWriter({
+    dataRoot: service.store.dataRoot,
+    projectExists: (projectId) => Boolean(service.snapshot().projects[projectId])
+  });
+  app.post("/api/requirements", asyncRoute(async (request, response) => {
+    send(response, { requirement: await requirementWriter.create(request.body) }, 201);
+  }));
+  app.patch("/api/requirements/:id", asyncRoute(async (request, response) => {
+    const ifMatch = request.header("If-Match");
+    const revision = ifMatch !== undefined && /^\d+$/.test(ifMatch) ? Number.parseInt(ifMatch, 10) : undefined;
+    try {
+      send(response, { requirement: await requirementWriter.update(routeParam(request, "id"), request.body, revision) });
+    } catch (error) {
+      if ((error as Error & { conflict?: boolean }).conflict) {
+        response.status(409).json({ error: { message: (error as Error).message }, requirement: await requirementReader.get(routeParam(request, "id")) });
+        return;
+      }
+      throw error;
+    }
+  }));
+  app.post("/api/requirements/:id/archive", asyncRoute(async (request, response) => {
+    send(response, { requirement: await requirementWriter.archive(routeParam(request, "id")) });
+  }));
+  app.post("/api/requirements/:id/restore", asyncRoute(async (request, response) => {
+    send(response, { requirement: await requirementWriter.restore(routeParam(request, "id")) });
+  }));
+  app.post("/api/requirements/import", asyncRoute(async (request, response) => {
+    const body = request.body as { mode?: unknown; payload?: unknown };
+    const mode = body.mode === "commit" ? "commit" : "dry-run";
+    const payload = Array.isArray(body.payload) ? body.payload as RequirementImportEntry[] : [];
+    send(response, await requirementWriter.import(payload, mode));
   }));
   app.post("/api/projects/connect", asyncRoute(async (request, response) => {
     send(response, await service.connectProject(request.body), 201);

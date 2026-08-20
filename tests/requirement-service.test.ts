@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   createRequirementReader,
+  createRequirementWriter,
   deliveryLane,
   invocationLane,
   latestRequirementInvocation,
   loadRequirementsFile,
   projectRequirement,
+  requirementContentHash,
+  type RequirementImportEntry,
   type RequirementServerRecord
 } from "../src/workbench/requirementService.js";
 import type { InvocationRecord, InvocationStatus } from "../src/workbench/types.js";
@@ -178,5 +181,84 @@ describe("requirement server projection (P1)", () => {
     const dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "req-svc-"));
     await fs.writeFile(path.join(dataRoot, "requirements.json"), JSON.stringify({ schemaVersion: 9, requirements: {} }), "utf8");
     await expect(loadRequirementsFile(dataRoot)).rejects.toThrow(/unsupported schema/);
+  });
+});
+
+describe("requirement write path (P2)", () => {
+  async function writerRoot(): Promise<string> {
+    const dataRoot = await fs.mkdtemp(path.join(os.tmpdir(), "req-write-"));
+    return dataRoot;
+  }
+
+  it("creates requirements with sequential codes and rejects unknown projects", async () => {
+    const dataRoot = await writerRoot();
+    const writer = createRequirementWriter({ dataRoot, projectExists: (id) => id === "proj-1" });
+    const first = await writer.create({ projectId: "proj-1", title: "一", summary: "s", priority: "high", owner: "o", rawRequirement: "r", acceptanceCriteria: [] });
+    const second = await writer.create({ projectId: "proj-1", title: "二", summary: "s", priority: "low", owner: "o", rawRequirement: "r", acceptanceCriteria: [] });
+    expect(first.code).toBe("R-001");
+    expect(second.code).toBe("R-002");
+    expect(first.revision).toBe(1);
+    await expect(writer.create({ projectId: "nope", title: "x", summary: "", priority: "low", owner: "", rawRequirement: "", acceptanceCriteria: [] })).rejects.toThrow(/unknown project/);
+  });
+
+  it("enforces revision CAS on updates and bumps the revision", async () => {
+    const dataRoot = await writerRoot();
+    const writer = createRequirementWriter({ dataRoot, projectExists: () => true });
+    const created = await writer.create({ projectId: "p", title: "t", summary: "s", priority: "low", owner: "o", rawRequirement: "r", acceptanceCriteria: [] });
+    const updated = await writer.update(created.id, { title: "t2", intentLane: "planned" }, 1);
+    expect(updated.title).toBe("t2");
+    expect(updated.intentLane).toBe("planned");
+    expect(updated.revision).toBe(2);
+    await expect(writer.update(created.id, { title: "stale" }, 1)).rejects.toThrow(/revision conflict/);
+    await expect(writer.update("req-missing", { title: "x" })).rejects.toThrow(/not found/);
+  });
+
+  it("archives and restores, and the reader reflects the state", async () => {
+    const dataRoot = await writerRoot();
+    const writer = createRequirementWriter({ dataRoot, projectExists: () => true });
+    const created = await writer.create({ projectId: "p", title: "t", summary: "s", priority: "low", owner: "o", rawRequirement: "r", acceptanceCriteria: [] });
+    const archived = await writer.archive(created.id);
+    expect(archived.archivedAt).toBeTruthy();
+    const reader = createRequirementReader({ dataRoot, snapshot: () => ({ invocations: {} }), readDelivery: async () => undefined });
+    expect((await reader.get(created.id))?.archivedAt).toBeTruthy();
+    const restored = await writer.restore(created.id);
+    expect(restored.archivedAt).toBeNull();
+  });
+
+  it("imports dry-run without writing and commits idempotently by content hash", async () => {
+    const dataRoot = await writerRoot();
+    const writer = createRequirementWriter({ dataRoot, projectExists: (id) => id === "proj-1" });
+    const entries: RequirementImportEntry[] = [
+      { legacyClientId: "req-local-1", projectId: "proj-1", title: "A", summary: "a", rawRequirement: "ra", acceptanceCriteria: ["c1"] },
+      { legacyClientId: "req-local-2", projectId: "proj-1", title: "B" },
+      { legacyClientId: "req-local-3", projectId: "ghost", title: "C" }
+    ];
+    const dry = await writer.import(entries, "dry-run");
+    expect(dry.created).toHaveLength(2);
+    expect(dry.invalid).toEqual([{ legacyClientId: "req-local-3", reason: expect.stringContaining("projectId") }]);
+    let afterDry = await loadRequirementsFile(dataRoot);
+    expect(Object.keys(afterDry.requirements)).toHaveLength(0);
+
+    const commit = await writer.import(entries, "commit");
+    expect(commit.created).toHaveLength(2);
+    const afterCommit = await loadRequirementsFile(dataRoot);
+    expect(Object.keys(afterCommit.requirements)).toHaveLength(2);
+    const imported = Object.values(afterCommit.requirements).find((r) => r.legacyClientId === "req-local-1");
+    expect(imported?.acceptanceCriteria).toEqual(["c1"]);
+
+    const retry = await writer.import(entries, "commit");
+    expect(retry.created).toHaveLength(0);
+    expect(retry.skipped).toHaveLength(2);
+    expect(retry.skipped.every((s) => s.reason.includes("已导入"))).toBe(true);
+
+    const changed: RequirementImportEntry[] = [{ legacyClientId: "req-local-1", projectId: "proj-1", title: "A-changed" }];
+    const conflicting = await writer.import(changed, "commit");
+    expect(conflicting.skipped[0]?.reason).toContain("人工裁决");
+  });
+
+  it("hashes only the human-intent content", async () => {
+    const base = { projectId: "p", title: "t", summary: "s", rawRequirement: "r", acceptanceCriteria: ["c"] };
+    expect(requirementContentHash(base)).toBe(requirementContentHash({ ...base }));
+    expect(requirementContentHash(base)).not.toBe(requirementContentHash({ ...base, title: "t2" }));
   });
 });
